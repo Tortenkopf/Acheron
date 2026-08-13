@@ -25,3 +25,10 @@ Grilling session, 2026-08-13.
 **Failure handling** — any `CaptureSource` read failure (e.g. device unplugged mid-run) is treated as fatal; the Daemon exits rather than attempting an internal reconnect/retry loop, relying on systemd's restart-on-failure policy (deferred to [Decide systemd service packaging](./10-decide-systemd-service-packaging.md)). Reasoned scope call for a personally-used MVP on one fixed device — a reconnect loop is real complexity for a failure the user will notice immediately and can resolve by relaunching.
 
 No new tickets surfaced. [Decide D-Bus interface surface](./08-decide-dbus-interface-surface.md) is now unblocked (its two blockers — this ticket and the data-model ticket — are both resolved).
+
+## Correction (from [Decide systemd service packaging](./10-decide-systemd-service-packaging.md))
+
+The "any `CaptureSource` read failure is fatal" rule above is too broad. Split by cause:
+
+- **Device absent** — the Tartarus Pro's nodes don't exist, whether at Daemon startup (booted before the device was plugged in) or after a mid-run unplug — is **not** fatal. The `CaptureSource` polls for the known `/dev/input/by-id/...` paths every ~2s until they open cleanly, then resumes normal capture. One poll loop covers both the boot-before-plugin and unplug/replug cases. Reasoning: with systemd's `Restart=on-failure` + burst-limit policy (settled in ticket 10), treating device-absence as a process exit means the unit crash-loops and lands in `failed` after 5 attempts in 60s — the opposite of the desired "stay around, pick the device up once it's plugged in" behavior.
+- **Genuine capture errors** (e.g. a `uinput` write failure, an unexpected fd error unrelated to the device being unplugged) — still fatal-exit, still deferred to systemd's `Restart=on-failure`, as originally decided. This class is a real bug, not an absent peripheral.

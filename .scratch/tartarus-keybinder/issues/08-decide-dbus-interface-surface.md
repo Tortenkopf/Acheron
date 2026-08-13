@@ -36,3 +36,7 @@ Grilling session, 2026-08-13. Supported by a background research check into `zva
 - `com.acheron.Daemon.Error.IoError`
 
 No new tickets surfaced. This closes out the D-Bus surface branch of the map.
+
+## Correction (from [Decide systemd service packaging](./10-decide-systemd-service-packaging.md))
+
+`GetState()` gains a fourth field, `device_connected: b`, alongside `profile`/`layer`/`active_toggles` — whether the Daemon's `CaptureSource` currently sees the Tartarus Pro's device nodes (per ticket 10's device-absent-is-non-fatal poll loop, correcting [ticket 07](./07-design-daemon-capture-event-loop.md)). A new signal, `DeviceConnectionChanged(connected: b)`, is added alongside the other three for the same live-push reason: the GUI needs to reflect this changing while its window is open, not just on connect.
