@@ -1,0 +1,3 @@
+# Direct evdev + uinput, not OpenRazer's DBus API
+
+OpenRazer is already installed and running on this system, and its DBus API does expose macro/remap methods for some Razer keypads (e.g. the Tartarus V2). We confirmed by reading `openrazer_daemon`'s source (`hardware/keyboards.py`) and by live DBus capability introspection that the Tartarus Pro's driver only wires up lighting methods — no macro or remap surface exists for it, unlike its sibling device. The Daemon therefore captures evdev directly and injects via `uinput`, without going through OpenRazer for remapping at all. OpenRazer remains available if lighting integration is ever wanted later, but plays no role in remapping.

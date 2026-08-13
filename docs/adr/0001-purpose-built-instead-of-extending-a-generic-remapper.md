@@ -1,0 +1,3 @@
+# Purpose-built app instead of extending an existing generic remapper
+
+Linux already has mature generic keyboard-remapping tools (`input-remapper`, `keyd`) that handle evdev capture, uinput injection, and profile switching, some with a GUI. We chose to build a new, Tartarus-Pro-specific app from scratch rather than extend one of these. These tools model "any keyboard," which has no natural home for the concepts central to this app — the Mode key's Layer, and the device's three-node input split (see CONTEXT.md) — and retrofitting those onto a generic tool would fight its existing model more than it would save.

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+target/
+
+# personal/local permission overrides, not shared project config
+.claude/settings.local.json
