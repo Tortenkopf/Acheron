@@ -1,0 +1,35 @@
+from acheron_gui import wire
+
+
+def test_keypress_binding_round_trips_through_a_variant():
+    binding = {"trigger": "fire_once", "type": "keypress", "key": "KEY_F1", "modifiers": ["ctrl", "shift"]}
+
+    variant_dict = wire.binding_to_variant(binding)
+    unpacked = {k: v.unpack() for k, v in variant_dict.items()}
+
+    assert unpacked == {"trigger": "fire_once", "type": "keypress", "key": "KEY_F1", "modifiers": ["ctrl", "shift"]}
+
+
+def test_keypress_with_no_modifiers_omits_the_modifiers_field():
+    binding = {"trigger": "fire_once", "type": "keypress", "key": "KEY_A", "modifiers": []}
+
+    variant_dict = wire.binding_to_variant(binding)
+
+    assert "modifiers" not in variant_dict
+
+
+def test_macro_binding_round_trips_through_a_variant():
+    binding = {
+        "trigger": "toggle",
+        "type": "macro",
+        "steps": [
+            {"type": "key_down", "key": "KEY_A"},
+            {"type": "delay_ms", "ms": 50},
+            {"type": "key_up", "key": "KEY_A"},
+        ],
+    }
+
+    variant_dict = wire.binding_to_variant(binding)
+    unpacked = {k: v.unpack() for k, v in variant_dict.items()}
+
+    assert unpacked == binding
