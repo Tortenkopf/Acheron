@@ -52,6 +52,11 @@ impl Config {
     pub fn active_profile(&self) -> Option<&Profile> {
         self.profiles.get(&self.active_profile)
     }
+
+    pub fn active_profile_mut(&mut self) -> Option<&mut Profile> {
+        let name = self.active_profile.clone();
+        self.profiles.get_mut(&name)
+    }
 }
 
 /// A Profile's Base-layer Bindings (CONTEXT.md: Profile, Layer). Held layer
@@ -199,7 +204,10 @@ fn parse(contents: &str) -> Result<Config, ConfigError> {
     Ok(config)
 }
 
-fn write(path: &Path, config: &Config) -> Result<(), ConfigError> {
+/// Rewrites `config.toml` in full — the only persistence path, used both for
+/// the initial seed and for every live D-Bus mutation (ticket 15), so
+/// `config.toml` on disk always matches in-memory state immediately.
+pub(crate) fn write(path: &Path, config: &Config) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(ConfigError::Io)?;
     }

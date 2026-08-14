@@ -3,13 +3,17 @@ use std::io;
 use acheron_daemon::capture::CaptureSource;
 use acheron_daemon::capture::evdev_source::EvdevCaptureSource;
 use acheron_daemon::config;
+use acheron_daemon::dbus::Daemon;
 use acheron_daemon::{dispatch, injector};
 use tokio::task::JoinError;
 
-/// No D-Bus surface yet (ticket 15) — this loads `config.toml` (seeding it
-/// on first run, per issue 11) and assembles the capture -> dispatch ->
-/// injector pipeline, with dispatch resolving each event against the
-/// active Profile's Base Layer (ticket 14).
+/// Loads `config.toml` (seeding it on first run, per issue 11), assembles
+/// the capture -> dispatch -> injector pipeline (dispatch resolving each
+/// event against the active Profile's Base Layer, ticket 14), and exposes
+/// the `com.acheron.Daemon` D-Bus surface on the session bus (ticket 15) —
+/// GUI-originated calls reach the dispatch task as `Command`s over the same
+/// channel `PhysicalEvent`s already flow through (issue 07's "D-Bus
+/// interleaving"), so it stays the sole owner of `Config`.
 ///
 /// No graceful-shutdown story exists yet either, so any of the three tasks
 /// finishing is treated as fatal: per issue 07/10, a genuine capture or
@@ -25,20 +29,28 @@ async fn main() -> io::Result<()> {
         );
         std::process::exit(1);
     });
-    let bindings = config
-        .active_profile()
-        .expect("load_or_seed validates active_profile names a real profile")
-        .base
-        .clone();
 
     let device = injector::build_device()?;
     let (inj, inj_handle) = injector::spawn(device);
 
-    let (tx, rx) = tokio::sync::mpsc::channel(256);
-    let dispatch_handle = tokio::spawn(dispatch::run(rx, inj, bindings));
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(256);
+    let dispatch_handle = tokio::spawn(dispatch::run(event_rx, cmd_rx, inj, config, config_path));
+
+    // Held for the process's lifetime: dropping it would take the D-Bus
+    // surface down while the other three tasks keep running.
+    let _connection = zbus::connection::Builder::session()
+        .map_err(io::Error::other)?
+        .name("com.acheron.Daemon")
+        .map_err(io::Error::other)?
+        .serve_at("/com/acheron/Daemon", Daemon::new(cmd_tx))
+        .map_err(io::Error::other)?
+        .build()
+        .await
+        .map_err(io::Error::other)?;
 
     let result = tokio::select! {
-        result = EvdevCaptureSource.run(tx) => report("capture", result),
+        result = EvdevCaptureSource.run(event_tx) => report("capture", result),
         result = inj_handle => report("injector", flatten(result)),
         result = dispatch_handle => report("dispatch", flatten(result)),
     };
