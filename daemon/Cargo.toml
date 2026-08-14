@@ -4,5 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-evdev = "0.13"
+evdev = { version = "0.13", features = ["serde"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+dirs = "6"
+
+[dev-dependencies]
+tempfile = "3"

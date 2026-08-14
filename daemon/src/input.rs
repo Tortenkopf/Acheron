@@ -7,6 +7,9 @@
 //! events and by the injector to translate a `PhysicalEvent` back into the
 //! identical raw evdev output for passthrough.
 
+use std::fmt;
+use std::str::FromStr;
+
 use evdev::KeyCode;
 
 /// Which of the Tartarus Pro's three evdev nodes an `Input` is read from.
@@ -53,6 +56,82 @@ pub enum Input {
     Grid(u8, u8),
     Thumbstick(Direction),
     Wheel(WheelEvent),
+}
+
+/// The flat snake_case string form of an `Input`, matching issue 01's table
+/// exactly (`mode_key`, `grid_r1c1`, `thumbstick_up`, `wheel_scroll_up`,
+/// `wheel_middle`, …). Used identically in TOML (ticket 14) and, later, on
+/// the D-Bus wire (issue 08).
+impl fmt::Display for Input {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Input::ModeKey => write!(f, "mode_key"),
+            Input::Grid(row, col) => write!(f, "grid_r{row}c{col}"),
+            Input::Thumbstick(Direction::Up) => write!(f, "thumbstick_up"),
+            Input::Thumbstick(Direction::Down) => write!(f, "thumbstick_down"),
+            Input::Thumbstick(Direction::Left) => write!(f, "thumbstick_left"),
+            Input::Thumbstick(Direction::Right) => write!(f, "thumbstick_right"),
+            Input::Wheel(WheelEvent::ScrollUp) => write!(f, "wheel_scroll_up"),
+            Input::Wheel(WheelEvent::ScrollDown) => write!(f, "wheel_scroll_down"),
+            Input::Wheel(WheelEvent::MiddleClick) => write!(f, "wheel_middle"),
+        }
+    }
+}
+
+/// An `Input` string that doesn't match any of issue 01's flat snake_case
+/// forms (e.g. a hand-edit typo in `config.toml`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseInputError(String);
+
+impl fmt::Display for ParseInputError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?} is not a valid Input", self.0)
+    }
+}
+
+impl std::error::Error for ParseInputError {}
+
+impl FromStr for Input {
+    type Err = ParseInputError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "mode_key" => return Ok(Input::ModeKey),
+            "thumbstick_up" => return Ok(Input::Thumbstick(Direction::Up)),
+            "thumbstick_down" => return Ok(Input::Thumbstick(Direction::Down)),
+            "thumbstick_left" => return Ok(Input::Thumbstick(Direction::Left)),
+            "thumbstick_right" => return Ok(Input::Thumbstick(Direction::Right)),
+            "wheel_scroll_up" => return Ok(Input::Wheel(WheelEvent::ScrollUp)),
+            "wheel_scroll_down" => return Ok(Input::Wheel(WheelEvent::ScrollDown)),
+            "wheel_middle" => return Ok(Input::Wheel(WheelEvent::MiddleClick)),
+            _ => {}
+        }
+        if let Some((row, col)) = s
+            .strip_prefix("grid_r")
+            .and_then(|rest| rest.split_once('c'))
+            && let (Ok(row), Ok(col)) = (row.parse::<u8>(), col.parse::<u8>())
+            && (1..=4).contains(&row)
+            && (1..=5).contains(&col)
+        {
+            return Ok(Input::Grid(row, col));
+        }
+        Err(ParseInputError(s.to_string()))
+    }
+}
+
+/// Serializes as the same flat string `Display` produces, so `Input` can be
+/// used directly as a TOML table key (ticket 14) without a wrapper type.
+impl serde::Serialize for Input {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Input {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 /// The 4x5 grid's evdev key codes, top-left to bottom-right, per issue 01's table.
@@ -135,20 +214,18 @@ pub fn key_code_for_input(input: Input) -> Option<KeyCode> {
     }
 }
 
-/// All key codes the virtual uinput device must declare support for, so that
-/// every `Input` other than wheel-scroll can be replayed through it.
+/// Linux's `KEY_MAX` (`linux/input-event-codes.h`) — the highest valid
+/// `EV_KEY` code. `BTN_*` codes share this same numeric space.
+const KEY_CODE_MAX: u16 = 0x2ff;
+
+/// All key codes the virtual uinput device must declare support for. Ticket
+/// 14 onward lets a Binding's `Action::Keypress` target *any* key (the remap
+/// target, not just this device's own physical Inputs), so rather than
+/// tracking a curated allow-list, the virtual device declares the whole
+/// standard `EV_KEY` range up front — same approach other Linux uinput
+/// remappers use, and harmless for the codes that go unused.
 pub fn all_injectable_key_codes() -> Vec<KeyCode> {
-    let mut codes = vec![KeyCode::KEY_LEFTALT, KeyCode::BTN_MIDDLE];
-    codes.extend([
-        KeyCode::KEY_UP,
-        KeyCode::KEY_DOWN,
-        KeyCode::KEY_LEFT,
-        KeyCode::KEY_RIGHT,
-    ]);
-    for row in GRID_KEYS {
-        codes.extend(row);
-    }
-    codes
+    (0..=KEY_CODE_MAX).map(KeyCode::new).collect()
 }
 
 #[cfg(test)]
@@ -202,5 +279,76 @@ mod tests {
         assert_eq!(key_code_for_input(Input::Grid(1, 0)), None);
         assert_eq!(key_code_for_input(Input::Grid(5, 1)), None);
         assert_eq!(key_code_for_input(Input::Grid(1, 6)), None);
+    }
+
+    #[test]
+    fn display_matches_issue_01s_flat_strings() {
+        assert_eq!(Input::ModeKey.to_string(), "mode_key");
+        assert_eq!(Input::Grid(1, 1).to_string(), "grid_r1c1");
+        assert_eq!(Input::Grid(4, 5).to_string(), "grid_r4c5");
+        assert_eq!(
+            Input::Thumbstick(Direction::Up).to_string(),
+            "thumbstick_up"
+        );
+        assert_eq!(
+            Input::Wheel(WheelEvent::ScrollUp).to_string(),
+            "wheel_scroll_up"
+        );
+        assert_eq!(
+            Input::Wheel(WheelEvent::MiddleClick).to_string(),
+            "wheel_middle"
+        );
+    }
+
+    #[test]
+    fn from_str_round_trips_every_input_through_its_display_form() {
+        let mut inputs = vec![
+            Input::ModeKey,
+            Input::Thumbstick(Direction::Up),
+            Input::Thumbstick(Direction::Down),
+            Input::Thumbstick(Direction::Left),
+            Input::Thumbstick(Direction::Right),
+            Input::Wheel(WheelEvent::ScrollUp),
+            Input::Wheel(WheelEvent::ScrollDown),
+            Input::Wheel(WheelEvent::MiddleClick),
+        ];
+        for row in 1..=4u8 {
+            for col in 1..=5u8 {
+                inputs.push(Input::Grid(row, col));
+            }
+        }
+
+        for input in inputs {
+            let parsed: Input = input
+                .to_string()
+                .parse()
+                .expect("must parse its own Display form");
+            assert_eq!(parsed, input);
+        }
+    }
+
+    #[test]
+    fn from_str_rejects_unknown_and_out_of_range_strings() {
+        assert!("not_an_input".parse::<Input>().is_err());
+        assert!("grid_r5c1".parse::<Input>().is_err());
+        assert!("grid_r1c6".parse::<Input>().is_err());
+        assert!("grid_r0c1".parse::<Input>().is_err());
+    }
+
+    #[test]
+    fn serde_round_trips_input_as_a_toml_string() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Wrapper {
+            input: Input,
+        }
+
+        let wrapper = Wrapper {
+            input: Input::Grid(2, 3),
+        };
+        let toml = toml::to_string(&wrapper).unwrap();
+        assert_eq!(toml.trim(), r#"input = "grid_r2c3""#);
+
+        let parsed: Wrapper = toml::from_str(&toml).unwrap();
+        assert_eq!(parsed.input, Input::Grid(2, 3));
     }
 }

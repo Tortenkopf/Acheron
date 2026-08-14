@@ -2,6 +2,7 @@
 //! process lifetime and serializes every output write through one channel,
 //! so no other task ever touches the fd directly (issue 07).
 
+use std::fmt;
 use std::io;
 
 use evdev::uinput::VirtualDevice;
@@ -10,6 +11,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::capture::{EventState, PhysicalEvent};
+use crate::config::Modifiers;
 use crate::input::{self, Input, WheelEvent};
 
 /// Where the injector task writes translated evdev events. The real
@@ -46,18 +48,56 @@ pub fn build_device() -> io::Result<VirtualDevice> {
         .build()
 }
 
-/// Handle for sending `PhysicalEvent`s to the injector task.
+/// A write-command sent to the injector task — either a passthrough
+/// `PhysicalEvent` (ticket 13) or a Binding's compiled Keypress firing
+/// (ticket 14) — so both ever go through the one channel/task/fd (issue 07).
+#[derive(Debug, Clone, PartialEq)]
+enum InjectorMessage {
+    Physical(PhysicalEvent),
+    Keypress { modifiers: Modifiers, key: KeyCode },
+}
+
+/// The injector task's channel has closed, meaning the task itself has
+/// died — per issue 07, a genuine fatal error for callers to propagate.
+#[derive(Debug)]
+pub struct InjectorClosed;
+
+impl fmt::Display for InjectorClosed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "injector task's channel is closed")
+    }
+}
+
+impl std::error::Error for InjectorClosed {}
+
+/// Handle for sending write-commands to the injector task.
 #[derive(Clone)]
 pub struct Injector {
-    tx: mpsc::Sender<PhysicalEvent>,
+    tx: mpsc::Sender<InjectorMessage>,
 }
 
 impl Injector {
-    pub async fn inject(
+    /// Re-emits a captured `PhysicalEvent` unchanged (passthrough).
+    pub async fn inject_physical(&self, event: PhysicalEvent) -> Result<(), InjectorClosed> {
+        self.tx
+            .send(InjectorMessage::Physical(event))
+            .await
+            .map_err(|_| InjectorClosed)
+    }
+
+    /// Fires a Keypress Action: presses `modifiers` then `key` in one frame,
+    /// then releases `key` then `modifiers` (reverse order) in a second
+    /// frame — the "canned modifier-down/key-down/key-up/modifier-up
+    /// sequence" issue 06 describes for a compiled Keypress.
+    pub async fn fire_keypress(
         &self,
-        event: PhysicalEvent,
-    ) -> Result<(), mpsc::error::SendError<PhysicalEvent>> {
-        self.tx.send(event).await
+        modifiers: Modifiers,
+        key: KeyCode,
+    ) -> Result<(), InjectorClosed> {
+        self.tx
+            .send(InjectorMessage::Keypress { modifiers, key })
+            .await
+            .map_err(|_| InjectorClosed)
     }
 }
 
@@ -70,15 +110,59 @@ pub fn spawn<S: InjectSink>(sink: S) -> (Injector, JoinHandle<io::Result<()>>) {
 
 async fn injector_loop<S: InjectSink>(
     mut sink: S,
-    mut rx: mpsc::Receiver<PhysicalEvent>,
+    mut rx: mpsc::Receiver<InjectorMessage>,
 ) -> io::Result<()> {
-    while let Some(event) = rx.recv().await {
-        let batch = translate(event);
-        if !batch.is_empty() {
-            sink.emit(&batch)?;
+    while let Some(message) = rx.recv().await {
+        match message {
+            InjectorMessage::Physical(event) => {
+                let batch = translate(event);
+                if !batch.is_empty() {
+                    sink.emit(&batch)?;
+                }
+            }
+            InjectorMessage::Keypress { modifiers, key } => {
+                let (press, release) = keypress_batches(modifiers, key);
+                sink.emit(&press)?;
+                sink.emit(&release)?;
+            }
         }
     }
     Ok(())
+}
+
+/// The modifier key codes a chord presses, in a fixed ctrl/shift/alt/super
+/// order (released in reverse).
+fn modifier_codes(modifiers: Modifiers) -> Vec<KeyCode> {
+    let mut codes = Vec::with_capacity(4);
+    if modifiers.ctrl {
+        codes.push(KeyCode::KEY_LEFTCTRL);
+    }
+    if modifiers.shift {
+        codes.push(KeyCode::KEY_LEFTSHIFT);
+    }
+    if modifiers.alt {
+        codes.push(KeyCode::KEY_LEFTALT);
+    }
+    if modifiers.super_key {
+        codes.push(KeyCode::KEY_LEFTMETA);
+    }
+    codes
+}
+
+/// Builds the press frame (modifiers down, then key down) and release frame
+/// (key up, then modifiers up in reverse) for a compiled Keypress firing.
+fn keypress_batches(modifiers: Modifiers, key: KeyCode) -> (Vec<InputEvent>, Vec<InputEvent>) {
+    let mods = modifier_codes(modifiers);
+
+    let mut press = Vec::with_capacity(mods.len() + 1);
+    press.extend(mods.iter().map(|&code| *KeyEvent::new(code, 1)));
+    press.push(*KeyEvent::new(key, 1));
+
+    let mut release = Vec::with_capacity(mods.len() + 1);
+    release.push(*KeyEvent::new(key, 0));
+    release.extend(mods.iter().rev().map(|&code| *KeyEvent::new(code, 0)));
+
+    (press, release)
 }
 
 /// Translates one `PhysicalEvent` into the raw evdev events that reproduce
@@ -199,6 +283,86 @@ mod tests {
         assert_eq!(
             input::input_for_key(Node::Main, code),
             Some(Input::Thumbstick(Direction::Left))
+        );
+    }
+
+    fn key_and_value(event: InputEvent) -> (KeyCode, i32) {
+        match event.destructure() {
+            evdev::EventSummary::Key(_, code, value) => (code, value),
+            other => panic!("expected a key event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keypress_batches_with_no_modifiers_is_just_the_key_down_then_up() {
+        let (press, release) = keypress_batches(Modifiers::default(), KeyCode::KEY_F1);
+        assert_eq!(
+            press.into_iter().map(key_and_value).collect::<Vec<_>>(),
+            vec![(KeyCode::KEY_F1, 1)]
+        );
+        assert_eq!(
+            release.into_iter().map(key_and_value).collect::<Vec<_>>(),
+            vec![(KeyCode::KEY_F1, 0)]
+        );
+    }
+
+    #[test]
+    fn keypress_batches_presses_modifiers_before_key_and_releases_in_reverse() {
+        let modifiers = Modifiers {
+            ctrl: true,
+            shift: true,
+            alt: false,
+            super_key: false,
+        };
+        let (press, release) = keypress_batches(modifiers, KeyCode::KEY_T);
+
+        assert_eq!(
+            press.into_iter().map(key_and_value).collect::<Vec<_>>(),
+            vec![
+                (KeyCode::KEY_LEFTCTRL, 1),
+                (KeyCode::KEY_LEFTSHIFT, 1),
+                (KeyCode::KEY_T, 1),
+            ]
+        );
+        assert_eq!(
+            release.into_iter().map(key_and_value).collect::<Vec<_>>(),
+            vec![
+                (KeyCode::KEY_T, 0),
+                (KeyCode::KEY_LEFTSHIFT, 0),
+                (KeyCode::KEY_LEFTCTRL, 0),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn fire_keypress_emits_a_press_batch_then_a_release_batch() {
+        let sink = testing::RecordingSink::new();
+        let (injector, handle) = spawn(sink.clone());
+
+        injector
+            .fire_keypress(Modifiers::default(), KeyCode::KEY_F1)
+            .await
+            .unwrap();
+        drop(injector);
+        handle.await.unwrap().unwrap();
+
+        let batches = sink.batches();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(
+            batches[0]
+                .iter()
+                .copied()
+                .map(key_and_value)
+                .collect::<Vec<_>>(),
+            vec![(KeyCode::KEY_F1, 1)]
+        );
+        assert_eq!(
+            batches[1]
+                .iter()
+                .copied()
+                .map(key_and_value)
+                .collect::<Vec<_>>(),
+            vec![(KeyCode::KEY_F1, 0)]
         );
     }
 }
