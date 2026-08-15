@@ -98,6 +98,17 @@ action = { type = "macro", steps = [
 - Pressing the physical key that has an active Toggle always stops that Toggle first, regardless of what Binding the current Layer nominally assigns to that key now; only once stopped does the key resume evaluating the current Layer's own Binding.
 - A Toggle's identity is pinned to the physical key that started it, independent of the live Binding lookup.
 
+### Daemon output suppression (ticket 23/24)
+
+A connected D-Bus client (in practice, the GUI reacting to its own window's focus state — ticket 25) can tell the Daemon to withhold all of its synthetic `uinput` output — Fire-once, Hold-to-repeat, and Toggle firings alike — for as long as it says so, via `SetOutputSuppressed(suppressed: b)`.
+
+- **Mechanism**: the single injector task that already serializes every `uinput` write (see "Daemon event loop and concurrency" below) gates each write behind a suppression flag. Only the actual write to the virtual device is withheld; Trigger-mode firing logic, Macro looping, and a running Toggle's `active_toggles` state are entirely unaffected and resume emitting exactly where they logically were the instant suppression clears.
+- **Trigger shape**: level-set, not edge-triggered — `SetOutputSuppressed` reflects "should output be suppressed right now," so a client can call it redundantly with the same value with no ill effect. This is deliberate: it closes the case of a client already in the suppress-worthy state (e.g. the GUI window already focused) before output starts, not just state transitions.
+- **Scope**: all Daemon output, not just Toggle output — a single stray Fire-once/Hold-to-repeat character landing somewhere it shouldn't (e.g. a focused GUI text field) is the same class of problem as a Toggle flooding one.
+- **Multiple clients**: last-write-wins on the flag; disconnect-clear (below) is tied to whichever connection most recently set it.
+- **Disconnect safety (required, not optional)**: suppression auto-clears if the connection that set it drops before an explicit clear call — crash, `kill -9`, any ungraceful disconnect — via peer/name-disconnect detection on the Daemon's `zbus` connection. Without this, suppression could get stuck on and silently mute the whole physical device with no on-screen way to explain why.
+- **Explicitly not a Toggle-stop condition**: this is separate from, and not an amendment to, "Toggle behavior across Layer/Profile switches" above. A Toggle is never stopped by suppression, only its output delivery is gated — the same two stop conditions (same-key press, Profile switch) remain the complete list.
+
 ### Daemon event loop and concurrency
 
 - One `tokio` runtime for the whole Daemon.
@@ -113,6 +124,7 @@ action = { type = "macro", steps = [
 
 - One flat object, `/com/acheron/Daemon`, bus name `com.acheron.Daemon`, one combined interface (also `com.acheron.Daemon`) — no ObjectManager hierarchy.
 - Mutating methods are atomic, per-entity, immediately validated and applied (in-memory + `config.toml` rewritten right away, no draft/save step): `CreateProfile`, `DeleteProfile`, `RenameProfile`, `SetModeKeyRole`, `SwitchProfile`, `SetBinding`, `ClearBinding`.
+- `SetOutputSuppressed(suppressed: b)` (ticket 24) is a separate, `Config`-free runtime control — it never touches `config.toml` and has no persistence — see "Daemon output suppression" above.
 - Reads: `GetConfig() -> a{sv}` returns the entire document in one call (hydrates the GUI's editor). `GetState() -> (profile: s, layer: s, active_toggles: as, device_connected: b)` returns the live runtime snapshot, for the GUI to sync on connect/reopen.
 - Signals (live push, not poll, since Layer/Toggle/connection state can change too fast/frequently for polling to track from a tray icon):
   - `ActiveProfileChanged(name: s)`

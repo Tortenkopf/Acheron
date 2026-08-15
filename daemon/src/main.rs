@@ -45,7 +45,7 @@ async fn main() -> io::Result<()> {
         .map_err(io::Error::other)?
         .name("com.acheron.Daemon")
         .map_err(io::Error::other)?
-        .serve_at("/com/acheron/Daemon", Daemon::new(cmd_tx))
+        .serve_at("/com/acheron/Daemon", Daemon::new(cmd_tx, inj.clone()))
         .map_err(io::Error::other)?
         .build()
         .await

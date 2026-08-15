@@ -60,3 +60,7 @@ _Avoid_: driver, service, agent
 **GUI**:
 The interactive application through which the user edits Profiles, Bindings, and Macros, and monitors current state (active Profile, active Layer). Configures the Daemon; does not perform remapping itself.
 _Avoid_: app, client, frontend
+
+**Output suppression**:
+A connected client's request that the Daemon withhold all synthetic output while the request is active, without stopping anything internally — Trigger-mode firing, Macro looping, and a Toggle's running state continue unaffected, and only the write to the physical device is withheld. Distinct from a Toggle *stopping*: a suppressed Toggle is still active and resumes emitting the instant suppression clears.
+_Avoid_: pause, mute, disable (all imply something is stopped, not just withheld)

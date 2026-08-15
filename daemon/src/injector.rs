@@ -48,14 +48,16 @@ pub fn build_device() -> io::Result<VirtualDevice> {
 }
 
 /// A write-command sent to the injector task — either a passthrough
-/// `PhysicalEvent` (ticket 13) or a single key state change, one `KeyDown`/
+/// `PhysicalEvent` (ticket 13), a single key state change, one `KeyDown`/
 /// `KeyUp` step of a compiled Binding firing (ticket 17's shared executor,
-/// `executor::run_once`/`ActiveToggle`) — so both ever go through the one
-/// channel/task/fd (issue 07).
+/// `executor::run_once`/`ActiveToggle`), or a suppression-flag update
+/// (ticket 24) — so all of them go through the one channel/task/fd
+/// (issue 07).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum InjectorMessage {
     Physical(PhysicalEvent),
     KeyState { key: KeyCode, down: bool },
+    SetSuppressed(bool),
 }
 
 /// The injector task's channel has closed, meaning the task itself has
@@ -95,6 +97,20 @@ impl Injector {
             .await
             .map_err(|_| InjectorClosed)
     }
+
+    /// Level-sets whether the injector withholds every subsequent write to
+    /// the virtual device (ticket 24/spec.md's "Daemon output suppression").
+    /// Queued as a message like any other write-command, so it takes effect
+    /// in the same order the D-Bus caller observed relative to firings that
+    /// were already in flight — never a separate out-of-band flag racing the
+    /// channel. Firing logic, Macro looping, and `active_toggles` are
+    /// untouched; only whether a write actually reaches `sink.emit` changes.
+    pub async fn set_suppressed(&self, suppressed: bool) -> Result<(), InjectorClosed> {
+        self.tx
+            .send(InjectorMessage::SetSuppressed(suppressed))
+            .await
+            .map_err(|_| InjectorClosed)
+    }
 }
 
 /// Spawns the injector task, which owns `sink` for the life of the task.
@@ -108,18 +124,22 @@ async fn injector_loop<S: InjectSink>(
     mut sink: S,
     mut rx: mpsc::Receiver<InjectorMessage>,
 ) -> io::Result<()> {
+    let mut suppressed = false;
     while let Some(message) = rx.recv().await {
         match message {
             InjectorMessage::Physical(event) => {
                 let batch = translate(event);
-                if !batch.is_empty() {
+                if !batch.is_empty() && !suppressed {
                     sink.emit(&batch)?;
                 }
             }
             InjectorMessage::KeyState { key, down } => {
-                let value = if down { 1 } else { 0 };
-                sink.emit(&[*KeyEvent::new(key, value)])?;
+                if !suppressed {
+                    let value = if down { 1 } else { 0 };
+                    sink.emit(&[*KeyEvent::new(key, value)])?;
+                }
             }
+            InjectorMessage::SetSuppressed(value) => suppressed = value,
         }
     }
     Ok(())

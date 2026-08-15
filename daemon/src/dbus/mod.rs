@@ -1,20 +1,26 @@
 //! The D-Bus surface (ticket 15 / issue 08): one flat object,
 //! `/com/acheron/Daemon`, on bus name `com.acheron.Daemon`, one combined
 //! interface (also `com.acheron.Daemon`) — no `ObjectManager` hierarchy.
-//! `Daemon` itself holds only a `Command` sender: every read/mutation is
-//! forwarded to the dispatch task (the sole owner of `Config`) and awaited
-//! over a `oneshot` reply, so this type never touches `Config` directly.
+//! `Daemon` holds a `Command` sender for every read/mutation of `Config`
+//! (forwarded to the dispatch task, the sole owner of `Config`, and awaited
+//! over a `oneshot` reply — this type never touches `Config` directly), plus
+//! an `Injector` handle used only by `SetOutputSuppressed` (ticket 24), which
+//! is deliberately Config-free and so bypasses dispatch entirely.
 
 pub mod wire;
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
+use futures_util::StreamExt;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use zbus::interface;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::OwnedValue;
 
 use crate::command::{Command, CommandError};
+use crate::injector::Injector;
 use crate::input::Input;
 
 /// `com.acheron.Daemon.Error.*` — a small named set (issue 08's grilling
@@ -50,15 +56,43 @@ fn dispatch_gone<T>(_: T) -> DaemonError {
     DaemonError::IoError("the dispatch task is not responding".to_string())
 }
 
+/// The injector task has stopped responding — only possible if it panicked
+/// or exited, both genuine Daemon-internal failures (mirrors `dispatch_gone`
+/// for the Config-free `SetOutputSuppressed` path, ticket 24).
+fn injector_gone<T>(_: T) -> DaemonError {
+    DaemonError::IoError("the injector task is not responding".to_string())
+}
+
 type DaemonResult<T> = Result<T, DaemonError>;
+
+/// Tracks which connection, if any, currently holds output suppression
+/// (ticket 24). `epoch` is bumped on every `SetOutputSuppressed` call,
+/// whatever its value — the disconnect-watcher task spawned for a `true`
+/// call captures the epoch it was born with and only auto-clears
+/// suppression if that epoch is still current, so a stale watcher from a
+/// since-superseded call can never clobber a newer one (last-write-wins,
+/// disconnect-clear tied to whichever connection most recently set it).
+struct SuppressionState {
+    epoch: u64,
+    watcher: Option<JoinHandle<()>>,
+}
 
 pub struct Daemon {
     commands: mpsc::Sender<Command>,
+    injector: Injector,
+    suppression: Arc<Mutex<SuppressionState>>,
 }
 
 impl Daemon {
-    pub fn new(commands: mpsc::Sender<Command>) -> Self {
-        Daemon { commands }
+    pub fn new(commands: mpsc::Sender<Command>, injector: Injector) -> Self {
+        Daemon {
+            commands,
+            injector,
+            suppression: Arc::new(Mutex::new(SuppressionState {
+                epoch: 0,
+                watcher: None,
+            })),
+        }
     }
 
     fn parse_input(input: &str) -> DaemonResult<Input> {
@@ -66,6 +100,43 @@ impl Daemon {
             .parse()
             .map_err(|_| DaemonError::InvalidBinding(format!("{input:?} is not a valid Input")))
     }
+}
+
+/// Waits for whichever connection sent a `SetOutputSuppressed(true)` call to
+/// disconnect. On a real message bus (`connection.is_bus()`), that's a
+/// specific client among potentially several sharing the Daemon's one
+/// session-bus connection, so it's tracked by unique name via
+/// `org.freedesktop.DBus`'s `NameOwnerChanged` (the standard idiom for
+/// "notice when my caller goes away" on a shared bus — zbus's own
+/// `Connection::close_when_bus_name_disappears`-style tests use the same
+/// `(0, name), (2, "")` match-arg filter). Over a private peer-to-peer
+/// connection (the test harness's `TestServer`, and any future non-bus
+/// transport), there is no bus daemon and no unique name to watch, but the
+/// `zbus::Connection` itself *is* the one peer, so its own close detection
+/// is exact.
+async fn watch_disconnect(connection: zbus::Connection, sender: Option<String>) {
+    if connection.is_bus()
+        && let Some(sender) = sender
+        && let Ok(dbus) = zbus::fdo::DBusProxy::new(&connection).await
+        && let Ok(mut stream) = dbus
+            .receive_name_owner_changed_with_args(&[(0, sender.as_str()), (2, "")])
+            .await
+    {
+        // Subscribed *before* checking current ownership, never the other
+        // way around, so a disconnect racing this setup can never be
+        // missed: if the name is already gone by the time we check, either
+        // it vanished before the subscription above took effect (caught by
+        // this check) or after (already queued in `stream`, caught by
+        // `stream.next()` below either way).
+        if let Ok(name) = zbus::names::BusName::try_from(sender.as_str())
+            && let Ok(false) = dbus.name_has_owner(name).await
+        {
+            return;
+        }
+        stream.next().await;
+        return;
+    }
+    connection.closed().await;
 }
 
 #[interface(name = "com.acheron.Daemon")]
@@ -104,6 +175,87 @@ impl Daemon {
                 .collect(),
             state.device_connected,
         ))
+    }
+
+    /// Level-sets whether the calling client wants Daemon output withheld —
+    /// reflects "should output be suppressed right now," not an
+    /// edge-triggered toggle, so a client (e.g. the GUI pushing its window's
+    /// live focus state) can call this redundantly with the same value with
+    /// no ill effect (ticket 23/24). Only the injector task's write to
+    /// `uinput` is gated: Trigger-mode firing, Macro looping, and a running
+    /// Toggle's `active_toggles` state are entirely unaffected, and resume
+    /// emitting output exactly where they logically were the instant
+    /// suppression clears.
+    ///
+    /// Last write wins across clients. If `suppressed` is `true`, a watcher
+    /// is spawned that auto-clears suppression the instant this call's
+    /// connection disconnects without an explicit clear — see
+    /// `watch_disconnect` — so suppression can never get stuck on and
+    /// silently mute the whole physical device.
+    async fn set_output_suppressed(
+        &self,
+        suppressed: bool,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> Result<(), DaemonError> {
+        let sender = header.sender().map(ToString::to_string);
+
+        // zbus spawns a fresh task per incoming method call (every method
+        // here takes `&self`, never `&mut self`), so two `SetOutputSuppressed`
+        // calls can genuinely run concurrently — the epoch bump and the old
+        // watcher's take/abort must happen in one atomic critical section,
+        // and `epoch` must be *this* call's own bumped value, not whatever
+        // `state.epoch` happens to read moments later after an `.await` —
+        // or a racing call's bump could get misattributed and this call's
+        // final store below could clobber a newer call's already-stored
+        // watcher.
+        let epoch = {
+            let mut state = self.suppression.lock().unwrap();
+            state.epoch += 1;
+            if let Some(handle) = state.watcher.take() {
+                handle.abort();
+            }
+            state.epoch
+        };
+
+        self.injector
+            .set_suppressed(suppressed)
+            .await
+            .map_err(injector_gone)?;
+
+        if suppressed {
+            let connection = connection.clone();
+            let injector = self.injector.clone();
+            let suppression = self.suppression.clone();
+            let handle = tokio::spawn(async move {
+                watch_disconnect(connection, sender).await;
+                let should_clear = {
+                    let mut state = suppression.lock().unwrap();
+                    if state.epoch == epoch {
+                        state.watcher = None;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if should_clear {
+                    let _ = injector.set_suppressed(false).await;
+                }
+            });
+
+            // Only claim the watcher slot if no concurrent call has
+            // superseded this one since `epoch` was captured above —
+            // otherwise abort immediately rather than overwrite whatever
+            // that newer call already stored.
+            let mut state = self.suppression.lock().unwrap();
+            if state.epoch == epoch {
+                state.watcher = Some(handle);
+            } else {
+                handle.abort();
+            }
+        }
+
+        Ok(())
     }
 
     /// Atomic: validates, applies in-memory, and rewrites `config.toml`
@@ -262,7 +414,6 @@ mod tests {
     use crate::config::{Config, DEFAULT_PROFILE_NAME, Profile};
     use crate::injector::testing::RecordingSink;
     use crate::injector::{self};
-    use futures_util::StreamExt;
     use zbus::Connection;
     use zbus::proxy;
 
@@ -281,6 +432,7 @@ mod tests {
             binding: HashMap<String, OwnedValue>,
         ) -> zbus::Result<()>;
         fn clear_binding(&self, input: &str, layer: &str) -> zbus::Result<()>;
+        fn set_output_suppressed(&self, suppressed: bool) -> zbus::Result<()>;
         fn set_mode_key_role(&self, role: &str) -> zbus::Result<()>;
         fn create_profile(&self, name: &str) -> zbus::Result<()>;
         fn delete_profile(&self, name: &str) -> zbus::Result<()>;
@@ -328,7 +480,7 @@ mod tests {
             let (event_tx, event_rx) = mpsc::channel(8);
             let (cmd_tx, cmd_rx) = mpsc::channel(8);
 
-            let daemon = Daemon::new(cmd_tx);
+            let daemon = Daemon::new(cmd_tx, inj.clone());
             let guid = zbus::Guid::generate();
             let (server_transport, client_transport) = tokio::net::UnixStream::pair().unwrap();
 
@@ -596,6 +748,14 @@ mod tests {
         assert_eq!(args.name, "Gaming");
 
         drop(signals);
+        // `emitter` holds its own clone of `server_connection` (needed to
+        // actually write the signal to the wire) — it must be dropped before
+        // `shut_down()`, or `server_connection`'s refcount never reaches
+        // zero, the `ObjectServer` never releases the `Daemon` it holds, and
+        // `shut_down`'s `inj_handle.await` (which needs every `Injector`
+        // clone gone, including the one `Daemon` now holds for ticket 24)
+        // deadlocks waiting for a teardown this leftover clone is blocking.
+        drop(emitter);
         server.shut_down().await;
     }
 
@@ -909,5 +1069,226 @@ mod tests {
             panic!("expected a key event");
         };
         assert_eq!((code, value), (evdev::KeyCode::KEY_A, 0));
+    }
+
+    /// Ticket 24's core requirement: while `SetOutputSuppressed(true)` is in
+    /// effect, a press that would otherwise passthrough to `uinput` produces
+    /// no injected output at all; the same press after an explicit
+    /// `SetOutputSuppressed(false)` reaches the sink normally.
+    #[tokio::test]
+    async fn set_output_suppressed_withholds_output_until_explicitly_cleared() {
+        let server = TestServer::start().await;
+
+        server
+            .proxy
+            .set_output_suppressed(true)
+            .await
+            .expect("SetOutputSuppressed(true) must succeed");
+
+        server.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            server.sink.batches().is_empty(),
+            "a press while suppression is set must never reach uinput"
+        );
+
+        server
+            .proxy
+            .set_output_suppressed(false)
+            .await
+            .expect("SetOutputSuppressed(false) must succeed");
+
+        server.press(Input::Grid(1, 2)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        let batches = server.shut_down().await;
+        assert_eq!(
+            batches.len(),
+            1,
+            "only the press made after clearing suppression reaches uinput"
+        );
+        let evdev::EventSummary::Key(_, code, _) = batches[0][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!(
+            code,
+            crate::input::key_code_for_input(Input::Grid(1, 2)).unwrap()
+        );
+    }
+
+    /// Ticket 24's Toggle-safety requirement: a Toggle started before
+    /// suppression keeps looping and reports active in `GetState()`
+    /// throughout a suppress/resume cycle — suppression withholds its
+    /// output, not its internal state — and its output reaches `uinput`
+    /// again as soon as suppression clears, with no explicit restart.
+    #[tokio::test]
+    async fn output_suppression_withholds_a_running_toggles_output_without_stopping_it() {
+        let server = TestServer::start().await;
+
+        let binding = wire::binding_to_dict(&crate::config::Binding {
+            trigger: crate::config::TriggerMode::Toggle,
+            action: crate::config::Action::Macro {
+                steps: vec![
+                    crate::config::MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
+                    crate::config::MacroStepDto::Delay(15),
+                    crate::config::MacroStepDto::KeyUp(evdev::KeyCode::KEY_A),
+                    crate::config::MacroStepDto::Delay(15),
+                ],
+            },
+        });
+        server
+            .proxy
+            .set_binding("grid_r1c1", "base", binding)
+            .await
+            .expect("SetBinding with a Macro/Toggle payload must succeed");
+
+        server.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        let (_, _, active_toggles, _) = server.proxy.get_state().await.unwrap();
+        assert_eq!(active_toggles, vec!["grid_r1c1".to_string()]);
+
+        server
+            .proxy
+            .set_output_suppressed(true)
+            .await
+            .expect("SetOutputSuppressed(true) must succeed");
+        let batches_at_suppression = server.sink.batches().len();
+
+        // Give the loop several laps' worth of real time to prove it keeps
+        // running (and stays reported as active) but produces no new writes.
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        assert_eq!(
+            server.sink.batches().len(),
+            batches_at_suppression,
+            "a running Toggle's output must not reach uinput while suppressed"
+        );
+        let (_, _, active_toggles, _) = server.proxy.get_state().await.unwrap();
+        assert_eq!(
+            active_toggles,
+            vec!["grid_r1c1".to_string()],
+            "the Toggle must still be reported active while its output is suppressed"
+        );
+
+        server
+            .proxy
+            .set_output_suppressed(false)
+            .await
+            .expect("SetOutputSuppressed(false) must succeed");
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        assert!(
+            server.sink.batches().len() > batches_at_suppression,
+            "the Toggle's buffered/next output must reach uinput again once suppression clears"
+        );
+
+        // Same physical key stops the Toggle so `shut_down` observes a clean
+        // force-release rather than tearing down mid-loop.
+        server.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        let (_, _, active_toggles, _) = server.proxy.get_state().await.unwrap();
+        assert!(active_toggles.is_empty());
+
+        server.shut_down().await;
+    }
+
+    /// Ticket 23/24's disconnect-safety requirement: suppression must never
+    /// get stuck on. This test cannot use `TestServer` — its `proxy` and the
+    /// server's real dispatch/injector tasks are meant to outlive the test —
+    /// so it builds its own minimal p2p harness whose client connection can
+    /// be dropped mid-test while the server side keeps running, to prove the
+    /// Daemon notices the disconnect itself rather than relying on an
+    /// explicit clear call that, by construction, the vanished client can
+    /// never make.
+    #[tokio::test]
+    async fn output_suppression_auto_clears_when_the_setting_client_disconnects() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let mut profiles = HashMap::new();
+        profiles.insert(DEFAULT_PROFILE_NAME.to_string(), Profile::default());
+        let config = Config {
+            schema_version: crate::config::SCHEMA_VERSION,
+            active_profile: DEFAULT_PROFILE_NAME.to_string(),
+            profiles,
+        };
+        crate::config::write(&config_path, &config).unwrap();
+
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone());
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+
+        let daemon = Daemon::new(cmd_tx, inj.clone());
+        let guid = zbus::Guid::generate();
+        let (server_transport, client_transport) = tokio::net::UnixStream::pair().unwrap();
+
+        let server_builder = zbus::connection::Builder::unix_stream(server_transport)
+            .server(guid)
+            .unwrap()
+            .p2p()
+            .serve_at("/com/acheron/Daemon", daemon)
+            .unwrap();
+        let client_builder = zbus::connection::Builder::unix_stream(client_transport).p2p();
+        let (server_connection, client_connection) =
+            tokio::join!(server_builder.build(), client_builder.build());
+        let server_connection = server_connection.unwrap();
+        let client_connection = client_connection.unwrap();
+
+        let dispatch_handle = tokio::spawn(crate::dispatch::run(
+            event_rx,
+            cmd_rx,
+            inj,
+            config,
+            config_path,
+            None,
+        ));
+
+        {
+            // Scoped so both the proxy and its connection clone are dropped
+            // at the end of this block, closing the client's half of the
+            // socket — simulating the GUI crashing/vanishing without ever
+            // calling `SetOutputSuppressed(false)`.
+            let proxy = DaemonProxyProxy::new(&client_connection).await.unwrap();
+            proxy
+                .set_output_suppressed(true)
+                .await
+                .expect("SetOutputSuppressed(true) must succeed");
+        }
+        drop(client_connection);
+
+        // Poll rather than sleep-once-and-assert: the server must notice the
+        // socket close and clear suppression on its own, but exactly how
+        // long that takes is scheduler-dependent.
+        let mut resumed = false;
+        for _ in 0..50 {
+            event_tx
+                .send(PhysicalEvent {
+                    input: Input::Grid(1, 1),
+                    state: EventState::Down,
+                })
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if !sink.batches().is_empty() {
+                resumed = true;
+                break;
+            }
+        }
+        assert!(
+            resumed,
+            "output must resume automatically once the client that set \
+             suppression disconnects, with no explicit clear call"
+        );
+
+        drop(server_connection);
+        drop(event_tx);
+        dispatch_handle.await.unwrap().unwrap();
+        inj_handle.await.unwrap().unwrap();
     }
 }
