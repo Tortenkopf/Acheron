@@ -119,6 +119,12 @@ class DaemonStub:
         for callback in self._profile_changed_callbacks:
             callback(name)
 
+    def set_output_suppressed(self, suppressed: bool) -> None:
+        # Ticket 24's flag is Config-free and never reflected back through
+        # GetState()/GetConfig() on the real Daemon either — this stub only
+        # needs to record what the GUI sent, for tests to assert against.
+        self.calls.append(("set_output_suppressed", suppressed))
+
     def subscribe_layer_changed(self, callback: Callable[[str], None]) -> None:
         self._layer_changed_callbacks.append(callback)
 

@@ -92,6 +92,8 @@ class DaemonClient(Protocol):
 
     def switch_profile(self, name: str) -> None: ...
 
+    def set_output_suppressed(self, suppressed: bool) -> None: ...
+
     def subscribe_layer_changed(self, callback: Callable[[str], None]) -> None: ...
 
     def subscribe_profile_changed(self, callback: Callable[[str], None]) -> None: ...
@@ -146,6 +148,9 @@ class DBusDaemonClient:
 
     def switch_profile(self, name: str) -> None:
         self._call("SwitchProfile", GLib.Variant("(s)", (name,)))
+
+    def set_output_suppressed(self, suppressed: bool) -> None:
+        self._call("SetOutputSuppressed", GLib.Variant("(b)", (suppressed,)))
 
     def subscribe_layer_changed(self, callback: Callable[[str], None]) -> None:
         """Wires ticket 18's `ActiveLayerChanged` signal to `callback(layer)`

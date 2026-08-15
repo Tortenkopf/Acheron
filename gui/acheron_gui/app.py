@@ -30,6 +30,11 @@ Deferring via `idle_add` lets the in-flight call unwind first (the Daemon
 was also fixed to reply before signaling, but this GUI-side guard is kept
 too, since any future signal wired to fire around a client's own in-flight
 call would hit the identical hazard).
+
+Ticket 25: `_wire_focus_tracking` drives ticket 24's `SetOutputSuppressed`
+from this window's own live `is-active` state, closing the ticket 22 freeze
+and ticket 23 stray-output risk end-to-end rather than leaving them reachable
+only via a manual D-Bus call.
 """
 
 from __future__ import annotations
@@ -59,6 +64,43 @@ CSS = """
 .tray-mock { border: 1px dashed alpha(currentColor, 0.35); border-radius: 8px; padding: 8px; }
 .error { color: #e53935; font-size: smaller; }
 """
+
+
+def _wire_focus_tracking(window, client: DaemonClient) -> None:
+    """Pushes `window`'s live focus state to `client.set_output_suppressed`
+    on every change, plus once immediately — covering the GUI launching
+    already focused, not just later transitions. `notify::is-active` carries
+    no value of its own (it's a GTK-computed, read-only property; nothing
+    can set it directly, in production or in a test), so the same handler
+    reads the current state back via `is_active()` and is also called
+    directly here for the initial push, rather than duplicating the read in
+    a separate one-shot call that could drift out of sync with it.
+
+    The actual `set_output_suppressed` call is deferred via `GLib.idle_add`,
+    same as `on_layer_changed`/`on_profile_changed` above and for the same
+    reason: `notify::is-active` can fire while some other blocking
+    `call_sync` (e.g. `switch_profile`) is still in flight, since both run on
+    the same `GMainContext` — calling straight through here would nest a
+    second blocking D-Bus round-trip inside the first one's still-unfinished
+    wait, the identical hazard that module docstring describes.
+
+    `window` is duck-typed (`is_active()` + `connect()`) rather than
+    annotated `Gtk.Window`, so tests can drive it with a plain fake exposing
+    the same two members instead of a real windowing system, which has no
+    way to force `is-active` true/false headlessly.
+    """
+
+    def push_focus_state(*_args) -> None:
+        suppressed = window.is_active()
+
+        def apply():
+            client.set_output_suppressed(suppressed)
+            return GLib.SOURCE_REMOVE
+
+        GLib.idle_add(apply)
+
+    window.connect("notify::is-active", push_focus_state)
+    push_focus_state()
 
 
 class AcheronApplication(Gtk.Application):
@@ -111,6 +153,7 @@ class AcheronApplication(Gtk.Application):
 
         self._client.subscribe_layer_changed(on_layer_changed)
         self._client.subscribe_profile_changed(on_profile_changed)
+        _wire_focus_tracking(win, self._client)
 
         rebuild()
         win.set_child(content_box)
