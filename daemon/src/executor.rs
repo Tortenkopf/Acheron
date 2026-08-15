@@ -138,6 +138,16 @@ impl ActiveToggle {
     }
 }
 
+/// Floor pacing between Toggle laps, independent of the compiled steps' own
+/// `Delay` total. Found live (ticket 26, 2026-08-15): a Toggle wrapping a
+/// plain `Action::Keypress` compiles (`keypress_steps`) to `[KeyDown,
+/// KeyUp]` with no `Delay` step at all, so without this floor a lap ran as
+/// fast as the injector channel + `uinput` write allowed — an unbounded
+/// flood of synthetic keystrokes that froze the focused app and then the
+/// whole input pipeline, hard enough to require a power cycle. Every lap,
+/// however it's compiled, now takes at least this long.
+const MIN_TOGGLE_LAP: Duration = Duration::from_millis(20);
+
 async fn run_toggle_loop(injector: Injector, steps: Vec<MacroStep>, cancel: CancellationToken) {
     let mut held: HashSet<KeyCode> = HashSet::new();
     'running: loop {
@@ -147,6 +157,7 @@ async fn run_toggle_loop(injector: Injector, steps: Vec<MacroStep>, cancel: Canc
             cancel.cancelled().await;
             break 'running;
         }
+        let lap_start = tokio::time::Instant::now();
         for step in &steps {
             let outcome = tokio::select! {
                 _ = cancel.cancelled() => break 'running,
@@ -156,6 +167,18 @@ async fn run_toggle_loop(injector: Injector, steps: Vec<MacroStep>, cancel: Canc
                 // The injector task has died — the whole Daemon is going
                 // down, so there's no one left to force-release to.
                 return;
+            }
+        }
+        // Unconditional floor, measured from the start of the lap so it
+        // only adds sleep when the lap's own steps (its own Delay total)
+        // didn't already take this long — covers a bare Action::Keypress
+        // (no Delay at all) and an under-paced Macro alike, and stays a
+        // no-op for any Macro that already paces itself past the floor.
+        let elapsed = lap_start.elapsed();
+        if elapsed < MIN_TOGGLE_LAP {
+            tokio::select! {
+                _ = cancel.cancelled() => break 'running,
+                _ = tokio::time::sleep(MIN_TOGGLE_LAP - elapsed) => {}
             }
         }
     }
@@ -483,5 +506,100 @@ mod tests {
         inj_handle.await.unwrap().unwrap();
 
         assert!(sink.batches().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn toggle_with_a_keypress_action_is_paced_by_the_floor() {
+        // Regression test for ticket 26's live-hardware incident: a Toggle
+        // wrapping a plain Action::Keypress compiles to [KeyDown, KeyUp]
+        // with no Delay step at all, so without a floor the loop would
+        // busy-spin as fast as the injector channel allowed.
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone());
+
+        let action = Action::Keypress {
+            modifiers: Modifiers::default(),
+            key: KeyCode::KEY_C,
+        };
+        let steps = compile(&action);
+        assert!(
+            !steps.iter().any(|s| matches!(s, MacroStep::Delay(_))),
+            "a plain Keypress must compile to zero Delay steps"
+        );
+
+        tokio::task::yield_now().await;
+        let toggle = ActiveToggle::spawn(inj.clone(), steps);
+        tokio::task::yield_now().await;
+
+        // Advance in floor-sized ticks. Without a floor, every lap would
+        // complete without ever waiting on simulated time, so the loop
+        // would never yield to these advances at all — it would just spin
+        // forever inside the task, and this test would hang instead of
+        // completing.
+        for _ in 0..7 {
+            tokio::time::advance(MIN_TOGGLE_LAP).await;
+            tokio::task::yield_now().await;
+        }
+
+        toggle.stop().await;
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+
+        let batches = sink.batches();
+        // One lap (2 batches) fires immediately (no sim time needed for a
+        // zero-Delay lap), then roughly one more lap per floor tick — a
+        // small, bounded number, nowhere near a busy loop's output.
+        assert!(
+            (8..=18).contains(&batches.len()),
+            "expected laps paced one-per-floor-tick, got {} batches: {batches:?}",
+            batches.len()
+        );
+        for (i, batch) in batches.iter().enumerate() {
+            let expected_value = if i % 2 == 0 { 1 } else { 0 };
+            assert_eq!(key_and_value(batch[0]), (KeyCode::KEY_C, expected_value));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn toggle_macro_with_a_delay_free_keydown_hits_the_same_floor() {
+        // Regression test for ticket 26: the floor must apply uniformly to
+        // every Toggle, not just ones compiled from Action::Keypress — a
+        // hand-built Toggle Macro of a single delay-free KeyDown is just as
+        // dangerous and must hit the same floor.
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone());
+
+        let steps = vec![MacroStep::KeyDown(KeyCode::KEY_A)];
+
+        tokio::task::yield_now().await;
+        let toggle = ActiveToggle::spawn(inj.clone(), steps);
+        tokio::task::yield_now().await;
+
+        for _ in 0..3 {
+            tokio::time::advance(MIN_TOGGLE_LAP).await;
+            tokio::task::yield_now().await;
+        }
+
+        toggle.stop().await;
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+
+        let batches = sink.batches();
+        // A small, bounded number of laps, each a KeyDown re-press (this
+        // Macro never itself sends a KeyUp), plus stop()'s trailing
+        // force-release of whatever was still held.
+        assert!(
+            (3..=7).contains(&batches.len()),
+            "expected a few floor-paced laps, got {} batches: {batches:?}",
+            batches.len()
+        );
+        for batch in &batches[..batches.len() - 1] {
+            assert_eq!(key_and_value(batch[0]), (KeyCode::KEY_A, 1));
+        }
+        assert_eq!(
+            key_and_value(batches.last().unwrap()[0]),
+            (KeyCode::KEY_A, 0),
+            "stop() must force-release the key still held"
+        );
     }
 }
