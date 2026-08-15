@@ -1,5 +1,5 @@
 Type: grilling
-Status: ready-for-agent
+Status: resolved
 
 ## Question
 
@@ -33,3 +33,26 @@ This ticket asks a narrower, adjacent question raised afterward: rather than cha
 ## Suggested next step
 
 A short grilling session to settle: is shape (b) (with both directions wired) worth doing given the `spec.md` documentation change it requires, or does the user still prefer to leave ticket 22 exactly as decided? If yes, this ticket's `## Answer` should record the exact mechanism (both-directions `StopAllToggles` as scoped above) so an implementation ticket can be split off cleanly, and note the required `spec.md`/`CONTEXT.md` addition to the Toggle-stop-conditions list.
+
+## Answer
+
+Grilling session, 2026-08-15.
+
+**Build something — but not shape (b) as originally sketched.** The user reframed the requirement mid-session, and it changed the design:
+
+> "The GUI should make sure that none of the daemon's output ever reaches it while its window has focus."
+
+Two things drove this, beyond the ticket 22 freeze itself: (1) the GUI is definitionally more likely to hit this bug than any other GTK app on the machine, since its whole purpose is to sit next to a Daemon that emits synthetic input; (2) some of the GUI's own popovers (the Binding editor) contain text entry fields — a running Macro/Toggle's output landing in one of those while it's focused isn't just a freeze risk, it's silent data corruption (stray characters typed into a field the user is editing).
+
+**Decision: suppress, not stop.**
+
+- Reject the ticket's original `StopAllToggles`/`active_toggles_changed` design. Instead: the injector task in `executor.rs` (the single task that already serializes every `uinput` write, per `spec.md`'s "Daemon event loop and concurrency" section) gates writes behind a "GUI is focused" flag. Firing logic, Macro looping, and Toggle's "on" state are all unaffected — only the actual write to the virtual device is withheld while the flag is set.
+- **This does not touch ticket 04's Toggle-stop-condition model at all.** A Toggle never stops because of GUI focus — it keeps running internally and resumes emitting the instant focus leaves the GUI window. `spec.md`'s "Toggle behavior across Layer/Profile switches" list (same-key press, Profile switch) gets no third entry. This directly resolves the "is this a new stop condition in ticket 04's category" tension this ticket raised — it isn't one.
+- It's also distinct in kind from the Out-of-Scope "no automatic, focused-application-based Profile switching" rule: that rule bans implicit *convenience* automation over which Profile is active. This suppression never touches Profile/Layer state — it's an I/O-hygiene safety guard scoped purely to output delivery.
+- **Scope: all Daemon output**, not just Toggle — Fire-once and Hold-to-repeat are suppressed too while the GUI is focused. The injector doesn't distinguish Trigger mode at the write level, so this costs nothing extra and matches the user's stated requirement exactly (a single stray Fire-once character landing in a focused text field is the same class of bug as a Toggle flooding one).
+- **Trigger shape: level-triggered**, not edge-triggered. The flag reflects the GUI's *current* focus state, not a one-shot "focus gained" event — this is what closes the "GUI already focused, output starts afterward" gap ticket 22 confirmed live, without needing two separately-wired signal directions the way the original `active_toggles_changed`-based sketch would have.
+- **Disconnect safety (required, not optional):** the suppression flag must auto-clear if the GUI disappears while it's set — crash, `kill -9`, any ungraceful exit — via the existing `zbus`/`com.acheron.Daemon` connection's peer-disconnect detection, in addition to an explicit focus-out call. Without this, "suppress" would trade ticket 22's rare, self-healing, single-window freeze for a rare-but-total, silent, whole-device output outage with no on-screen way to explain why (the GUI that would show the problem is the thing that's gone) — strictly worse than the bug being fixed.
+
+**Documentation implication:** this needs a new `spec.md`/`CONTEXT.md` section describing Daemon-output suppression while the GUI has focus — separate from, and not an amendment to, the Toggle-stop-conditions list.
+
+**Next step:** implementation ticket split off (see ticket 24 and ticket 25).
