@@ -7,7 +7,7 @@ use std::io;
 
 use evdev::uinput::VirtualDevice;
 use evdev::{AttributeSet, InputEvent, KeyCode, KeyEvent, RelativeAxisCode, RelativeAxisEvent};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::capture::{EventState, PhysicalEvent};
@@ -50,13 +50,26 @@ pub fn build_device() -> io::Result<VirtualDevice> {
 /// A write-command sent to the injector task — either a passthrough
 /// `PhysicalEvent` (ticket 13), a single key state change, one `KeyDown`/
 /// `KeyUp` step of a compiled Binding firing (ticket 17's shared executor,
-/// `executor::run_once`/`ActiveToggle`), or a suppression-flag update
-/// (ticket 24) — so all of them go through the one channel/task/fd
-/// (issue 07).
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// `executor::run_once`/`ActiveToggle`), a suppression-bypassing force-
+/// release (ticket 25), or a suppression-flag update (ticket 24) — so all
+/// of them go through the one channel/task/fd (issue 07).
+///
+/// `KeyState` carries a reply channel reporting whether the write actually
+/// reached `sink.emit` (`true`) or was withheld by suppression (`false`) —
+/// `executor::execute_step` needs this to keep a Toggle's `held` bookkeeping
+/// honest (ticket 25's live-hardware finding): blindly removing a key from
+/// `held` on every `KeyUp` step regardless of suppression let a genuinely
+/// still-down key silently drop out of `held` right before a stop's
+/// force-release, which only re-releases what's still listed there.
+#[derive(Debug)]
 enum InjectorMessage {
     Physical(PhysicalEvent),
-    KeyState { key: KeyCode, down: bool },
+    KeyState {
+        key: KeyCode,
+        down: bool,
+        applied: oneshot::Sender<bool>,
+    },
+    ForceRelease(KeyCode),
     SetSuppressed(bool),
 }
 
@@ -91,9 +104,33 @@ impl Injector {
     /// Emits a single key down/up transition — one `KeyDown`/`KeyUp` step of
     /// a compiled Binding firing (ticket 17's shared executor). Each step is
     /// its own `SYN_REPORT` frame, same as a real physical key press.
-    pub async fn set_key_state(&self, key: KeyCode, down: bool) -> Result<(), InjectorClosed> {
+    /// Returns whether the write actually reached `sink.emit` (`false` if
+    /// suppression withheld it) — see `InjectorMessage::KeyState`'s doc
+    /// comment for why `execute_step` needs this.
+    pub async fn set_key_state(&self, key: KeyCode, down: bool) -> Result<bool, InjectorClosed> {
+        let (applied, rx) = oneshot::channel();
         self.tx
-            .send(InjectorMessage::KeyState { key, down })
+            .send(InjectorMessage::KeyState { key, down, applied })
+            .await
+            .map_err(|_| InjectorClosed)?;
+        rx.await.map_err(|_| InjectorClosed)
+    }
+
+    /// Releases `key` regardless of suppression — the one write this task
+    /// never gates. Used only by `ActiveToggle::stop()`'s force-release
+    /// (`executor::force_release`): a Toggle's `held` bookkeeping tracks
+    /// what it logically thinks it's holding independent of whether
+    /// suppression let the matching `KeyDown` actually reach `uinput`, so a
+    /// key that went down for real *before* suppression turned on (started
+    /// unfocused, then the GUI gained focus) would otherwise never get
+    /// released while suppression stays on — left stuck down at the OS
+    /// level even though `active_toggles` correctly shows the Toggle
+    /// stopped. Found live against real hardware (ticket 25): gating this
+    /// the same as every other write reproduced ticket 22's freeze on
+    /// stop, not just on start.
+    pub async fn force_release_key(&self, key: KeyCode) -> Result<(), InjectorClosed> {
+        self.tx
+            .send(InjectorMessage::ForceRelease(key))
             .await
             .map_err(|_| InjectorClosed)
     }
@@ -133,11 +170,15 @@ async fn injector_loop<S: InjectSink>(
                     sink.emit(&batch)?;
                 }
             }
-            InjectorMessage::KeyState { key, down } => {
+            InjectorMessage::KeyState { key, down, applied } => {
                 if !suppressed {
                     let value = if down { 1 } else { 0 };
                     sink.emit(&[*KeyEvent::new(key, value)])?;
                 }
+                let _ = applied.send(!suppressed);
+            }
+            InjectorMessage::ForceRelease(key) => {
+                sink.emit(&[*KeyEvent::new(key, 0)])?;
             }
             InjectorMessage::SetSuppressed(value) => suppressed = value,
         }

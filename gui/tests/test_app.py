@@ -47,7 +47,12 @@ def test_initial_focus_state_is_pushed_once_on_connect():
     _wire_focus_tracking(window, stub)
     _pump_idle_callbacks()
 
-    assert stub.calls == [("set_output_suppressed", True)]
+    # Launching already focused also stops any Toggle a fresh connect might
+    # find already running — same guard as any other focus-gain.
+    assert stub.calls == [
+        ("set_output_suppressed", True),
+        ("stop_all_toggles",),
+    ]
 
 
 def test_initial_push_reflects_an_unfocused_start_too():
@@ -60,7 +65,10 @@ def test_initial_push_reflects_an_unfocused_start_too():
     assert stub.calls == [("set_output_suppressed", False)]
 
 
-def test_gaining_focus_suppresses_output():
+def test_gaining_focus_suppresses_output_and_stops_every_toggle():
+    # Ticket 25's live-hardware finding: suppression alone can't undo a key
+    # that armed the OS's own autorepeat before the GUI gained focus, so
+    # focus-gain also force-stops any running Toggle, suppress-call first.
     stub = DaemonStub()
     window = _FakeFocusWindow(initially_active=False)
     _wire_focus_tracking(window, stub)
@@ -72,28 +80,29 @@ def test_gaining_focus_suppresses_output():
     assert stub.calls == [
         ("set_output_suppressed", False),
         ("set_output_suppressed", True),
+        ("stop_all_toggles",),
     ]
 
 
-def test_losing_focus_resumes_output():
+def test_losing_focus_resumes_output_without_touching_toggles():
+    # No resume-on-unfocus, deliberately: a Toggle stopped by a focus-gain
+    # guard must not be silently restarted by the GUI later losing focus.
     stub = DaemonStub()
     window = _FakeFocusWindow(initially_active=True)
     _wire_focus_tracking(window, stub)
     _pump_idle_callbacks()
+    stub.calls.clear()
 
     window.simulate_focus_change(False)
     _pump_idle_callbacks()
 
-    assert stub.calls == [
-        ("set_output_suppressed", True),
-        ("set_output_suppressed", False),
-    ]
+    assert stub.calls == [("set_output_suppressed", False)]
 
 
-def test_set_output_suppressed_is_not_called_synchronously_from_the_signal_handler():
+def test_daemon_calls_are_not_made_synchronously_from_the_signal_handler():
     # Regression guard for the nested-call_sync reentrancy hazard the
     # module docstring describes: the signal handler must only ever queue
-    # the Daemon call via GLib.idle_add, never call straight through.
+    # the Daemon calls via GLib.idle_add, never call straight through.
     stub = DaemonStub()
     window = _FakeFocusWindow(initially_active=False)
     _wire_focus_tracking(window, stub)

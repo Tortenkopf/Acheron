@@ -94,6 +94,8 @@ class DaemonClient(Protocol):
 
     def set_output_suppressed(self, suppressed: bool) -> None: ...
 
+    def stop_all_toggles(self) -> None: ...
+
     def subscribe_layer_changed(self, callback: Callable[[str], None]) -> None: ...
 
     def subscribe_profile_changed(self, callback: Callable[[str], None]) -> None: ...
@@ -151,6 +153,9 @@ class DBusDaemonClient:
 
     def set_output_suppressed(self, suppressed: bool) -> None:
         self._call("SetOutputSuppressed", GLib.Variant("(b)", (suppressed,)))
+
+    def stop_all_toggles(self) -> None:
+        self._call("StopAllToggles", None)
 
     def subscribe_layer_changed(self, callback: Callable[[str], None]) -> None:
         """Wires ticket 18's `ActiveLayerChanged` signal to `callback(layer)`

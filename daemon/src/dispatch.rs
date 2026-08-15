@@ -394,9 +394,7 @@ async fn handle_command(
                 // state is considered live, per spec.md's "Toggle behavior
                 // across Layer/Profile switches" — no Toggle survives a
                 // Profile switch, regardless of which Profile started it.
-                for (_, toggle) in toggles.drain() {
-                    toggle.stop().await;
-                }
+                stop_all_toggles(toggles).await;
             }
             // The reply is sent *before* the signal, deliberately: the
             // caller's own SwitchProfile call is typically a blocking D-Bus
@@ -414,6 +412,20 @@ async fn handle_command(
                 let _ = Daemon::active_profile_changed(emitter, &name).await;
             }
         }
+        Command::StopAllToggles { reply } => {
+            stop_all_toggles(toggles).await;
+            let _ = reply.send(());
+        }
+    }
+}
+
+/// Force-stops every currently running Toggle — shared by `SwitchProfile`
+/// (as part of switching) and `StopAllToggles` (ticket 25, on its own,
+/// GUI-focus-gain triggered) so the drain-and-stop loop has exactly one
+/// implementation.
+async fn stop_all_toggles(toggles: &mut HashMap<Input, ActiveToggle>) {
+    for (_, toggle) in toggles.drain() {
+        toggle.stop().await;
     }
 }
 
@@ -986,6 +998,15 @@ mod tests {
                     name: name.to_string(),
                     reply,
                 })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
+        async fn stop_all_toggles(&self) {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::StopAllToggles { reply })
                 .await
                 .unwrap();
             rx.await.unwrap()
@@ -1795,6 +1816,68 @@ mod tests {
             panic!("expected a key event");
         };
         assert_eq!((code, value), (evdev::KeyCode::KEY_A, 1));
+        let evdev::EventSummary::Key(_, code, value) = batches[1][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_A, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_all_toggles_force_stops_every_active_toggle_without_switching_profile() {
+        // Ticket 25's live-hardware finding: the GUI needs to be able to
+        // kill a Toggle left running once its own window gains focus,
+        // without that also being a Profile switch — same force-stop
+        // mechanism as SwitchProfile, minus the Profile change.
+        let mut base = HashMap::new();
+        base.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::Toggle,
+                action: Action::Macro {
+                    steps: vec![
+                        MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
+                        MacroStepDto::Delay(50),
+                    ],
+                },
+            },
+        );
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            DEFAULT_PROFILE_NAME.to_string(),
+            Profile {
+                base,
+                ..Default::default()
+            },
+        );
+        let config = Config {
+            schema_version: config::SCHEMA_VERSION,
+            active_profile: DEFAULT_PROFILE_NAME.to_string(),
+            profiles,
+        };
+        let harness = CommandHarness::spawn(config);
+
+        harness.press(Input::Grid(1, 1)).await;
+        tokio::time::advance(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            harness.get_state().await.active_toggles,
+            vec![Input::Grid(1, 1)]
+        );
+
+        harness.stop_all_toggles().await;
+
+        let state = harness.get_state().await;
+        assert!(
+            state.active_toggles.is_empty(),
+            "the Toggle must be force-stopped"
+        );
+        assert_eq!(
+            state.profile, DEFAULT_PROFILE_NAME,
+            "stopping Toggles must not change the active Profile"
+        );
+
+        let batches = harness.shut_down().await;
+        assert_eq!(batches.len(), 2, "one KeyDown lap, then the force-released KeyUp");
         let evdev::EventSummary::Key(_, code, value) = batches[1][0].destructure() else {
             panic!("expected a key event");
         };

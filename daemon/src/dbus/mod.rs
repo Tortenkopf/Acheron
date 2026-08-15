@@ -373,6 +373,26 @@ impl Daemon {
         rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
     }
 
+    /// Force-stops every currently running Toggle (ticket 25) — a deliberate
+    /// GUI-side guard against a Toggle left running unnoticed once the GUI's
+    /// own window gains focus, distinct from `SetOutputSuppressed`: that
+    /// method alone never stops anything (its own doc comment above still
+    /// holds — Trigger firing/Macro looping/`active_toggles` are untouched
+    /// by suppression on its own), but the GUI calls this explicitly
+    /// alongside `SetOutputSuppressed(true)` on every focus-gain, since
+    /// nobody wants a macro silently still running in the background once
+    /// they've alt-tabbed to the GUI to look at it. Same underlying
+    /// force-stop mechanism as `SwitchProfile`, minus the Profile change.
+    /// Never fails.
+    async fn stop_all_toggles(&self) -> Result<(), DaemonError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::StopAllToggles { reply })
+            .await
+            .map_err(dispatch_gone)?;
+        rx.await.map_err(dispatch_gone)
+    }
+
     /// Fires on active-Profile changes — every `SwitchProfile` call, as of
     /// ticket 19.
     #[zbus(signal)]
@@ -438,6 +458,7 @@ mod tests {
         fn delete_profile(&self, name: &str) -> zbus::Result<()>;
         fn rename_profile(&self, old_name: &str, new_name: &str) -> zbus::Result<()>;
         fn switch_profile(&self, name: &str) -> zbus::Result<()>;
+        fn stop_all_toggles(&self) -> zbus::Result<()>;
 
         #[zbus(signal)]
         fn active_profile_changed(&self, name: String) -> zbus::Result<()>;
@@ -1069,6 +1090,66 @@ mod tests {
             panic!("expected a key event");
         };
         assert_eq!((code, value), (evdev::KeyCode::KEY_A, 0));
+    }
+
+    /// Ticket 25's live-hardware finding: the GUI's guard against a Toggle
+    /// left running once its own window gains focus needs a real end-to-end
+    /// path — `StopAllToggles` force-stops a running Toggle with an exact
+    /// KeyUp release even while `SetOutputSuppressed(true)` is already in
+    /// effect (the exact sequence the GUI issues on every focus-gain: it
+    /// pushes suppression on, then stops all Toggles). Regression coverage
+    /// for the bug this ticket found: force-release used to be gated by
+    /// suppression the same as any other write, silently dropping the
+    /// release and leaving the key stuck down.
+    #[tokio::test]
+    async fn stop_all_toggles_over_real_dbus_releases_a_key_even_while_suppressed() {
+        let server = TestServer::start().await;
+
+        let binding = wire::binding_to_dict(&crate::config::Binding {
+            trigger: crate::config::TriggerMode::Toggle,
+            action: crate::config::Action::Macro {
+                steps: vec![
+                    crate::config::MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
+                    crate::config::MacroStepDto::Delay(50),
+                ],
+            },
+        });
+        server
+            .proxy
+            .set_binding("grid_r1c1", "base", binding)
+            .await
+            .expect("SetBinding with a Macro/Toggle payload must succeed");
+
+        // Started while unsuppressed, matching the real repro: the Toggle's
+        // KeyDown reaches the sink for real before the GUI ever gains focus.
+        server.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        let (_, _, active_toggles, _) = server.proxy.get_state().await.unwrap();
+        assert_eq!(active_toggles, vec!["grid_r1c1".to_string()]);
+
+        // The GUI's own focus-gain sequence: suppress first, then stop.
+        server.proxy.set_output_suppressed(true).await.unwrap();
+        server.proxy.stop_all_toggles().await.unwrap();
+
+        let (profile, _, active_toggles, _) = server.proxy.get_state().await.unwrap();
+        assert!(
+            active_toggles.is_empty(),
+            "the Toggle must be force-stopped"
+        );
+        assert_eq!(profile, DEFAULT_PROFILE_NAME);
+
+        let batches = server.shut_down().await;
+        assert_eq!(batches.len(), 2, "one KeyDown lap, then the force-released KeyUp");
+        let evdev::EventSummary::Key(_, code, value) = batches[1][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!(
+            (code, value),
+            (evdev::KeyCode::KEY_A, 0),
+            "force-release must bypass suppression, not be silently dropped"
+        );
     }
 
     /// Ticket 24's core requirement: while `SetOutputSuppressed(true)` is in

@@ -88,6 +88,13 @@ pub enum Command {
         name: String,
         reply: oneshot::Sender<Result<(), CommandError>>,
     },
+    /// Force-stops every currently running Toggle without switching
+    /// anything else (ticket 25) — the GUI's deliberate guard against a
+    /// Toggle left running unnoticed once its own window gains focus (e.g.
+    /// alt-tabbing out of a game with a macro still going). Same underlying
+    /// mechanism as `SwitchProfile`'s force-stop, minus the Profile change.
+    /// Never fails: draining an already-empty `toggles` map is a no-op.
+    StopAllToggles { reply: oneshot::Sender<()> },
 }
 
 /// Errors a `Command` can fail with. Deliberately narrower than the D-Bus

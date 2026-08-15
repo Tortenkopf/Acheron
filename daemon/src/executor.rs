@@ -86,8 +86,12 @@ pub fn compile(action: &Action) -> Vec<MacroStep> {
 async fn run_once(injector: &Injector, steps: &[MacroStep]) -> Result<(), InjectorClosed> {
     for step in steps {
         match step {
-            MacroStep::KeyDown(key) => injector.set_key_state(*key, true).await?,
-            MacroStep::KeyUp(key) => injector.set_key_state(*key, false).await?,
+            MacroStep::KeyDown(key) => {
+                injector.set_key_state(*key, true).await?;
+            }
+            MacroStep::KeyUp(key) => {
+                injector.set_key_state(*key, false).await?;
+            }
             MacroStep::Delay(duration) => tokio::time::sleep(*duration).await,
         }
     }
@@ -164,13 +168,26 @@ async fn execute_step(
     step: MacroStep,
 ) -> Result<(), InjectorClosed> {
     match step {
+        // `held` must mirror reality, not intent: only update it once we
+        // know the write actually reached `uinput` (ticket 25's
+        // live-hardware finding). A `KeyUp` step whose write suppression
+        // silently withheld must NOT drop `key` from `held` — the key is
+        // still genuinely down, and `force_release` on stop only
+        // re-releases what's still listed here (bypassing suppression, but
+        // only for keys it still knows about).
         MacroStep::KeyDown(key) => {
-            held.insert(key);
-            injector.set_key_state(key, true).await
+            let applied = injector.set_key_state(key, true).await?;
+            if applied {
+                held.insert(key);
+            }
+            Ok(())
         }
         MacroStep::KeyUp(key) => {
-            held.remove(&key);
-            injector.set_key_state(key, false).await
+            let applied = injector.set_key_state(key, false).await?;
+            if applied {
+                held.remove(&key);
+            }
+            Ok(())
         }
         MacroStep::Delay(duration) => {
             tokio::time::sleep(duration).await;
@@ -181,9 +198,13 @@ async fn execute_step(
 
 async fn force_release(injector: &Injector, held: HashSet<KeyCode>) {
     for key in held {
-        // Best-effort: if the injector is already gone the Daemon is
-        // shutting down anyway.
-        let _ = injector.set_key_state(key, false).await;
+        // Bypasses suppression (ticket 25's live-hardware test caught the
+        // stuck-key bug from gating this the same as `set_key_state`): a key
+        // this loop thinks it's holding may have gone down for real before
+        // suppression turned on, so releasing it must never be withheld —
+        // best-effort otherwise, since if the injector is already gone the
+        // Daemon is shutting down anyway.
+        let _ = injector.force_release_key(key).await;
     }
 }
 
@@ -350,6 +371,102 @@ mod tests {
         assert_eq!(
             downs, ups,
             "every KeyDown must have a matching KeyUp after stop"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn toggle_stop_force_releases_a_held_key_even_while_output_is_suppressed() {
+        // Regression test for ticket 25's live-hardware finding: a key can
+        // go down for real (unsuppressed), then suppression turns on (e.g.
+        // the GUI gains focus) before the same physical key stops the
+        // Toggle — the force-release on stop must still reach the sink, or
+        // the key is left stuck down at the OS level with `active_toggles`
+        // wrongly implying it was released.
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone());
+
+        let steps = vec![
+            MacroStep::KeyDown(KeyCode::KEY_A),
+            MacroStep::Delay(Duration::from_millis(50)),
+        ];
+        let toggle = ActiveToggle::spawn(inj.clone(), steps);
+
+        // KEY_A's KeyDown is sent for real while unsuppressed.
+        tokio::time::advance(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(sink.batches().len(), 1, "the initial KeyDown must have reached the sink");
+
+        inj.set_suppressed(true).await.unwrap();
+        toggle.stop().await;
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+
+        let batches = sink.batches();
+        let evdev::EventSummary::Key(_, code, value) = batches.last().unwrap()[0].destructure()
+        else {
+            panic!("expected a key event");
+        };
+        assert_eq!(code, KeyCode::KEY_A, "the held key must still be force-released");
+        assert_eq!(
+            value, 0,
+            "force-release must bypass suppression, not be silently dropped"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_suppressed_keyup_step_keeps_the_key_in_held_for_a_later_force_release() {
+        // Regression test for a `/code-review` finding on the fix above: a
+        // Toggle's own *normal* loop step (not the stop path) can also hit
+        // suppression mid-lap. `execute_step`'s KeyUp arm used to remove the
+        // key from `held` unconditionally, even when the matching write was
+        // silently withheld by suppression — so if the Toggle was stopped
+        // shortly after, `force_release` no longer knew that key was still
+        // genuinely down, and it was never actually released.
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone());
+
+        let steps = vec![
+            MacroStep::KeyDown(KeyCode::KEY_A),
+            MacroStep::Delay(Duration::from_millis(10)),
+            MacroStep::KeyUp(KeyCode::KEY_A),
+            MacroStep::Delay(Duration::from_millis(10)),
+        ];
+        let toggle = ActiveToggle::spawn(inj.clone(), steps);
+
+        // KEY_A's KeyDown is sent for real while unsuppressed.
+        tokio::time::advance(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(sink.batches().len(), 1, "the initial KeyDown must have reached the sink");
+
+        // Suppression turns on (the GUI gains focus) before the loop's own
+        // KeyUp step runs. That KeyUp's write is withheld — no new batch —
+        // but the key is still genuinely down at the OS level.
+        inj.set_suppressed(true).await.unwrap();
+        tokio::time::advance(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            sink.batches().len(),
+            1,
+            "the suppressed KeyUp step must not have reached the sink"
+        );
+
+        toggle.stop().await;
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+
+        let batches = sink.batches();
+        assert_eq!(
+            batches.len(),
+            2,
+            "stop must still force-release the key the suppressed KeyUp step never actually released"
+        );
+        let evdev::EventSummary::Key(_, code, value) = batches[1][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!(
+            (code, value),
+            (KeyCode::KEY_A, 0),
+            "the key must not be left stuck down just because a normal loop step got suppressed"
         );
     }
 

@@ -125,6 +125,14 @@ class DaemonStub:
         # needs to record what the GUI sent, for tests to assert against.
         self.calls.append(("set_output_suppressed", suppressed))
 
+    def stop_all_toggles(self) -> None:
+        # Ticket 25's GUI-side guard against a Toggle left running once the
+        # GUI's own window gains focus — same observable effect on
+        # active_toggles as switch_profile's force-stop, minus the Profile
+        # change.
+        self._active_toggles = []
+        self.calls.append(("stop_all_toggles",))
+
     def subscribe_layer_changed(self, callback: Callable[[str], None]) -> None:
         self._layer_changed_callbacks.append(callback)
 

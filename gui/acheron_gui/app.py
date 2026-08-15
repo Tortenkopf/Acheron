@@ -76,13 +76,33 @@ def _wire_focus_tracking(window, client: DaemonClient) -> None:
     directly here for the initial push, rather than duplicating the read in
     a separate one-shot call that could drift out of sync with it.
 
-    The actual `set_output_suppressed` call is deferred via `GLib.idle_add`,
-    same as `on_layer_changed`/`on_profile_changed` above and for the same
-    reason: `notify::is-active` can fire while some other blocking
-    `call_sync` (e.g. `switch_profile`) is still in flight, since both run on
-    the same `GMainContext` — calling straight through here would nest a
-    second blocking D-Bus round-trip inside the first one's still-unfinished
-    wait, the identical hazard that module docstring describes.
+    On every transition *to* focused, also calls `client.stop_all_toggles()`
+    right after suppressing — a deliberate, separate guard live-hardware
+    testing showed suppression alone can't provide (ticket 25): a Toggle
+    already outputting a real held key *before* the GUI gains focus has
+    already armed the OS's own key-repeat for it, and suppression only gates
+    *future* writes, so it can't retroactively undo that. The two known
+    freeze triggers this closes: (a) a Toggle already running when the GUI
+    regains focus — no live key-repeat left for the window's activation
+    handshake to race against; (b) a Toggle stopped *while* the GUI has
+    focus — `stop_all_toggles`'s force-release always reaches `uinput` even
+    while suppressed (`daemon/src/injector.rs`'s `ForceRelease`, unlike a
+    plain `KeyState` write), so a key genuinely armed by a spontaneous
+    `is-active` flicker (real, observed on this compositor even with no
+    deliberate focus change) never gets left stuck down. No corresponding
+    resume on focus-*loss*, by design: nobody wants a Toggle silently still
+    running in the background just because the GUI happened to have focus
+    when it started — matching `spec.md`'s Toggle-stop-conditions list,
+    which now includes "the GUI's own window gains focus" alongside the
+    same-key-press and Profile-switch conditions.
+
+    The actual Daemon calls are deferred via `GLib.idle_add`, same as
+    `on_layer_changed`/`on_profile_changed` above and for the same reason:
+    `notify::is-active` can fire while some other blocking `call_sync` (e.g.
+    `switch_profile`) is still in flight, since both run on the same
+    `GMainContext` — calling straight through here would nest a second
+    blocking D-Bus round-trip inside the first one's still-unfinished wait,
+    the identical hazard that module docstring describes.
 
     `window` is duck-typed (`is_active()` + `connect()`) rather than
     annotated `Gtk.Window`, so tests can drive it with a plain fake exposing
@@ -91,10 +111,12 @@ def _wire_focus_tracking(window, client: DaemonClient) -> None:
     """
 
     def push_focus_state(*_args) -> None:
-        suppressed = window.is_active()
+        focused = window.is_active()
 
         def apply():
-            client.set_output_suppressed(suppressed)
+            client.set_output_suppressed(focused)
+            if focused:
+                client.stop_all_toggles()
             return GLib.SOURCE_REMOVE
 
         GLib.idle_add(apply)
