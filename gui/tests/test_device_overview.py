@@ -2,7 +2,7 @@ from gi.repository import Gtk
 
 from acheron_gui.daemon_client import AlreadyExistsError, DaemonError, NotFoundError
 from acheron_gui.daemon_stub import DaemonStub
-from acheron_gui.device_overview import build_main_view
+from acheron_gui.device_overview import build_main_view, build_status_wrapped_view, compute_status
 from acheron_gui.inputs import ALL_INPUTS
 
 from .widget_tree import find_all, find_one
@@ -12,6 +12,25 @@ def _build(stub, ui_state):
     config = stub.get_config()
     profile, layer, _toggles, _connected = stub.get_state()
     return build_main_view(stub, config, profile, layer, lambda: None, ui_state)
+
+
+def _build_status(stub, status: str, ui_state=None):
+    config = stub.get_config()
+    profile, layer, _toggles, _connected = stub.get_state()
+    return build_status_wrapped_view(
+        stub, config, profile, layer, status, lambda: None, ui_state or {"table_open": False}
+    )
+
+
+def _device_overview_root(outer: Gtk.Widget) -> Gtk.Widget:
+    """Locates `build_main_view`'s own returned root inside
+    `build_status_wrapped_view`'s wrapper: directly the last child of
+    `outer` when healthy (`[badge, root]`), or the `Gtk.Overlay`'s main
+    child when not (`[badge, Gtk.Overlay(root, dim-overlay)]`)."""
+    last = outer.get_last_child()
+    if isinstance(last, Gtk.Overlay):
+        return last.get_child()
+    return last
 
 
 def _action_table_toggle(root):
@@ -327,3 +346,71 @@ def test_a_failed_mode_key_role_change_reverts_the_toggle_button():
     # build_binding_editor's Save/Clear error handling.
     assert role_btn.get_active() is False
     assert stub.get_config()["profiles"]["Default"]["mode_key_role"] == "layer_switch"
+
+
+def test_compute_status_collapses_the_two_booleans_to_the_three_reachable_states():
+    # device_connected is meaningless while the Daemon isn't running (ticket
+    # 12) — a not-running Daemon reporting device_connected=True must still
+    # collapse to "not_running", not a nonexistent fourth state.
+    assert compute_status(daemon_running=False, device_connected=False) == "not_running"
+    assert compute_status(daemon_running=False, device_connected=True) == "not_running"
+    assert compute_status(daemon_running=True, device_connected=False) == "running_disconnected"
+    assert compute_status(daemon_running=True, device_connected=True) == "running_connected"
+
+
+def test_running_connected_status_enables_the_grid_with_no_dim_overlay():
+    stub = DaemonStub()
+
+    outer = _build_status(stub, "running_connected")
+
+    root = _device_overview_root(outer)
+    assert root.get_sensitive()
+    assert find_all(outer, lambda w: isinstance(w, Gtk.Overlay)) == []
+
+
+def test_not_running_status_disables_the_grid_under_its_own_message():
+    stub = DaemonStub()
+
+    outer = _build_status(stub, "not_running")
+
+    root = _device_overview_root(outer)
+    assert not root.get_sensitive()
+    msg = find_one(outer, lambda w: "dim-overlay-label" in w.get_css_classes())
+    assert msg.get_label() == "Daemon not running — start it to edit Bindings"
+
+
+def test_running_disconnected_status_disables_the_grid_under_its_own_message():
+    stub = DaemonStub()
+
+    outer = _build_status(stub, "running_disconnected")
+
+    root = _device_overview_root(outer)
+    assert not root.get_sensitive()
+    msg = find_one(outer, lambda w: "dim-overlay-label" in w.get_css_classes())
+    assert msg.get_label() == "Device disconnected — plug in the Tartarus Pro to edit Bindings"
+
+
+def test_status_badge_shows_the_right_label_per_state():
+    stub = DaemonStub()
+    expected = {
+        "running_connected": "Connected",
+        "running_disconnected": "Daemon running — device disconnected",
+        "not_running": "Daemon not running",
+    }
+
+    for status, label_text in expected.items():
+        outer = _build_status(stub, status)
+        badge = find_one(outer, lambda w: "status-badge" in w.get_css_classes())
+        label = find_one(badge, lambda w: isinstance(w, Gtk.Label))
+        assert label_text in label.get_label()
+
+
+def test_tray_mock_gets_a_status_line_inserted_right_after_its_heading():
+    stub = DaemonStub()
+
+    outer = _build_status(stub, "running_disconnected")
+
+    tray_box = find_one(outer, lambda w: "tray-mock" in w.get_css_classes())
+    heading = tray_box.get_first_child()
+    status_line = heading.get_next_sibling()
+    assert "Daemon running — device disconnected" in status_line.get_label()

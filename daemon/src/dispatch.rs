@@ -44,6 +44,7 @@ use crate::input::Input;
 /// injector passthrough/remapping) still has work to do.
 pub async fn run(
     mut rx_events: mpsc::Receiver<PhysicalEvent>,
+    mut rx_connection: mpsc::Receiver<bool>,
     mut rx_commands: mpsc::Receiver<Command>,
     injector: Injector,
     mut config: Config,
@@ -64,7 +65,17 @@ pub async fn run(
     // The one piece of momentary Layer runtime state (ticket 18) — not part
     // of `Config`, reset to `Base` whenever this task starts.
     let mut active_layer = Layer::Base;
+    // The dispatch task's live view of device connectivity (ticket 20),
+    // updated from `rx_connection` — the `CaptureSource`'s poll loop reports
+    // transitions there, this task owns the one canonical value `GetState()`
+    // reads and `DeviceConnectionChanged` fires from. Starts optimistic
+    // (matches the pre-ticket-20 hardcoded default): the real
+    // `EvdevCaptureSource` reports its actual initial view within
+    // milliseconds of this task starting, so this only briefly matters at
+    // startup.
+    let mut device_connected = true;
     let mut commands_open = true;
+    let mut connection_open = true;
     loop {
         tokio::select! {
             event = rx_events.recv() => {
@@ -80,9 +91,15 @@ pub async fn run(
                 )
                 .await?;
             }
+            connected = rx_connection.recv(), if connection_open => {
+                match connected {
+                    Some(connected) => handle_connection_change(&mut device_connected, &signal_emitter, connected).await,
+                    None => connection_open = false,
+                }
+            }
             cmd = rx_commands.recv(), if commands_open => {
                 match cmd {
-                    Some(cmd) => handle_command(&mut config, &config_path, &mut toggles, &active_layer, &signal_emitter, cmd).await,
+                    Some(cmd) => handle_command(&mut config, &config_path, &mut toggles, &active_layer, device_connected, &signal_emitter, cmd).await,
                     None => commands_open = false,
                 }
             }
@@ -165,6 +182,25 @@ async fn handle_layer_switch(
     }
 }
 
+/// Updates the dispatch task's view of device connectivity (ticket 20) and
+/// emits `DeviceConnectionChanged` only on an actual transition — mirrors
+/// `handle_layer_switch`'s pattern for `ActiveLayerChanged` above, including
+/// skipping the push when `signal_emitter` is `None` (unit tests with no
+/// live D-Bus connection).
+async fn handle_connection_change(
+    device_connected: &mut bool,
+    signal_emitter: &Option<SignalEmitter<'static>>,
+    connected: bool,
+) {
+    if connected == *device_connected {
+        return;
+    }
+    *device_connected = connected;
+    if let Some(emitter) = signal_emitter {
+        let _ = Daemon::device_connection_changed(emitter, connected).await;
+    }
+}
+
 /// Branches on `TriggerMode` x event state, per ticket 17: Fire-once fires
 /// only on `Down`; Hold-to-repeat fires on `Down` and every subsequent
 /// `Repeat` (the device's own evdev autorepeat, no separate repeat-interval
@@ -224,6 +260,7 @@ async fn handle_command(
     config_path: &Path,
     toggles: &mut HashMap<Input, ActiveToggle>,
     active_layer: &Layer,
+    device_connected: bool,
     signal_emitter: &Option<SignalEmitter<'static>>,
     cmd: Command,
 ) {
@@ -236,7 +273,7 @@ async fn handle_command(
                 profile: config.active_profile.clone(),
                 layer: active_layer.as_str(),
                 active_toggles: toggles.keys().copied().collect(),
-                device_connected: true,
+                device_connected,
             });
         }
         Command::SetBinding {
@@ -487,9 +524,11 @@ mod tests {
         let (inj, inj_handle) = injector::spawn(sink.clone());
 
         let (tx, rx) = mpsc::channel(8);
+        let (conn_tx, conn_rx) = mpsc::channel(8);
         let (_cmd_tx, cmd_rx) = mpsc::channel(8);
         let dispatch_handle = tokio::spawn(run(
             rx,
+            conn_rx,
             cmd_rx,
             inj.clone(),
             config_with_bindings(bindings),
@@ -497,7 +536,10 @@ mod tests {
             None,
         ));
 
-        FakeCaptureSource::new(scripted).run(tx).await.unwrap();
+        FakeCaptureSource::new(scripted)
+            .run(tx, conn_tx)
+            .await
+            .unwrap();
 
         drop(inj);
         dispatch_handle.await.unwrap().unwrap();
@@ -640,9 +682,11 @@ mod tests {
         let sink = RecordingSink::new();
         let (inj, inj_handle) = injector::spawn(sink.clone());
         let (tx, rx) = mpsc::channel(8);
+        let (_conn_tx, conn_rx) = mpsc::channel(8);
         let (_cmd_tx, cmd_rx) = mpsc::channel(8);
         let dispatch_handle = tokio::spawn(run(
             rx,
+            conn_rx,
             cmd_rx,
             inj.clone(),
             config_with_bindings(bindings),
@@ -717,9 +761,11 @@ mod tests {
         let sink = RecordingSink::new();
         let (inj, inj_handle) = injector::spawn(sink.clone());
         let (tx, rx) = mpsc::channel(8);
+        let (_conn_tx, conn_rx) = mpsc::channel(8);
         let (_cmd_tx, cmd_rx) = mpsc::channel(8);
         let dispatch_handle = tokio::spawn(run(
             rx,
+            conn_rx,
             cmd_rx,
             inj.clone(),
             config_with_bindings(bindings),
@@ -878,6 +924,7 @@ mod tests {
         config_path: PathBuf,
         cmd_tx: mpsc::Sender<Command>,
         event_tx: mpsc::Sender<PhysicalEvent>,
+        conn_tx: mpsc::Sender<bool>,
         sink: RecordingSink,
         dispatch_handle: tokio::task::JoinHandle<io::Result<()>>,
         inj_handle: tokio::task::JoinHandle<io::Result<()>>,
@@ -892,9 +939,11 @@ mod tests {
             let sink = RecordingSink::new();
             let (inj, inj_handle) = injector::spawn(sink.clone());
             let (event_tx, event_rx) = mpsc::channel(8);
+            let (conn_tx, conn_rx) = mpsc::channel(8);
             let (cmd_tx, cmd_rx) = mpsc::channel(8);
             let dispatch_handle = tokio::spawn(run(
                 event_rx,
+                conn_rx,
                 cmd_rx,
                 inj,
                 config,
@@ -907,6 +956,7 @@ mod tests {
                 config_path,
                 cmd_tx,
                 event_tx,
+                conn_tx,
                 sink,
                 dispatch_handle,
                 inj_handle,
@@ -1034,9 +1084,18 @@ mod tests {
                 .unwrap();
         }
 
+        /// Stands in for the `CaptureSource`'s poll loop reporting a
+        /// device-connection transition (ticket 20) — there's no real
+        /// evdev poll loop in these tests, so this is the seam that drives
+        /// `device_connected`/`DeviceConnectionChanged`.
+        async fn set_device_connected(&self, connected: bool) {
+            self.conn_tx.send(connected).await.unwrap();
+        }
+
         async fn shut_down(self) -> Vec<Vec<evdev::InputEvent>> {
             drop(self.cmd_tx);
             drop(self.event_tx);
+            drop(self.conn_tx);
             self.dispatch_handle.await.unwrap().unwrap();
             self.inj_handle.await.unwrap().unwrap();
             self.sink.batches()
@@ -1145,21 +1204,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_state_command_returns_this_tickets_fixed_stub_values() {
+    async fn get_state_command_returns_live_values() {
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
 
         let state = harness.get_state().await;
         harness.shut_down().await;
 
-        // Device detection is ticket 20's scope, so that field stays
-        // fixed/stubbed. `active_toggles` is real as of ticket 17 (see the
-        // Toggle tests above); with no Toggle running it's correctly empty
-        // here. `layer` is real as of ticket 18 — with no ModeKey press this
-        // task's dispatch loop starts and stays at Base.
+        // `active_toggles` is real as of ticket 17; with no Toggle running
+        // it's correctly empty here. `layer` is real as of ticket 18 — with
+        // no ModeKey press this task's dispatch loop starts and stays at
+        // Base. `device_connected` starts optimistic (ticket 20 — no
+        // connection transition has been reported yet in this test).
         assert_eq!(state.profile, DEFAULT_PROFILE_NAME);
         assert_eq!(state.layer, "base");
         assert!(state.active_toggles.is_empty());
         assert!(state.device_connected);
+    }
+
+    #[tokio::test]
+    async fn get_state_reflects_a_reported_device_disconnection() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        harness.set_device_connected(false).await;
+        // `PhysicalEvent`s/`Command`s/connection transitions arrive on
+        // separate channels the dispatch task `select!`s over with no
+        // ordering guarantee between them — same caveat the Layer tests
+        // above document, same fix.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(!harness.get_state().await.device_connected);
+
+        harness.set_device_connected(true).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert!(harness.get_state().await.device_connected);
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn redundant_connection_reports_are_idempotent() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        // The `CaptureSource` seam can report the same combined value
+        // redundantly (e.g. two of three nodes independently reconfirming
+        // "still connected") — `handle_connection_change` must treat this
+        // as a no-op, not error or misbehave.
+        harness.set_device_connected(true).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(harness.get_state().await.device_connected);
+        harness.shut_down().await;
     }
 
     fn profile_with_held_bindings(bindings: HashMap<Input, Binding>) -> Profile {

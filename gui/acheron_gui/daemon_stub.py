@@ -21,6 +21,11 @@ Toggle, used to exercise `switch_profile`'s force-stop-on-switch effect
 name, `NotFoundError` on an unknown one, `InvalidBindingError` on deleting
 the active Profile (the real Daemon's `active_profile` must always name a
 real Profile, so it can never be deleted out from under itself).
+
+`simulate_daemon_stopped`/`_started` and `simulate_device_disconnected`/
+`_connected` (ticket 20) are the equivalent seam for the Daemon-presence
+`NameOwnerChanged` watch and the `DeviceConnectionChanged` signal — there's
+no real session bus in GUI tests either.
 """
 
 from __future__ import annotations
@@ -40,8 +45,12 @@ class DaemonStub:
         }
         self._layer = "base"
         self._active_toggles: list[str] = []
+        self._daemon_running = True
+        self._device_connected = True
         self._layer_changed_callbacks: list[Callable[[str], None]] = []
         self._profile_changed_callbacks: list[Callable[[str], None]] = []
+        self._running_changed_callbacks: list[Callable[[bool], None]] = []
+        self._device_connection_changed_callbacks: list[Callable[[bool], None]] = []
         # Recorded for tests that want to assert what the GUI actually sent,
         # not just the resulting state.
         self.calls: list[tuple] = []
@@ -58,7 +67,7 @@ class DaemonStub:
         }
 
     def get_state(self) -> tuple[str, str, list[str], bool]:
-        return (self._active_profile, self._layer, list(self._active_toggles), True)
+        return (self._active_profile, self._layer, list(self._active_toggles), self._device_connected)
 
     def set_binding(self, input_str: str, layer: str, binding: dict) -> None:
         # Deep-copied for the same reason: SetBinding's real wire encoding
@@ -138,6 +147,54 @@ class DaemonStub:
 
     def subscribe_profile_changed(self, callback: Callable[[str], None]) -> None:
         self._profile_changed_callbacks.append(callback)
+
+    def subscribe_daemon_running_changed(self, callback: Callable[[bool], None]) -> None:
+        # Mirrors the real `DBusDaemonClient`'s `Gio.bus_watch_name`: it
+        # reports the currently-known state right away (covers "already
+        # running when the GUI launched"), not just future transitions —
+        # unlike subscribe_device_connection_changed below, which really is
+        # signal-only on the real Daemon (its initial value instead reaches
+        # the GUI through GetState(), once daemon_running is known true).
+        self._running_changed_callbacks.append(callback)
+        callback(self._daemon_running)
+
+    def subscribe_device_connection_changed(self, callback: Callable[[bool], None]) -> None:
+        self._device_connection_changed_callbacks.append(callback)
+
+    def simulate_daemon_stopped(self) -> None:
+        """Stands in for `com.acheron.Daemon`'s bus name vanishing (ticket
+        20) — there's no real session bus in GUI tests, so this is the seam
+        a test uses to drive the same live-update path
+        `subscribe_daemon_running_changed` wires up against the real
+        `NameOwnerChanged` watch."""
+        if not self._daemon_running:
+            return
+        self._daemon_running = False
+        for callback in self._running_changed_callbacks:
+            callback(False)
+
+    def simulate_daemon_started(self) -> None:
+        if self._daemon_running:
+            return
+        self._daemon_running = True
+        for callback in self._running_changed_callbacks:
+            callback(True)
+
+    def simulate_device_disconnected(self) -> None:
+        """Stands in for a real `DeviceConnectionChanged(False)` signal
+        (ticket 20)."""
+        if not self._device_connected:
+            return
+        self._device_connected = False
+        for callback in self._device_connection_changed_callbacks:
+            callback(False)
+
+    def simulate_device_connected(self) -> None:
+        if self._device_connected:
+            return
+        self._device_connected = True
+        for callback in self._device_connection_changed_callbacks:
+            callback(True)
 
     def simulate_mode_key_press(self) -> None:
         self._set_layer("held")

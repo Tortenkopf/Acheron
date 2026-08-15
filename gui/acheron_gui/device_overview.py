@@ -38,6 +38,47 @@ from .binding_editor import action_summary, build_binding_editor
 from .daemon_client import DaemonError
 from .inputs import GRID_COLS, GRID_ROWS, grid_input, input_label
 
+# Ticket 12/20 — Daemon/device status surface. Mirrors
+# prototype/12-daemon-device-status-indicators/prototype.py's STATUS_STATES
+# exactly: (label, colour, tray glyph) per reachable 3-way state — this
+# ticket wires it to the real Daemon instead of that prototype's StatusStub.
+# `device_connected` is meaningless while the Daemon isn't running, so this
+# is one 3-way state, not two independent booleans.
+STATUS_STATES = {
+    "running_connected": ("Connected", "#4caf50", "\U0001f3ae"),
+    "running_disconnected": ("Daemon running — device disconnected", "#ff9800", "\U0001f50c"),
+    "not_running": ("Daemon not running", "#f44336", "\U0001f480"),
+}
+
+_OVERLAY_MESSAGES = {
+    "not_running": "Daemon not running — start it to edit Bindings",
+    "running_disconnected": "Device disconnected — plug in the Tartarus Pro to edit Bindings",
+}
+
+# Rendered instead of a real GetConfig() while the Daemon has never
+# successfully answered one yet (e.g. the GUI launched before the Daemon
+# finished starting) — same shape as issue 11's seed Config. Purely inert
+# placeholder data: build_status_wrapped_view never shows this config
+# set_sensitive(True), since status is never "running_connected" while it's
+# what's being rendered.
+PLACEHOLDER_CONFIG = {
+    "schema_version": 1,
+    "active_profile": "Default",
+    "profiles": {"Default": {"base": {}, "held": {}, "mode_key_role": "layer_switch"}},
+}
+
+
+def compute_status(daemon_running: bool, device_connected: bool) -> str:
+    """The one 3-way status ticket 12 settled on: `device_connected` is
+    meaningless while the Daemon isn't running, so this collapses the two
+    booleans down to the three reachable states rather than treating them
+    as independent."""
+    if not daemon_running:
+        return "not_running"
+    if not device_connected:
+        return "running_disconnected"
+    return "running_connected"
+
 
 def build_layer_bar(
     client, selected_layer: str, mode_key_role: str, on_change: Callable[[], None], ui_state: dict
@@ -220,7 +261,14 @@ def build_profile_sidebar(client, config: dict, profile: str, on_change: Callabl
     return sidebar
 
 
-def build_tray_mock(client, profile: str, layer: str, profiles: list[str], on_change: Callable[[], None]) -> Gtk.Box:
+def build_tray_mock(
+    client,
+    profile: str,
+    layer: str,
+    profiles: list[str],
+    on_change: Callable[[], None],
+    status: str | None = None,
+) -> Gtk.Box:
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
     box.add_css_class("tray-mock")
     box.set_size_request(190, -1)
@@ -229,6 +277,16 @@ def build_tray_mock(client, profile: str, layer: str, profiles: list[str], on_ch
     heading = Gtk.Label(label="Tray icon (simulated)", xalign=0)
     heading.add_css_class("heading")
     box.append(heading)
+
+    # `status` is `None` for callers with nothing to say about it (ticket
+    # 09's original prototype reuse, this module's own tests building
+    # `build_main_view` directly) — ticket 12/20's status line only appears
+    # when a real 3-way status is actually known.
+    if status is not None:
+        label, colour, glyph = STATUS_STATES[status]
+        status_lbl = Gtk.Label()
+        status_lbl.set_markup(f"{glyph}  <span foreground='{colour}'>{label}</span>")
+        box.append(status_lbl)
 
     icon_row = Gtk.Box(spacing=6)
     icon_row.append(Gtk.Label(label="\U0001f3ae"))
@@ -308,7 +366,15 @@ def make_input_button(
     return btn
 
 
-def build_main_view(client, config: dict, profile: str, layer: str, on_change: Callable[[], None], ui_state: dict) -> Gtk.Widget:
+def build_main_view(
+    client,
+    config: dict,
+    profile: str,
+    layer: str,
+    on_change: Callable[[], None],
+    ui_state: dict,
+    status: str | None = None,
+) -> Gtk.Widget:
     selected_layer = ui_state.setdefault("selected_layer", "base")
     mode_key_role = config["profiles"][profile]["mode_key_role"]
     mode_key_bindable = mode_key_role == "bound"
@@ -410,5 +476,72 @@ def build_main_view(client, config: dict, profile: str, layer: str, on_change: C
 
     table_toggle.connect("toggled", on_toggle)
 
-    root.append(build_tray_mock(client, profile, layer, list(config["profiles"]), on_change))
+    root.append(build_tray_mock(client, profile, layer, list(config["profiles"]), on_change, status))
     return root
+
+
+def build_status_badge(status: str) -> Gtk.Box:
+    label, colour, _glyph = STATUS_STATES[status]
+    box = Gtk.Box(spacing=6)
+    box.add_css_class("status-badge")
+    lbl = Gtk.Label()
+    lbl.set_markup(f"<span foreground='{colour}'>●</span> {label}")
+    box.append(lbl)
+    box.set_margin_top(6)
+    box.set_margin_bottom(2)
+    box.set_margin_start(12)
+    return box
+
+
+def build_status_wrapped_view(
+    client, config: dict, profile: str, layer: str, status: str, on_change: Callable[[], None], ui_state: dict
+) -> Gtk.Widget:
+    """Wraps `build_main_view`'s whole Device Overview (profile sidebar,
+    grid, Action Table, tray mock — all one widget tree, per ticket 09) with
+    ticket 12/20's status chip above it and, whenever `status` isn't
+    `"running_connected"`, a dimmed `Gtk.Overlay` disabling the whole thing —
+    matching prototype/12-daemon-device-status-indicators/prototype.py's
+    variant C, per this ticket's "build from the prototype directly, not
+    from the prose" instruction rather than redesigning it. That includes
+    disabling the tray mock's own Quick-switch control along with
+    everything else: `root.set_sensitive(False)` covers the whole subtree
+    the prototype already validated this against live.
+
+    Unlike the prototype (which spliced its tray status line into a
+    `build_main_view` it didn't own, via `get_last_child()`/
+    `get_first_child()` — the only option available there), this ticket owns
+    the real `build_main_view`/`build_tray_mock` outright, so `status` is
+    passed straight through as a parameter instead: a future reordering of
+    `build_main_view`'s own `root.append(...)` calls can't silently break
+    the tray status line's placement the way reaching into the built tree
+    from outside could.
+    """
+    root = build_main_view(client, config, profile, layer, on_change, ui_state, status)
+
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    outer.append(build_status_badge(status))
+
+    healthy = status == "running_connected"
+    root.set_sensitive(healthy)
+    if healthy:
+        outer.append(root)
+        return outer
+
+    overlay = Gtk.Overlay()
+    overlay.set_child(root)
+    dim = Gtk.Box(halign=Gtk.Align.FILL, valign=Gtk.Align.FILL)
+    dim.add_css_class("dim-overlay")
+    msg = Gtk.Label(label=_OVERLAY_MESSAGES[status])
+    msg.add_css_class("dim-overlay-label")
+    # halign/valign alone only position a widget *within space it has
+    # claimed* — without hexpand/vexpand it claims just its own natural
+    # size, so the box packs it at the start instead of centering it (the
+    # same pitfall prototype/12's own docstring already caught).
+    msg.set_hexpand(True)
+    msg.set_vexpand(True)
+    msg.set_halign(Gtk.Align.CENTER)
+    msg.set_valign(Gtk.Align.CENTER)
+    dim.append(msg)
+    overlay.add_overlay(dim)
+    outer.append(overlay)
+    return outer

@@ -156,8 +156,8 @@ impl Daemon {
     /// The live runtime snapshot. `active_toggles` reflects the dispatch
     /// task's real `HashMap<Input, ActiveToggle>` as of ticket 17. `layer`
     /// reflects the dispatch task's real active Layer as of ticket 18.
-    /// `device_connected` is hardcoded `true` (real detection is ticket 20's
-    /// scope).
+    /// `device_connected` reflects the `CaptureSource`'s poll loop's current
+    /// view as of ticket 20.
     async fn get_state(&self) -> Result<(String, String, Vec<String>, bool), DaemonError> {
         let (reply, rx) = oneshot::channel();
         self.commands
@@ -425,6 +425,17 @@ impl Daemon {
         signal_emitter: &SignalEmitter<'_>,
         active_inputs: Vec<String>,
     ) -> zbus::Result<()>;
+
+    /// Fires on every device-connection transition, as reported by the
+    /// `CaptureSource`'s poll loop (ticket 20). The dispatch task calls this
+    /// directly (it holds the `SignalEmitter` `main.rs` builds alongside the
+    /// D-Bus connection, same pattern as `active_layer_changed` above), not
+    /// through a `Command`.
+    #[zbus(signal)]
+    pub async fn device_connection_changed(
+        signal_emitter: &SignalEmitter<'_>,
+        connected: bool,
+    ) -> zbus::Result<()>;
 }
 
 #[cfg(test)]
@@ -465,6 +476,9 @@ mod tests {
 
         #[zbus(signal)]
         fn active_layer_changed(&self, layer: String) -> zbus::Result<()>;
+
+        #[zbus(signal)]
+        fn device_connection_changed(&self, connected: bool) -> zbus::Result<()>;
     }
 
     /// Spins up a real, in-process `zbus` peer-to-peer connection (no
@@ -477,6 +491,7 @@ mod tests {
         config_path: std::path::PathBuf,
         proxy: DaemonProxyProxy<'static>,
         event_tx: mpsc::Sender<PhysicalEvent>,
+        conn_tx: mpsc::Sender<bool>,
         sink: RecordingSink,
         server_connection: Connection,
         dispatch_handle: tokio::task::JoinHandle<std::io::Result<()>>,
@@ -499,6 +514,7 @@ mod tests {
             let sink = RecordingSink::new();
             let (inj, inj_handle) = injector::spawn(sink.clone());
             let (event_tx, event_rx) = mpsc::channel(8);
+            let (conn_tx, conn_rx) = mpsc::channel(8);
             let (cmd_tx, cmd_rx) = mpsc::channel(8);
 
             let daemon = Daemon::new(cmd_tx, inj.clone());
@@ -531,6 +547,7 @@ mod tests {
                 .into_owned();
             let dispatch_handle = tokio::spawn(crate::dispatch::run(
                 event_rx,
+                conn_rx,
                 cmd_rx,
                 inj,
                 config,
@@ -543,6 +560,7 @@ mod tests {
                 config_path,
                 proxy,
                 event_tx,
+                conn_tx,
                 sink,
                 server_connection,
                 dispatch_handle,
@@ -560,10 +578,17 @@ mod tests {
                 .unwrap();
         }
 
+        /// Stands in for the `CaptureSource`'s poll loop reporting a
+        /// device-connection transition (ticket 20).
+        async fn set_device_connected(&self, connected: bool) {
+            self.conn_tx.send(connected).await.unwrap();
+        }
+
         async fn shut_down(self) -> Vec<Vec<evdev::InputEvent>> {
             drop(self.proxy);
             drop(self.server_connection);
             drop(self.event_tx);
+            drop(self.conn_tx);
             self.dispatch_handle.await.unwrap().unwrap();
             self.inj_handle.await.unwrap().unwrap();
             self.sink.batches()
@@ -735,7 +760,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_state_over_real_dbus_returns_this_tickets_fixed_stub_values() {
+    async fn get_state_over_real_dbus_returns_the_live_snapshot() {
         let server = TestServer::start().await;
 
         let (profile, layer, active_toggles, device_connected) =
@@ -747,6 +772,35 @@ mod tests {
         assert_eq!(layer, "base");
         assert!(active_toggles.is_empty());
         assert!(device_connected);
+    }
+
+    /// Ticket 20's end-to-end live demo, exercised without real hardware: a
+    /// reported device-connection transition must both be reflected in a
+    /// subsequent `GetState()` and push a real `DeviceConnectionChanged`
+    /// signal to a subscribed client.
+    #[tokio::test]
+    async fn device_connection_transition_updates_get_state_and_pushes_the_signal_over_real_dbus() {
+        let server = TestServer::start().await;
+
+        let mut signals = server
+            .proxy
+            .receive_device_connection_changed()
+            .await
+            .unwrap();
+
+        server.set_device_connected(false).await;
+        let signal = signals.next().await.expect("signal must be delivered");
+        assert!(!signal.args().unwrap().connected);
+
+        let (_, _, _, device_connected) = server.proxy.get_state().await.unwrap();
+        assert!(!device_connected);
+
+        server.set_device_connected(true).await;
+        let signal = signals.next().await.expect("signal must be delivered");
+        assert!(signal.args().unwrap().connected);
+
+        drop(signals);
+        server.shut_down().await;
     }
 
     /// Proves the signal plumbing itself works end to end over a real
@@ -1303,6 +1357,7 @@ mod tests {
         let sink = RecordingSink::new();
         let (inj, inj_handle) = injector::spawn(sink.clone());
         let (event_tx, event_rx) = mpsc::channel(8);
+        let (_conn_tx, conn_rx) = mpsc::channel(8);
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
 
         let daemon = Daemon::new(cmd_tx, inj.clone());
@@ -1323,6 +1378,7 @@ mod tests {
 
         let dispatch_handle = tokio::spawn(crate::dispatch::run(
             event_rx,
+            conn_rx,
             cmd_rx,
             inj,
             config,

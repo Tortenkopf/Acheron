@@ -13,8 +13,8 @@ use crate::input::Input;
 /// dispatch task's real active Layer (ticket 18: `"base"`/`"held"`, flips
 /// under `Mode key` press/release when the active Profile's
 /// `mode_key_role` is `LayerSwitch`). `active_toggles` is real as of ticket
-/// 17; `device_connected` is hardcoded `true` (real detection is ticket
-/// 20's scope).
+/// 17; `device_connected` is real as of ticket 20, reflecting the
+/// `CaptureSource`'s poll loop's current view.
 #[derive(Debug, Clone, PartialEq)]
 pub struct State {
     pub profile: String,

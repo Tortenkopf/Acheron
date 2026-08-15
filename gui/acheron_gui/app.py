@@ -35,11 +35,25 @@ Ticket 25: `_wire_focus_tracking` drives ticket 24's `SetOutputSuppressed`
 from this window's own live `is-active` state, closing the ticket 22 freeze
 and ticket 23 stray-output risk end-to-end rather than leaving them reachable
 only via a manual D-Bus call.
+
+Ticket 20: `_wire_status_tracking` subscribes to the Daemon-presence
+(`NameOwnerChanged`) and `DeviceConnectionChanged` signals and keeps a live
+`{"daemon_running", "device_connected"}` dict in sync, rebuilding on every
+transition — the same deferred-via-`GLib.idle_add` pattern as the two
+callbacks above, and for the same reentrancy reason. `rebuild()` only calls
+`get_config()`/`get_state()` while `daemon_running` is true (those calls
+would simply fail otherwise); while it isn't, or on a failed call racing a
+just-reported disconnect, it keeps showing the last successfully fetched
+Config (`device_overview.PLACEHOLDER_CONFIG` if there's never been one)
+underneath the status chip's dimmed overlay — `build_status_wrapped_view`
+disables the whole thing either way, so stale data being visible-but-inert
+is harmless.
 """
 
 from __future__ import annotations
 
 import sys
+from typing import Callable
 
 import gi
 
@@ -48,8 +62,8 @@ gi.require_version("Gdk", "4.0")
 gi.require_version("GLib", "2.0")
 from gi.repository import Gdk, Gtk, GLib
 
-from .daemon_client import DaemonClient, DBusDaemonClient
-from .device_overview import build_main_view
+from .daemon_client import DaemonClient, DaemonError, DBusDaemonClient
+from .device_overview import PLACEHOLDER_CONFIG, build_status_wrapped_view, compute_status
 from .gtk_utils import clear_children
 
 CSS = """
@@ -63,6 +77,9 @@ CSS = """
 .mode-key, .mode-key > button { border-radius: 999px; }
 .tray-mock { border: 1px dashed alpha(currentColor, 0.35); border-radius: 8px; padding: 8px; }
 .error { color: #e53935; font-size: smaller; }
+.status-badge { font-size: 1.05em; }
+.dim-overlay { background-color: alpha(black, 0.45); border-radius: 6px; }
+.dim-overlay-label { color: white; font-weight: bold; }
 """
 
 
@@ -125,6 +142,54 @@ def _wire_focus_tracking(window, client: DaemonClient) -> None:
     push_focus_state()
 
 
+def _wire_status_tracking(client: DaemonClient, on_change: Callable[[], None]) -> dict:
+    """Subscribes to ticket 20's Daemon-presence and device-connection
+    signals and keeps a live `{"daemon_running": bool, "device_connected":
+    bool}` dict in sync, calling `on_change()` on every transition.
+
+    Both start `False` — conservative until the first real signal lands,
+    since `subscribe_daemon_running_changed`'s underlying `Gio.bus_watch_name`
+    resolves the actual state asynchronously rather than synchronously
+    within this call (see `daemon_client.DBusDaemonClient`). A vanished
+    Daemon also forces `device_connected` back to `False`: there's no live
+    poll loop to ask once it's gone, and "not running" already implies
+    "not connected" per `device_overview.compute_status`.
+
+    Deferred via `GLib.idle_add`, same reentrancy guard `_wire_focus_tracking`
+    documents: both signals can arrive while some other blocking `call_sync`
+    is still in flight, since callbacks and `call_sync` share one
+    `GMainContext`.
+
+    Standalone/testable the same way `_wire_focus_tracking` is — a fake
+    Daemon (`DaemonStub`) drives it directly via `simulate_daemon_stopped`/
+    `_started`/`simulate_device_disconnected`/`_connected`, no real
+    `Gtk.Application` main loop needed.
+    """
+    status = {"daemon_running": False, "device_connected": False}
+
+    def on_running_changed(running: bool) -> None:
+        def apply():
+            status["daemon_running"] = running
+            if not running:
+                status["device_connected"] = False
+            on_change()
+            return GLib.SOURCE_REMOVE
+
+        GLib.idle_add(apply)
+
+    def on_device_connection_changed(connected: bool) -> None:
+        def apply():
+            status["device_connected"] = connected
+            on_change()
+            return GLib.SOURCE_REMOVE
+
+        GLib.idle_add(apply)
+
+    client.subscribe_daemon_running_changed(on_running_changed)
+    client.subscribe_device_connection_changed(on_device_connection_changed)
+    return status
+
+
 class AcheronApplication(Gtk.Application):
     def __init__(self, client: DaemonClient | None = None):
         super().__init__(application_id="com.acheron.gui")
@@ -151,12 +216,51 @@ class AcheronApplication(Gtk.Application):
         # Overview/Action Table show/edit — except it's also kept in sync
         # with the Daemon's live Layer via the signal subscription below.
         ui_state = {"table_open": False, "expanded_rows": set(), "selected_layer": "base"}
+        # Last successfully fetched Config/profile/layer (ticket 20) — kept
+        # so the dimmed grid still has *something* to render while the
+        # Daemon isn't reachable, rather than Device Overview vanishing
+        # outright. `PLACEHOLDER_CONFIG` covers the one gap this can't: the
+        # GUI launching before the Daemon has ever answered a single
+        # GetConfig().
+        last_known = {"config": PLACEHOLDER_CONFIG, "profile": "Default", "layer": "base"}
 
         def rebuild():
             clear_children(content_box)
-            config = self._client.get_config()
-            profile, layer, _active_toggles, _device_connected = self._client.get_state()
-            content_box.append(build_main_view(self._client, config, profile, layer, rebuild, ui_state))
+            if status["daemon_running"]:
+                try:
+                    config = self._client.get_config()
+                    profile, layer, _active_toggles, device_connected = self._client.get_state()
+                except (DaemonError, GLib.Error):
+                    # A rare race: the Daemon vanished between
+                    # subscribe_daemon_running_changed reporting it up and
+                    # this call landing. Keep showing last_known under the
+                    # overlay rather than crashing the GUI over it — the
+                    # presence watch's own "vanished" callback will drive
+                    # another rebuild() once it catches up.
+                    pass
+                else:
+                    # Committed together, only once both calls succeeded —
+                    # a get_state() failure right after a successful
+                    # get_config() must not leave last_known["profile"]/
+                    # ["layer"] stale against a newer config that may no
+                    # longer even contain that profile (build_main_view
+                    # would then KeyError looking it up).
+                    last_known["config"] = config
+                    last_known["profile"] = profile
+                    last_known["layer"] = layer
+                    status["device_connected"] = device_connected
+            current_status = compute_status(status["daemon_running"], status["device_connected"])
+            content_box.append(
+                build_status_wrapped_view(
+                    self._client,
+                    last_known["config"],
+                    last_known["profile"],
+                    last_known["layer"],
+                    current_status,
+                    rebuild,
+                    ui_state,
+                )
+            )
 
         def on_layer_changed(layer: str):
             def apply():
@@ -175,7 +279,20 @@ class AcheronApplication(Gtk.Application):
 
         self._client.subscribe_layer_changed(on_layer_changed)
         self._client.subscribe_profile_changed(on_profile_changed)
+        status = _wire_status_tracking(self._client, rebuild)
         _wire_focus_tracking(win, self._client)
+
+        # `_wire_status_tracking`/`_wire_focus_tracking` above may have
+        # already queued their initial state via `GLib.idle_add` (e.g. the
+        # real `Gio.bus_watch_name`'s "already running" announce is often
+        # this fast). Draining those now, before this first `rebuild()`,
+        # means the very first paint reflects that real state instead of
+        # `status`'s conservative `False`/`False` default flashing
+        # "Daemon not running" for a frame on every launch — the same
+        # pattern `gui/tests/test_app.py`'s `_pump_idle_callbacks` uses.
+        context = GLib.MainContext.default()
+        while context.iteration(False):
+            pass
 
         rebuild()
         win.set_child(content_box)

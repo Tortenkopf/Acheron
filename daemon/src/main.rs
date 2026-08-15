@@ -34,6 +34,7 @@ async fn main() -> io::Result<()> {
     let (inj, inj_handle) = injector::spawn(device);
 
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
+    let (connection_tx, connection_rx) = tokio::sync::mpsc::channel(8);
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(256);
 
     // Built before the dispatch task so a real `SignalEmitter` (ticket 18's
@@ -57,6 +58,7 @@ async fn main() -> io::Result<()> {
 
     let dispatch_handle = tokio::spawn(dispatch::run(
         event_rx,
+        connection_rx,
         cmd_rx,
         inj,
         config,
@@ -65,7 +67,7 @@ async fn main() -> io::Result<()> {
     ));
 
     let result = tokio::select! {
-        result = EvdevCaptureSource.run(event_tx) => report("capture", result),
+        result = EvdevCaptureSource.run(event_tx, connection_tx) => report("capture", result),
         result = inj_handle => report("injector", flatten(result)),
         result = dispatch_handle => report("dispatch", flatten(result)),
     };

@@ -25,13 +25,17 @@ pub struct PhysicalEvent {
     pub state: EventState,
 }
 
-/// Produces a stream of normalized `PhysicalEvent`s into `tx`. Nothing
-/// downstream of the channel knows or cares which implementation produced
+/// Produces a stream of normalized `PhysicalEvent`s into `tx`, and a live
+/// device-connection view into `connection_tx` (ticket 20: `true`/`false`
+/// sent on every transition, redundant sends are harmless — the dispatch
+/// task consuming it only reacts to an actual value change). Nothing
+/// downstream of either channel knows or cares which implementation produced
 /// an event — this is the swappable capture layer the map's standing
 /// architectural discipline calls for.
 pub trait CaptureSource: Send + 'static {
     fn run(
         self,
         tx: mpsc::Sender<PhysicalEvent>,
+        connection_tx: mpsc::Sender<bool>,
     ) -> impl std::future::Future<Output = std::io::Result<()>> + Send;
 }

@@ -100,6 +100,10 @@ class DaemonClient(Protocol):
 
     def subscribe_profile_changed(self, callback: Callable[[str], None]) -> None: ...
 
+    def subscribe_daemon_running_changed(self, callback: Callable[[bool], None]) -> None: ...
+
+    def subscribe_device_connection_changed(self, callback: Callable[[bool], None]) -> None: ...
+
 
 class DBusDaemonClient:
     """Talks to the real Daemon process over the session bus. Every method
@@ -168,6 +172,31 @@ class DBusDaemonClient:
         """Wires ticket 19's `ActiveProfileChanged` signal to
         `callback(name)`, same mechanism as `subscribe_layer_changed`."""
         self._connect_signal("ActiveProfileChanged", callback)
+
+    def subscribe_daemon_running_changed(self, callback: Callable[[bool], None]) -> None:
+        """Live `NameOwnerChanged` watch on `com.acheron.Daemon`'s own bus
+        name (ticket 20) — not a one-shot check on window open, since the
+        Daemon can crash while the window stays open. `Gio.bus_watch_name`
+        is GLib's own idiom for this: `on_appeared`/`on_vanished` fire once
+        with the name's current owned/unowned state as soon as it's known,
+        then again on every subsequent transition, so this single watch
+        covers both "was already running when the GUI launched" and "started
+        or crashed later" with no separate one-shot check needed."""
+
+        def on_appeared(_connection, _name, _owner):
+            callback(True)
+
+        def on_vanished(_connection, _name):
+            callback(False)
+
+        Gio.bus_watch_name(
+            Gio.BusType.SESSION, BUS_NAME, Gio.BusNameWatcherFlags.NONE, on_appeared, on_vanished
+        )
+
+    def subscribe_device_connection_changed(self, callback: Callable[[bool], None]) -> None:
+        """Wires ticket 20's `DeviceConnectionChanged` signal to
+        `callback(connected)`, same mechanism as `subscribe_layer_changed`."""
+        self._connect_signal("DeviceConnectionChanged", callback)
 
     def _connect_signal(self, wanted_signal_name: str, callback: Callable[[str], None]) -> None:
         def on_g_signal(_proxy, _sender_name, signal_name, parameters):

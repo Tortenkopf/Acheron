@@ -1,23 +1,51 @@
 //! A scripted `CaptureSource` for tests: feeds a fixed sequence of
-//! `PhysicalEvent`s into the shared channel, no real device involved.
+//! `PhysicalEvent`s (and, per ticket 20, device-connection transitions) into
+//! the shared channels, no real device involved.
 
 use super::{CaptureSource, PhysicalEvent};
 use tokio::sync::mpsc;
 
+/// One scripted step: either a captured `PhysicalEvent`, or a device
+/// connection transition (ticket 20's `device_connected`/
+/// `DeviceConnectionChanged` — exercised here without a real evdev poll
+/// loop).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScriptedEvent {
+    Physical(PhysicalEvent),
+    Connection(bool),
+}
+
 pub struct FakeCaptureSource {
-    events: Vec<PhysicalEvent>,
+    events: Vec<ScriptedEvent>,
 }
 
 impl FakeCaptureSource {
     pub fn new(events: Vec<PhysicalEvent>) -> Self {
+        Self {
+            events: events.into_iter().map(ScriptedEvent::Physical).collect(),
+        }
+    }
+
+    /// Scripts a mix of `PhysicalEvent`s and connection transitions, in
+    /// order — the seam ticket 20's dispatch-side tests use to exercise
+    /// `device_connected`/`DeviceConnectionChanged` without a real poll loop.
+    pub fn scripted(events: Vec<ScriptedEvent>) -> Self {
         Self { events }
     }
 }
 
 impl CaptureSource for FakeCaptureSource {
-    async fn run(self, tx: mpsc::Sender<PhysicalEvent>) -> std::io::Result<()> {
+    async fn run(
+        self,
+        tx: mpsc::Sender<PhysicalEvent>,
+        connection_tx: mpsc::Sender<bool>,
+    ) -> std::io::Result<()> {
         for event in self.events {
-            if tx.send(event).await.is_err() {
+            let sent = match event {
+                ScriptedEvent::Physical(event) => tx.send(event).await.is_ok(),
+                ScriptedEvent::Connection(connected) => connection_tx.send(connected).await.is_ok(),
+            };
+            if !sent {
                 break;
             }
         }
@@ -44,8 +72,9 @@ mod tests {
             },
         ];
         let (tx, mut rx) = mpsc::channel(8);
+        let (connection_tx, _connection_rx) = mpsc::channel(8);
         FakeCaptureSource::new(events.clone())
-            .run(tx)
+            .run(tx, connection_tx)
             .await
             .unwrap();
 
@@ -53,5 +82,33 @@ mod tests {
             assert_eq!(rx.recv().await, Some(expected));
         }
         assert_eq!(rx.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn scripted_connection_transitions_are_replayed_in_order_alongside_events() {
+        let events = vec![
+            ScriptedEvent::Connection(false),
+            ScriptedEvent::Physical(PhysicalEvent {
+                input: Input::ModeKey,
+                state: EventState::Down,
+            }),
+            ScriptedEvent::Connection(true),
+        ];
+        let (tx, mut rx) = mpsc::channel(8);
+        let (connection_tx, mut connection_rx) = mpsc::channel(8);
+        FakeCaptureSource::scripted(events)
+            .run(tx, connection_tx)
+            .await
+            .unwrap();
+
+        assert_eq!(connection_rx.recv().await, Some(false));
+        assert_eq!(
+            rx.recv().await,
+            Some(PhysicalEvent {
+                input: Input::ModeKey,
+                state: EventState::Down,
+            })
+        );
+        assert_eq!(connection_rx.recv().await, Some(true));
     }
 }
