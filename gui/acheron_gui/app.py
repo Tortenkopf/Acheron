@@ -48,6 +48,15 @@ Config (`device_overview.PLACEHOLDER_CONFIG` if there's never been one)
 underneath the status chip's dimmed overlay — `build_status_wrapped_view`
 disables the whole thing either way, so stale data being visible-but-inert
 is harmless.
+
+Ticket 21: `_ensure_daemon_started_on_launch` is the GUI's half of the
+login-autostart-plus-safety-net design (spec.md "Packaging and lifecycle") —
+called once, synchronously, right at the start of `do_activate`, before the
+status/focus wiring above even subscribes. `systemd --user`'s own
+`WantedBy=default.target` is the primary autostart trigger; this call only
+exists to recover a Daemon that's crashed into `failed` (systemd's own
+`StartLimitBurst` guard latches it there, per install.sh's unit) or that
+somehow isn't running yet, without the user ever touching a terminal.
 """
 
 from __future__ import annotations
@@ -65,6 +74,7 @@ from gi.repository import Gdk, Gtk, GLib
 from .daemon_client import DaemonClient, DaemonError, DBusDaemonClient
 from .device_overview import PLACEHOLDER_CONFIG, build_status_wrapped_view, compute_status
 from .gtk_utils import clear_children
+from .systemd_client import DBusSystemdClient, SystemdClient
 
 CSS = """
 .heading { font-weight: bold; }
@@ -190,12 +200,34 @@ def _wire_status_tracking(client: DaemonClient, on_change: Callable[[], None]) -
     return status
 
 
+def _ensure_daemon_started_on_launch(systemd_client: SystemdClient) -> None:
+    """Ticket 21's GUI-side safety net: on its own launch, ask systemd to
+    clear any latched `failed` state and (re)start the Daemon unit —
+    `ResetFailed` then `StartUnit`, over the session D-Bus connection, no
+    `systemctl` shell-out. Best-effort and silent on failure (e.g. the unit
+    isn't installed yet, or systemd is unreachable): this must never block
+    the GUI from opening, since the status chip (ticket 20) already gives
+    the user an honest, live answer if the Daemon still isn't up afterward.
+    """
+    try:
+        systemd_client.ensure_daemon_started()
+    except GLib.Error:
+        pass
+
+
 class AcheronApplication(Gtk.Application):
-    def __init__(self, client: DaemonClient | None = None):
+    def __init__(
+        self,
+        client: DaemonClient | None = None,
+        systemd_client: SystemdClient | None = None,
+    ):
         super().__init__(application_id="com.acheron.gui")
         self._client = client or DBusDaemonClient()
+        self._systemd_client = systemd_client or DBusSystemdClient()
 
     def do_activate(self):
+        _ensure_daemon_started_on_launch(self._systemd_client)
+
         provider = Gtk.CssProvider()
         provider.load_from_string(CSS)
         Gtk.StyleContext.add_provider_for_display(

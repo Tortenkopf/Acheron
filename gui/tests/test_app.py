@@ -1,6 +1,10 @@
 from gi.repository import GLib
 
-from acheron_gui.app import _wire_focus_tracking, _wire_status_tracking
+from acheron_gui.app import (
+    _ensure_daemon_started_on_launch,
+    _wire_focus_tracking,
+    _wire_status_tracking,
+)
 from acheron_gui.daemon_stub import DaemonStub
 
 
@@ -203,3 +207,48 @@ def test_status_tracking_calls_on_change_for_every_transition_deferred_via_idle_
     assert len(calls) == 1, "must be deferred via GLib.idle_add, not called inline"
     _pump_idle_callbacks()
     assert len(calls) == 2
+
+
+class _FakeSystemdClient:
+    """Stands in for `systemd_client.DBusSystemdClient` — no real systemd
+    --user session in GUI tests, so this is the seam
+    `_ensure_daemon_started_on_launch` is tested against, mirroring
+    `DaemonStub`'s role for the Daemon's own D-Bus surface."""
+
+    def __init__(self, raises: Exception | None = None):
+        self._raises = raises
+        self.calls: list[str] = []
+
+    def ensure_daemon_started(self) -> None:
+        self.calls.append("ensure_daemon_started")
+        if self._raises is not None:
+            raise self._raises
+
+
+def test_ensure_daemon_started_on_launch_calls_the_systemd_client():
+    fake = _FakeSystemdClient()
+
+    _ensure_daemon_started_on_launch(fake)
+
+    assert fake.calls == ["ensure_daemon_started"]
+
+
+def test_ensure_daemon_started_on_launch_swallows_a_glib_error():
+    # Best-effort: a failure here (unit not installed, systemd unreachable,
+    # etc.) must never prevent the GUI from opening.
+    fake = _FakeSystemdClient(raises=GLib.Error("systemd unreachable"))
+
+    _ensure_daemon_started_on_launch(fake)  # must not raise
+
+
+def test_dbus_systemd_client_does_not_connect_at_construction_time():
+    # Regression guard: connecting eagerly in __init__ would let a
+    # proxy-construction failure crash AcheronApplication.__init__ itself,
+    # before do_activate's try/except (_ensure_daemon_started_on_launch) ever
+    # gets a chance to swallow it — exactly the "must never block the GUI
+    # from opening" case this client exists to avoid.
+    from acheron_gui.systemd_client import DBusSystemdClient
+
+    client = DBusSystemdClient()
+
+    assert client._proxy is None

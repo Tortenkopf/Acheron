@@ -1,0 +1,78 @@
+"""GUI-side client for systemd's own D-Bus API (`org.freedesktop.systemd1`),
+used only for ticket 21's launch-time safety net: on its own launch, the GUI
+asks systemd to clear any latched `failed` state on the Daemon's unit and
+(re)start it, over the same session D-Bus this process already talks to
+`com.acheron.Daemon` over — no `systemctl` shell-out, no subprocess.
+`StartUnit` is a no-op if the unit's already running (systemd's own
+contract), so no status check is needed first; `ResetFailed` is what lets a
+prior crash — which latches the unit in `failed` per install.sh's
+`Restart=on-failure`/`StartLimitBurst` guard — actually restart instead of
+being refused by systemd's own start-limit.
+
+Structural `SystemdClient` Protocol mirrors `daemon_client.DaemonClient`'s
+shape — `DBusSystemdClient` (real) vs a plain fake for tests — so `app.py`'s
+launch-time wiring never branches on which one it's holding.
+"""
+
+from __future__ import annotations
+
+from typing import Protocol
+
+import gi
+
+gi.require_version("Gio", "2.0")
+gi.require_version("GLib", "2.0")
+from gi.repository import Gio, GLib
+
+SYSTEMD_BUS_NAME = "org.freedesktop.systemd1"
+SYSTEMD_OBJECT_PATH = "/org/freedesktop/systemd1"
+SYSTEMD_MANAGER_INTERFACE = "org.freedesktop.systemd1.Manager"
+DAEMON_UNIT = "acheron-daemon.service"
+
+
+class SystemdClient(Protocol):
+    def ensure_daemon_started(self) -> None: ...
+
+
+class DBusSystemdClient:
+    """Talks to the real `systemd --user` manager over the session bus via
+    `Gio.DBusProxy` — the same client choice spec.md makes for the Daemon's
+    own D-Bus surface.
+
+    The proxy is built lazily, on the first `ensure_daemon_started()` call,
+    rather than in `__init__` — this client is constructed unconditionally
+    in `AcheronApplication.__init__` (ticket 21), well before `do_activate`'s
+    try/except gets a chance to run, so a proxy-construction failure (e.g.
+    the session bus itself being unreachable) must surface from the same
+    call `_ensure_daemon_started_on_launch` already guards, not from
+    construction, or it would crash the whole GUI on launch — exactly the
+    "must never block the GUI from opening" case this client exists to
+    avoid."""
+
+    def __init__(self, proxy: Gio.DBusProxy | None = None):
+        self._proxy = proxy
+
+    def ensure_daemon_started(self) -> None:
+        proxy = self._proxy or self._connect()
+        self._proxy = proxy
+        proxy.call_sync(
+            "ResetFailed", GLib.Variant("(s)", (DAEMON_UNIT,)), Gio.DBusCallFlags.NONE, -1, None
+        )
+        proxy.call_sync(
+            "StartUnit",
+            GLib.Variant("(ss)", (DAEMON_UNIT, "replace")),
+            Gio.DBusCallFlags.NONE,
+            -1,
+            None,
+        )
+
+    def _connect(self) -> Gio.DBusProxy:
+        return Gio.DBusProxy.new_for_bus_sync(
+            Gio.BusType.SESSION,
+            Gio.DBusProxyFlags.NONE,
+            None,
+            SYSTEMD_BUS_NAME,
+            SYSTEMD_OBJECT_PATH,
+            SYSTEMD_MANAGER_INTERFACE,
+            None,
+        )
