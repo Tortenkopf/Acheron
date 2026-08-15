@@ -4,7 +4,7 @@
 
 **Blocked by:** 19
 
-**Status:** ready-for-agent
+**Status:** resolved — root-caused and diagnosed; deliberately no code change (see 2026-08-15 decision comment below)
 
 ## Repro
 
@@ -82,4 +82,11 @@ Reduction sequence, each still freezing:
 - **(a) File upstream** against `gnome-shell`/`mutter` (GNOME Shell 50.1, GTK 4.22.4) — the bare-window minimal repro (v4) is a clean, self-contained upstream bug report on its own, needing no Acheron code at all beyond something that holds a key logically down via `UInput`/synthetic input at a similar cadence to `executor.rs`'s `run_toggle_loop`.
 - **(b) Daemon-side mitigation** — same option as before: have `run_toggle_loop` cycle (release, then re-press) rather than leave a key raw-held, denying the OS/compositor the sustained-key-repeat-source state the race needs. The self-healing finding above makes this more clearly correct as a *complete* fix rather than just a probability-reducer: since the freeze requires the stream to keep flowing and clears the instant it stops, removing the sustained raw-hold removes the trigger outright, not just its likelihood. Still needs the same product decision on the "held key becomes a fast periodic re-press instead of a true continuous hold" tradeoff documented in the original comment before implementing.
 
-Still needs a decision on (a) vs (b) vs both before further code changes; leaving unresolved.
+**2026-08-15 (same follow-up session) — self-heal verified on the real, unmodified GUI, with one important caveat.** Re-tested directly against `acheron_gui.app` (not a stripped variant) to confirm the self-healing finding above wasn't an artifact of the reduced variants:
+
+- Plain repro (no popover interaction at all before/during/after the freeze): confirmed self-heals live on the real app too — stop the Toggle, the same still-running window becomes clickable again, no restart needed.
+- **Caveat found incidentally:** if a grid button's popover is opened (or attempted to be opened) *while the window is already frozen*, the window does **not** recover after the Toggle is stopped — it stays permanently wedged (same idling-heartbeat/`Gio.Application.run()` signature, so still not a Python-level deadlock, but no longer self-clearing) and needs a real process restart, matching the original workaround. By contrast, a popover opened and closed *before* the freeze sequence starts doesn't block recovery at all — confirmed with a clean isolated test (open popover, close it normally, then freeze, then stop Toggle: recovered fine). So the self-heal workaround is reliable **as long as no popover/dropdown is opened while the window is unresponsive** — this plausibly reconnects to Finding 3's original (independently insufficient) `xdg_popup` grab-race theory: attempting a popover grab against an already-wedged surface likely compounds into its own, separate, non-self-clearing wedge, on top of the base Toggle-driven one.
+
+**Decision (2026-08-15, same session):** leaving this unresolved/parked rather than pursuing (a) or (b). Rationale (user call): the Daemon holding a Toggle key raw-down is correct, intended behavior — it's what a Toggle is supposed to do — and this freeze is a narrow edge case that only a user deliberately running an autorepeat-macro Toggle at all would hit, at which point unexpected interaction with other focused windows is already an accepted risk of that feature. Not worth the "held key becomes a periodic re-press" behavior change from (b), or the yet-unfiled upstream report from (a), for this narrow a case.
+
+Practical guidance to carry forward given this decision: if the GUI freezes while a Toggle is running, stopping the Toggle alone recovers it **unless** a popover/dropdown was opened while it was already frozen, in which case a full GUI restart is required (same as before this session's findings). No further Acheron-side code changes planned; this comment records the fully-diagnosed state in case someone revisits (a)/(b) later.
