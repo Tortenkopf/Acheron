@@ -33,8 +33,12 @@ impl From<CommandError> for DaemonError {
     fn from(err: CommandError) -> Self {
         match err {
             CommandError::NotFound => {
-                DaemonError::NotFound("no Binding is set for this Input".to_string())
+                DaemonError::NotFound("the requested entity was not found".to_string())
             }
+            CommandError::AlreadyExists => {
+                DaemonError::AlreadyExists("that name is already taken".to_string())
+            }
+            CommandError::InvalidRequest(message) => DaemonError::InvalidBinding(message),
             CommandError::IoError(message) => DaemonError::IoError(message),
         }
     }
@@ -163,10 +167,62 @@ impl Daemon {
         rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
     }
 
-    /// Fires on active-Profile changes. Nothing yet switches Profiles at
-    /// this ticket's scope (that's ticket 19) — wired now so this and the
-    /// two signals below fire correctly once later tickets add the
-    /// triggering behavior (ticket 15's checklist).
+    /// Creates a new, empty Profile (ticket 19) — atomic/immediately-
+    /// applied/immediately-persisted, per the conventions `SetBinding`/
+    /// `SetModeKeyRole` already established. Errors `AlreadyExists` if
+    /// `name` is already taken.
+    async fn create_profile(&self, name: String) -> Result<(), DaemonError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::CreateProfile { name, reply })
+            .await
+            .map_err(dispatch_gone)?;
+        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+    }
+
+    /// Deletes a Profile by name. Errors `NotFound` if it doesn't exist, or
+    /// `InvalidBinding` if it's the currently active Profile — switch away
+    /// from it first via `SwitchProfile`.
+    async fn delete_profile(&self, name: String) -> Result<(), DaemonError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::DeleteProfile { name, reply })
+            .await
+            .map_err(dispatch_gone)?;
+        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+    }
+
+    /// Renames a Profile, updating `active_profile` too if it's the active
+    /// one. Errors `NotFound` if `old_name` doesn't exist, or
+    /// `AlreadyExists` if `new_name` is already taken.
+    async fn rename_profile(&self, old_name: String, new_name: String) -> Result<(), DaemonError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::RenameProfile {
+                old_name,
+                new_name,
+                reply,
+            })
+            .await
+            .map_err(dispatch_gone)?;
+        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+    }
+
+    /// Switches the active Profile, force-stopping every currently running
+    /// Toggle as part of the switch before the new Profile's state becomes
+    /// active (ticket 19). Errors `NotFound` if `name` doesn't name a real
+    /// Profile.
+    async fn switch_profile(&self, name: String) -> Result<(), DaemonError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::SwitchProfile { name, reply })
+            .await
+            .map_err(dispatch_gone)?;
+        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+    }
+
+    /// Fires on active-Profile changes — every `SwitchProfile` call, as of
+    /// ticket 19.
     #[zbus(signal)]
     pub async fn active_profile_changed(
         signal_emitter: &SignalEmitter<'_>,
@@ -226,6 +282,10 @@ mod tests {
         ) -> zbus::Result<()>;
         fn clear_binding(&self, input: &str, layer: &str) -> zbus::Result<()>;
         fn set_mode_key_role(&self, role: &str) -> zbus::Result<()>;
+        fn create_profile(&self, name: &str) -> zbus::Result<()>;
+        fn delete_profile(&self, name: &str) -> zbus::Result<()>;
+        fn rename_profile(&self, old_name: &str, new_name: &str) -> zbus::Result<()>;
+        fn switch_profile(&self, name: &str) -> zbus::Result<()>;
 
         #[zbus(signal)]
         fn active_profile_changed(&self, name: String) -> zbus::Result<()>;
@@ -517,10 +577,9 @@ mod tests {
     }
 
     /// Proves the signal plumbing itself works end to end over a real
-    /// connection — nothing in dispatch calls this yet (nothing changes
-    /// active Profile at this ticket's scope), but a later ticket only
-    /// needs to call `Daemon::active_profile_changed` for a subscribed
-    /// client to receive it correctly, per ticket 15's checklist.
+    /// connection, directly (not through a real `SwitchProfile` call, which
+    /// has its own dedicated test below) — kept from ticket 15/18's original
+    /// version of this test now that ticket 19 actually wires a trigger.
     #[tokio::test]
     async fn active_profile_changed_signal_is_delivered_to_a_subscribed_client() {
         let server = TestServer::start().await;
@@ -658,5 +717,197 @@ mod tests {
         );
 
         server.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn create_profile_over_real_dbus_adds_an_empty_profile_and_persists() {
+        let server = TestServer::start().await;
+
+        server
+            .proxy
+            .create_profile("Gaming")
+            .await
+            .expect("CreateProfile must succeed");
+
+        let config = server.proxy.get_config().await.unwrap();
+        let on_disk = std::fs::read_to_string(&server.config_path).unwrap();
+        server.shut_down().await;
+
+        let profiles: wire::Dict = config.get("profiles").unwrap().clone().try_into().unwrap();
+        assert!(profiles.contains_key("Gaming"));
+        assert!(on_disk.contains("[profiles.Gaming]"));
+    }
+
+    #[tokio::test]
+    async fn create_profile_over_real_dbus_with_a_duplicate_name_is_rejected() {
+        let server = TestServer::start().await;
+
+        let err = server
+            .proxy
+            .create_profile(DEFAULT_PROFILE_NAME)
+            .await
+            .expect_err("creating a Profile with an existing name must fail");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.AlreadyExists")
+        );
+
+        server.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn delete_profile_over_real_dbus_rejects_deleting_the_active_profile() {
+        let server = TestServer::start().await;
+
+        let err = server
+            .proxy
+            .delete_profile(DEFAULT_PROFILE_NAME)
+            .await
+            .expect_err("deleting the active Profile must fail");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.InvalidBinding")
+        );
+
+        server.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn delete_profile_over_real_dbus_on_an_unknown_name_returns_not_found() {
+        let server = TestServer::start().await;
+
+        let err = server
+            .proxy
+            .delete_profile("Nonexistent")
+            .await
+            .expect_err("deleting an unknown Profile must fail");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.NotFound")
+        );
+
+        server.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn rename_profile_over_real_dbus_renames_and_persists() {
+        let server = TestServer::start().await;
+
+        server
+            .proxy
+            .rename_profile(DEFAULT_PROFILE_NAME, "Renamed")
+            .await
+            .expect("RenameProfile must succeed");
+
+        let config = server.proxy.get_config().await.unwrap();
+        let on_disk = std::fs::read_to_string(&server.config_path).unwrap();
+        server.shut_down().await;
+
+        let profiles: wire::Dict = config.get("profiles").unwrap().clone().try_into().unwrap();
+        assert!(!profiles.contains_key(DEFAULT_PROFILE_NAME));
+        assert!(profiles.contains_key("Renamed"));
+        let active_profile: String = config
+            .get("active_profile")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(active_profile, "Renamed");
+        assert!(on_disk.contains("active_profile = \"Renamed\""));
+    }
+
+    /// Ticket 19's live demo, exercised without real hardware: creating a
+    /// second Profile, switching to it over real D-Bus, and getting the
+    /// `ActiveProfileChanged` push a subscribed client (the GUI/tray) relies
+    /// on.
+    #[tokio::test]
+    async fn switch_profile_over_real_dbus_changes_active_profile_and_pushes_the_signal() {
+        let server = TestServer::start().await;
+        server.proxy.create_profile("Gaming").await.unwrap();
+        let mut signals = server.proxy.receive_active_profile_changed().await.unwrap();
+
+        server
+            .proxy
+            .switch_profile("Gaming")
+            .await
+            .expect("SwitchProfile must succeed");
+
+        let signal = signals.next().await.expect("signal must be delivered");
+        assert_eq!(signal.args().unwrap().name, "Gaming");
+
+        let (profile, ..) = server.proxy.get_state().await.unwrap();
+        drop(signals);
+        server.shut_down().await;
+
+        assert_eq!(profile, "Gaming");
+    }
+
+    #[tokio::test]
+    async fn switch_profile_over_real_dbus_on_an_unknown_name_returns_not_found() {
+        let server = TestServer::start().await;
+
+        let err = server
+            .proxy
+            .switch_profile("Nonexistent")
+            .await
+            .expect_err("switching to an unknown Profile must fail");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.NotFound")
+        );
+
+        server.shut_down().await;
+    }
+
+    /// Ticket 19's core behavioral requirement, exercised end-to-end over
+    /// real D-Bus and a real dispatch task: a Toggle left running in one
+    /// Profile is force-stopped — with an exact-key release, not a stuck
+    /// key — the instant `SwitchProfile` switches away from it.
+    #[tokio::test]
+    async fn switch_profile_over_real_dbus_force_stops_an_active_toggle_with_exact_key_release() {
+        let server = TestServer::start().await;
+        server.proxy.create_profile("Gaming").await.unwrap();
+
+        let binding = wire::binding_to_dict(&crate::config::Binding {
+            trigger: crate::config::TriggerMode::Toggle,
+            action: crate::config::Action::Macro {
+                steps: vec![
+                    crate::config::MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
+                    crate::config::MacroStepDto::Delay(50),
+                ],
+            },
+        });
+        server
+            .proxy
+            .set_binding("grid_r1c1", "base", binding)
+            .await
+            .expect("SetBinding with a Macro/Toggle payload must succeed");
+
+        server.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        let (_, _, active_toggles, _) = server.proxy.get_state().await.unwrap();
+        assert_eq!(active_toggles, vec!["grid_r1c1".to_string()]);
+
+        server
+            .proxy
+            .switch_profile("Gaming")
+            .await
+            .expect("SwitchProfile must succeed");
+
+        let (_, _, active_toggles, _) = server.proxy.get_state().await.unwrap();
+        assert!(
+            active_toggles.is_empty(),
+            "the Toggle must be force-stopped by the switch"
+        );
+
+        let batches = server.shut_down().await;
+
+        assert_eq!(batches.len(), 2, "one KeyDown lap, then the force-release");
+        let evdev::EventSummary::Key(_, code, value) = batches[0][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_A, 1));
+        let evdev::EventSummary::Key(_, code, value) = batches[1][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_A, 0));
     }
 }

@@ -1,6 +1,6 @@
 from gi.repository import Gtk
 
-from acheron_gui.daemon_client import DaemonError
+from acheron_gui.daemon_client import AlreadyExistsError, DaemonError, NotFoundError
 from acheron_gui.daemon_stub import DaemonStub
 from acheron_gui.device_overview import build_main_view
 from acheron_gui.inputs import ALL_INPUTS
@@ -60,13 +60,211 @@ def test_action_table_open_state_survives_a_rebuild():
     assert rebuilt_revealer.get_reveal_child() is True
 
 
-def test_profile_controls_are_disabled_pending_a_later_ticket():
+def _profile_sidebar(root: Gtk.Widget) -> Gtk.Widget:
+    """Scopes a search to the left-hand Profile sidebar specifically — a
+    Profile's name button is also duplicated in the tray mock's "Quick
+    switch" popover, so an unscoped label search would match both."""
+    heading = find_one(root, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "Profiles")
+    return heading.get_parent()
+
+
+def _popover_of(menu_button: Gtk.MenuButton) -> Gtk.Widget:
+    popover = menu_button.get_popover()
+    assert popover is not None
+    return popover
+
+
+def _fill_and_submit_name_prompt(menu_button: Gtk.MenuButton, name: str, submit_label: str) -> None:
+    popover = _popover_of(menu_button)
+    find_one(popover, lambda w: isinstance(w, Gtk.Entry)).set_text(name)
+    find_one(popover, lambda w: isinstance(w, Gtk.Button) and w.get_label() == submit_label).emit("clicked")
+
+
+def test_clicking_a_sidebar_profile_button_switches_to_it():
+    stub = DaemonStub()
+    stub.create_profile("Gaming")
+
+    root = _build(stub, {"table_open": False})
+    switch_btn = find_one(_profile_sidebar(root), lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Gaming")
+
+    switch_btn.emit("clicked")
+
+    assert stub.get_state()[0] == "Gaming"
+    assert ("switch_profile", "Gaming") in stub.calls
+
+
+def test_clicking_the_already_active_profiles_sidebar_button_is_a_no_op():
     stub = DaemonStub()
 
     root = _build(stub, {"table_open": False})
+    switch_btn = find_one(_profile_sidebar(root), lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Default")
 
-    profile_buttons = find_all(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Default")
-    assert profile_buttons and all(not b.get_sensitive() for b in profile_buttons)
+    switch_btn.emit("clicked")
+
+    # No superfluous SwitchProfile call for the Profile already active — a
+    # real SwitchProfile would force-stop every running Toggle even when
+    # switching "to" the Profile that's already live.
+    assert stub.calls == []
+
+
+def test_delete_is_disabled_for_the_active_profile_and_enabled_for_others():
+    stub = DaemonStub()
+    stub.create_profile("Gaming")
+
+    root = _build(stub, {"table_open": False})
+    delete_btns = find_all(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "×")
+
+    sensitivities = {b.get_sensitive() for b in delete_btns}
+    assert sensitivities == {True, False}, "exactly one active (disabled) and one non-active (enabled) Profile"
+
+
+def test_clicking_delete_on_a_non_active_profile_removes_it():
+    stub = DaemonStub()
+    stub.create_profile("Gaming")
+
+    root = _build(stub, {"table_open": False})
+    delete_btn = find_one(
+        root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "×" and w.get_sensitive()
+    )
+
+    delete_btn.emit("clicked")
+
+    assert "Gaming" not in stub.get_config()["profiles"]
+
+
+def test_creating_a_profile_via_the_new_profile_popover_calls_create_profile():
+    stub = DaemonStub()
+
+    root = _build(stub, {"table_open": False})
+    new_btn = find_one(root, lambda w: isinstance(w, Gtk.MenuButton) and w.get_label() == "+ New Profile")
+
+    _fill_and_submit_name_prompt(new_btn, "Gaming", "Create")
+
+    assert "Gaming" in stub.get_config()["profiles"]
+    assert ("create_profile", "Gaming") in stub.calls
+
+
+def test_renaming_the_active_profile_via_its_popover_calls_rename_profile():
+    stub = DaemonStub()
+
+    root = _build(stub, {"table_open": False})
+    rename_btn = find_one(root, lambda w: isinstance(w, Gtk.MenuButton) and w.get_label() == "✎")
+
+    _fill_and_submit_name_prompt(rename_btn, "Renamed", "Rename")
+
+    assert stub.get_config()["active_profile"] == "Renamed"
+    assert ("rename_profile", "Default", "Renamed") in stub.calls
+
+
+def test_tray_quick_switch_calls_switch_profile():
+    stub = DaemonStub()
+    stub.create_profile("Gaming")
+
+    root = _build(stub, {"table_open": False})
+    quick_switch = find_one(root, lambda w: isinstance(w, Gtk.MenuButton) and w.get_label() == "Quick switch ▾")
+    popover = _popover_of(quick_switch)
+    gaming_btn = find_one(popover, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Gaming")
+
+    gaming_btn.emit("clicked")
+
+    assert stub.get_state()[0] == "Gaming"
+
+
+def test_a_failed_tray_quick_switch_shows_an_error_and_keeps_the_popover_open():
+    stub = _SwitchProfileFailsDaemonStub()
+    stub.create_profile("Gaming")
+
+    root = _build(stub, {"table_open": False})
+    quick_switch = find_one(root, lambda w: isinstance(w, Gtk.MenuButton) and w.get_label() == "Quick switch ▾")
+    popover = _popover_of(quick_switch)
+    gaming_btn = find_one(popover, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Gaming")
+
+    gaming_btn.emit("clicked")
+
+    error_label = find_one(popover, lambda w: "error" in w.get_css_classes())
+    assert error_label.get_visible()
+    assert stub.get_state()[0] == "Default"
+
+
+def test_switching_profile_via_the_sidebar_clears_active_toggles():
+    # The GUI-level half of ticket 19's live demo: a Toggle left running in
+    # the first Profile must be gone from GetState() the instant the switch
+    # (from either the sidebar or the tray) lands — exact-key-release is the
+    # Daemon's own tested responsibility, not something this GUI-level test
+    # can observe.
+    stub = DaemonStub()
+    stub.create_profile("Gaming")
+    stub.simulate_toggle_started("grid_r1c1")
+    assert stub.get_state()[2] == ["grid_r1c1"]
+
+    root = _build(stub, {"table_open": False})
+    switch_btn = find_one(_profile_sidebar(root), lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Gaming")
+    switch_btn.emit("clicked")
+
+    assert stub.get_state()[2] == []
+
+
+class _SwitchProfileFailsDaemonStub(DaemonStub):
+    def switch_profile(self, name):
+        raise NotFoundError(f"no Profile named {name!r}")
+
+
+def test_a_failed_switch_shows_an_error_in_the_sidebar_instead_of_swallowing_it():
+    stub = _SwitchProfileFailsDaemonStub()
+    stub.create_profile("Gaming")
+
+    root = _build(stub, {"table_open": False})
+    sidebar = _profile_sidebar(root)
+    switch_btn = find_one(sidebar, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Gaming")
+
+    switch_btn.emit("clicked")
+
+    error_label = find_one(sidebar, lambda w: "sidebar-error" in w.get_css_classes())
+    assert error_label.get_visible()
+    assert error_label.get_label()
+    # The failed switch must not be misreported as having happened.
+    assert stub.get_state()[0] == "Default"
+
+
+class _DeleteProfileFailsDaemonStub(DaemonStub):
+    def delete_profile(self, name):
+        raise NotFoundError(f"no Profile named {name!r}")
+
+
+def test_a_failed_delete_shows_an_error_in_the_sidebar_instead_of_swallowing_it():
+    stub = _DeleteProfileFailsDaemonStub()
+    stub.create_profile("Gaming")
+
+    root = _build(stub, {"table_open": False})
+    sidebar = _profile_sidebar(root)
+    delete_btn = find_one(
+        sidebar, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "×" and w.get_sensitive()
+    )
+
+    delete_btn.emit("clicked")
+
+    error_label = find_one(sidebar, lambda w: "sidebar-error" in w.get_css_classes())
+    assert error_label.get_visible()
+    assert error_label.get_label()
+    assert "Gaming" in stub.get_config()["profiles"]
+
+
+class _CreateProfileFailsDaemonStub(DaemonStub):
+    def create_profile(self, name):
+        raise AlreadyExistsError(f"a Profile named {name!r} already exists")
+
+
+def test_a_failed_create_profile_shows_an_error_instead_of_closing_the_popover():
+    stub = _CreateProfileFailsDaemonStub()
+
+    root = _build(stub, {"table_open": False})
+    new_btn = find_one(root, lambda w: isinstance(w, Gtk.MenuButton) and w.get_label() == "+ New Profile")
+
+    _fill_and_submit_name_prompt(new_btn, "Gaming", "Create")
+
+    error_label = find_one(_popover_of(new_btn), lambda w: "error" in w.get_css_classes())
+    assert error_label.get_visible()
+    assert error_label.get_label()
 
 
 def test_clicking_the_held_tab_switches_which_layer_is_shown_and_edited():

@@ -82,7 +82,7 @@ pub async fn run(
             }
             cmd = rx_commands.recv(), if commands_open => {
                 match cmd {
-                    Some(cmd) => handle_command(&mut config, &config_path, &mut toggles, &active_layer, cmd).await,
+                    Some(cmd) => handle_command(&mut config, &config_path, &mut toggles, &active_layer, &signal_emitter, cmd).await,
                     None => commands_open = false,
                 }
             }
@@ -224,6 +224,7 @@ async fn handle_command(
     config_path: &Path,
     toggles: &mut HashMap<Input, ActiveToggle>,
     active_layer: &Layer,
+    signal_emitter: &Option<SignalEmitter<'static>>,
     cmd: Command,
 ) {
     match cmd {
@@ -297,6 +298,106 @@ async fn handle_command(
                 // unstoppable via that key (code review finding).
                 if let Some(toggle) = toggles.remove(&Input::ModeKey) {
                     toggle.stop().await;
+                }
+            }
+            let _ = reply.send(result);
+        }
+        Command::CreateProfile { name, reply } => {
+            if name.trim().is_empty() {
+                let _ = reply.send(Err(CommandError::InvalidRequest(
+                    "Profile name can't be empty".to_string(),
+                )));
+                return;
+            }
+            if config.profiles.contains_key(&name) {
+                let _ = reply.send(Err(CommandError::AlreadyExists));
+                return;
+            }
+            config.profiles.insert(name.clone(), Profile::default());
+            let result = persist(config, config_path).await;
+            if result.is_err() {
+                config.profiles.remove(&name);
+            }
+            let _ = reply.send(result);
+        }
+        Command::DeleteProfile { name, reply } => {
+            if name == config.active_profile {
+                let _ = reply.send(Err(CommandError::InvalidRequest(
+                    "cannot delete the active Profile".to_string(),
+                )));
+                return;
+            }
+            let Some(previous) = config.profiles.remove(&name) else {
+                let _ = reply.send(Err(CommandError::NotFound));
+                return;
+            };
+            let result = persist(config, config_path).await;
+            if result.is_err() {
+                config.profiles.insert(name, previous);
+            }
+            let _ = reply.send(result);
+        }
+        Command::RenameProfile {
+            old_name,
+            new_name,
+            reply,
+        } => {
+            if new_name.trim().is_empty() {
+                let _ = reply.send(Err(CommandError::InvalidRequest(
+                    "Profile name can't be empty".to_string(),
+                )));
+                return;
+            }
+            if !config.profiles.contains_key(&old_name) {
+                let _ = reply.send(Err(CommandError::NotFound));
+                return;
+            }
+            if old_name != new_name && config.profiles.contains_key(&new_name) {
+                let _ = reply.send(Err(CommandError::AlreadyExists));
+                return;
+            }
+            if old_name == new_name {
+                let _ = reply.send(Ok(()));
+                return;
+            }
+            let profile = config
+                .profiles
+                .remove(&old_name)
+                .expect("just checked old_name exists");
+            config.profiles.insert(new_name.clone(), profile.clone());
+            let was_active = config.active_profile == old_name;
+            if was_active {
+                config.active_profile = new_name.clone();
+            }
+            let result = persist(config, config_path).await;
+            if result.is_err() {
+                config.profiles.remove(&new_name);
+                config.profiles.insert(old_name.clone(), profile);
+                if was_active {
+                    config.active_profile = old_name;
+                }
+            }
+            let _ = reply.send(result);
+        }
+        Command::SwitchProfile { name, reply } => {
+            if !config.profiles.contains_key(&name) {
+                let _ = reply.send(Err(CommandError::NotFound));
+                return;
+            }
+            let previous = std::mem::replace(&mut config.active_profile, name.clone());
+            let result = persist(config, config_path).await;
+            if result.is_err() {
+                config.active_profile = previous;
+            } else {
+                // Force-stop every active Toggle before the new Profile's
+                // state is considered live, per spec.md's "Toggle behavior
+                // across Layer/Profile switches" — no Toggle survives a
+                // Profile switch, regardless of which Profile started it.
+                for (_, toggle) in toggles.drain() {
+                    toggle.stop().await;
+                }
+                if let Some(emitter) = signal_emitter {
+                    let _ = Daemon::active_profile_changed(emitter, &name).await;
                 }
             }
             let _ = reply.send(result);
@@ -829,6 +930,55 @@ mod tests {
             rx.await.unwrap()
         }
 
+        async fn create_profile(&self, name: &str) -> Result<(), CommandError> {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::CreateProfile {
+                    name: name.to_string(),
+                    reply,
+                })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
+        async fn delete_profile(&self, name: &str) -> Result<(), CommandError> {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::DeleteProfile {
+                    name: name.to_string(),
+                    reply,
+                })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
+        async fn rename_profile(&self, old_name: &str, new_name: &str) -> Result<(), CommandError> {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::RenameProfile {
+                    old_name: old_name.to_string(),
+                    new_name: new_name.to_string(),
+                    reply,
+                })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
+        async fn switch_profile(&self, name: &str) -> Result<(), CommandError> {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::SwitchProfile {
+                    name: name.to_string(),
+                    reply,
+                })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
         async fn get_config(&self) -> Config {
             let (reply, rx) = oneshot::channel();
             self.cmd_tx.send(Command::GetConfig(reply)).await.unwrap();
@@ -1290,6 +1440,344 @@ mod tests {
 
         // One KeyDown from the loop's single lap, then a force-released
         // KeyUp for exactly that key on stop — no stuck key.
+        assert_eq!(batches.len(), 2);
+        let evdev::EventSummary::Key(_, code, value) = batches[0][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_A, 1));
+        let evdev::EventSummary::Key(_, code, value) = batches[1][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_A, 0));
+    }
+
+    #[tokio::test]
+    async fn create_profile_command_adds_an_empty_profile_and_persists() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        harness
+            .create_profile("Gaming")
+            .await
+            .expect("CreateProfile must succeed");
+
+        let on_disk = std::fs::read_to_string(&harness.config_path).unwrap();
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+
+        let profile = &config.profiles["Gaming"];
+        assert!(profile.base.is_empty());
+        assert!(profile.held.is_empty());
+        assert_eq!(profile.mode_key_role, ModeKeyRole::LayerSwitch);
+        let reparsed: Config = toml::from_str(&on_disk).unwrap();
+        assert!(reparsed.profiles.contains_key("Gaming"));
+    }
+
+    #[tokio::test]
+    async fn create_profile_command_rejects_a_duplicate_name() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .create_profile(DEFAULT_PROFILE_NAME)
+            .await
+            .expect_err("creating a Profile with an existing name must fail");
+        assert!(matches!(err, CommandError::AlreadyExists));
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn create_profile_command_rejects_an_empty_or_whitespace_name() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        for name in ["", "   "] {
+            let err = harness
+                .create_profile(name)
+                .await
+                .expect_err("creating a Profile with an empty name must fail");
+            assert!(matches!(err, CommandError::InvalidRequest(_)));
+        }
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+        assert_eq!(config.profiles.len(), 1, "no empty-named Profile created");
+    }
+
+    #[tokio::test]
+    async fn delete_profile_command_removes_a_non_active_profile_and_persists() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness.create_profile("Gaming").await.unwrap();
+
+        harness
+            .delete_profile("Gaming")
+            .await
+            .expect("DeleteProfile must succeed");
+
+        let on_disk = std::fs::read_to_string(&harness.config_path).unwrap();
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+
+        assert!(!config.profiles.contains_key("Gaming"));
+        let reparsed: Config = toml::from_str(&on_disk).unwrap();
+        assert!(!reparsed.profiles.contains_key("Gaming"));
+    }
+
+    #[tokio::test]
+    async fn delete_profile_command_rejects_deleting_the_active_profile() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .delete_profile(DEFAULT_PROFILE_NAME)
+            .await
+            .expect_err("deleting the active Profile must fail");
+        assert!(matches!(err, CommandError::InvalidRequest(_)));
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+        assert!(config.profiles.contains_key(DEFAULT_PROFILE_NAME));
+    }
+
+    #[tokio::test]
+    async fn delete_profile_command_on_an_unknown_name_returns_not_found() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .delete_profile("Nonexistent")
+            .await
+            .expect_err("deleting an unknown Profile must fail");
+        assert!(matches!(err, CommandError::NotFound));
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn rename_profile_command_renames_the_active_profile_and_updates_active_profile() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        harness
+            .rename_profile(DEFAULT_PROFILE_NAME, "Renamed")
+            .await
+            .expect("RenameProfile must succeed");
+
+        let on_disk = std::fs::read_to_string(&harness.config_path).unwrap();
+        let config = harness.get_config().await;
+        let state = harness.get_state().await;
+        harness.shut_down().await;
+
+        assert!(!config.profiles.contains_key(DEFAULT_PROFILE_NAME));
+        assert!(config.profiles.contains_key("Renamed"));
+        assert_eq!(config.active_profile, "Renamed");
+        assert_eq!(state.profile, "Renamed");
+        let reparsed: Config = toml::from_str(&on_disk).unwrap();
+        assert_eq!(reparsed.active_profile, "Renamed");
+    }
+
+    #[tokio::test]
+    async fn rename_profile_command_leaves_active_profile_untouched_when_renaming_a_different_one()
+     {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness.create_profile("Gaming").await.unwrap();
+
+        harness
+            .rename_profile("Gaming", "Editing")
+            .await
+            .expect("RenameProfile must succeed");
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+
+        assert_eq!(config.active_profile, DEFAULT_PROFILE_NAME);
+        assert!(config.profiles.contains_key("Editing"));
+    }
+
+    #[tokio::test]
+    async fn rename_profile_command_rejects_a_duplicate_new_name() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness.create_profile("Gaming").await.unwrap();
+
+        let err = harness
+            .rename_profile("Gaming", DEFAULT_PROFILE_NAME)
+            .await
+            .expect_err("renaming onto an existing name must fail");
+        assert!(matches!(err, CommandError::AlreadyExists));
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn rename_profile_command_rejects_an_empty_or_whitespace_new_name() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        for new_name in ["", "   "] {
+            let err = harness
+                .rename_profile(DEFAULT_PROFILE_NAME, new_name)
+                .await
+                .expect_err("renaming to an empty name must fail");
+            assert!(matches!(err, CommandError::InvalidRequest(_)));
+        }
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+        assert!(config.profiles.contains_key(DEFAULT_PROFILE_NAME));
+    }
+
+    #[tokio::test]
+    async fn rename_profile_command_on_an_unknown_old_name_returns_not_found() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .rename_profile("Nonexistent", "Whatever")
+            .await
+            .expect_err("renaming an unknown Profile must fail");
+        assert!(matches!(err, CommandError::NotFound));
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn switch_profile_command_switches_active_profile_and_persists() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness.create_profile("Gaming").await.unwrap();
+
+        harness
+            .switch_profile("Gaming")
+            .await
+            .expect("SwitchProfile must succeed");
+
+        let on_disk = std::fs::read_to_string(&harness.config_path).unwrap();
+        let state = harness.get_state().await;
+        harness.shut_down().await;
+
+        assert_eq!(state.profile, "Gaming");
+        let reparsed: Config = toml::from_str(&on_disk).unwrap();
+        assert_eq!(reparsed.active_profile, "Gaming");
+    }
+
+    #[tokio::test]
+    async fn switch_profile_command_on_an_unknown_name_returns_not_found() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .switch_profile("Nonexistent")
+            .await
+            .expect_err("switching to an unknown Profile must fail");
+        assert!(matches!(err, CommandError::NotFound));
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn each_profile_carries_independent_binding_sets() {
+        let mut gaming_base = HashMap::new();
+        gaming_base.insert(Input::Grid(1, 1), keypress_binding(evdev::KeyCode::KEY_F1));
+        let mut profiles = HashMap::new();
+        profiles.insert(DEFAULT_PROFILE_NAME.to_string(), Profile::default());
+        profiles.insert(
+            "Gaming".to_string(),
+            Profile {
+                base: gaming_base,
+                ..Default::default()
+            },
+        );
+        let config = Config {
+            schema_version: config::SCHEMA_VERSION,
+            active_profile: DEFAULT_PROFILE_NAME.to_string(),
+            profiles,
+        };
+        let harness = CommandHarness::spawn(config);
+
+        // Base layer, Default Profile: Grid(1,1) is unbound there, so it
+        // passes through — Gaming's own Binding must not leak across.
+        harness.press(Input::Grid(1, 1)).await;
+        // `PhysicalEvent`s and `Command`s arrive on separate channels the
+        // dispatch task `select!`s over with no ordering guarantee between
+        // them (issue 07), so the switch below isn't guaranteed to be
+        // processed after this press without yielding first — same pattern
+        // the Held-layer tests above use.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        harness.switch_profile("Gaming").await.unwrap();
+
+        // Same physical key, now evaluated under Gaming's own independent
+        // Binding set.
+        harness.press(Input::Grid(1, 1)).await;
+
+        let batches = harness.shut_down().await;
+
+        assert_eq!(
+            batches.len(),
+            3,
+            "one passthrough + one press + one release"
+        );
+        let evdev::EventSummary::Key(_, code, _) = batches[0][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!(code, evdev::KeyCode::KEY_1, "Default Profile: passthrough");
+        let evdev::EventSummary::Key(_, code, _) = batches[1][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!(code, evdev::KeyCode::KEY_F1, "Gaming Profile: remapped");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn switch_profile_force_stops_every_active_toggle_with_exact_key_release() {
+        let mut base = HashMap::new();
+        base.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::Toggle,
+                action: Action::Macro {
+                    // Deliberately unbalanced within the window we switch
+                    // in: KeyDown fires, then a long Delay, so KEY_A is
+                    // still held when the Profile switch stops it.
+                    steps: vec![
+                        MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
+                        MacroStepDto::Delay(50),
+                    ],
+                },
+            },
+        );
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            DEFAULT_PROFILE_NAME.to_string(),
+            Profile {
+                base,
+                ..Default::default()
+            },
+        );
+        profiles.insert("Gaming".to_string(), Profile::default());
+        let config = Config {
+            schema_version: config::SCHEMA_VERSION,
+            active_profile: DEFAULT_PROFILE_NAME.to_string(),
+            profiles,
+        };
+        let harness = CommandHarness::spawn(config);
+
+        harness.press(Input::Grid(1, 1)).await;
+        tokio::time::advance(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            harness.get_state().await.active_toggles,
+            vec![Input::Grid(1, 1)]
+        );
+
+        harness
+            .switch_profile("Gaming")
+            .await
+            .expect("SwitchProfile must succeed");
+
+        let state = harness.get_state().await;
+        assert!(
+            state.active_toggles.is_empty(),
+            "the Toggle must be force-stopped by the switch, not orphaned"
+        );
+
+        let batches = harness.shut_down().await;
+
+        // One KeyDown lap, then the force-released KeyUp for exactly that
+        // key — no stuck key, no continued looping into the new Profile.
         assert_eq!(batches.len(), 2);
         let evdev::EventSummary::Key(_, code, value) = batches[0][0].destructure() else {
             panic!("expected a key event");

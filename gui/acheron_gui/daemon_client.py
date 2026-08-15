@@ -84,7 +84,17 @@ class DaemonClient(Protocol):
 
     def set_mode_key_role(self, role: str) -> None: ...
 
+    def create_profile(self, name: str) -> None: ...
+
+    def delete_profile(self, name: str) -> None: ...
+
+    def rename_profile(self, old_name: str, new_name: str) -> None: ...
+
+    def switch_profile(self, name: str) -> None: ...
+
     def subscribe_layer_changed(self, callback: Callable[[str], None]) -> None: ...
+
+    def subscribe_profile_changed(self, callback: Callable[[str], None]) -> None: ...
 
 
 class DBusDaemonClient:
@@ -125,16 +135,35 @@ class DBusDaemonClient:
     def set_mode_key_role(self, role: str) -> None:
         self._call("SetModeKeyRole", GLib.Variant("(s)", (role,)))
 
+    def create_profile(self, name: str) -> None:
+        self._call("CreateProfile", GLib.Variant("(s)", (name,)))
+
+    def delete_profile(self, name: str) -> None:
+        self._call("DeleteProfile", GLib.Variant("(s)", (name,)))
+
+    def rename_profile(self, old_name: str, new_name: str) -> None:
+        self._call("RenameProfile", GLib.Variant("(ss)", (old_name, new_name)))
+
+    def switch_profile(self, name: str) -> None:
+        self._call("SwitchProfile", GLib.Variant("(s)", (name,)))
+
     def subscribe_layer_changed(self, callback: Callable[[str], None]) -> None:
         """Wires ticket 18's `ActiveLayerChanged` signal to `callback(layer)`
         — `Gio.DBusProxy` re-emits every D-Bus signal it receives as its own
         `"g-signal"` GObject signal, so this is a plain filtered connect
         rather than a second subscription mechanism."""
+        self._connect_signal("ActiveLayerChanged", callback)
 
+    def subscribe_profile_changed(self, callback: Callable[[str], None]) -> None:
+        """Wires ticket 19's `ActiveProfileChanged` signal to
+        `callback(name)`, same mechanism as `subscribe_layer_changed`."""
+        self._connect_signal("ActiveProfileChanged", callback)
+
+    def _connect_signal(self, wanted_signal_name: str, callback: Callable[[str], None]) -> None:
         def on_g_signal(_proxy, _sender_name, signal_name, parameters):
-            if signal_name == "ActiveLayerChanged":
-                (layer,) = parameters.unpack()
-                callback(layer)
+            if signal_name == wanted_signal_name:
+                (value,) = parameters.unpack()
+                callback(value)
 
         self._proxy.connect("g-signal", on_g_signal)
 

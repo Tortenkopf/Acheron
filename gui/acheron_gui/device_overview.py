@@ -6,11 +6,13 @@ diamond rotated 90° clockwise, a circular Mode key above it, and key 20 as
 a separate paddle below it. Clicking any control opens the shared Binding
 editor (`binding_editor.build_binding_editor`) in a popover.
 
-Profile switching is rendered (matching the prototype's structure) but
-still deliberately disabled here: there is no `SwitchProfile`/Profile
-parameter on the wire yet (ticket 19) for it to drive, and letting it
-*look* interactive without being backed by anything real would silently
-mis-target edits.
+The Profile sidebar (ticket 19) is real: switching a Profile calls
+`SwitchProfile`, "+ New Profile" calls `CreateProfile`, and each row's "✎"/
+"×" call `RenameProfile`/`DeleteProfile` — "×" is disabled on the active
+Profile, mirroring the Daemon's own "can't delete the Profile out from under
+itself" rule rather than only surfacing it as a post-hoc error. The tray
+mock's "Quick switch" popover lists the same real Profiles and calls
+`SwitchProfile` too.
 
 The Base/Held tab row (ticket 18) is real: clicking a tab sets
 `ui_state["selected_layer"]`, the Layer whose Bindings Device Overview and
@@ -83,7 +85,142 @@ def build_layer_bar(
     return box
 
 
-def build_tray_mock(profile: str, layer: str, profiles: list[str]) -> Gtk.Box:
+def build_name_prompt_popover(
+    client_error_context: str, initial_text: str, submit_label: str, on_submit: Callable[[str], None]
+) -> Gtk.Popover:
+    """A small Entry-plus-submit-button popover shared by "+ New Profile"
+    and each row's rename ("✎") control — the closest existing pattern is
+    `build_binding_editor`'s own Save/error handling, reused here at a much
+    smaller scale rather than inventing a separate dialog mechanism."""
+    popover = Gtk.Popover()
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    box.set_margin_top(8)
+    box.set_margin_bottom(8)
+    box.set_margin_start(8)
+    box.set_margin_end(8)
+
+    entry = Gtk.Entry(text=initial_text)
+    entry.set_width_chars(16)
+    box.append(entry)
+
+    error_label = Gtk.Label(xalign=0, wrap=True)
+    error_label.add_css_class("error")
+    error_label.set_visible(False)
+    box.append(error_label)
+
+    def on_submit_clicked(_widget):
+        name = entry.get_text().strip()
+        if not name:
+            error_label.set_label("Name can't be empty")
+            error_label.set_visible(True)
+            return
+        try:
+            on_submit(name)
+        except DaemonError as exc:
+            error_label.set_label(f"{client_error_context}: {exc}")
+            error_label.set_visible(True)
+            return
+        popover.popdown()
+
+    submit_btn = Gtk.Button(label=submit_label)
+    submit_btn.add_css_class("suggested-action")
+    submit_btn.connect("clicked", on_submit_clicked)
+    entry.connect("activate", on_submit_clicked)
+    box.append(submit_btn)
+
+    popover.set_child(box)
+    return popover
+
+
+def build_profile_sidebar(client, config: dict, profile: str, on_change: Callable[[], None]) -> Gtk.Box:
+    sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+    sidebar.add_css_class("sidebar")
+    sidebar.set_size_request(150, -1)
+    heading = Gtk.Label(label="Profiles", xalign=0)
+    heading.add_css_class("heading")
+    sidebar.append(heading)
+
+    # A plain sidebar Button has no popover to host build_name_prompt_popover's
+    # own inline error_label, so this shared one covers Switch/Delete the same
+    # way — matching build_binding_editor's show_error convention rather than
+    # swallowing a failed mutation silently (e.g. a stale row surviving a
+    # concurrent client's delete: the click still visibly does something).
+    error_label = Gtk.Label(xalign=0, wrap=True)
+    error_label.add_css_class("error")
+    error_label.add_css_class("sidebar-error")
+    error_label.set_visible(False)
+    sidebar.append(error_label)
+
+    def show_error(exc: Exception) -> None:
+        error_label.set_label(str(exc))
+        error_label.set_visible(True)
+
+    for name in config["profiles"]:
+        row = Gtk.Box(spacing=4)
+
+        switch_btn = Gtk.Button(label=name, hexpand=True)
+        if name == profile:
+            switch_btn.add_css_class("suggested-action")
+
+        def on_switch_clicked(_b, name=name):
+            if name == profile:
+                return
+            try:
+                client.switch_profile(name)
+            except DaemonError as exc:
+                show_error(exc)
+                return
+            on_change()
+
+        switch_btn.connect("clicked", on_switch_clicked)
+        row.append(switch_btn)
+
+        rename_btn = Gtk.MenuButton(label="✎")
+        rename_btn.set_tooltip_text(f"Rename {name!r}")
+
+        def on_rename_submitted(new_name: str, name=name):
+            client.rename_profile(name, new_name)
+            on_change()
+
+        rename_btn.set_popover(
+            build_name_prompt_popover(f"Renaming {name!r}", name, "Rename", on_rename_submitted)
+        )
+        row.append(rename_btn)
+
+        delete_btn = Gtk.Button(label="×")
+        is_active = name == profile
+        delete_btn.set_sensitive(not is_active)
+        delete_btn.set_tooltip_text(
+            "Can't delete the active Profile — switch away from it first"
+            if is_active
+            else f"Delete {name!r}"
+        )
+
+        def on_delete_clicked(_b, name=name):
+            try:
+                client.delete_profile(name)
+            except DaemonError as exc:
+                show_error(exc)
+                return
+            on_change()
+
+        delete_btn.connect("clicked", on_delete_clicked)
+        row.append(delete_btn)
+
+        sidebar.append(row)
+
+    new_btn = Gtk.MenuButton(label="+ New Profile")
+
+    def on_create_submitted(name: str):
+        client.create_profile(name)
+        on_change()
+
+    new_btn.set_popover(build_name_prompt_popover("Creating a Profile", "", "Create", on_create_submitted))
+    sidebar.append(new_btn)
+    return sidebar
+
+
+def build_tray_mock(client, profile: str, layer: str, profiles: list[str], on_change: Callable[[], None]) -> Gtk.Box:
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
     box.add_css_class("tray-mock")
     box.set_size_request(190, -1)
@@ -101,11 +238,31 @@ def build_tray_mock(profile: str, layer: str, profiles: list[str]) -> Gtk.Box:
     menu_btn = Gtk.MenuButton(label="Quick switch ▾")
     popover = Gtk.Popover()
     menu_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+    error_label = Gtk.Label(xalign=0, wrap=True)
+    error_label.add_css_class("error")
+    error_label.set_visible(False)
     for name in profiles:
         b = Gtk.Button(label=name)
-        b.set_sensitive(False)
-        b.set_tooltip_text("Profile switching lands in a later ticket")
+        if name == profile:
+            b.add_css_class("suggested-action")
+
+        def on_pick(_b, name=name):
+            if name != profile:
+                try:
+                    client.switch_profile(name)
+                except DaemonError as exc:
+                    # Same reasoning as the sidebar's own show_error: leave
+                    # the popover open with the failure visible rather than
+                    # popping down as if the switch had happened.
+                    error_label.set_label(str(exc))
+                    error_label.set_visible(True)
+                    return
+            popover.popdown()
+            on_change()
+
+        b.connect("clicked", on_pick)
         menu_box.append(b)
+    menu_box.append(error_label)
     popover.set_child(menu_box)
     menu_btn.set_popover(popover)
     box.append(menu_btn)
@@ -167,24 +324,7 @@ def build_main_view(client, config: dict, profile: str, layer: str, on_change: C
     root.set_margin_start(12)
     root.set_margin_end(12)
 
-    sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-    sidebar.add_css_class("sidebar")
-    sidebar.set_size_request(150, -1)
-    heading = Gtk.Label(label="Profiles", xalign=0)
-    heading.add_css_class("heading")
-    sidebar.append(heading)
-    for name in config["profiles"]:
-        b = Gtk.Button(label=name)
-        if name == profile:
-            b.add_css_class("suggested-action")
-        b.set_sensitive(False)
-        b.set_tooltip_text("Profile switching lands in a later ticket")
-        sidebar.append(b)
-    new_btn = Gtk.Button(label="+ New Profile")
-    new_btn.set_sensitive(False)
-    new_btn.set_tooltip_text("Creating Profiles lands in a later ticket")
-    sidebar.append(new_btn)
-    root.append(sidebar)
+    root.append(build_profile_sidebar(client, config, profile, on_change))
 
     main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
     main.set_hexpand(True)
@@ -270,5 +410,5 @@ def build_main_view(client, config: dict, profile: str, layer: str, on_change: C
 
     table_toggle.connect("toggled", on_toggle)
 
-    root.append(build_tray_mock(profile, layer, list(config["profiles"])))
+    root.append(build_tray_mock(client, profile, layer, list(config["profiles"]), on_change))
     return root

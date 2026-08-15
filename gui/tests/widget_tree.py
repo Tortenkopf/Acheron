@@ -1,7 +1,22 @@
 """Test-only helper for walking a built Gtk4 widget tree, including into
-`Gtk.Popover`/`Gtk.MenuButton` contents — which `get_first_child()` doesn't
-reach on its own, since a Popover's contents realize as a separate surface
-rather than a normal child in the tree.
+`Gtk.Popover`/`Gtk.MenuButton` contents. A `Gtk.MenuButton`'s popover is
+explicitly walked below since it isn't guaranteed reachable through
+`get_first_child()` alone — but in this GTK4 environment it turns out
+`get_first_child()` *does* also reach it (as one of the MenuButton's normal
+internal children), so without deduplication a popover's contents get
+yielded twice from a root-rooted walk. `_seen` guards against that on
+either GTK4 behavior, so callers' `find_all`/`find_one` counts stay correct
+regardless.
+
+`_seen` holds the widget objects themselves (relying on PyGObject wrappers'
+identity-based `__eq__`/`__hash__` on the underlying GObject), not their
+`id()` — `get_first_child()`/`get_next_sibling()` mint a fresh, short-lived
+Python wrapper on every call, and once a `child` local is reassigned the
+previous wrapper's refcount can drop to zero and its memory get reused for
+the *next* freshly-minted wrapper. `id()` would then alias two genuinely
+different widgets together, under-counting real matches; keeping the
+objects in the set instead keeps them alive for the rest of this walk and
+compares them correctly.
 """
 
 from __future__ import annotations
@@ -11,20 +26,25 @@ from collections.abc import Callable, Iterator
 from gi.repository import Gtk
 
 
-def walk(widget: Gtk.Widget) -> Iterator[Gtk.Widget]:
+def walk(widget: Gtk.Widget, _seen: set[Gtk.Widget] | None = None) -> Iterator[Gtk.Widget]:
+    if _seen is None:
+        _seen = set()
+    if widget in _seen:
+        return
+    _seen.add(widget)
     yield widget
     if isinstance(widget, Gtk.Popover):
         child = widget.get_child()
         if child is not None:
-            yield from walk(child)
+            yield from walk(child, _seen)
         return
     if isinstance(widget, Gtk.MenuButton):
         popover = widget.get_popover()
         if popover is not None:
-            yield from walk(popover)
+            yield from walk(popover, _seen)
     child = widget.get_first_child()
     while child is not None:
-        yield from walk(child)
+        yield from walk(child, _seen)
         child = child.get_next_sibling()
 
 

@@ -12,7 +12,15 @@ and Held Layers (all passthrough), `mode_key_role` defaulting to
 event reaching the Daemon and it pushing `ActiveLayerChanged` back out: there
 is no capture layer in GUI tests, so this is the seam a test uses to drive
 the same live-update path `subscribe_layer_changed` wires up against the
-real Daemon.
+real Daemon. `simulate_toggle_started` is the equivalent seam for a running
+Toggle, used to exercise `switch_profile`'s force-stop-on-switch effect
+(ticket 19) at the GUI level.
+
+`create_profile`/`delete_profile`/`rename_profile`/`switch_profile` (ticket
+19) mirror the real Daemon's validation: `AlreadyExistsError` on a taken
+name, `NotFoundError` on an unknown one, `InvalidBindingError` on deleting
+the active Profile (the real Daemon's `active_profile` must always name a
+real Profile, so it can never be deleted out from under itself).
 """
 
 from __future__ import annotations
@@ -20,7 +28,7 @@ from __future__ import annotations
 import copy
 from typing import Callable
 
-from .daemon_client import NotFoundError
+from .daemon_client import AlreadyExistsError, InvalidBindingError, NotFoundError
 
 
 class DaemonStub:
@@ -31,7 +39,9 @@ class DaemonStub:
             active_profile: {"base": {}, "held": {}, "mode_key_role": "layer_switch"}
         }
         self._layer = "base"
+        self._active_toggles: list[str] = []
         self._layer_changed_callbacks: list[Callable[[str], None]] = []
+        self._profile_changed_callbacks: list[Callable[[str], None]] = []
         # Recorded for tests that want to assert what the GUI actually sent,
         # not just the resulting state.
         self.calls: list[tuple] = []
@@ -48,7 +58,7 @@ class DaemonStub:
         }
 
     def get_state(self) -> tuple[str, str, list[str], bool]:
-        return (self._active_profile, self._layer, [], True)
+        return (self._active_profile, self._layer, list(self._active_toggles), True)
 
     def set_binding(self, input_str: str, layer: str, binding: dict) -> None:
         # Deep-copied for the same reason: SetBinding's real wire encoding
@@ -70,14 +80,64 @@ class DaemonStub:
         self._profiles[self._active_profile]["mode_key_role"] = role
         self.calls.append(("set_mode_key_role", role))
 
+    def create_profile(self, name: str) -> None:
+        if name in self._profiles:
+            raise AlreadyExistsError(f"a Profile named {name!r} already exists")
+        self._profiles[name] = {"base": {}, "held": {}, "mode_key_role": "layer_switch"}
+        self.calls.append(("create_profile", name))
+
+    def delete_profile(self, name: str) -> None:
+        if name == self._active_profile:
+            raise InvalidBindingError("cannot delete the active Profile")
+        if name not in self._profiles:
+            raise NotFoundError(f"no Profile named {name!r}")
+        del self._profiles[name]
+        self.calls.append(("delete_profile", name))
+
+    def rename_profile(self, old_name: str, new_name: str) -> None:
+        if old_name not in self._profiles:
+            raise NotFoundError(f"no Profile named {old_name!r}")
+        if new_name != old_name and new_name in self._profiles:
+            raise AlreadyExistsError(f"a Profile named {new_name!r} already exists")
+        self.calls.append(("rename_profile", old_name, new_name))
+        if new_name == old_name:
+            return
+        self._profiles[new_name] = self._profiles.pop(old_name)
+        if self._active_profile == old_name:
+            self._active_profile = new_name
+
+    def switch_profile(self, name: str) -> None:
+        if name not in self._profiles:
+            raise NotFoundError(f"no Profile named {name!r}")
+        self._active_profile = name
+        # Every active Toggle is force-stopped as part of the switch (ticket
+        # 19) — no exact-key-release tracking in this GUI-level fake (that's
+        # the Daemon's job, covered by its own tests), just the observable
+        # "gone from GetState()" effect the GUI reacts to.
+        self._active_toggles = []
+        self.calls.append(("switch_profile", name))
+        for callback in self._profile_changed_callbacks:
+            callback(name)
+
     def subscribe_layer_changed(self, callback: Callable[[str], None]) -> None:
         self._layer_changed_callbacks.append(callback)
+
+    def subscribe_profile_changed(self, callback: Callable[[str], None]) -> None:
+        self._profile_changed_callbacks.append(callback)
 
     def simulate_mode_key_press(self) -> None:
         self._set_layer("held")
 
     def simulate_mode_key_release(self) -> None:
         self._set_layer("base")
+
+    def simulate_toggle_started(self, input_str: str) -> None:
+        """Stands in for a real physical press starting a Toggle — there's
+        no capture layer in GUI tests, so this is the seam a test uses to
+        put `GetState()`'s `active_toggles` in the state `SwitchProfile`
+        must clear."""
+        if input_str not in self._active_toggles:
+            self._active_toggles.append(input_str)
 
     def _set_layer(self, layer: str) -> None:
         if layer == self._layer:

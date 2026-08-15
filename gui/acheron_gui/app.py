@@ -8,6 +8,14 @@ Ticket 18: also subscribes to `ActiveLayerChanged` so a real Mode-key
 hold/release (while the active Profile's `mode_key_role` is `LayerSwitch`)
 flips `ui_state["selected_layer"]` and rebuilds — the "GUI's tab indicator
 flips to Held" half of the live demo.
+
+Ticket 19: also subscribes to `ActiveProfileChanged` and rebuilds on it —
+covers a switch made from the tray's own real (non-GUI-process) icon, or any
+other D-Bus client, not just this window's own sidebar/tray-mock controls.
+`rebuild()` re-fetches `GetState()` on every call, so the newly active
+Profile is picked up with no separate `ui_state` key needed (unlike
+`selected_layer`, which is view state with no Daemon-side equivalent to
+re-fetch).
 """
 
 from __future__ import annotations
@@ -75,7 +83,11 @@ class AcheronApplication(Gtk.Application):
             ui_state["selected_layer"] = layer
             rebuild()
 
+        def on_profile_changed(_name: str):
+            rebuild()
+
         self._client.subscribe_layer_changed(on_layer_changed)
+        self._client.subscribe_profile_changed(on_profile_changed)
 
         rebuild()
         win.set_child(content_box)
