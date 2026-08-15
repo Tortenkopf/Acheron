@@ -159,7 +159,7 @@ A connected D-Bus client (in practice, the GUI reacting to its own window's focu
 - `systemd --user` unit at `~/.config/systemd/user/acheron-daemon.service` — not a system unit (the permission story — `plugdev` group, existing `/dev/uinput` ACL — is already solved at the user level for this device/user).
 - Unit: `Type=simple`, `ExecStart=%h/.local/bin/acheron-daemon`, `After=graphical-session.target`, `WantedBy=default.target`, `Restart=on-failure`, `RestartSec=1`, `StartLimitIntervalSec=60`, `StartLimitBurst=5`. Logs go to the default journal.
 - Install: a small idempotent `install.sh` — build release binary, copy to `~/.local/bin/acheron-daemon`, copy unit file, `systemctl --user daemon-reload`, `systemctl --user enable --now acheron-daemon`. No distro packaging.
-- Autostart is two-layered: login-enabled via `WantedBy=default.target` as the primary trigger, plus the GUI calling `org.freedesktop.systemd1.Manager.ResetFailed` then `StartUnit` over the session D-Bus connection on its own launch, as a safety net (no `systemctl` shell-out, no subprocess).
+- Autostart is two-layered: login-enabled via `WantedBy=default.target` as the primary trigger, plus the GUI calling `org.freedesktop.systemd1.Manager.ResetFailedUnit` then `StartUnit` over the session D-Bus connection on its own launch, as a safety net (no `systemctl` shell-out, no subprocess). (`ResetFailedUnit`, not the no-argument `ResetFailed` originally written here — ticket 21's live crash-recovery demo caught that `Manager.ResetFailed()` takes no arguments and clears every failed unit, not one; `ResetFailedUnit(s unit_name)` is the real per-unit call.)
 
 ### Permissions confirmed on the development machine (re-verify on fresh install)
 

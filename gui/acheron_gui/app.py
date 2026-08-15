@@ -203,16 +203,23 @@ def _wire_status_tracking(client: DaemonClient, on_change: Callable[[], None]) -
 def _ensure_daemon_started_on_launch(systemd_client: SystemdClient) -> None:
     """Ticket 21's GUI-side safety net: on its own launch, ask systemd to
     clear any latched `failed` state and (re)start the Daemon unit —
-    `ResetFailed` then `StartUnit`, over the session D-Bus connection, no
-    `systemctl` shell-out. Best-effort and silent on failure (e.g. the unit
-    isn't installed yet, or systemd is unreachable): this must never block
-    the GUI from opening, since the status chip (ticket 20) already gives
-    the user an honest, live answer if the Daemon still isn't up afterward.
+    `ResetFailedUnit` then `StartUnit`, over the session D-Bus connection, no
+    `systemctl` shell-out. Best-effort on failure (e.g. the unit isn't
+    installed yet, or systemd is unreachable): this must never block the GUI
+    from opening, since the status chip (ticket 20) already gives the user a
+    live answer if the Daemon still isn't up afterward.
+
+    Failures are still printed to stderr rather than swallowed outright — a
+    live crash-recovery demo (deliberately tripping `StartLimitBurst`, then
+    relaunching the GUI) caught a real bug here (the wrong systemd method
+    name, `systemd_client.py`'s docstring has the story) that a fully silent
+    `except: pass` would have made much slower to notice, since the Daemon
+    just stayed down with no error visible anywhere.
     """
     try:
         systemd_client.ensure_daemon_started()
-    except GLib.Error:
-        pass
+    except GLib.Error as err:
+        print(f"acheron-gui: could not ensure the Daemon is started: {err}", file=sys.stderr)
 
 
 class AcheronApplication(Gtk.Application):

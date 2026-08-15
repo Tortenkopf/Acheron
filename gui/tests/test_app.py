@@ -233,12 +233,17 @@ def test_ensure_daemon_started_on_launch_calls_the_systemd_client():
     assert fake.calls == ["ensure_daemon_started"]
 
 
-def test_ensure_daemon_started_on_launch_swallows_a_glib_error():
+def test_ensure_daemon_started_on_launch_does_not_raise_on_a_glib_error(capsys):
     # Best-effort: a failure here (unit not installed, systemd unreachable,
-    # etc.) must never prevent the GUI from opening.
+    # etc.) must never prevent the GUI from opening — but it also must not
+    # go completely unreported, per the live-hardware finding that a fully
+    # silent swallow made a real bug (wrong systemd method name) far harder
+    # to notice.
     fake = _FakeSystemdClient(raises=GLib.Error("systemd unreachable"))
 
     _ensure_daemon_started_on_launch(fake)  # must not raise
+
+    assert "systemd unreachable" in capsys.readouterr().err
 
 
 def test_dbus_systemd_client_does_not_connect_at_construction_time():

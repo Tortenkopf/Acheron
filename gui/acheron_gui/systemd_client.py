@@ -4,10 +4,21 @@ asks systemd to clear any latched `failed` state on the Daemon's unit and
 (re)start it, over the same session D-Bus this process already talks to
 `com.acheron.Daemon` over — no `systemctl` shell-out, no subprocess.
 `StartUnit` is a no-op if the unit's already running (systemd's own
-contract), so no status check is needed first; `ResetFailed` is what lets a
-prior crash — which latches the unit in `failed` per install.sh's
+contract), so no status check is needed first; `ResetFailedUnit` is what
+lets a prior crash — which latches the unit in `failed` per install.sh's
 `Restart=on-failure`/`StartLimitBurst` guard — actually restart instead of
 being refused by systemd's own start-limit.
+
+Live-hardware testing (deliberately tripping `StartLimitBurst`, then
+relaunching the GUI) caught the ticket/spec's own `Manager.ResetFailed(unit)`
+call as wrong: `Manager.ResetFailed()` takes *no* arguments and clears every
+failed unit on the bus, not one — calling it with a unit-name string is a
+`GLib.Error` (`InvalidArgs`), silently swallowed by
+`_ensure_daemon_started_on_launch`'s best-effort handling, which is exactly
+how this went unnoticed until a real `failed`-state demo. The correct
+per-unit call, confirmed live via `busctl --user introspect` against the
+running `org.freedesktop.systemd1.Manager`, is `ResetFailedUnit(s
+unit_name)`.
 
 Structural `SystemdClient` Protocol mirrors `daemon_client.DaemonClient`'s
 shape — `DBusSystemdClient` (real) vs a plain fake for tests — so `app.py`'s
@@ -56,7 +67,11 @@ class DBusSystemdClient:
         proxy = self._proxy or self._connect()
         self._proxy = proxy
         proxy.call_sync(
-            "ResetFailed", GLib.Variant("(s)", (DAEMON_UNIT,)), Gio.DBusCallFlags.NONE, -1, None
+            "ResetFailedUnit",
+            GLib.Variant("(s)", (DAEMON_UNIT,)),
+            Gio.DBusCallFlags.NONE,
+            -1,
+            None,
         )
         proxy.call_sync(
             "StartUnit",
