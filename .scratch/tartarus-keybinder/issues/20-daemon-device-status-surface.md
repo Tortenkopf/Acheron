@@ -4,14 +4,14 @@
 
 **Blocked by:** 16
 
-**Status:** resolved — pending live-hardware verification (see comments)
+**Status:** resolved
 
 - [x] `CaptureSource` failure handling splits by cause: device-absent (nodes don't exist — at startup, or after a mid-run unplug) is non-fatal and polls the known `/dev/input/by-id/...` paths every ~2s until they reopen cleanly, then resumes; genuine capture errors (e.g. a `uinput` write failure) remain fatal-exit.
 - [x] `GetState()` gains a `device_connected: b` field reflecting the poll loop's current view, and a `DeviceConnectionChanged(connected: b)` signal fires on every transition.
 - [x] The GUI detects Daemon presence via a live `NameOwnerChanged` watch on `com.acheron.Daemon` on the session bus — not a one-shot check on window open.
 - [x] A status chip (colour dot + label) appears above Device Overview and a matching line appears in the tray mock, both reflecting all three reachable states (running+connected / running+disconnected / not running) from the same `GetState()`/signal data, per the prototype.
 - [x] Whenever status isn't running+connected, the entire Device Overview grid is disabled (`set_sensitive(False)`) under a dimmed `Gtk.Overlay` with a centered message naming which condition is unmet, matching the prototype's two message strings; the overlay label uses `hexpand=True`/`vexpand=True` alongside `halign`/`valign = CENTER` (the centering pitfall the prototype already caught).
-- [ ] Live demo: physically unplug the Tartarus Pro — chip, tray line, and grid overlay all flip to disconnected within ~2s, and editing is blocked; replug it and confirm automatic recovery with no Daemon restart. Separately, kill the Daemon process — chip/tray flip to "not running" and editing is blocked. - Ask the user to perform the necessary hardware interactions. **Not yet performed — needs the user to run it against real hardware; see comments.**
+- [x] Live demo: physically unplug the Tartarus Pro — chip, tray line, and grid overlay all flip to disconnected within ~2s, and editing is blocked; replug it and confirm automatic recovery with no Daemon restart. Separately, kill the Daemon process — chip/tray flip to "not running" and editing is blocked. - Ask the user to perform the necessary hardware interactions.
 - [x] Automated tests use the fake `CaptureSource` (device-absent scripted) and a fake Daemon D-Bus object to exercise all three status states in the GUI without real hardware or a real Daemon process.
 
 ## Comments
@@ -38,4 +38,13 @@ Implemented across both processes:
 2. **Non-atomic partial update**: if `GetConfig()` succeeded but the following `GetState()` failed, `last_known["config"]` was updated while `last_known["profile"]`/`["layer"]` stayed stale — a later render could `KeyError` looking up a profile no longer in the newer config. Fixed with `try`/`except`/`else` so both calls' results commit together or not at all.
 3. **Fragile structural reach-in**: the tray status line was originally spliced into `build_main_view`'s output via `root.get_last_child()`/`.get_first_child()` (mirroring the prototype's own approach, which had no other option since it reused a `build_main_view` it didn't own). Since this ticket owns the real `build_main_view`/`build_tray_mock` outright, refactored to pass `status` straight through as a parameter instead, removing the coupling to internal append order.
 
-**Not done in this session:** the live-hardware demo (physical unplug/replug, killing the real Daemon process) — needs the user's own hands on the device and terminal. Automated coverage (fake `CaptureSource`/`DaemonStub`) exercises the same logic paths without hardware, per spec.md's stated testing scope, but the ticket's live-demo checkbox is left unchecked until that's actually run.
+**2026-08-15 (same day) — live-verified against the real Daemon + real GUI + real Tartarus Pro, all three checks passing first try, no code changes needed.**
+
+Launched the real `target/debug/acheron-daemon` and `gui/main.py` against each other and the physical device (already plugged in; ACLs on `/dev/uinput` and `plugdev`-group access to the evdev nodes were already set up from ticket 25's own live testing, so no new permissions work was needed).
+
+- **Baseline**: GUI showed the green "Connected" chip/tray line, grid enabled — confirmed by the user.
+- **Unplug**: physically unplugged the Tartarus Pro. GUI flipped to the orange "device disconnected" chip/tray line within ~2s, grid dimmed under the overlay message. Confirmed independently via `busctl --user call com.acheron.Daemon /com/acheron/Daemon com.acheron.Daemon GetState` → `device_connected: false`, and the daemon process (PID unchanged) was still alive — `stderr` showed three benign `evdev`-crate "Failed to ungrab device: No such device (os error 19)" lines (its own `Device` `Drop` impl trying to ungrab a now-vanished fd), not a crash.
+- **Replug**: plugged the Tartarus Pro back in. GUI flipped back to green "Connected" within ~2s, grid re-enabled. Confirmed via `GetState` → `device_connected: true`, and the daemon PID was unchanged throughout — no restart, exactly per the ticket's "automatic recovery with no Daemon restart" requirement.
+- **Kill Daemon**: sent `SIGKILL` to the daemon process (simulating a crash) while the GUI stayed open. Confirmed the process was dead and `com.acheron.Daemon` no longer owned its bus name (`busctl --user list` showed only `com.acheron.gui` left). GUI flipped to the red "Daemon not running" chip/tray line, grid disabled under the "start it to edit Bindings" overlay — the `NameOwnerChanged`-based presence watch caught the crash live, not just a one-shot check.
+
+No code changes came out of this round — all three scenarios worked as designed on the first attempt.
