@@ -78,10 +78,11 @@ impl Daemon {
         Ok(wire::config_to_dict(&config))
     }
 
-    /// The live runtime snapshot. `layer`/`active_toggles` are fixed stub
-    /// values and `device_connected` is hardcoded `true` at this ticket's
-    /// scope (Layers/Toggles don't exist yet — issues 18/17; real device
-    /// detection is ticket 20's scope).
+    /// The live runtime snapshot. `active_toggles` reflects the dispatch
+    /// task's real `HashMap<Input, ActiveToggle>` as of ticket 17. `layer`
+    /// stays a fixed stub (Layers don't exist yet — ticket 18) and
+    /// `device_connected` is hardcoded `true` (real detection is ticket 20's
+    /// scope).
     async fn get_state(&self) -> Result<(String, String, Vec<String>, bool), DaemonError> {
         let (reply, rx) = oneshot::channel();
         self.commands
@@ -156,8 +157,13 @@ impl Daemon {
     ) -> zbus::Result<()>;
 
     /// Fires with the full current snapshot (not a delta — D-Bus signals
-    /// aren't guaranteed-delivery) on every Toggle start/stop. Nothing yet
-    /// has an active Toggle at this ticket's scope (ticket 17).
+    /// aren't guaranteed-delivery) on every Toggle start/stop. Toggles are
+    /// real as of ticket 17 (`GetState`'s `active_toggles` reflects them
+    /// live), but nothing calls this signal yet — the dispatch task, the
+    /// sole owner of the `ActiveToggle` map, has no `SignalEmitter` handle
+    /// to push through, and the GUI doesn't poll/consume Toggle state yet
+    /// either. Wiring live push notification here is left for whichever
+    /// ticket first needs it.
     #[zbus(signal)]
     pub async fn active_toggles_changed(
         signal_emitter: &SignalEmitter<'_>,
@@ -336,6 +342,57 @@ mod tests {
         assert_eq!(code, evdev::KeyCode::KEY_F1);
         assert!(on_disk.contains("grid_r1c1"));
         assert!(on_disk.contains("KEY_F1"));
+    }
+
+    /// Ticket 17: `SetBinding`'s `a{sv}` encoding, already settled in ticket
+    /// 15, is exercised for real with a `Macro`/`Toggle` payload — no
+    /// wire-format changes needed, but the Daemon must actually run it: a
+    /// first press starts the Toggle, a second press on the same physical
+    /// key stops it and force-releases exactly the key it left held.
+    #[tokio::test]
+    async fn set_binding_over_real_dbus_with_a_macro_toggle_payload_starts_and_stops_it() {
+        let server = TestServer::start().await;
+
+        let binding = wire::binding_to_dict(&crate::config::Binding {
+            trigger: crate::config::TriggerMode::Toggle,
+            action: crate::config::Action::Macro {
+                steps: vec![
+                    crate::config::MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
+                    crate::config::MacroStepDto::Delay(50),
+                ],
+            },
+        });
+
+        server
+            .proxy
+            .set_binding("grid_r1c1", binding)
+            .await
+            .expect("SetBinding with a Macro/Toggle payload must succeed");
+
+        server.press(Input::Grid(1, 1)).await;
+        // Let the Toggle's own task actually run its first KeyDown and
+        // register its Delay sleep before stopping it — a real (unpaused)
+        // 50ms Delay comfortably outlasts a few scheduler yields, so the
+        // second press below cancels it well before the Delay would elapse
+        // on its own.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        // Same physical key stops it — this press is consumed by the stop.
+        server.press(Input::Grid(1, 1)).await;
+
+        let batches = server.shut_down().await;
+
+        assert_eq!(batches.len(), 2, "one KeyDown lap, then the force-release");
+        let evdev::EventSummary::Key(_, code, value) = batches[0][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_A, 1));
+        let evdev::EventSummary::Key(_, code, value) = batches[1][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_A, 0));
     }
 
     #[tokio::test]

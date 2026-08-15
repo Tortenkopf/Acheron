@@ -8,11 +8,10 @@
 //! conventions (profiles -> layers -> bindings -> `Input` string keys ->
 //! `Binding` dict), so `config_to_dict` is built directly on `binding_to_dict`.
 //!
-//! Only `Action::Keypress`/`TriggerMode::FireOnce` are exercised by the
-//! dispatch task at this ticket's scope (ticket 15), but the encoding here
-//! already covers `Action::Macro` and the other `TriggerMode`s per issue 08,
-//! so a later ticket can wire their firing semantics without redesigning
-//! the wire format.
+//! `Action::Macro` and every `TriggerMode` round-trip through this encoding
+//! unchanged from issue 08's original design — ticket 17 wired their real
+//! firing semantics into the dispatch task without touching the wire format
+//! at all.
 
 use std::collections::HashMap;
 

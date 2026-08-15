@@ -3,19 +3,23 @@
 //! calls push a `Command` alongside `PhysicalEvent`s, so one task remains
 //! the sole owner of `Config`, no lock or second copy of state). Resolves
 //! each `PhysicalEvent`'s `Input` against the active Profile's Base Layer
-//! (ticket 14); applies `Command`s (ticket 15) by mutating `Config` in place
-//! and rewriting `config.toml` immediately, atomically per call. Held Layer,
-//! Trigger-mode branching beyond Fire-once, and `Action::Macro` all remain
-//! future work (issues 17/18) — see `fire` below.
+//! (ticket 14) and, per ticket 17, branches on `TriggerMode` — Fire-once
+//! fires once on `Down`, Hold-to-repeat fires on `Down` and every `Repeat`,
+//! Toggle starts/stops only on `Down`. Applies `Command`s (ticket 15) by
+//! mutating `Config` in place and rewriting `config.toml` immediately,
+//! atomically per call. Held Layer remains future work (ticket 18).
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use crate::capture::{EventState, PhysicalEvent};
 use crate::command::{Command, CommandError, State};
-use crate::config::{self, Action, Config, Profile};
+use crate::config::{self, Binding, Config, Profile, TriggerMode};
+use crate::executor::{self, ActiveToggle};
 use crate::injector::Injector;
 use crate::input::Input;
 
@@ -32,16 +36,27 @@ pub async fn run(
     mut config: Config,
     config_path: PathBuf,
 ) -> io::Result<()> {
+    // Sole owner of every currently-running Toggle (spec.md: "Active
+    // toggles: HashMap<Input, ActiveToggle>"), mutated only from this task —
+    // no Mutex, matching the rest of the dispatch task's state.
+    let mut toggles: HashMap<Input, ActiveToggle> = HashMap::new();
+    // Tracks the most recent Fire-once/Hold-to-repeat firing spawned per
+    // Input, so a fast HoldToRepeat autorepeat (or a rapid re-Down) can't
+    // spawn a second overlapping firing for the same Input while a slow
+    // Macro's raw uinput writes for the first are still in flight — two
+    // concurrent firings racing on the shared Injector channel could
+    // interleave their KeyDown/KeyUp steps out of order on the wire.
+    let mut in_flight: HashMap<Input, JoinHandle<()>> = HashMap::new();
     let mut commands_open = true;
     loop {
         tokio::select! {
             event = rx_events.recv() => {
                 let Some(event) = event else { break };
-                handle_event(&injector, &config, event).await?;
+                handle_event(&injector, &config, &mut toggles, &mut in_flight, event).await?;
             }
             cmd = rx_commands.recv(), if commands_open => {
                 match cmd {
-                    Some(cmd) => handle_command(&mut config, &config_path, cmd).await,
+                    Some(cmd) => handle_command(&mut config, &config_path, &toggles, cmd).await,
                     None => commands_open = false,
                 }
             }
@@ -53,28 +68,88 @@ pub async fn run(
 async fn handle_event(
     injector: &Injector,
     config: &Config,
+    toggles: &mut HashMap<Input, ActiveToggle>,
+    in_flight: &mut HashMap<Input, JoinHandle<()>>,
     event: PhysicalEvent,
 ) -> io::Result<()> {
+    // A Down on an Input with an active Toggle always stops that Toggle
+    // first, regardless of what Binding the Input's current Layer nominally
+    // assigns — this press is consumed entirely by the stop, per spec.md's
+    // "Toggle behavior across Layer/Profile switches". Only a later press
+    // resumes normal evaluation.
+    if event.state == EventState::Down
+        && let Some(toggle) = toggles.remove(&event.input)
+    {
+        toggle.stop().await;
+        return Ok(());
+    }
+
     let bindings = &config
         .active_profile()
         .expect("load_or_seed validates active_profile names a real profile")
         .base;
     match bindings.get(&event.input) {
         Some(binding) => {
-            // Ticket 14 only wires Fire-once: the Action fires once on
-            // Down, Repeat/Up are ignored outright (no passthrough of
-            // the original key). Hold-to-repeat/Toggle's real firing
-            // semantics — and branching on `binding.trigger` at all —
-            // land in ticket 17.
-            if event.state == EventState::Down {
-                fire(injector, event.input, &binding.action).await?;
-            }
-            Ok(())
+            fire(
+                injector,
+                toggles,
+                in_flight,
+                event.input,
+                binding,
+                event.state,
+            )
+            .await
         }
         None => injector
             .inject_physical(event)
             .await
             .map_err(io::Error::other),
+    }
+}
+
+/// Branches on `TriggerMode` x event state, per ticket 17: Fire-once fires
+/// only on `Down`; Hold-to-repeat fires on `Down` and every subsequent
+/// `Repeat` (the device's own evdev autorepeat, no separate repeat-interval
+/// config); Toggle starts its own looping task on `Down` (stopping is
+/// handled earlier, in `handle_event`, before a Binding is even looked up).
+/// Every other combination (a bound Input's `Up`, or `Repeat` for
+/// Fire-once/Toggle) is ignored outright — no passthrough of the original
+/// key for a bound Input, matching the pre-ticket-17 Fire-once behavior.
+async fn fire(
+    injector: &Injector,
+    toggles: &mut HashMap<Input, ActiveToggle>,
+    in_flight: &mut HashMap<Input, JoinHandle<()>>,
+    input: Input,
+    binding: &Binding,
+    state: EventState,
+) -> io::Result<()> {
+    match (binding.trigger, state) {
+        (TriggerMode::FireOnce, EventState::Down)
+        | (TriggerMode::HoldToRepeat, EventState::Down | EventState::Repeat) => {
+            // Same-Input firings must never run concurrently — their raw
+            // steps share one Injector channel, and two interleaved firings
+            // could land their KeyDown/KeyUp writes out of order. A still-
+            // running previous firing (a slow Macro outlasting a fast
+            // HoldToRepeat autorepeat) means this one is dropped rather than
+            // queued: the previous firing already reproduces the intended
+            // effect, and queuing would only build an ever-growing backlog
+            // while the key stays held.
+            if let Some(handle) = in_flight.get(&input)
+                && !handle.is_finished()
+            {
+                return Ok(());
+            }
+            let steps = executor::compile(&binding.action);
+            let handle = executor::spawn_fire_once(injector.clone(), steps);
+            in_flight.insert(input, handle);
+            Ok(())
+        }
+        (TriggerMode::Toggle, EventState::Down) => {
+            let steps = executor::compile(&binding.action);
+            toggles.insert(input, ActiveToggle::spawn(injector.clone(), steps));
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -86,7 +161,12 @@ fn active_profile_mut(config: &mut Config) -> &mut Profile {
         .expect("load_or_seed validates active_profile names a real profile")
 }
 
-async fn handle_command(config: &mut Config, config_path: &Path, cmd: Command) {
+async fn handle_command(
+    config: &mut Config,
+    config_path: &Path,
+    toggles: &HashMap<Input, ActiveToggle>,
+    cmd: Command,
+) {
     match cmd {
         Command::GetConfig(reply) => {
             let _ = reply.send(config.clone());
@@ -95,7 +175,7 @@ async fn handle_command(config: &mut Config, config_path: &Path, cmd: Command) {
             let _ = reply.send(State {
                 profile: config.active_profile.clone(),
                 layer: "base",
-                active_toggles: Vec::new(),
+                active_toggles: toggles.keys().copied().collect(),
                 device_connected: true,
             });
         }
@@ -150,37 +230,17 @@ async fn persist(config: &Config, config_path: &Path) -> Result<(), CommandError
         .map_err(CommandError::from)
 }
 
-async fn fire(injector: &Injector, input: Input, action: &Action) -> io::Result<()> {
-    match action {
-        Action::Keypress { modifiers, key } => injector
-            .fire_keypress(*modifiers, *key)
-            .await
-            .map_err(io::Error::other),
-        // Not implemented until ticket 17 — Action::Macro is a schema-only
-        // stub for this ticket (issue 06). Logged rather than silently
-        // dropped, so a hand-edited Macro binding doesn't look like a
-        // dead/misconfigured key with no clue why nothing happened.
-        Action::Macro { .. } => {
-            eprintln!(
-                "acheron-daemon: {input} is bound to a Macro action, which isn't implemented \
-                 until ticket 17 — ignoring this press"
-            );
-            Ok(())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::capture::fake::FakeCaptureSource;
     use crate::capture::{CaptureSource, EventState};
-    use crate::config::{Binding, DEFAULT_PROFILE_NAME, Modifiers, Profile, TriggerMode};
+    use crate::config::{Action, DEFAULT_PROFILE_NAME, MacroStepDto, Modifiers};
     use crate::injector::testing::RecordingSink;
     use crate::injector::{self};
     use crate::input::{Direction, WheelEvent};
-    use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::time::Duration;
     use tokio::sync::oneshot;
 
     fn config_with_bindings(bindings: HashMap<Input, Binding>) -> Config {
@@ -336,6 +396,250 @@ mod tests {
 
         // Only the Down produced output: one press batch + one release batch.
         assert_eq!(batches.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn hold_to_repeat_fires_on_down_and_every_repeat_but_not_up() {
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::HoldToRepeat,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: evdev::KeyCode::KEY_F1,
+                },
+            },
+        );
+
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone());
+        let (tx, rx) = mpsc::channel(8);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        let dispatch_handle = tokio::spawn(run(
+            rx,
+            cmd_rx,
+            inj.clone(),
+            config_with_bindings(bindings),
+            unused_config_path(),
+        ));
+
+        // Real evdev autorepeat events land tens of milliseconds apart —
+        // comfortably enough for a same-Input firing's steps to finish. Send
+        // each event with yields in between so the previous firing's spawned
+        // task runs to completion first, exercising the code review fix
+        // (ticket 17): overlapping same-Input firings are dropped, not
+        // queued, so back-to-back events with no gap would otherwise only
+        // produce the first firing's output.
+        for state in [
+            EventState::Down,
+            EventState::Repeat,
+            EventState::Repeat,
+            EventState::Up,
+        ] {
+            tx.send(PhysicalEvent {
+                input: Input::Grid(1, 1),
+                state,
+            })
+            .await
+            .unwrap();
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        drop(tx);
+        dispatch_handle.await.unwrap().unwrap();
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+
+        let batches = sink.batches();
+
+        // Down + two Repeats = three firings, each a KeyDown/KeyUp pair; the
+        // trailing Up produced nothing.
+        assert_eq!(batches.len(), 6);
+        for pair in batches.chunks(2) {
+            let evdev::EventSummary::Key(_, down_code, down_value) = pair[0][0].destructure()
+            else {
+                panic!("expected a key event");
+            };
+            let evdev::EventSummary::Key(_, up_code, up_value) = pair[1][0].destructure() else {
+                panic!("expected a key event");
+            };
+            assert_eq!((down_code, down_value), (evdev::KeyCode::KEY_F1, 1));
+            assert_eq!((up_code, up_value), (evdev::KeyCode::KEY_F1, 0));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_same_input_firings_are_dropped_not_queued() {
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::HoldToRepeat,
+                action: Action::Macro {
+                    steps: vec![
+                        MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
+                        MacroStepDto::Delay(20),
+                        MacroStepDto::KeyUp(evdev::KeyCode::KEY_A),
+                    ],
+                },
+            },
+        );
+
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone());
+        let (tx, rx) = mpsc::channel(8);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        let dispatch_handle = tokio::spawn(run(
+            rx,
+            cmd_rx,
+            inj.clone(),
+            config_with_bindings(bindings),
+            unused_config_path(),
+        ));
+
+        // Down starts a firing that immediately sends KeyDown, then sleeps
+        // 20ms. A Repeat that lands before that firing finishes must be
+        // dropped, not spawn a second overlapping firing.
+        tx.send(PhysicalEvent {
+            input: Input::Grid(1, 1),
+            state: EventState::Down,
+        })
+        .await
+        .unwrap();
+        tokio::task::yield_now().await;
+        tx.send(PhysicalEvent {
+            input: Input::Grid(1, 1),
+            state: EventState::Repeat,
+        })
+        .await
+        .unwrap();
+        tokio::task::yield_now().await;
+
+        // Let the first firing's Delay elapse and its KeyUp land.
+        tokio::time::advance(Duration::from_millis(20)).await;
+        tokio::task::yield_now().await;
+
+        // A later Repeat, after the first firing has fully finished, starts
+        // a genuinely new firing.
+        tx.send(PhysicalEvent {
+            input: Input::Grid(1, 1),
+            state: EventState::Repeat,
+        })
+        .await
+        .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(20)).await;
+        tokio::task::yield_now().await;
+
+        drop(tx);
+        dispatch_handle.await.unwrap().unwrap();
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+
+        let batches = sink.batches();
+
+        // Two firings' worth of output (KeyDown/KeyUp pairs), not three —
+        // the overlapping Repeat produced nothing.
+        assert_eq!(batches.len(), 4);
+        for pair in batches.chunks(2) {
+            let evdev::EventSummary::Key(_, down_code, down_value) = pair[0][0].destructure()
+            else {
+                panic!("expected a key event");
+            };
+            let evdev::EventSummary::Key(_, up_code, up_value) = pair[1][0].destructure() else {
+                panic!("expected a key event");
+            };
+            assert_eq!((down_code, down_value), (evdev::KeyCode::KEY_A, 1));
+            assert_eq!((up_code, up_value), (evdev::KeyCode::KEY_A, 0));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fire_once_macro_action_runs_its_delayed_steps_in_order() {
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::FireOnce,
+                action: Action::Macro {
+                    steps: vec![
+                        MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
+                        MacroStepDto::Delay(20),
+                        MacroStepDto::KeyUp(evdev::KeyCode::KEY_A),
+                    ],
+                },
+            },
+        );
+        let harness = CommandHarness::spawn(config_with_bindings(bindings));
+
+        harness.press(Input::Grid(1, 1)).await;
+        tokio::time::advance(Duration::from_millis(25)).await;
+        tokio::task::yield_now().await;
+
+        let batches = harness.shut_down().await;
+
+        assert_eq!(batches.len(), 2);
+        let evdev::EventSummary::Key(_, code, value) = batches[0][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_A, 1));
+        let evdev::EventSummary::Key(_, code, value) = batches[1][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_A, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn toggle_starts_on_down_and_the_same_key_stops_it_on_the_next_down() {
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::Toggle,
+                action: Action::Macro {
+                    // Deliberately unbalanced within the window we stop in:
+                    // KeyDown fires, then a long Delay, so KEY_A is still
+                    // held when the second press stops the Toggle.
+                    steps: vec![
+                        MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
+                        MacroStepDto::Delay(50),
+                    ],
+                },
+            },
+        );
+        let harness = CommandHarness::spawn(config_with_bindings(bindings));
+
+        harness.press(Input::Grid(1, 1)).await;
+        tokio::time::advance(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+
+        let state = harness.get_state().await;
+        assert_eq!(state.active_toggles, vec![Input::Grid(1, 1)]);
+
+        // Same physical key, still Down: stops the Toggle instead of
+        // starting a second one — this press is consumed entirely by the
+        // stop, no re-fire. `shut_down` closes the event channel right
+        // after this send and awaits dispatch to drain it, which only
+        // happens once this stop (including its force-release) has fully
+        // run, so there's nothing racy left to synchronize on here.
+        harness.press(Input::Grid(1, 1)).await;
+
+        let batches = harness.shut_down().await;
+
+        // One KeyDown from the loop's single lap, then a force-released
+        // KeyUp for exactly that key on stop — no stuck key, no extra output.
+        assert_eq!(batches.len(), 2);
+        let evdev::EventSummary::Key(_, code, value) = batches[0][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_A, 1));
+        let evdev::EventSummary::Key(_, code, value) = batches[1][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_A, 0));
     }
 
     /// Harness for the `Command` tests below: a real `tempfile` config path
@@ -533,9 +837,10 @@ mod tests {
         let state = harness.get_state().await;
         harness.shut_down().await;
 
-        // Layers/Toggles don't exist yet (issues 18/17) and device
-        // detection is ticket 20's scope — this ticket's `GetState()` is
-        // fixed/stubbed on everything but the active Profile's name.
+        // Layers don't exist yet (ticket 18) and device detection is ticket
+        // 20's scope — those two fields stay fixed/stubbed. `active_toggles`
+        // is real as of ticket 17 (see the Toggle tests above); with no
+        // Toggle running it's correctly empty here.
         assert_eq!(state.profile, DEFAULT_PROFILE_NAME);
         assert_eq!(state.layer, "base");
         assert!(state.active_toggles.is_empty());

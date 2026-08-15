@@ -1,11 +1,12 @@
 //! The config-facing domain model and `config.toml` lifecycle (ticket 14).
 //!
-//! Scope is deliberately narrow, per the ticket: one Profile (`Default`),
-//! Base Layer only (no `Layer` enum/Held layer yet — that's ticket 18's
-//! concern), `Action::Keypress` only, `TriggerMode::FireOnce` only. The
-//! other `Action`/`TriggerMode` variants exist as stubs so the schema shape
-//! already fully decided in issue 06 round-trips through TOML, but nothing
-//! downstream is required to make them fire yet.
+//! Scope is deliberately narrow: one Profile (`Default`), Base Layer only
+//! (no `Layer` enum/Held layer yet — that's ticket 18's concern). Every
+//! `Action`/`TriggerMode` variant's schema shape was already fully decided
+//! in issue 06; ticket 17 wired all of them (`Action::Macro`,
+//! `TriggerMode::HoldToRepeat`/`Toggle`) up to actually fire, via
+//! `executor::compile` and the shared executor dispatch.rs runs firings
+//! through.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -74,10 +75,8 @@ pub struct Binding {
     pub action: Action,
 }
 
-/// CONTEXT.md: Trigger mode. Only `FireOnce` is wired up to fire in this
-/// ticket; `HoldToRepeat`/`Toggle` exist so the type and its TOML form are
-/// already settled, per issue 06 — their real firing semantics land in
-/// ticket 17.
+/// CONTEXT.md: Trigger mode. `FireOnce`/`HoldToRepeat`/`Toggle` firing
+/// semantics all live in `dispatch::fire` and `executor` (ticket 17).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TriggerMode {
@@ -86,8 +85,8 @@ pub enum TriggerMode {
     Toggle,
 }
 
-/// CONTEXT.md: Action. Only `Keypress` is wired up to fire in this ticket;
-/// `Macro` exists as a stub matching issue 06's already-decided shape.
+/// CONTEXT.md: Action. Both variants compile into the shared executor's
+/// `Vec<executor::MacroStep>` (ticket 17's `executor::compile`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Action {
@@ -117,8 +116,8 @@ pub struct Modifiers {
 }
 
 /// `Action::Macro`'s config-facing step DTO, per issue 06 — keyboard-only
-/// for MVP. Not executed until ticket 17; defined now so the TOML shape is
-/// stable from `schema_version = 1` onward.
+/// for MVP. `executor::compile` turns this into the runtime `MacroStep` the
+/// shared executor actually walks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MacroStepDto {
