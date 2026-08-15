@@ -31,8 +31,8 @@ What a Binding produces when triggered — either a Keypress or a Macro.
 _Avoid_: output, effect
 
 **Keypress**:
-An Action that is a single remapped key or shortcut (may be a chord, e.g. Ctrl+Shift+T).
-_Avoid_: single binding, simple action
+An Action that is a single remapped key or shortcut (may be a modifier combination, e.g. Ctrl+Shift+T).
+_Avoid_: single binding, simple action, chord (reserved — see Chord)
 
 **Macro**:
 An Action that is a hand-specified sequence of Keypresses, each with its own delay before the next fires.

@@ -1,4 +1,5 @@
 Label: wayfinder:map
+Status: archived — MVP shipped; superseded by [Tartarus input expansion](../tartarus-input-expansion/map.md)
 
 ## Destination
 

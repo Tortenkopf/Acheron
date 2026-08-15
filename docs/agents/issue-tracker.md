@@ -4,6 +4,7 @@ Issues and specs for this repo live as markdown files in `.scratch/`.
 
 ## Conventions
 
+- `.scratch/README.md` indexes every effort — one line per directory, naming it, giving its status (active/archived), and linking its `map.md` (or ticket list, for non-wayfinder efforts). Update it whenever an effort starts or is archived, so a fresh session can see what exists without opening any map body.
 - One feature per directory: `.scratch/<feature-slug>/`
 - The spec is `.scratch/<feature-slug>/spec.md`
 - Implementation issues are one file per ticket at `.scratch/<feature-slug>/issues/<NN>-<slug>.md`, numbered from `01` — never a single combined tickets file
