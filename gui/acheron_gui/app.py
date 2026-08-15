@@ -16,6 +16,20 @@ other D-Bus client, not just this window's own sidebar/tray-mock controls.
 Profile is picked up with no separate `ui_state` key needed (unlike
 `selected_layer`, which is view state with no Daemon-side equivalent to
 re-fetch).
+
+Both signal callbacks defer their rebuild to `GLib.idle_add` rather than
+calling it inline. `Gio.DBusProxy.call_sync` (every `DaemonClient` mutation)
+blocks by iterating the same `GMainContext` a `"g-signal"` callback also
+runs on — so calling `rebuild()` (more blocking `call_sync`s) directly from
+inside a signal callback nests a second synchronous D-Bus round-trip inside
+the first one's still-unfinished wait. This is a real, reproduced hang for
+`SwitchProfile`: the Daemon used to emit `ActiveProfileChanged` before
+replying, so the GUI's own blocking `SwitchProfile` call could see the
+signal — and run this callback — before that same call had returned.
+Deferring via `idle_add` lets the in-flight call unwind first (the Daemon
+was also fixed to reply before signaling, but this GUI-side guard is kept
+too, since any future signal wired to fire around a client's own in-flight
+call would hit the identical hazard).
 """
 
 from __future__ import annotations
@@ -26,7 +40,8 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
-from gi.repository import Gdk, Gtk
+gi.require_version("GLib", "2.0")
+from gi.repository import Gdk, Gtk, GLib
 
 from .daemon_client import DaemonClient, DBusDaemonClient
 from .device_overview import build_main_view
@@ -80,11 +95,19 @@ class AcheronApplication(Gtk.Application):
             content_box.append(build_main_view(self._client, config, profile, layer, rebuild, ui_state))
 
         def on_layer_changed(layer: str):
-            ui_state["selected_layer"] = layer
-            rebuild()
+            def apply():
+                ui_state["selected_layer"] = layer
+                rebuild()
+                return GLib.SOURCE_REMOVE
+
+            GLib.idle_add(apply)
 
         def on_profile_changed(_name: str):
-            rebuild()
+            def apply():
+                rebuild()
+                return GLib.SOURCE_REMOVE
+
+            GLib.idle_add(apply)
 
         self._client.subscribe_layer_changed(on_layer_changed)
         self._client.subscribe_profile_changed(on_profile_changed)

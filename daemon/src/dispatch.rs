@@ -386,7 +386,8 @@ async fn handle_command(
             }
             let previous = std::mem::replace(&mut config.active_profile, name.clone());
             let result = persist(config, config_path).await;
-            if result.is_err() {
+            let succeeded = result.is_ok();
+            if !succeeded {
                 config.active_profile = previous;
             } else {
                 // Force-stop every active Toggle before the new Profile's
@@ -396,11 +397,22 @@ async fn handle_command(
                 for (_, toggle) in toggles.drain() {
                     toggle.stop().await;
                 }
-                if let Some(emitter) = signal_emitter {
-                    let _ = Daemon::active_profile_changed(emitter, &name).await;
-                }
             }
+            // The reply is sent *before* the signal, deliberately: the
+            // caller's own SwitchProfile call is typically a blocking D-Bus
+            // round-trip (e.g. the GUI's `call_sync`) still waiting on this
+            // very reply. Emitting ActiveProfileChanged first would let that
+            // caller's own subscribed signal handler fire while its
+            // SwitchProfile call is still unresolved, on the same
+            // connection — a reentrancy hazard (a synchronous callback
+            // nested inside a synchronous call already in flight) that
+            // doesn't exist for ActiveLayerChanged, since nothing there is
+            // emitted as the direct, immediate side effect of the very call
+            // that's still awaiting its own reply.
             let _ = reply.send(result);
+            if succeeded && let Some(emitter) = signal_emitter {
+                let _ = Daemon::active_profile_changed(emitter, &name).await;
+            }
         }
     }
 }
