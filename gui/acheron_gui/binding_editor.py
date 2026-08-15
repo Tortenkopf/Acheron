@@ -60,11 +60,12 @@ def build_binding_editor(
     client,
     config: dict,
     profile: str,
+    layer: str,
     inp: str,
     on_saved: Callable[[], None],
 ) -> Gtk.Widget:
-    base = config["profiles"][profile]["base"]
-    existing = base.get(inp)
+    bindings = config["profiles"][profile][layer]
+    existing = bindings.get(inp)
     starting = existing or {"trigger": "fire_once", "type": "keypress", "key": "KEY_A", "modifiers": []}
 
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -72,7 +73,7 @@ def build_binding_editor(
     box.set_margin_bottom(10)
     box.set_margin_start(10)
     box.set_margin_end(10)
-    heading = Gtk.Label(label=f"{profile} / base / {input_label(inp)}", xalign=0)
+    heading = Gtk.Label(label=f"{profile} / {layer} / {input_label(inp)}", xalign=0)
     heading.add_css_class("heading")
     box.append(heading)
 
@@ -201,7 +202,7 @@ def build_binding_editor(
                 "steps": draft["steps"],
             }
         try:
-            client.set_binding(inp, binding)
+            client.set_binding(inp, layer, binding)
         except DaemonError as exc:
             show_error(exc)
             return
@@ -218,7 +219,7 @@ def build_binding_editor(
             on_saved()
             return
         try:
-            client.clear_binding(inp)
+            client.clear_binding(inp, layer)
         except DaemonError as exc:
             show_error(exc)
             return

@@ -66,8 +66,8 @@ impl Daemon {
 
 #[interface(name = "com.acheron.Daemon")]
 impl Daemon {
-    /// The entire config document — at this ticket's scope, the `Default`
-    /// Profile's Base-layer Bindings (issue 08).
+    /// The entire config document — every Profile's Base- and Held-layer
+    /// Bindings plus its `mode_key_role` (issue 08, ticket 18).
     async fn get_config(&self) -> Result<HashMap<String, OwnedValue>, DaemonError> {
         let (reply, rx) = oneshot::channel();
         self.commands
@@ -80,7 +80,7 @@ impl Daemon {
 
     /// The live runtime snapshot. `active_toggles` reflects the dispatch
     /// task's real `HashMap<Input, ActiveToggle>` as of ticket 17. `layer`
-    /// stays a fixed stub (Layers don't exist yet — ticket 18) and
+    /// reflects the dispatch task's real active Layer as of ticket 18.
     /// `device_connected` is hardcoded `true` (real detection is ticket 20's
     /// scope).
     async fn get_state(&self) -> Result<(String, String, Vec<String>, bool), DaemonError> {
@@ -103,19 +103,25 @@ impl Daemon {
     }
 
     /// Atomic: validates, applies in-memory, and rewrites `config.toml`
-    /// immediately — no draft/save step (issue 08).
+    /// immediately — no draft/save step (issue 08). `layer` (`"base"`/
+    /// `"held"`) lets the GUI edit each Layer's Bindings independently
+    /// (ticket 18) — always the active Profile's; a Profile argument is
+    /// ticket 19's job.
     async fn set_binding(
         &self,
         input: String,
+        layer: String,
         binding: HashMap<String, OwnedValue>,
     ) -> Result<(), DaemonError> {
         let input = Self::parse_input(&input)?;
+        let layer = wire::layer_from_str(&layer).map_err(DaemonError::InvalidBinding)?;
         let binding = wire::binding_from_dict(&binding).map_err(DaemonError::InvalidBinding)?;
 
         let (reply, rx) = oneshot::channel();
         self.commands
             .send(Command::SetBinding {
                 input,
+                layer,
                 binding,
                 reply,
             })
@@ -126,13 +132,32 @@ impl Daemon {
 
     /// Atomic: removes the Binding (passthrough resumes) and rewrites
     /// `config.toml` immediately. Errors `NotFound` if `input` has no
-    /// Binding to clear.
-    async fn clear_binding(&self, input: String) -> Result<(), DaemonError> {
+    /// Binding to clear on `layer`.
+    async fn clear_binding(&self, input: String, layer: String) -> Result<(), DaemonError> {
         let input = Self::parse_input(&input)?;
+        let layer = wire::layer_from_str(&layer).map_err(DaemonError::InvalidBinding)?;
 
         let (reply, rx) = oneshot::channel();
         self.commands
-            .send(Command::ClearBinding { input, reply })
+            .send(Command::ClearBinding {
+                input,
+                layer,
+                reply,
+            })
+            .await
+            .map_err(dispatch_gone)?;
+        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+    }
+
+    /// Flips the active Profile's `mode_key_role` (ticket 18) —
+    /// `"layer_switch"`/`"bound"`. Held-layer Bindings are retained either
+    /// way; only which role governs the Mode key's dispatch changes.
+    async fn set_mode_key_role(&self, role: String) -> Result<(), DaemonError> {
+        let role = wire::mode_key_role_from_str(&role).map_err(DaemonError::InvalidBinding)?;
+
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::SetModeKeyRole { role, reply })
             .await
             .map_err(dispatch_gone)?;
         rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
@@ -148,8 +173,11 @@ impl Daemon {
         name: &str,
     ) -> zbus::Result<()>;
 
-    /// Fires on Layer transitions (Mode key pressed/released) — `"base"` /
-    /// `"held"`. Nothing yet changes Layer at this ticket's scope (ticket 18).
+    /// Fires on Layer transitions (Mode key pressed/released while the
+    /// active Profile's `mode_key_role` is `LayerSwitch`) — `"base"` /
+    /// `"held"` (ticket 18). The dispatch task calls this directly (it
+    /// holds the `SignalEmitter` `main.rs` builds alongside the D-Bus
+    /// connection), not through a `Command` — nothing needs a reply.
     #[zbus(signal)]
     pub async fn active_layer_changed(
         signal_emitter: &SignalEmitter<'_>,
@@ -193,12 +221,17 @@ mod tests {
         fn set_binding(
             &self,
             input: &str,
+            layer: &str,
             binding: HashMap<String, OwnedValue>,
         ) -> zbus::Result<()>;
-        fn clear_binding(&self, input: &str) -> zbus::Result<()>;
+        fn clear_binding(&self, input: &str, layer: &str) -> zbus::Result<()>;
+        fn set_mode_key_role(&self, role: &str) -> zbus::Result<()>;
 
         #[zbus(signal)]
         fn active_profile_changed(&self, name: String) -> zbus::Result<()>;
+
+        #[zbus(signal)]
+        fn active_layer_changed(&self, layer: String) -> zbus::Result<()>;
     }
 
     /// Spins up a real, in-process `zbus` peer-to-peer connection (no
@@ -234,13 +267,6 @@ mod tests {
             let (inj, inj_handle) = injector::spawn(sink.clone());
             let (event_tx, event_rx) = mpsc::channel(8);
             let (cmd_tx, cmd_rx) = mpsc::channel(8);
-            let dispatch_handle = tokio::spawn(crate::dispatch::run(
-                event_rx,
-                cmd_rx,
-                inj,
-                config,
-                config_path.clone(),
-            ));
 
             let daemon = Daemon::new(cmd_tx);
             let guid = zbus::Guid::generate();
@@ -262,6 +288,22 @@ mod tests {
             let server_connection = server_connection.unwrap();
             let client_connection = client_connection.unwrap();
             let proxy = DaemonProxyProxy::new(&client_connection).await.unwrap();
+
+            // Real signal emission (ticket 18's `ActiveLayerChanged`) needs a
+            // live connection, so this test harness wires one through —
+            // unlike `dispatch.rs`'s own unit tests, which pass `None` and
+            // never assert on the signal itself.
+            let signal_emitter = SignalEmitter::new(&server_connection, "/com/acheron/Daemon")
+                .unwrap()
+                .into_owned();
+            let dispatch_handle = tokio::spawn(crate::dispatch::run(
+                event_rx,
+                cmd_rx,
+                inj,
+                config,
+                config_path.clone(),
+                Some(signal_emitter),
+            ));
 
             TestServer {
                 _dir: dir,
@@ -310,7 +352,7 @@ mod tests {
 
         server
             .proxy
-            .set_binding("grid_r1c1", binding)
+            .set_binding("grid_r1c1", "base", binding)
             .await
             .expect("SetBinding over D-Bus must succeed");
 
@@ -365,7 +407,7 @@ mod tests {
 
         server
             .proxy
-            .set_binding("grid_r1c1", binding)
+            .set_binding("grid_r1c1", "base", binding)
             .await
             .expect("SetBinding with a Macro/Toggle payload must succeed");
 
@@ -401,7 +443,7 @@ mod tests {
 
         let err = server
             .proxy
-            .clear_binding("grid_r1c1")
+            .clear_binding("grid_r1c1", "base")
             .await
             .expect_err("clearing an unbound Input must fail");
         assert!(
@@ -425,9 +467,33 @@ mod tests {
 
         let err = server
             .proxy
-            .set_binding("not_a_real_input", binding)
+            .set_binding("not_a_real_input", "base", binding)
             .await
             .expect_err("an unparseable Input must be rejected");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.InvalidBinding")
+        );
+
+        server.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn set_binding_over_real_dbus_with_an_invalid_layer_string_is_rejected() {
+        let server = TestServer::start().await;
+
+        let binding = wire::binding_to_dict(&crate::config::Binding {
+            trigger: crate::config::TriggerMode::FireOnce,
+            action: crate::config::Action::Keypress {
+                modifiers: crate::config::Modifiers::default(),
+                key: evdev::KeyCode::KEY_F1,
+            },
+        });
+
+        let err = server
+            .proxy
+            .set_binding("grid_r1c1", "bogus", binding)
+            .await
+            .expect_err("an unparseable Layer must be rejected");
         assert!(
             matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.InvalidBinding")
         );
@@ -471,6 +537,126 @@ mod tests {
         assert_eq!(args.name, "Gaming");
 
         drop(signals);
+        server.shut_down().await;
+    }
+
+    /// Ticket 18's end-to-end live demo, exercised without real hardware:
+    /// a real `PhysicalEvent` Down/Up on `Input::ModeKey`, under the default
+    /// `LayerSwitch` role, must push a real `ActiveLayerChanged` signal to a
+    /// subscribed client for each transition.
+    #[tokio::test]
+    async fn mode_key_press_and_release_pushes_active_layer_changed_over_real_dbus() {
+        let server = TestServer::start().await;
+
+        let mut signals = server.proxy.receive_active_layer_changed().await.unwrap();
+
+        server.press(Input::ModeKey).await;
+        let signal = signals.next().await.expect("Held signal must be delivered");
+        assert_eq!(signal.args().unwrap().layer, "held");
+
+        server
+            .event_tx
+            .send(PhysicalEvent {
+                input: Input::ModeKey,
+                state: EventState::Up,
+            })
+            .await
+            .unwrap();
+        let signal = signals.next().await.expect("Base signal must be delivered");
+        assert_eq!(signal.args().unwrap().layer, "base");
+
+        drop(signals);
+        server.shut_down().await;
+    }
+
+    /// Ticket 18: `SetBinding`/`ClearBinding` target the Held Layer
+    /// independently of Base when told to, over the real D-Bus surface.
+    #[tokio::test]
+    async fn set_binding_over_real_dbus_targets_the_held_layer_independently() {
+        let server = TestServer::start().await;
+
+        let binding = wire::binding_to_dict(&crate::config::Binding {
+            trigger: crate::config::TriggerMode::FireOnce,
+            action: crate::config::Action::Keypress {
+                modifiers: crate::config::Modifiers::default(),
+                key: evdev::KeyCode::KEY_F1,
+            },
+        });
+
+        server
+            .proxy
+            .set_binding("grid_r1c1", "held", binding)
+            .await
+            .expect("SetBinding on the Held layer must succeed");
+
+        let config = server.proxy.get_config().await.unwrap();
+        server.shut_down().await;
+
+        let profiles: wire::Dict = config.get("profiles").unwrap().clone().try_into().unwrap();
+        let default_profile: wire::Dict = profiles
+            .get(DEFAULT_PROFILE_NAME)
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let base: wire::Dict = default_profile
+            .get("base")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let held: wire::Dict = default_profile
+            .get("held")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert!(!base.contains_key("grid_r1c1"), "Base must be untouched");
+        assert!(held.contains_key("grid_r1c1"));
+    }
+
+    #[tokio::test]
+    async fn set_mode_key_role_over_real_dbus_flips_the_active_profiles_role() {
+        let server = TestServer::start().await;
+
+        server
+            .proxy
+            .set_mode_key_role("bound")
+            .await
+            .expect("SetModeKeyRole must succeed");
+
+        let config = server.proxy.get_config().await.unwrap();
+        server.shut_down().await;
+
+        let profiles: wire::Dict = config.get("profiles").unwrap().clone().try_into().unwrap();
+        let default_profile: wire::Dict = profiles
+            .get(DEFAULT_PROFILE_NAME)
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let role: String = default_profile
+            .get("mode_key_role")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(role, "bound");
+    }
+
+    #[tokio::test]
+    async fn set_mode_key_role_over_real_dbus_with_an_invalid_role_is_rejected() {
+        let server = TestServer::start().await;
+
+        let err = server
+            .proxy
+            .set_mode_key_role("bogus")
+            .await
+            .expect_err("an unparseable role must be rejected");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.InvalidBinding")
+        );
+
         server.shut_down().await;
     }
 }

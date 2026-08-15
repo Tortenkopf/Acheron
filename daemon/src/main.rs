@@ -9,7 +9,7 @@ use tokio::task::JoinError;
 
 /// Loads `config.toml` (seeding it on first run, per issue 11), assembles
 /// the capture -> dispatch -> injector pipeline (dispatch resolving each
-/// event against the active Profile's Base Layer, ticket 14), and exposes
+/// event against the active Profile's active Layer, ticket 18), and exposes
 /// the `com.acheron.Daemon` D-Bus surface on the session bus (ticket 15) —
 /// GUI-originated calls reach the dispatch task as `Command`s over the same
 /// channel `PhysicalEvent`s already flow through (issue 07's "D-Bus
@@ -35,11 +35,13 @@ async fn main() -> io::Result<()> {
 
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(256);
-    let dispatch_handle = tokio::spawn(dispatch::run(event_rx, cmd_rx, inj, config, config_path));
 
-    // Held for the process's lifetime: dropping it would take the D-Bus
-    // surface down while the other three tasks keep running.
-    let _connection = zbus::connection::Builder::session()
+    // Built before the dispatch task so a real `SignalEmitter` (ticket 18's
+    // `ActiveLayerChanged`, pushed directly from the dispatch task on every
+    // Mode-key transition) can be handed to it. Held for the process's
+    // lifetime: dropping it would take the D-Bus surface down while the
+    // other three tasks keep running.
+    let connection = zbus::connection::Builder::session()
         .map_err(io::Error::other)?
         .name("com.acheron.Daemon")
         .map_err(io::Error::other)?
@@ -48,6 +50,19 @@ async fn main() -> io::Result<()> {
         .build()
         .await
         .map_err(io::Error::other)?;
+    let signal_emitter =
+        zbus::object_server::SignalEmitter::new(&connection, "/com/acheron/Daemon")
+            .map_err(io::Error::other)?
+            .into_owned();
+
+    let dispatch_handle = tokio::spawn(dispatch::run(
+        event_rx,
+        cmd_rx,
+        inj,
+        config,
+        config_path,
+        Some(signal_emitter),
+    ));
 
     let result = tokio::select! {
         result = EvdevCaptureSource.run(event_tx) => report("capture", result),

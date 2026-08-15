@@ -6,13 +6,15 @@
 
 use tokio::sync::oneshot;
 
-use crate::config::{Binding, Config};
+use crate::config::{Binding, Config, Layer, ModeKeyRole};
 use crate::input::Input;
 
-/// The live runtime snapshot `GetState()` returns. `layer` and
-/// `active_toggles` are fixed stub values at this ticket's scope (Layers and
-/// Toggles don't exist yet — issues 18/17); `device_connected` is hardcoded
-/// `true` (real detection is ticket 20's scope).
+/// The live runtime snapshot `GetState()` returns. `layer` reflects the
+/// dispatch task's real active Layer (ticket 18: `"base"`/`"held"`, flips
+/// under `Mode key` press/release when the active Profile's
+/// `mode_key_role` is `LayerSwitch`). `active_toggles` is real as of ticket
+/// 17; `device_connected` is hardcoded `true` (real detection is ticket
+/// 20's scope).
 #[derive(Debug, Clone, PartialEq)]
 pub struct State {
     pub profile: String,
@@ -29,11 +31,21 @@ pub enum Command {
     GetState(oneshot::Sender<State>),
     SetBinding {
         input: Input,
+        layer: Layer,
         binding: Binding,
         reply: oneshot::Sender<Result<(), CommandError>>,
     },
     ClearBinding {
         input: Input,
+        layer: Layer,
+        reply: oneshot::Sender<Result<(), CommandError>>,
+    },
+    /// Flips the active Profile's `mode_key_role` (ticket 18). Never fails
+    /// on its own account — the active Profile always exists — but keeps a
+    /// `Result` reply for symmetry with the other mutating Commands and
+    /// room for a future validation rule.
+    SetModeKeyRole {
+        role: ModeKeyRole,
         reply: oneshot::Sender<Result<(), CommandError>>,
     },
 }

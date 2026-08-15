@@ -13,7 +13,7 @@ before "Save" is clicked.
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Callable, Protocol
 
 import gi
 
@@ -78,9 +78,13 @@ class DaemonClient(Protocol):
 
     def get_state(self) -> tuple[str, str, list[str], bool]: ...
 
-    def set_binding(self, input_str: str, binding: dict) -> None: ...
+    def set_binding(self, input_str: str, layer: str, binding: dict) -> None: ...
 
-    def clear_binding(self, input_str: str) -> None: ...
+    def clear_binding(self, input_str: str, layer: str) -> None: ...
+
+    def set_mode_key_role(self, role: str) -> None: ...
+
+    def subscribe_layer_changed(self, callback: Callable[[str], None]) -> None: ...
 
 
 class DBusDaemonClient:
@@ -109,12 +113,30 @@ class DBusDaemonClient:
     def get_state(self) -> tuple[str, str, list[str], bool]:
         return self._call("GetState", None)
 
-    def set_binding(self, input_str: str, binding: dict) -> None:
-        parameters = GLib.Variant("(sa{sv})", (input_str, wire.binding_to_variant(binding)))
+    def set_binding(self, input_str: str, layer: str, binding: dict) -> None:
+        parameters = GLib.Variant(
+            "(ssa{sv})", (input_str, layer, wire.binding_to_variant(binding))
+        )
         self._call("SetBinding", parameters)
 
-    def clear_binding(self, input_str: str) -> None:
-        self._call("ClearBinding", GLib.Variant("(s)", (input_str,)))
+    def clear_binding(self, input_str: str, layer: str) -> None:
+        self._call("ClearBinding", GLib.Variant("(ss)", (input_str, layer)))
+
+    def set_mode_key_role(self, role: str) -> None:
+        self._call("SetModeKeyRole", GLib.Variant("(s)", (role,)))
+
+    def subscribe_layer_changed(self, callback: Callable[[str], None]) -> None:
+        """Wires ticket 18's `ActiveLayerChanged` signal to `callback(layer)`
+        — `Gio.DBusProxy` re-emits every D-Bus signal it receives as its own
+        `"g-signal"` GObject signal, so this is a plain filtered connect
+        rather than a second subscription mechanism."""
+
+        def on_g_signal(_proxy, _sender_name, signal_name, parameters):
+            if signal_name == "ActiveLayerChanged":
+                (layer,) = parameters.unpack()
+                callback(layer)
+
+        self._proxy.connect("g-signal", on_g_signal)
 
     def _call(self, method: str, parameters: GLib.Variant | None) -> tuple:
         try:

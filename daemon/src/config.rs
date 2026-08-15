@@ -1,12 +1,11 @@
 //! The config-facing domain model and `config.toml` lifecycle (ticket 14).
 //!
-//! Scope is deliberately narrow: one Profile (`Default`), Base Layer only
-//! (no `Layer` enum/Held layer yet — that's ticket 18's concern). Every
-//! `Action`/`TriggerMode` variant's schema shape was already fully decided
-//! in issue 06; ticket 17 wired all of them (`Action::Macro`,
+//! Every `Action`/`TriggerMode` variant's schema shape was already fully
+//! decided in issue 06; ticket 17 wired all of them (`Action::Macro`,
 //! `TriggerMode::HoldToRepeat`/`Toggle`) up to actually fire, via
 //! `executor::compile` and the shared executor dispatch.rs runs firings
-//! through.
+//! through. Ticket 18 added the `Layer` enum and each Profile's `held`
+//! Binding map alongside `base`, plus the per-Profile `mode_key_role`.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -60,13 +59,69 @@ impl Config {
     }
 }
 
-/// A Profile's Base-layer Bindings (CONTEXT.md: Profile, Layer). Held layer
-/// is out of scope for this ticket (issue 18).
+/// CONTEXT.md: Layer — closed 2-variant enum, `Base`/`Held`. Every Profile
+/// always has both present at the type level (fixed hardware fact — one
+/// Mode key), each with its own sparse Binding map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Layer {
+    Base,
+    Held,
+}
+
+impl Layer {
+    /// The flat lowercase string form used both for `ActiveLayerChanged`'s
+    /// payload and the D-Bus wire's Layer argument (issue 08).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Layer::Base => "base",
+            Layer::Held => "held",
+        }
+    }
+}
+
+/// A per-Profile switch (ticket 18) deciding what the Mode key does:
+/// `LayerSwitch` (default) makes it a momentary Hypershift-style Layer
+/// activator, intercepted by the dispatch task before any Binding lookup;
+/// `Bound` routes it through the identical `(Layer, Input) -> Binding`
+/// lookup and Trigger-mode dispatch as any other Input.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModeKeyRole {
+    #[default]
+    LayerSwitch,
+    Bound,
+}
+
+/// A Profile's Base- and Held-layer Bindings (CONTEXT.md: Profile, Layer).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Profile {
     /// Sparse map keyed by `Input`; an absent entry means passthrough.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub base: HashMap<Input, Binding>,
+    /// Retained (not deleted) even while `mode_key_role` is `Bound` makes it
+    /// unreachable — flipping back to `LayerSwitch` must not lose these
+    /// (ticket 18).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub held: HashMap<Input, Binding>,
+    #[serde(default)]
+    pub mode_key_role: ModeKeyRole,
+}
+
+impl Profile {
+    pub fn layer(&self, layer: Layer) -> &HashMap<Input, Binding> {
+        match layer {
+            Layer::Base => &self.base,
+            Layer::Held => &self.held,
+        }
+    }
+
+    pub fn layer_mut(&mut self, layer: Layer) -> &mut HashMap<Input, Binding> {
+        match layer {
+            Layer::Base => &mut self.base,
+            Layer::Held => &mut self.held,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -247,6 +302,8 @@ mod tests {
         assert_eq!(config.active_profile, "Default");
         let default = config.active_profile().expect("Default must be active");
         assert!(default.base.is_empty());
+        assert!(default.held.is_empty());
+        assert_eq!(default.mode_key_role, ModeKeyRole::LayerSwitch);
     }
 
     #[test]
@@ -349,5 +406,73 @@ action = { type = "keypress", key = "KEY_T", modifiers = { ctrl = true, shift = 
                 key: KeyCode::KEY_T,
             }
         );
+    }
+
+    #[test]
+    fn parses_a_held_layer_binding_and_mode_key_role() {
+        let toml = r#"
+schema_version = 1
+active_profile = "Default"
+
+[profiles.Default]
+mode_key_role = "bound"
+
+[profiles.Default.held.grid_r2c1]
+trigger = "toggle"
+action = { type = "macro", steps = [
+  { key_down = "KEY_A" }, { delay_ms = 50 }, { key_up = "KEY_A" },
+] }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let profile = &config.profiles["Default"];
+        assert_eq!(profile.mode_key_role, ModeKeyRole::Bound);
+        assert!(profile.base.is_empty());
+        let binding = &profile.held[&Input::Grid(2, 1)];
+        assert_eq!(binding.trigger, TriggerMode::Toggle);
+    }
+
+    #[test]
+    fn a_profile_missing_held_and_mode_key_role_defaults_both() {
+        // A hand-written or pre-ticket-18 file that only sets `base` must
+        // still parse, defaulting the new fields rather than refusing to
+        // start (issue 06's "sparse" data model / no forced migration).
+        let toml = r#"
+schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base.grid_r1c1]
+trigger = "fire_once"
+action = { type = "keypress", key = "KEY_F1" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let profile = &config.profiles["Default"];
+        assert!(profile.held.is_empty());
+        assert_eq!(profile.mode_key_role, ModeKeyRole::LayerSwitch);
+    }
+
+    #[test]
+    fn held_layer_bindings_survive_a_full_write_and_reparse_round_trip() {
+        let (_dir, path) = temp_config_path();
+        let mut config = Config::seed();
+        let profile = config.active_profile_mut().unwrap();
+        profile.mode_key_role = ModeKeyRole::Bound;
+        profile.held.insert(
+            Input::Grid(2, 1),
+            Binding {
+                trigger: TriggerMode::Toggle,
+                action: Action::Macro {
+                    steps: vec![
+                        MacroStepDto::KeyDown(KeyCode::KEY_A),
+                        MacroStepDto::Delay(50),
+                        MacroStepDto::KeyUp(KeyCode::KEY_A),
+                    ],
+                },
+            },
+        );
+
+        write(&path, &config).unwrap();
+        let reparsed = load_or_seed(&path).unwrap();
+
+        assert_eq!(reparsed, config);
     }
 }

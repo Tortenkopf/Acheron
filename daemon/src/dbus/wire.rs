@@ -18,7 +18,9 @@ use std::collections::HashMap;
 use evdev::KeyCode;
 use zbus::zvariant::{OwnedValue, Value};
 
-use crate::config::{Action, Binding, Config, MacroStepDto, Modifiers, Profile, TriggerMode};
+use crate::config::{
+    Action, Binding, Config, Layer, MacroStepDto, ModeKeyRole, Modifiers, Profile, TriggerMode,
+};
 
 /// The `a{sv}` shape every `Action`/`MacroStep`/`Binding`/`Config` entity
 /// marshals as.
@@ -67,6 +69,35 @@ fn key_to_string(key: KeyCode) -> String {
 fn key_from_str(s: &str) -> Result<KeyCode, String> {
     s.parse()
         .map_err(|_| format!("{s:?} is not a valid key code"))
+}
+
+/// `Layer` marshals as its own flat lowercase string, produced by
+/// `Layer::as_str` directly (no wrapper here — unlike `TriggerMode`/
+/// `ModeKeyRole`, `Layer` already exposes its wire string as an inherent
+/// method), reused identically for `SetBinding`/`ClearBinding`'s Layer
+/// argument and `GetState()`/`ActiveLayerChanged`'s payload (issue 08 /
+/// ticket 18).
+pub fn layer_from_str(s: &str) -> Result<Layer, String> {
+    match s {
+        "base" => Ok(Layer::Base),
+        "held" => Ok(Layer::Held),
+        other => Err(format!("{other:?} is not a valid Layer")),
+    }
+}
+
+fn mode_key_role_str(role: ModeKeyRole) -> &'static str {
+    match role {
+        ModeKeyRole::LayerSwitch => "layer_switch",
+        ModeKeyRole::Bound => "bound",
+    }
+}
+
+pub fn mode_key_role_from_str(s: &str) -> Result<ModeKeyRole, String> {
+    match s {
+        "layer_switch" => Ok(ModeKeyRole::LayerSwitch),
+        "bound" => Ok(ModeKeyRole::Bound),
+        other => Err(format!("{other:?} is not a valid mode-key role")),
+    }
 }
 
 fn trigger_mode_str(trigger: TriggerMode) -> &'static str {
@@ -211,22 +242,28 @@ pub fn binding_from_dict(dict: &Dict) -> Result<Binding, String> {
     Ok(Binding { trigger, action })
 }
 
-fn profile_to_dict(profile: &Profile) -> Dict {
-    let base: Dict = profile
-        .base
+fn bindings_to_dict(bindings: &std::collections::HashMap<crate::input::Input, Binding>) -> Dict {
+    bindings
         .iter()
         .map(|(input, binding)| (input.to_string(), scalar(binding_to_dict(binding))))
-        .collect();
+        .collect()
+}
+
+fn profile_to_dict(profile: &Profile) -> Dict {
     let mut dict = Dict::new();
-    dict.insert("base".to_string(), scalar(base));
+    dict.insert("base".to_string(), scalar(bindings_to_dict(&profile.base)));
+    dict.insert("held".to_string(), scalar(bindings_to_dict(&profile.held)));
+    dict.insert(
+        "mode_key_role".to_string(),
+        scalar(mode_key_role_str(profile.mode_key_role).to_string()),
+    );
     dict
 }
 
 /// `GetConfig()`'s full-document return: `schema_version`/`active_profile`
 /// as scalars, `profiles` recursively reusing `binding_to_dict`'s
-/// conventions (issue 08). At this ticket's scope a `Profile` only has a
-/// `base` field (Held Layer is ticket 18's job), so that's all `profile_to_dict`
-/// emits — nothing here hides a Layer that doesn't exist yet.
+/// conventions (issue 08); each Profile now also carries `held` alongside
+/// `base` and its `mode_key_role` (ticket 18).
 pub fn config_to_dict(config: &Config) -> Dict {
     let mut dict = Dict::new();
     dict.insert("schema_version".to_string(), scalar(config.schema_version));
@@ -360,7 +397,13 @@ mod tests {
             },
         );
         let mut profiles = StdHashMap::new();
-        profiles.insert("Default".to_string(), Profile { base });
+        profiles.insert(
+            "Default".to_string(),
+            Profile {
+                base,
+                ..Default::default()
+            },
+        );
         let config = Config {
             schema_version: 1,
             active_profile: "Default".to_string(),
@@ -393,5 +436,40 @@ mod tests {
             .try_into()
             .unwrap();
         assert_eq!(dict_get_string(&binding_dict, "type"), "keypress");
+
+        // Held Layer and mode_key_role are always present, even when empty/
+        // default — nothing here hides a Layer that doesn't have Bindings
+        // yet (ticket 18).
+        let held_dict: Dict = get(&default_profile, "held")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert!(held_dict.is_empty());
+        assert_eq!(
+            dict_get_string(&default_profile, "mode_key_role"),
+            "layer_switch"
+        );
+    }
+
+    #[test]
+    fn every_layer_round_trips_through_its_wire_string() {
+        for layer in [Layer::Base, Layer::Held] {
+            let s = layer.as_str();
+            assert_eq!(layer_from_str(s).unwrap(), layer);
+        }
+    }
+
+    #[test]
+    fn layer_from_str_rejects_an_unknown_string() {
+        assert!(layer_from_str("bogus").is_err());
+    }
+
+    #[test]
+    fn every_mode_key_role_round_trips_through_its_wire_string() {
+        for role in [ModeKeyRole::LayerSwitch, ModeKeyRole::Bound] {
+            let s = mode_key_role_str(role);
+            assert_eq!(mode_key_role_from_str(s).unwrap(), role);
+        }
     }
 }

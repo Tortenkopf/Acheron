@@ -3,6 +3,11 @@ by default the real `DBusDaemonClient` against `com.acheron.Daemon`, per
 ticket 16. On launch, opens straight to Device Overview reflecting
 `GetConfig()`/`GetState()` — no separate onboarding wizard, even against
 the all-passthrough seed `Default` Profile (issue 11's first-run answer).
+
+Ticket 18: also subscribes to `ActiveLayerChanged` so a real Mode-key
+hold/release (while the active Profile's `mode_key_role` is `LayerSwitch`)
+flips `ui_state["selected_layer"]` and rebuilds — the "GUI's tab indicator
+flips to Held" half of the live demo.
 """
 
 from __future__ import annotations
@@ -54,14 +59,23 @@ class AcheronApplication(Gtk.Application):
         # re-expanding one of its rows, and then editing a Binding would
         # snap them shut again, since rebuild() reconstructs the whole
         # widget tree (including a fresh Gtk.Revealer/Gtk.Expander, which
-        # default closed) from scratch (ticket 09).
-        ui_state = {"table_open": False, "expanded_rows": set()}
+        # default closed) from scratch (ticket 09). `selected_layer` is the
+        # same kind of view state (ticket 18) — which Layer Device
+        # Overview/Action Table show/edit — except it's also kept in sync
+        # with the Daemon's live Layer via the signal subscription below.
+        ui_state = {"table_open": False, "expanded_rows": set(), "selected_layer": "base"}
 
         def rebuild():
             clear_children(content_box)
             config = self._client.get_config()
             profile, layer, _active_toggles, _device_connected = self._client.get_state()
             content_box.append(build_main_view(self._client, config, profile, layer, rebuild, ui_state))
+
+        def on_layer_changed(layer: str):
+            ui_state["selected_layer"] = layer
+            rebuild()
+
+        self._client.subscribe_layer_changed(on_layer_changed)
 
         rebuild()
         win.set_child(content_box)
