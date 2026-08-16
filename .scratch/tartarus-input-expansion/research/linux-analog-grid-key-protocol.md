@@ -24,12 +24,16 @@ hardware and from Linux-side sources that file never read.
    query path returns this device's true serial (`PM2443F36300141`, matching what Synapse
    reported on Windows), firmware `v1.2`, and `device_mode = 00 00`. The transport is proven;
    only the specific *set*-device-mode command is unproven and risky.
-3. **The reset risk is real, first-party, and sharper than "some units".** It is not a
-   third-hand rumour: OpenRazer's shipped kernel source on this very machine carries a
-   Tartarus-Pro-specific carve-out with the comment *"Tartarus Pro resets when it receives
-   this command"*, and its Python daemon sets `DRIVER_MODE = False` for this device alone
-   among all keyboards. But there is a concrete, testable hypothesis for why
-   `open-tartarus-driver` never reproduced it: **they send a different `transaction_id`.**
+3. **The reset risk is better characterised, and smaller than it first looks.** OpenRazer's
+   shipped kernel source on this very machine carries a Tartarus-Pro-specific carve-out
+   commented *"Tartarus Pro resets when it receives this command"*, and its Python daemon
+   sets `DRIVER_MODE = False` for this device alone among all keyboards. But: "reset" means a
+   USB re-enumeration (a firmware self-reboot), not a hang or a brick — the reported
+   *loops* were loops only because the sender sat in the device-detection path, which is no
+   longer true on our stack. It traces to a single contributor's report, uncorroborated by
+   any user in the entire Tartarus Pro paper trail. And there is a concrete, testable
+   hypothesis for why `open-tartarus-driver` never reproduced it: **they send a different
+   `transaction_id`.** See §5.
 
 Everything needed to write the prototype — exact 91-byte buffer, exact ioctl numbers, device
 discovery, permissions — is below. No re-derivation from Windows source is needed at
@@ -370,6 +374,68 @@ revision difference" is that project's speculation, and it never states its own 
 firmware. Our unit is **v1.2** (`1.2.0.0`), latest offered by Synapse as of 2026-08-16 — so
 "newer firmware fixed it" is an untested guess in either direction.
 
+### What "resets" actually means — and whether it's recoverable
+
+No source describes the failure directly: there are no logs, no `dmesg` output, and no
+symptom write-up anywhere in the public record. But the *shape* of the two bugs pins the
+mechanism down tightly, because of what has to be true for either loop to form.
+
+**"Reset" means the device drops off the USB bus and re-enumerates.** `razer_kbd_probe()` is
+only ever called when the HID/USB core binds a newly-appeared interface. For sending a command
+inside probe to cause an "infinite reconnect loop", the command must make the device
+disappear from the bus and come back — at which point probe runs again, sends again, and so
+on. Same for the daemon-side loop: `set_device_mode(0x03, 0x00)` is sent on device *detection*,
+so a loop requires repeated detections. This is a firmware self-reboot — functionally the
+same thing a physical replug does — not a hang.
+
+**It is therefore almost certainly recoverable, and the loop reports are themselves the
+evidence.** A device stuck in an infinite reconnect loop is, by definition, successfully
+re-enumerating on every cycle. Nothing in the record describes a device that stopped
+enumerating, needed a firmware recovery, or was bricked; the complaint is that it kept coming
+back, over and over. Power-cycling is strictly a superset of what the reset already does to
+itself.
+
+**On our current software stack the loop cannot form at all.** Both loop-forming senders are
+gone for this device in the OpenRazer 3.12.4 installed here: the kernel probe skips
+`razer_set_device_mode()` for the Tartarus Pro (`razerkbd_driver.c:5501`), and the daemon's
+`DRIVER_MODE = False` means it never sends driver mode on detection. So a one-shot manual
+send from the prototype has nothing to re-trigger it — the predicted worst case is *one*
+reset and *one* re-enumeration, not a loop. The loop was a property of where the send sat in
+the lifecycle, not of the command.
+
+Two genuine unknowns remain, and the prototype should record both:
+- **What mode the device comes back in** after a reset. If the unlock survives the reset the
+  behaviour is confusing but harmless; if it doesn't, mode 3 may be unreachable on this unit
+  by this route.
+- **Whether re-enumeration is clean**, i.e. whether the three `hidraw`/evdev nodes come back
+  with the same properties (node numbers *will* change; that's expected and is why discovery
+  goes through sysfs).
+
+### How strong is the evidence, really?
+
+Weaker than "it's in the shipped source" suggests, and worth stating plainly since the
+carve-outs look authoritative:
+
+- The **entire** public evidence base is PR #2710's own description, written by one
+  contributor (`countgitmick`) reporting their own hardware testing, plus maintainer
+  `z3ntu`'s one-line review response to it. z3ntu does not appear to own the device — in the
+  same review he asks the contributor to confirm basic hardware facts about the profile LEDs
+  — so the merge reflects trust in the contributor's testing, not independent reproduction.
+- **No user ever reported this symptom.** Searched the whole Tartarus Pro paper trail:
+  issue [#1039](https://github.com/openrazer/openrazer/issues/1039) (61 comments),
+  issue [#1177](https://github.com/openrazer/openrazer/issues/1177),
+  PR [#2336](https://github.com/openrazer/openrazer/pull/2336) (17 comments) and
+  PR [#2622](https://github.com/openrazer/openrazer/pull/2622). Not one mention of a reset,
+  reconnect, disconnect, loop or crash. The behaviour surfaces exactly once, in #2710.
+- Against it: `open-tartarus-driver` sends this command on every startup and reports never
+  reproducing the fault across extensive testing — with a different `transaction_id`, on
+  Windows, on an unknown firmware.
+
+So: one credible first-hand report that a maintainer found convincing enough to encode as a
+permanent carve-out, one first-hand report of the opposite, and no corroboration either way.
+That is enough to justify treating the command as risky and to approach it deliberately — it
+is not enough to treat "this device resets on set-device-mode" as established fact.
+
 ### The transaction_id hypothesis — worth trying first
 
 The three implementations do **not** send the same bytes:
@@ -451,9 +517,12 @@ In order, stopping at the first surprise:
    us (`DRIVER_MODE = False`), and record the pre-state: `device_mode` (`00 00`),
    `firmware_version` (`v1.2`), and the three `hidraw` nodes resolved via sysfs. Confirm
    `device_mode` still reads `00 00` — that is the recovery check for every later step.
-2. **Have a recovery plan for the reset case first.** The failure mode is a reconnect loop, so:
-   know how to unplug the device, and be ready for the possibility that a physical replug is
-   the only fix. Do this with nothing else depending on the keypad.
+2. **Know what a reset would look like before triggering one.** Per §5, the expected worst
+   case on this stack is a single USB disconnect + re-enumerate (a firmware self-reboot), not
+   a hang and not a loop — nothing re-sends the command on reconnect. Watch `dmesg -w` and
+   `udevadm monitor` during the send so a reset is *observed* rather than guessed at, and
+   expect the `hidraw` node numbers to change if it happens. Have a replug available as the
+   fallback, but it shouldn't be needed.
 3. **Open the Interface-1 read fd before sending anything**, so the one-shot standby report
    isn't missed.
 4. **Send the unlock with `transaction_id = 0x01`** (§2/§5) — not the sysfs shortcut, not
@@ -526,7 +595,14 @@ firmware revision.
 ### OpenRazer upstream
 - [PR #2710](https://github.com/openrazer/openrazer/pull/2710) — Tartarus Pro support, merged
   2026-03-14; both stability fixes and the maintainer's *"the firmware knows the command, but
-  it just does bad stuff with it"* review comment.
+  it just does bad stuff with it"* review comment. The sole public source for the reset
+  behaviour.
+- [Issue #1039](https://github.com/openrazer/openrazer/issues/1039) (61 comments),
+  [Issue #1177](https://github.com/openrazer/openrazer/issues/1177),
+  [PR #2336](https://github.com/openrazer/openrazer/pull/2336) (17 comments),
+  [PR #2622](https://github.com/openrazer/openrazer/pull/2622) — searched for reset/reconnect/
+  disconnect/loop/crash reports; **no hits**. Negative evidence for how widely the reset has
+  actually been seen.
 - [PR #1868](https://github.com/openrazer/openrazer/pull/1868) — unmerged Linux analog support
   for the Huntsman Mini Analog: Interface 1, `(key, analog)` pair layout, `analog_threshold`
   default 128, and the "keys only emit their analog values" framing.
