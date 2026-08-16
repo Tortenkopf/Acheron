@@ -50,3 +50,19 @@ Settle at least:
 ## Answer
 
 _(unresolved)_
+
+## Comments
+
+**[Ticket 16](./16-task-analog-mode-hardware-facts.md) has resolved; this ticket is
+unblocked.** Two corrections to the question above:
+
+- **"What happens to the 14 non-grid Inputs?" — there are 8, not 14**, and they all survive
+  driver mode. `Input` has 28 variants: 20 `Grid`, plus `ModeKey`, `Thumbstick` ×4 and
+  `Wheel` ×3. So the question is live exactly as posed (does depth become structurally
+  optional on `Input`, or do grid keys become a distinct type?) — but it covers 8 Inputs,
+  and none of them is at risk of vanishing.
+- **Device-mode representation has a new asymmetry to model**: the mode survives
+  suspend/resume but not a power cycle, and an unclean Daemon death leaves it on. Whatever
+  the model says about "which mode the Daemon landed in" therefore cannot be write-once at
+  startup — the device can change mode underneath a running Daemon, and only a USB
+  re-enumeration signals it.

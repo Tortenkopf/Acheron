@@ -54,3 +54,27 @@ Settle at least:
 ## Answer
 
 _(unresolved)_
+
+## Comments
+
+**[Ticket 16](./16-task-analog-mode-hardware-facts.md) settled the facts this ticket was
+waiting on** — three of its bullets can be tightened before the grilling starts:
+
+- **The hybrid source is confirmed, not "almost certainly".** Driver mode silences the 20
+  grid keys and nothing else; the Mode key, thumbstick ×4 and wheel ×3 keep emitting evdev
+  normally while the analog stream runs.
+- **The Hold-to-repeat regression is narrower than written here.** The device's own evdev
+  autorepeat *does* still fire in driver mode — for the Mode key and thumbstick. It is lost
+  for the 20 grid keys only, so the analog source must synthesise repeat for the grid while
+  the other 8 Inputs keep riding the kernel's autorepeat unchanged. Two repeat sources have
+  to coexist and behave identically, rather than one replacing the other wholesale.
+- **Mode lifecycle: suspend needs no handling; re-enumeration does.** Driver mode survives
+  suspend/resume with the `hidraw` fd still open and the stream simply resuming, but a power
+  cycle restores digital mode. So the re-unlock hook belongs on the reconnect path
+  (`connection_tx`) and nowhere else. An unclean death leaves the device in driver mode with
+  20 dead grid keys until something re-locks it, and a re-lock from a fresh process that
+  never sent the unlock does work — so a Daemon restart can recover the state, provided it
+  re-locks or re-unlocks on start rather than assuming.
+
+Also settled: `byte n = keycap n` is confirmed per-key out of order, so the port can rely on
+the identity mapping.
