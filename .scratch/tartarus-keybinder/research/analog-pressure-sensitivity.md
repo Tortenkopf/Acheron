@@ -2,6 +2,15 @@
 
 Ticket: [05-research-analog-pressure-sensitivity](../issues/05-research-analog-pressure-sensitivity.md)
 
+> **Partly superseded (2026-08-16).** The protocol facts below still stand, but the Linux
+> feasibility framing ("unverified on Linux", "nobody has done this", "extrapolation from a
+> Windows-only reference") has been overtaken by
+> [Linux `hidraw` implementation plan for the Tartarus Pro analog grid-key signal](../../tartarus-input-expansion/research/linux-analog-grid-key-protocol.md),
+> which corroborates the protocol against our own hardware's HID descriptors, pins down the
+> exact byte buffer and ioctls, finds Linux prior art on a sibling Razer analog device, and
+> sharpens the firmware-reset risk into something first-party and testable. Read that file
+> first; this one for background.
+
 ## Bottom line
 
 Yes — the Tartarus Pro's 20 grid keys have a **genuine per-key analog signal**, not a

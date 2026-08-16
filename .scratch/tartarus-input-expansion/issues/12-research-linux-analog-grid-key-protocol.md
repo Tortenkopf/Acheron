@@ -1,8 +1,9 @@
 Type: research
+Status: resolved
 
 ## Question
 
-Sharpen [existing research](../tartarus-keybinder/research/analog-pressure-sensitivity.md) into a concrete Linux `hidraw` implementation plan for the Tartarus Pro's per-grid-key analog depth signal, as the first step of an open-ended attempt to close a genuine Linux gap (no existing Linux tool exposes this — see [Lock the v1.0 feature list](./08-decide-v1-feature-list.md)).
+Sharpen [existing research](../../tartarus-keybinder/research/analog-pressure-sensitivity.md) into a concrete Linux `hidraw` implementation plan for the Tartarus Pro's per-grid-key analog depth signal, as the first step of an open-ended attempt to close a genuine Linux gap (no existing Linux tool exposes this — see [Lock the v1.0 feature list](./08-decide-v1-feature-list.md)).
 
 That prior research (done for the archived MVP map, where analog was correctly ruled out of scope for a discrete-remap-only effort) already establishes the bottom line: the signal is real hardware-level analog sensing (Razer Analog Optical Switches), sent as an undocumented HID Feature Report, reverse-engineered in detail by **`ultramonaka/open-tartarus-driver`** — but that project is Windows-only, and its documented protocol (Report ID `0x06` on Interface 1, the unlock command on Interface 2, byte layout, CRC) has never been verified against Linux `hidraw` or against this repo's own hardware.
 
@@ -14,3 +15,21 @@ Settle at least:
 - Produce a concrete, implementation-ready translation (exact ioctl calls, byte buffers, report IDs) that [the follow-up prototype](./13-task-standalone-analog-capture-prototype.md) can build directly against, rather than re-deriving from Windows source at prototype time.
 
 Does not touch Acheron's codebase — this is protocol investigation only, output is notes (append to or supersede the existing research file, or a new one in this map's own `research/` location — writer's judgment).
+
+## Answer
+
+Full write-up: [Linux `hidraw` implementation plan for the Tartarus Pro analog grid-key signal](../research/linux-analog-grid-key-protocol.md) — a new file in this map's own `research/`, superseding the Linux-feasibility framing of the older [analog-pressure-sensitivity](../../tartarus-keybinder/research/analog-pressure-sensitivity.md) notes (whose protocol facts still stand).
+
+**Implementation-ready, and materially more certain than the prior research.** The exact 91-byte unlock buffer is pinned down from `open-tartarus-driver`'s Rust source (`build_razer_cmd` + the single `send_feature_report` call site), with `transaction_id = 0x01`, `command_class 0x00`, `command_id 0x04`, `arguments[0] = 0x03`, CRC `0x05` — and a byte-by-byte table including the mode-`0x00` re-lock (CRC `0x06`). The Linux side is `ioctl(fd, HIDIOCSFEATURE(91) = 0xC05B4806, buf)` on the Interface-2 `hidraw` node, then plain `read()` on the Interface-1 node filtering `buf[0] == 0x06`, depths at `buf[1..21]`. `send_feature_report` is just `hidapi`'s wrapper over that ioctl, so the "which Windows API" question the prior research left open is moot.
+
+**The protocol is no longer single-sourced.** Our own hardware's descriptors were read directly and corroborate it independently: Interface 1 (endpoint `0x82`, `wMaxPacketSize` `0x18` = 24) declares Report `0x06` with 23 payload bytes; Interface 2 declares a 90-byte unnumbered vendor Feature Report (= `struct razer_report`). Because report `0x06` is in the parsed descriptor, the kernel will forward it rather than drop it — a genuine open risk, now closed. Separately, OpenRazer's Interface-2 control channel already round-trips real data from Linux on this unit today (it returns the same serial Synapse reported, plus firmware `v1.2`, `device_mode = 00 00`), so the transport is proven; only the set-device-mode command is unproven.
+
+**Linux wrinkles, all resolved:** OpenRazer's `razerkbd` claims all three interfaces but cannot starve `hidraw` (verified in both OpenRazer 3.12.4 and mainline `hid-core.c`), and its daemon uniquely sets `DRIVER_MODE = False` for this device so it will never touch device mode behind us; discovery must match `bInterfaceNumber` via sysfs, **not** the HID-usage filter `open-tartarus-driver` uses (which would exclude the analog interface on Linux); `/dev/hidraw*` is root-only, so the prototype needs `sudo` and a shipped feature needs a udev rule — **which spends the map's "no privileged install step" property**, worth weighing against analog's v1.0 status. There is a one-line unlock shortcut via OpenRazer's `device_mode` sysfs attribute; it is the wrong one to use (it hardcodes the implicated `transaction_id`).
+
+**On the reset risk — sharper, and with a testable hypothesis.** It is first-party, not rumour: OpenRazer PR #2710 (merged, and the source running on this machine) carries two Tartarus-Pro-specific carve-outs whose stated cause is that this firmware resets on `set_device_mode` — including mode `0x00`, so there is no known-safe "just send mode 0" escape. Nothing anywhere narrows it to a firmware revision. But the three implementations send **different transaction ids** — `open-tartarus-driver` `0x01` (works), OpenRazer kernel `0x1F` (resets), OpenRazer sysfs `0xFF` (reset loop) — and this device is already known to be transaction-id-picky across command classes, so the resets may be a wrong-`transaction_id` artefact. Prefer `0x01`.
+
+**Two findings that change the shape of the feature, not just the plan:**
+- The prior research's "nobody has done this on Linux" is too strong — OpenRazer PR #1868 (unmerged) implements Razer analog driver mode on Linux for the Huntsman Mini Analog, same Interface 1, no reset trouble. Its payload layout differs (sparse `(key, analog)` pairs), so don't read the format across.
+- **Driver mode probably silences the grid keys' ordinary keycodes** (PR #1868: "keys only emit their analog values"; `open-tartarus-driver` reports double-input problems only for the D-pad/wheel, never the 20 analog keys). Inferred, not verified — and it is the cheapest, highest-value thing for the prototype to check, because if true, analog is a device-wide mode switch that Acheron's whole evdev capture path sits underneath, not an additive second capture stream.
+
+Ticket 13 is unblocked, with an ordered, caution-first procedure in §7 of the write-up.
