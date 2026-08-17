@@ -408,6 +408,7 @@ mod tests {
             schema_version: 1,
             active_profile: "Default".to_string(),
             profiles,
+            force_digital: false,
         };
 
         let dict = config_to_dict(&config);

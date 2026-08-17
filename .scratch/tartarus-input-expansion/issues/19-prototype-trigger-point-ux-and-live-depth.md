@@ -1,5 +1,5 @@
 Type: prototype
-Blocked by: 17
+Blocked by: 17, 23
 
 ## Question
 
@@ -9,6 +9,12 @@ deliver from a user's point of view — everything else is plumbing.
 
 The key question is "how should it look and behave," so `/prototype` is the type: build a
 throwaway to react to before committing to a shape in `binding_editor.py`.
+
+Blocked on [ticket 23](./23-task-wire-analog-supervisor-and-install.md) as well as 17 — a
+depression bar prototyping "live depth" needs live depth actually flowing through a running
+Daemon to react to, not just the data model it's shaped by. (Added when ticket 18's grilling
+session split the capture-path rework into tickets 21-23 and found this ticket's original
+`Blocked by: 17` no longer matched what it needs.)
 
 Settled during charting, build it in rather than re-litigating: **depth crosses the D-Bus
 wire on request, not always.** The GUI enters a live-depth mode while the binding editor is

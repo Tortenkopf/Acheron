@@ -65,10 +65,12 @@ mod tests {
             PhysicalEvent {
                 input: Input::ModeKey,
                 state: EventState::Down,
+                depth: None,
             },
             PhysicalEvent {
                 input: Input::ModeKey,
                 state: EventState::Up,
+                depth: None,
             },
         ];
         let (tx, mut rx) = mpsc::channel(8);
@@ -91,6 +93,7 @@ mod tests {
             ScriptedEvent::Physical(PhysicalEvent {
                 input: Input::ModeKey,
                 state: EventState::Down,
+                depth: None,
             }),
             ScriptedEvent::Connection(true),
         ];
@@ -107,6 +110,7 @@ mod tests {
             Some(PhysicalEvent {
                 input: Input::ModeKey,
                 state: EventState::Down,
+                depth: None,
             })
         );
         assert_eq!(connection_rx.recv().await, Some(true));

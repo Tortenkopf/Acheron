@@ -45,6 +45,9 @@ class DaemonStub:
         }
         self._layer = "base"
         self._active_toggles: list[str] = []
+        # Hardcoded, mirroring the real Daemon's ticket 21 stand-in — there
+        # is no analog CaptureSource yet for either side to report on.
+        self._capture_mode = "digital"
         self._daemon_running = True
         self._device_connected = True
         self._layer_changed_callbacks: list[Callable[[str], None]] = []
@@ -66,8 +69,14 @@ class DaemonStub:
             "profiles": {name: copy.deepcopy(profile) for name, profile in self._profiles.items()},
         }
 
-    def get_state(self) -> tuple[str, str, list[str], bool]:
-        return (self._active_profile, self._layer, list(self._active_toggles), self._device_connected)
+    def get_state(self) -> tuple[str, str, list[str], bool, str]:
+        return (
+            self._active_profile,
+            self._layer,
+            list(self._active_toggles),
+            self._device_connected,
+            self._capture_mode,
+        )
 
     def set_binding(self, input_str: str, layer: str, binding: dict) -> None:
         # Deep-copied for the same reason: SetBinding's real wire encoding

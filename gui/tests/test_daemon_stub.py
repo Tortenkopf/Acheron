@@ -14,7 +14,7 @@ def test_fresh_stub_matches_the_seed_configs_shape():
         "active_profile": "Default",
         "profiles": {"Default": {"base": {}, "held": {}, "mode_key_role": "layer_switch"}},
     }
-    assert stub.get_state() == ("Default", "base", [], True)
+    assert stub.get_state() == ("Default", "base", [], True, "digital")
 
 
 def test_set_binding_then_get_config_reflects_it():

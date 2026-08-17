@@ -1,5 +1,5 @@
 Type: grilling
-Blocked by: 17
+Blocked by: 17, 23
 
 ## Question
 
@@ -20,6 +20,12 @@ needing its own Action kind. It is Hold-to-repeat with a depth-driven rate.
 
 This ticket is why depth has to reach `dispatch.rs` at all rather than being thresholded
 away inside the capture layer — see [ticket 17](./17-decide-analog-data-model.md).
+
+Blocked on [ticket 23](./23-task-wire-analog-supervisor-and-install.md) as well as 17 —
+designing a depth-driven firing rate needs real depth events reaching `dispatch.rs` from a
+running Daemon to test against, not just the model. (Added when ticket 18's grilling session
+split the capture-path rework into tickets 21-23 and found this ticket's original
+`Blocked by: 17` no longer matched what it needs.)
 
 Settle at least:
 

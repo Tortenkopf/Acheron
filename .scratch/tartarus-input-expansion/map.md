@@ -48,6 +48,33 @@ Like the previous map, this one carries execution.
 
 - [Collect the remaining driver-mode hardware facts](./issues/16-task-analog-mode-hardware-facts.md) — **the strand survives its own invalidation test: driver mode silences the 20 grid keys and nothing else.** The Mode key, the thumbstick's four directions and the wheel's three events all keep emitting evdev normally while the analog stream runs, so Layers and the thumbstick are never at risk and ticket 18's *hybrid* source (`hidraw` for the grid, evdev for the other 8) is confirmed rather than assumed. Four more facts, all on the real unit with the Daemon stopped: **a power cycle restores digital mode** (a genuine re-enumeration — HID IDs and evdev nodes both moved), but **driver mode survives suspend/resume with the `hidraw` fd still open and the stream simply resuming** — so the recovery trigger is USB re-enumeration alone, and the re-unlock belongs on the existing `connection_tx` reconnect path. **An unclean death strands the user with 20 dead grid keys** and everything else working, and **a re-lock from a fresh process that never sent the unlock does work**, which is what makes a Daemon restart recoverable. **`byte n = keycap n` is now confirmed per-key, pressed in a deliberate non-reading order** — ticket 13's inference rested on layout-order presses and no longer does. Two findings beyond the questions asked: **the device's own evdev autorepeat still fires in driver mode**, so ticket 18's Hold-to-repeat regression applies to the 20 grid keys only rather than to every Input; and the standby `0x06` report marks a mode *transition*, not every `set_device_mode`. Still no reset — nine clean sends now across both tickets. Raw capture in `assets/16-driver-mode-facts.jsonl`, now including evdev events. Unblocks [the analog data model](./issues/17-decide-analog-data-model.md).
 
+- [Decide the analog data model](./issues/17-decide-analog-data-model.md) — `PhysicalEvent` widens with an optional `depth: Option<u8>` field (not a new variant or parallel channel); the model carries both an actuation point and a release point (hysteresis); `Input` stays unified, with depth-setting validated rather than typed away into a `GridKey`. Actuation points are scoped per-Input per-Profile (shared across Base/Held, avoiding the Binding-scoped asymmetry) with a Profile-level default (placeholder 128/112) individual keys can override, plus a GUI "reset all to default" affordance backed by a dedicated `ResetActuationPoints()` call. Device mode gets a `Config.force_digital` preference (`SetForceDigital`, mirrors `SetOutputSuppressed`) plus a live-reported `capture_mode` in `GetState()`/a new `CaptureModeChanged` signal, since ticket 16 proved the actual mode can change under a running Daemon. Five new D-Bus methods total, all active-Profile-scoped and atomically persisted like `SetBinding`. Purely additive to `config.toml` — `#[serde(default)]` throughout, no `SCHEMA_VERSION` bump. CONTEXT.md gained Depth/Actuation point/Release point/Capture mode glossary entries. Unblocks [ticket 18](./issues/18-rework-capture-path-for-analog.md), [ticket 19](./issues/19-prototype-trigger-point-ux-and-live-depth.md), and [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md).
+
+- [Rework the capture path for analog](./issues/18-rework-capture-path-for-analog.md) — settled
+  across ten decisions via a full grilling session against the real code and device (nothing
+  built yet): the analog `CaptureSource` generalizes `evdev_source`'s node loop to a subset
+  (Main+If02 unchanged) plus one new hidraw-based grid task in the same `JoinSet`; `hidraw`
+  discovery walks `/sys/class/hidraw` per-(re)open with absence treated like evdev's existing
+  non-fatal retry bucket; unlock gets a 500ms report-`0x06` timeout and only resends on a fresh
+  reopen (reset-risk-aware backoff); Hold-to-repeat timing is read live from the real device's
+  kernel autorepeat via `get_auto_repeat()` rather than hardcoded; per-key actuation-point
+  thresholding happens in the capture layer via a `watch`-channel snapshot dispatch publishes,
+  keeping `Config` single-owner; `force_digital`/`capture_mode` (ticket 17) get a genuine live
+  source-swap in `main.rs`, retried only at startup/reconnect/explicit toggle, never on a
+  background timer; fatality taxonomy is unchanged (dispatch/injector exit fatal, capture
+  absence/swap is not); the udev rule targets `plugdev`/`MODE="0660"`, installed best-effort by
+  `install.sh`; threshold/repeat logic is pure and unit-tested separately from the I/O loop. No
+  second prototype ticket — everything left was architecture, not a look/feel question. The
+  build itself was too large for one session and split into three sequential task tickets:
+  [Apply the analog data model to code](./issues/21-task-apply-analog-data-model-to-code.md)
+  (ticket 17's shapes were never actually written into `config.rs`/`command.rs`/`dbus`, AFK, no
+  hardware needed), [Build the analog CaptureSource](./issues/22-task-build-analog-capture-source.md)
+  (the hidraw grid task itself, HITL), and
+  [Wire live source-swap, udev rule, and install.sh](./issues/23-task-wire-analog-supervisor-and-install.md)
+  (`main.rs` integration and end-to-end verification, HITL). Tickets 19 and 20's `Blocked by`
+  was corrected from `17` to `17, 23` — both need real depth events flowing through a running
+  Daemon, not just the settled model.
+
 ## Not yet specified
 
 - **Composition between Chord/mouse-button/Stepper/Profile-Switch** — e.g. can a Chord's Action be a Stepper step; can a Stepper's forward/backward pair include a Chord as one side. Not sharp enough to ticket until those tickets have settled their own shape.

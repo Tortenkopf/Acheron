@@ -34,6 +34,12 @@ pub struct Config {
     pub schema_version: u32,
     pub active_profile: String,
     pub profiles: HashMap<String, Profile>,
+    /// A hardware/troubleshooting-level override that forces Digital Capture
+    /// mode even when Analog would otherwise unlock (ticket 17 §4) — a
+    /// `Config`-level preference, not per-Profile, distinct from
+    /// `command::State::capture_mode`'s live-reported actual mode.
+    #[serde(default)]
+    pub force_digital: bool,
 }
 
 impl Config {
@@ -46,6 +52,7 @@ impl Config {
             schema_version: SCHEMA_VERSION,
             active_profile: DEFAULT_PROFILE_NAME.to_string(),
             profiles,
+            force_digital: false,
         }
     }
 
@@ -106,6 +113,17 @@ pub struct Profile {
     pub held: HashMap<Input, Binding>,
     #[serde(default)]
     pub mode_key_role: ModeKeyRole,
+    /// The Actuation/Release point every Grid key uses unless it has its own
+    /// entry in `actuation_overrides` (ticket 17 §5) — per-Input, per-Profile,
+    /// shared across Base and Held (an actuation point describes the key's
+    /// physical travel, not what it does when triggered).
+    #[serde(default)]
+    pub default_actuation: ActuationPoint,
+    /// Sparse per-key overrides of `default_actuation`, keyed by `Input`
+    /// (always a `Grid` variant — enforced at the `Command` layer, not the
+    /// type level, per ticket 17 §3).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub actuation_overrides: HashMap<Input, ActuationPoint>,
 }
 
 impl Profile {
@@ -128,6 +146,27 @@ impl Profile {
 pub struct Binding {
     pub trigger: TriggerMode,
     pub action: Action,
+}
+
+/// CONTEXT.md: Actuation point, Release point. A Grid key's Binding fires a
+/// Down at `actuation` and an Up at `release` — hysteresis, so a single
+/// Depth boundary doesn't chatter (ticket 17 §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActuationPoint {
+    pub actuation: u8,
+    pub release: u8,
+}
+
+/// 128/112 (half-travel, 16-point margin) is an explicit placeholder, not a
+/// tuned value — ticket 19 is where it gets felt through a real UI and
+/// adjusted (ticket 17 §5).
+impl Default for ActuationPoint {
+    fn default() -> Self {
+        ActuationPoint {
+            actuation: 128,
+            release: 112,
+        }
+    }
 }
 
 /// CONTEXT.md: Trigger mode. `FireOnce`/`HoldToRepeat`/`Toggle` firing
@@ -448,6 +487,34 @@ action = { type = "keypress", key = "KEY_F1" }
         let profile = &config.profiles["Default"];
         assert!(profile.held.is_empty());
         assert_eq!(profile.mode_key_role, ModeKeyRole::LayerSwitch);
+    }
+
+    #[test]
+    fn a_pre_ticket_17_config_defaults_actuation_fields_and_force_digital() {
+        // A config.toml written before ticket 17 has no `default_actuation`,
+        // `actuation_overrides`, or `force_digital` at all — it must still
+        // parse unchanged, defaulting all three (ticket 17 §6: additive,
+        // no schema_version bump).
+        let toml = r#"
+schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base.grid_r1c1]
+trigger = "fire_once"
+action = { type = "keypress", key = "KEY_F1" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.force_digital);
+        let profile = &config.profiles["Default"];
+        assert_eq!(profile.default_actuation, ActuationPoint::default());
+        assert_eq!(
+            profile.default_actuation,
+            ActuationPoint {
+                actuation: 128,
+                release: 112,
+            }
+        );
+        assert!(profile.actuation_overrides.is_empty());
     }
 
     #[test]

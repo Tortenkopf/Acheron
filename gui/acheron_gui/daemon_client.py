@@ -76,7 +76,7 @@ class DaemonClient(Protocol):
 
     def get_config(self) -> dict: ...
 
-    def get_state(self) -> tuple[str, str, list[str], bool]: ...
+    def get_state(self) -> tuple[str, str, list[str], bool, str]: ...
 
     def set_binding(self, input_str: str, layer: str, binding: dict) -> None: ...
 
@@ -128,7 +128,7 @@ class DBusDaemonClient:
         (config,) = self._call("GetConfig", None)
         return config
 
-    def get_state(self) -> tuple[str, str, list[str], bool]:
+    def get_state(self) -> tuple[str, str, list[str], bool, str]:
         return self._call("GetState", None)
 
     def set_binding(self, input_str: str, layer: str, binding: dict) -> None:

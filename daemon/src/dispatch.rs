@@ -30,7 +30,9 @@ use zbus::object_server::SignalEmitter;
 
 use crate::capture::{EventState, PhysicalEvent};
 use crate::command::{Command, CommandError, State};
-use crate::config::{self, Binding, Config, Layer, ModeKeyRole, Profile, TriggerMode};
+use crate::config::{
+    self, ActuationPoint, Binding, Config, Layer, ModeKeyRole, Profile, TriggerMode,
+};
 use crate::dbus::Daemon;
 use crate::executor::{self, ActiveToggle};
 use crate::injector::Injector;
@@ -247,6 +249,32 @@ async fn fire(
     }
 }
 
+/// Shared by `SetActuationPoint`/`ClearActuationPoint` (ticket 17 §3): an
+/// actuation point is a property of a physical Grid key, so setting or
+/// clearing one on any other `Input` variant is rejected.
+fn reject_non_grid_input(input: Input) -> Result<(), CommandError> {
+    if matches!(input, Input::Grid(_, _)) {
+        Ok(())
+    } else {
+        Err(CommandError::InvalidRequest(
+            "actuation points can only be set on Grid Inputs".to_string(),
+        ))
+    }
+}
+
+/// Shared by `SetActuationPoint`/`SetDefaultActuation`: the hysteresis
+/// invariant ticket 17 §2 asks for — a Release point above its Actuation
+/// point would never fire an Up once the Down threshold is crossed.
+fn reject_release_above_actuation(actuation: u8, release: u8) -> Result<(), CommandError> {
+    if release <= actuation {
+        Ok(())
+    } else {
+        Err(CommandError::InvalidRequest(
+            "release point must not exceed the actuation point".to_string(),
+        ))
+    }
+}
+
 /// The `Default` Profile always exists — `load_or_seed` (issue 11) refuses
 /// to start a `Config` whose `active_profile` doesn't name a real Profile.
 fn active_profile_mut(config: &mut Config) -> &mut Profile {
@@ -274,6 +302,9 @@ async fn handle_command(
                 layer: active_layer.as_str(),
                 active_toggles: toggles.keys().copied().collect(),
                 device_connected,
+                // Hardcoded: there is no real analog `CaptureSource` yet to
+                // report on (tickets 22/23 make this genuinely live).
+                capture_mode: "digital",
             });
         }
         Command::SetBinding {
@@ -453,6 +484,93 @@ async fn handle_command(
             stop_all_toggles(toggles).await;
             let _ = reply.send(());
         }
+        Command::SetActuationPoint {
+            input,
+            actuation,
+            release,
+            reply,
+        } => {
+            if let Err(err) = reject_non_grid_input(input) {
+                let _ = reply.send(Err(err));
+                return;
+            }
+            if let Err(err) = reject_release_above_actuation(actuation, release) {
+                let _ = reply.send(Err(err));
+                return;
+            }
+            let point = ActuationPoint { actuation, release };
+            let previous = active_profile_mut(config)
+                .actuation_overrides
+                .insert(input, point);
+            let result = persist(config, config_path).await;
+            if result.is_err() {
+                let overrides = &mut active_profile_mut(config).actuation_overrides;
+                match previous {
+                    Some(prev) => {
+                        overrides.insert(input, prev);
+                    }
+                    None => {
+                        overrides.remove(&input);
+                    }
+                }
+            }
+            let _ = reply.send(result);
+        }
+        Command::ClearActuationPoint { input, reply } => {
+            if let Err(err) = reject_non_grid_input(input) {
+                let _ = reply.send(Err(err));
+                return;
+            }
+            let previous = active_profile_mut(config)
+                .actuation_overrides
+                .remove(&input);
+            let result = persist(config, config_path).await;
+            if result.is_err()
+                && let Some(prev) = previous
+            {
+                active_profile_mut(config)
+                    .actuation_overrides
+                    .insert(input, prev);
+            }
+            let _ = reply.send(result);
+        }
+        Command::SetDefaultActuation {
+            actuation,
+            release,
+            reply,
+        } => {
+            if let Err(err) = reject_release_above_actuation(actuation, release) {
+                let _ = reply.send(Err(err));
+                return;
+            }
+            let previous = std::mem::replace(
+                &mut active_profile_mut(config).default_actuation,
+                ActuationPoint { actuation, release },
+            );
+            let result = persist(config, config_path).await;
+            if result.is_err() {
+                active_profile_mut(config).default_actuation = previous;
+            }
+            let _ = reply.send(result);
+        }
+        Command::ResetActuationPoints { reply } => {
+            let previous = std::mem::take(&mut active_profile_mut(config).actuation_overrides);
+            let result = persist(config, config_path).await;
+            if result.is_err() {
+                active_profile_mut(config).actuation_overrides = previous;
+            }
+            let _ = reply.send(result);
+        }
+        Command::SetForceDigital { force, reply } => {
+            // Persists the preference only — actually swapping the live
+            // capture source on this call is ticket 23's job.
+            let previous = std::mem::replace(&mut config.force_digital, force);
+            let result = persist(config, config_path).await;
+            if result.is_err() {
+                config.force_digital = previous;
+            }
+            let _ = reply.send(result);
+        }
     }
 }
 
@@ -485,7 +603,7 @@ mod tests {
     use super::*;
     use crate::capture::fake::FakeCaptureSource;
     use crate::capture::{CaptureSource, EventState};
-    use crate::config::{Action, DEFAULT_PROFILE_NAME, MacroStepDto, Modifiers};
+    use crate::config::{Action, ActuationPoint, DEFAULT_PROFILE_NAME, MacroStepDto, Modifiers};
     use crate::injector::testing::RecordingSink;
     use crate::injector::{self};
     use crate::input::{Direction, WheelEvent};
@@ -507,6 +625,7 @@ mod tests {
             schema_version: config::SCHEMA_VERSION,
             active_profile: DEFAULT_PROFILE_NAME.to_string(),
             profiles,
+            force_digital: false,
         }
     }
 
@@ -558,18 +677,22 @@ mod tests {
             PhysicalEvent {
                 input: Input::Grid(3, 1),
                 state: EventState::Down,
+                depth: None,
             },
             PhysicalEvent {
                 input: Input::Grid(2, 3),
                 state: EventState::Repeat,
+                depth: None,
             },
             PhysicalEvent {
                 input: Input::Thumbstick(Direction::Up),
                 state: EventState::Up,
+                depth: None,
             },
             PhysicalEvent {
                 input: Input::Wheel(WheelEvent::ScrollDown),
                 state: EventState::Down,
+                depth: None,
             },
         ];
 
@@ -611,6 +734,7 @@ mod tests {
         let scripted = vec![PhysicalEvent {
             input: Input::Grid(1, 1),
             state: EventState::Down,
+            depth: None,
         }];
 
         let batches = run_scripted(scripted, bindings).await;
@@ -648,14 +772,17 @@ mod tests {
             PhysicalEvent {
                 input: Input::Grid(1, 1),
                 state: EventState::Down,
+                depth: None,
             },
             PhysicalEvent {
                 input: Input::Grid(1, 1),
                 state: EventState::Repeat,
+                depth: None,
             },
             PhysicalEvent {
                 input: Input::Grid(1, 1),
                 state: EventState::Up,
+                depth: None,
             },
         ];
 
@@ -710,6 +837,7 @@ mod tests {
             tx.send(PhysicalEvent {
                 input: Input::Grid(1, 1),
                 state,
+                depth: None,
             })
             .await
             .unwrap();
@@ -779,6 +907,7 @@ mod tests {
         tx.send(PhysicalEvent {
             input: Input::Grid(1, 1),
             state: EventState::Down,
+            depth: None,
         })
         .await
         .unwrap();
@@ -786,6 +915,7 @@ mod tests {
         tx.send(PhysicalEvent {
             input: Input::Grid(1, 1),
             state: EventState::Repeat,
+            depth: None,
         })
         .await
         .unwrap();
@@ -800,6 +930,7 @@ mod tests {
         tx.send(PhysicalEvent {
             input: Input::Grid(1, 1),
             state: EventState::Repeat,
+            depth: None,
         })
         .await
         .unwrap();
@@ -1062,6 +1193,69 @@ mod tests {
             rx.await.unwrap()
         }
 
+        async fn set_actuation_point(
+            &self,
+            input: Input,
+            actuation: u8,
+            release: u8,
+        ) -> Result<(), CommandError> {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::SetActuationPoint {
+                    input,
+                    actuation,
+                    release,
+                    reply,
+                })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
+        async fn clear_actuation_point(&self, input: Input) -> Result<(), CommandError> {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::ClearActuationPoint { input, reply })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
+        async fn set_default_actuation(
+            &self,
+            actuation: u8,
+            release: u8,
+        ) -> Result<(), CommandError> {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::SetDefaultActuation {
+                    actuation,
+                    release,
+                    reply,
+                })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
+        async fn reset_actuation_points(&self) -> Result<(), CommandError> {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::ResetActuationPoints { reply })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
+        async fn set_force_digital(&self, force: bool) -> Result<(), CommandError> {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::SetForceDigital { force, reply })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
         async fn get_config(&self) -> Config {
             let (reply, rx) = oneshot::channel();
             self.cmd_tx.send(Command::GetConfig(reply)).await.unwrap();
@@ -1079,6 +1273,7 @@ mod tests {
                 .send(PhysicalEvent {
                     input,
                     state: EventState::Down,
+                    depth: None,
                 })
                 .await
                 .unwrap();
@@ -1215,10 +1410,13 @@ mod tests {
         // no ModeKey press this task's dispatch loop starts and stays at
         // Base. `device_connected` starts optimistic (ticket 20 — no
         // connection transition has been reported yet in this test).
+        // `capture_mode` is hardcoded to "digital" as of ticket 21 — there
+        // is no real analog CaptureSource yet to report on.
         assert_eq!(state.profile, DEFAULT_PROFILE_NAME);
         assert_eq!(state.layer, "base");
         assert!(state.active_toggles.is_empty());
         assert!(state.device_connected);
+        assert_eq!(state.capture_mode, "digital");
     }
 
     #[tokio::test]
@@ -1284,6 +1482,7 @@ mod tests {
             .send(PhysicalEvent {
                 input: Input::ModeKey,
                 state: EventState::Down,
+                depth: None,
             })
             .await
             .unwrap();
@@ -1329,6 +1528,7 @@ mod tests {
             .send(PhysicalEvent {
                 input: Input::ModeKey,
                 state: EventState::Down,
+                depth: None,
             })
             .await
             .unwrap();
@@ -1337,6 +1537,7 @@ mod tests {
             .send(PhysicalEvent {
                 input: Input::ModeKey,
                 state: EventState::Up,
+                depth: None,
             })
             .await
             .unwrap();
@@ -1372,6 +1573,7 @@ mod tests {
             .send(PhysicalEvent {
                 input: Input::ModeKey,
                 state: EventState::Down,
+                depth: None,
             })
             .await
             .unwrap();
@@ -1380,6 +1582,7 @@ mod tests {
             .send(PhysicalEvent {
                 input: Input::ModeKey,
                 state: EventState::Up,
+                depth: None,
             })
             .await
             .unwrap();
@@ -1413,6 +1616,7 @@ mod tests {
             .send(PhysicalEvent {
                 input: Input::ModeKey,
                 state: EventState::Down,
+                depth: None,
             })
             .await
             .unwrap();
@@ -1428,6 +1632,7 @@ mod tests {
             .send(PhysicalEvent {
                 input: Input::ModeKey,
                 state: EventState::Repeat,
+                depth: None,
             })
             .await
             .unwrap();
@@ -1547,6 +1752,7 @@ mod tests {
             .send(PhysicalEvent {
                 input: Input::ModeKey,
                 state: EventState::Down,
+                depth: None,
             })
             .await
             .unwrap();
@@ -1706,7 +1912,7 @@ mod tests {
 
     #[tokio::test]
     async fn rename_profile_command_leaves_active_profile_untouched_when_renaming_a_different_one()
-     {
+    {
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
         harness.create_profile("Gaming").await.unwrap();
 
@@ -1815,6 +2021,7 @@ mod tests {
             schema_version: config::SCHEMA_VERSION,
             active_profile: DEFAULT_PROFILE_NAME.to_string(),
             profiles,
+            force_digital: false,
         };
         let harness = CommandHarness::spawn(config);
 
@@ -1884,6 +2091,7 @@ mod tests {
             schema_version: config::SCHEMA_VERSION,
             active_profile: DEFAULT_PROFILE_NAME.to_string(),
             profiles,
+            force_digital: false,
         };
         let harness = CommandHarness::spawn(config);
 
@@ -1953,6 +2161,7 @@ mod tests {
             schema_version: config::SCHEMA_VERSION,
             active_profile: DEFAULT_PROFILE_NAME.to_string(),
             profiles,
+            force_digital: false,
         };
         let harness = CommandHarness::spawn(config);
 
@@ -1977,10 +2186,187 @@ mod tests {
         );
 
         let batches = harness.shut_down().await;
-        assert_eq!(batches.len(), 2, "one KeyDown lap, then the force-released KeyUp");
+        assert_eq!(
+            batches.len(),
+            2,
+            "one KeyDown lap, then the force-released KeyUp"
+        );
         let evdev::EventSummary::Key(_, code, value) = batches[1][0].destructure() else {
             panic!("expected a key event");
         };
         assert_eq!((code, value), (evdev::KeyCode::KEY_A, 0));
+    }
+
+    #[tokio::test]
+    async fn set_actuation_point_command_applies_live_and_persists_to_disk() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        harness
+            .set_actuation_point(Input::Grid(1, 1), 200, 180)
+            .await
+            .expect("SetActuationPoint must succeed");
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+
+        let profile = &config.profiles[DEFAULT_PROFILE_NAME];
+        assert_eq!(
+            profile.actuation_overrides[&Input::Grid(1, 1)],
+            ActuationPoint {
+                actuation: 200,
+                release: 180,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn set_actuation_point_rejects_a_non_grid_input() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .set_actuation_point(Input::ModeKey, 200, 180)
+            .await
+            .expect_err("a non-Grid Input must be rejected");
+        assert!(matches!(err, CommandError::InvalidRequest(_)));
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn set_actuation_point_rejects_a_release_point_above_actuation() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .set_actuation_point(Input::Grid(1, 1), 100, 150)
+            .await
+            .expect_err("release > actuation must be rejected");
+        assert!(matches!(err, CommandError::InvalidRequest(_)));
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn clear_actuation_point_command_reverts_to_the_profile_default() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        harness
+            .set_actuation_point(Input::Grid(1, 1), 200, 180)
+            .await
+            .expect("SetActuationPoint must succeed");
+        harness
+            .clear_actuation_point(Input::Grid(1, 1))
+            .await
+            .expect("ClearActuationPoint must succeed");
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+
+        assert!(
+            !config.profiles[DEFAULT_PROFILE_NAME]
+                .actuation_overrides
+                .contains_key(&Input::Grid(1, 1))
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_actuation_point_on_an_unoverridden_key_is_a_no_op_success() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        harness
+            .clear_actuation_point(Input::Grid(1, 1))
+            .await
+            .expect("clearing an unoverridden key must still succeed");
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn clear_actuation_point_rejects_a_non_grid_input() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .clear_actuation_point(Input::ModeKey)
+            .await
+            .expect_err("a non-Grid Input must be rejected");
+        assert!(matches!(err, CommandError::InvalidRequest(_)));
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn set_default_actuation_command_applies_live_and_persists_to_disk() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        harness
+            .set_default_actuation(140, 120)
+            .await
+            .expect("SetDefaultActuation must succeed");
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+
+        assert_eq!(
+            config.profiles[DEFAULT_PROFILE_NAME].default_actuation,
+            ActuationPoint {
+                actuation: 140,
+                release: 120,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn set_default_actuation_rejects_a_release_point_above_actuation() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .set_default_actuation(100, 150)
+            .await
+            .expect_err("release > actuation must be rejected");
+        assert!(matches!(err, CommandError::InvalidRequest(_)));
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn reset_actuation_points_clears_every_override_in_one_call() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        harness
+            .set_actuation_point(Input::Grid(1, 1), 200, 180)
+            .await
+            .expect("SetActuationPoint must succeed");
+        harness
+            .set_actuation_point(Input::Grid(2, 2), 90, 70)
+            .await
+            .expect("SetActuationPoint must succeed");
+
+        harness
+            .reset_actuation_points()
+            .await
+            .expect("ResetActuationPoints must succeed");
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+
+        assert!(
+            config.profiles[DEFAULT_PROFILE_NAME]
+                .actuation_overrides
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn set_force_digital_command_applies_live_and_persists_to_disk() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        harness
+            .set_force_digital(true)
+            .await
+            .expect("SetForceDigital must succeed");
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+
+        assert!(config.force_digital);
     }
 }

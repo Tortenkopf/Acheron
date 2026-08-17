@@ -256,6 +256,7 @@ mod tests {
         let event = PhysicalEvent {
             input: Input::ModeKey,
             state: EventState::Down,
+            depth: None,
         };
         let batch = translate(event);
         assert_eq!(batch.len(), 1);
@@ -273,6 +274,7 @@ mod tests {
         let event = PhysicalEvent {
             input: Input::Wheel(WheelEvent::ScrollUp),
             state: EventState::Down,
+            depth: None,
         };
         let batch = translate(event);
         assert_eq!(batch.len(), 2);
@@ -295,6 +297,7 @@ mod tests {
         let event = PhysicalEvent {
             input: Input::Thumbstick(Direction::Left),
             state: EventState::Repeat,
+            depth: None,
         };
         let batch = translate(event);
         assert_eq!(batch.len(), 1);

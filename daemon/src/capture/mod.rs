@@ -23,6 +23,13 @@ pub enum EventState {
 pub struct PhysicalEvent {
     pub input: Input,
     pub state: EventState,
+    /// The Depth (0-255) this event was captured at (ticket 17 §1). `None`
+    /// for every evdev-sourced event — including a `Grid` `Input` while
+    /// degraded to Digital Capture mode — and for every non-`Grid` `Input`
+    /// regardless of Capture mode; `Some` only for an Analog-sourced `Grid`
+    /// event. How an analog source synthesizes `Down`/`Repeat`/`Up` from
+    /// depth thresholds is ticket 18's job, not this field's.
+    pub depth: Option<u8>,
 }
 
 /// Produces a stream of normalized `PhysicalEvent`s into `tx`, and a live

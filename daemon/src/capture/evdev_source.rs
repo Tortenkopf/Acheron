@@ -171,7 +171,11 @@ fn normalize(node: Node, summary: EventSummary) -> Option<PhysicalEvent> {
         EventSummary::Key(_, code, value) => {
             let input = input::input_for_key(node, code)?;
             let state = key_value_to_state(value)?;
-            Some(PhysicalEvent { input, state })
+            Some(PhysicalEvent {
+                input,
+                state,
+                depth: None,
+            })
         }
         EventSummary::RelativeAxis(_, RelativeAxisCode::REL_WHEEL, value) => {
             let wheel = if value > 0 {
@@ -182,6 +186,7 @@ fn normalize(node: Node, summary: EventSummary) -> Option<PhysicalEvent> {
             Some(PhysicalEvent {
                 input: Input::Wheel(wheel),
                 state: EventState::Down,
+                depth: None,
             })
         }
         _ => None,

@@ -157,8 +157,10 @@ impl Daemon {
     /// task's real `HashMap<Input, ActiveToggle>` as of ticket 17. `layer`
     /// reflects the dispatch task's real active Layer as of ticket 18.
     /// `device_connected` reflects the `CaptureSource`'s poll loop's current
-    /// view as of ticket 20.
-    async fn get_state(&self) -> Result<(String, String, Vec<String>, bool), DaemonError> {
+    /// view as of ticket 20. `capture_mode` (`"analog"`/`"digital"`) is
+    /// hardcoded to `"digital"` as of ticket 21 — see `command::State`'s doc
+    /// comment.
+    async fn get_state(&self) -> Result<(String, String, Vec<String>, bool, String), DaemonError> {
         let (reply, rx) = oneshot::channel();
         self.commands
             .send(Command::GetState(reply))
@@ -174,6 +176,7 @@ impl Daemon {
                 .map(ToString::to_string)
                 .collect(),
             state.device_connected,
+            state.capture_mode.to_string(),
         ))
     }
 
@@ -393,6 +396,87 @@ impl Daemon {
         rx.await.map_err(dispatch_gone)
     }
 
+    /// Sets a per-key Actuation/Release point override on the active
+    /// Profile (ticket 17 §5/§7). Errors `InvalidBinding` if `input` isn't a
+    /// `Grid` Input, or if `release > actuation`.
+    async fn set_actuation_point(
+        &self,
+        input: String,
+        actuation: u8,
+        release: u8,
+    ) -> Result<(), DaemonError> {
+        let input = Self::parse_input(&input)?;
+
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::SetActuationPoint {
+                input,
+                actuation,
+                release,
+                reply,
+            })
+            .await
+            .map_err(dispatch_gone)?;
+        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+    }
+
+    /// Removes a per-key override, reverting that key to the active
+    /// Profile's default Actuation/Release point. Errors `InvalidBinding` if
+    /// `input` isn't a `Grid` Input.
+    async fn clear_actuation_point(&self, input: String) -> Result<(), DaemonError> {
+        let input = Self::parse_input(&input)?;
+
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::ClearActuationPoint { input, reply })
+            .await
+            .map_err(dispatch_gone)?;
+        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+    }
+
+    /// Sets the active Profile's default Actuation/Release point — what
+    /// every Grid key without its own override uses. Errors
+    /// `InvalidBinding` if `release > actuation`.
+    async fn set_default_actuation(&self, actuation: u8, release: u8) -> Result<(), DaemonError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::SetDefaultActuation {
+                actuation,
+                release,
+                reply,
+            })
+            .await
+            .map_err(dispatch_gone)?;
+        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+    }
+
+    /// Clears every per-key override on the active Profile in one call/one
+    /// `config.toml` rewrite — the GUI's "reset all keys to Profile
+    /// default" affordance (ticket 17 §5). Never fails on validation
+    /// grounds; can still surface `IoError` if the rewrite itself fails.
+    async fn reset_actuation_points(&self) -> Result<(), DaemonError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::ResetActuationPoints { reply })
+            .await
+            .map_err(dispatch_gone)?;
+        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+    }
+
+    /// The live setter for `Config.force_digital` (ticket 17 §4) — the
+    /// user-facing override that forces Digital Capture mode even when
+    /// Analog would otherwise unlock. For this ticket, only persists the
+    /// flag; actually swapping the live capture source on this call is
+    /// ticket 23's job.
+    async fn set_force_digital(&self, force: bool) -> Result<(), DaemonError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::SetForceDigital { force, reply })
+            .await
+            .map_err(dispatch_gone)?;
+        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+    }
+
     /// Fires on active-Profile changes — every `SwitchProfile` call, as of
     /// ticket 19.
     #[zbus(signal)]
@@ -436,6 +520,20 @@ impl Daemon {
         signal_emitter: &SignalEmitter<'_>,
         connected: bool,
     ) -> zbus::Result<()>;
+
+    /// Fires on Capture-mode transitions — `"analog"`/`"digital"` (ticket 17
+    /// §4). Ticket 16 proved the actual mode can change under a *running*
+    /// Daemon (survives suspend, not a power cycle), so this mirrors
+    /// `device_connection_changed` exactly. Nothing calls this yet in this
+    /// ticket — `command::State::capture_mode` is hardcoded, so there is no
+    /// real transition to report — but the signal needs to exist and be
+    /// wired into this trait/proxy now so ticket 23 can call it without
+    /// touching this file again.
+    #[zbus(signal)]
+    pub async fn capture_mode_changed(
+        signal_emitter: &SignalEmitter<'_>,
+        mode: &str,
+    ) -> zbus::Result<()>;
 }
 
 #[cfg(test)]
@@ -455,7 +553,7 @@ mod tests {
     )]
     trait DaemonProxy {
         fn get_config(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
-        fn get_state(&self) -> zbus::Result<(String, String, Vec<String>, bool)>;
+        fn get_state(&self) -> zbus::Result<(String, String, Vec<String>, bool, String)>;
         fn set_binding(
             &self,
             input: &str,
@@ -470,6 +568,11 @@ mod tests {
         fn rename_profile(&self, old_name: &str, new_name: &str) -> zbus::Result<()>;
         fn switch_profile(&self, name: &str) -> zbus::Result<()>;
         fn stop_all_toggles(&self) -> zbus::Result<()>;
+        fn set_actuation_point(&self, input: &str, actuation: u8, release: u8) -> zbus::Result<()>;
+        fn clear_actuation_point(&self, input: &str) -> zbus::Result<()>;
+        fn set_default_actuation(&self, actuation: u8, release: u8) -> zbus::Result<()>;
+        fn reset_actuation_points(&self) -> zbus::Result<()>;
+        fn set_force_digital(&self, force: bool) -> zbus::Result<()>;
 
         #[zbus(signal)]
         fn active_profile_changed(&self, name: String) -> zbus::Result<()>;
@@ -479,6 +582,9 @@ mod tests {
 
         #[zbus(signal)]
         fn device_connection_changed(&self, connected: bool) -> zbus::Result<()>;
+
+        #[zbus(signal)]
+        fn capture_mode_changed(&self, mode: String) -> zbus::Result<()>;
     }
 
     /// Spins up a real, in-process `zbus` peer-to-peer connection (no
@@ -508,6 +614,7 @@ mod tests {
                 schema_version: crate::config::SCHEMA_VERSION,
                 active_profile: DEFAULT_PROFILE_NAME.to_string(),
                 profiles,
+                force_digital: false,
             };
             crate::config::write(&config_path, &config).unwrap();
 
@@ -573,6 +680,7 @@ mod tests {
                 .send(PhysicalEvent {
                     input,
                     state: EventState::Down,
+                    depth: None,
                 })
                 .await
                 .unwrap();
@@ -763,7 +871,7 @@ mod tests {
     async fn get_state_over_real_dbus_returns_the_live_snapshot() {
         let server = TestServer::start().await;
 
-        let (profile, layer, active_toggles, device_connected) =
+        let (profile, layer, active_toggles, device_connected, capture_mode) =
             server.proxy.get_state().await.unwrap();
 
         server.shut_down().await;
@@ -772,6 +880,7 @@ mod tests {
         assert_eq!(layer, "base");
         assert!(active_toggles.is_empty());
         assert!(device_connected);
+        assert_eq!(capture_mode, "digital");
     }
 
     /// Ticket 20's end-to-end live demo, exercised without real hardware: a
@@ -792,7 +901,7 @@ mod tests {
         let signal = signals.next().await.expect("signal must be delivered");
         assert!(!signal.args().unwrap().connected);
 
-        let (_, _, _, device_connected) = server.proxy.get_state().await.unwrap();
+        let (_, _, _, device_connected, _) = server.proxy.get_state().await.unwrap();
         assert!(!device_connected);
 
         server.set_device_connected(true).await;
@@ -853,6 +962,7 @@ mod tests {
             .send(PhysicalEvent {
                 input: Input::ModeKey,
                 state: EventState::Up,
+                depth: None,
             })
             .await
             .unwrap();
@@ -1118,7 +1228,7 @@ mod tests {
         for _ in 0..5 {
             tokio::task::yield_now().await;
         }
-        let (_, _, active_toggles, _) = server.proxy.get_state().await.unwrap();
+        let (_, _, active_toggles, _, _) = server.proxy.get_state().await.unwrap();
         assert_eq!(active_toggles, vec!["grid_r1c1".to_string()]);
 
         server
@@ -1127,7 +1237,7 @@ mod tests {
             .await
             .expect("SwitchProfile must succeed");
 
-        let (_, _, active_toggles, _) = server.proxy.get_state().await.unwrap();
+        let (_, _, active_toggles, _, _) = server.proxy.get_state().await.unwrap();
         assert!(
             active_toggles.is_empty(),
             "the Toggle must be force-stopped by the switch"
@@ -1180,14 +1290,14 @@ mod tests {
         for _ in 0..5 {
             tokio::task::yield_now().await;
         }
-        let (_, _, active_toggles, _) = server.proxy.get_state().await.unwrap();
+        let (_, _, active_toggles, _, _) = server.proxy.get_state().await.unwrap();
         assert_eq!(active_toggles, vec!["grid_r1c1".to_string()]);
 
         // The GUI's own focus-gain sequence: suppress first, then stop.
         server.proxy.set_output_suppressed(true).await.unwrap();
         server.proxy.stop_all_toggles().await.unwrap();
 
-        let (profile, _, active_toggles, _) = server.proxy.get_state().await.unwrap();
+        let (profile, _, active_toggles, _, _) = server.proxy.get_state().await.unwrap();
         assert!(
             active_toggles.is_empty(),
             "the Toggle must be force-stopped"
@@ -1195,7 +1305,11 @@ mod tests {
         assert_eq!(profile, DEFAULT_PROFILE_NAME);
 
         let batches = server.shut_down().await;
-        assert_eq!(batches.len(), 2, "one KeyDown lap, then the force-released KeyUp");
+        assert_eq!(
+            batches.len(),
+            2,
+            "one KeyDown lap, then the force-released KeyUp"
+        );
         let evdev::EventSummary::Key(_, code, value) = batches[1][0].destructure() else {
             panic!("expected a key event");
         };
@@ -1285,7 +1399,7 @@ mod tests {
         for _ in 0..5 {
             tokio::task::yield_now().await;
         }
-        let (_, _, active_toggles, _) = server.proxy.get_state().await.unwrap();
+        let (_, _, active_toggles, _, _) = server.proxy.get_state().await.unwrap();
         assert_eq!(active_toggles, vec!["grid_r1c1".to_string()]);
 
         server
@@ -1303,7 +1417,7 @@ mod tests {
             batches_at_suppression,
             "a running Toggle's output must not reach uinput while suppressed"
         );
-        let (_, _, active_toggles, _) = server.proxy.get_state().await.unwrap();
+        let (_, _, active_toggles, _, _) = server.proxy.get_state().await.unwrap();
         assert_eq!(
             active_toggles,
             vec!["grid_r1c1".to_string()],
@@ -1327,7 +1441,7 @@ mod tests {
         for _ in 0..5 {
             tokio::task::yield_now().await;
         }
-        let (_, _, active_toggles, _) = server.proxy.get_state().await.unwrap();
+        let (_, _, active_toggles, _, _) = server.proxy.get_state().await.unwrap();
         assert!(active_toggles.is_empty());
 
         server.shut_down().await;
@@ -1351,6 +1465,7 @@ mod tests {
             schema_version: crate::config::SCHEMA_VERSION,
             active_profile: DEFAULT_PROFILE_NAME.to_string(),
             profiles,
+            force_digital: false,
         };
         crate::config::write(&config_path, &config).unwrap();
 
@@ -1408,6 +1523,7 @@ mod tests {
                 .send(PhysicalEvent {
                     input: Input::Grid(1, 1),
                     state: EventState::Down,
+                    depth: None,
                 })
                 .await
                 .unwrap();
@@ -1427,5 +1543,177 @@ mod tests {
         drop(event_tx);
         dispatch_handle.await.unwrap().unwrap();
         inj_handle.await.unwrap().unwrap();
+    }
+
+    /// Ticket 21's D-Bus round-trip for `SetActuationPoint`: succeeds over a
+    /// real connection and persists to `config.toml`.
+    #[tokio::test]
+    async fn set_actuation_point_over_real_dbus_persists_the_override() {
+        let server = TestServer::start().await;
+
+        server
+            .proxy
+            .set_actuation_point("grid_r1c1", 200, 180)
+            .await
+            .expect("SetActuationPoint over D-Bus must succeed");
+
+        let on_disk = std::fs::read_to_string(&server.config_path).unwrap();
+        server.shut_down().await;
+
+        assert!(on_disk.contains("grid_r1c1"));
+        assert!(on_disk.contains("200"));
+        assert!(on_disk.contains("180"));
+    }
+
+    #[tokio::test]
+    async fn set_actuation_point_over_real_dbus_with_a_non_grid_input_is_rejected() {
+        let server = TestServer::start().await;
+
+        let err = server
+            .proxy
+            .set_actuation_point("mode_key", 200, 180)
+            .await
+            .expect_err("a non-Grid Input must be rejected");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.InvalidBinding")
+        );
+
+        server.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn set_actuation_point_over_real_dbus_with_release_above_actuation_is_rejected() {
+        let server = TestServer::start().await;
+
+        let err = server
+            .proxy
+            .set_actuation_point("grid_r1c1", 100, 150)
+            .await
+            .expect_err("release > actuation must be rejected");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.InvalidBinding")
+        );
+
+        server.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn clear_actuation_point_over_real_dbus_removes_the_override() {
+        // `GetConfig()`'s wire dict doesn't carry actuation fields (out of
+        // this ticket's scope), so this asserts against `config.toml`
+        // directly, same as `set_binding_over_real_dbus_...`'s own on-disk
+        // assertions above.
+        let server = TestServer::start().await;
+
+        server
+            .proxy
+            .set_actuation_point("grid_r1c1", 200, 180)
+            .await
+            .expect("SetActuationPoint over D-Bus must succeed");
+        server
+            .proxy
+            .clear_actuation_point("grid_r1c1")
+            .await
+            .expect("ClearActuationPoint over D-Bus must succeed");
+
+        let on_disk = std::fs::read_to_string(&server.config_path).unwrap();
+        server.shut_down().await;
+
+        assert!(!on_disk.contains("actuation_overrides"));
+    }
+
+    #[tokio::test]
+    async fn clear_actuation_point_over_real_dbus_with_a_non_grid_input_is_rejected() {
+        let server = TestServer::start().await;
+
+        let err = server
+            .proxy
+            .clear_actuation_point("mode_key")
+            .await
+            .expect_err("a non-Grid Input must be rejected");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.InvalidBinding")
+        );
+
+        server.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn set_default_actuation_over_real_dbus_persists_the_profile_default() {
+        let server = TestServer::start().await;
+
+        server
+            .proxy
+            .set_default_actuation(140, 120)
+            .await
+            .expect("SetDefaultActuation over D-Bus must succeed");
+
+        let on_disk = std::fs::read_to_string(&server.config_path).unwrap();
+        server.shut_down().await;
+
+        assert!(on_disk.contains("140"));
+        assert!(on_disk.contains("120"));
+    }
+
+    #[tokio::test]
+    async fn set_default_actuation_over_real_dbus_with_release_above_actuation_is_rejected() {
+        let server = TestServer::start().await;
+
+        let err = server
+            .proxy
+            .set_default_actuation(100, 150)
+            .await
+            .expect_err("release > actuation must be rejected");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.InvalidBinding")
+        );
+
+        server.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn reset_actuation_points_over_real_dbus_clears_every_override() {
+        let server = TestServer::start().await;
+
+        server
+            .proxy
+            .set_actuation_point("grid_r1c1", 200, 180)
+            .await
+            .expect("SetActuationPoint over D-Bus must succeed");
+        server
+            .proxy
+            .set_actuation_point("grid_r2c2", 90, 70)
+            .await
+            .expect("SetActuationPoint over D-Bus must succeed");
+
+        server
+            .proxy
+            .reset_actuation_points()
+            .await
+            .expect("ResetActuationPoints over D-Bus must succeed");
+
+        // `GetConfig()`'s wire dict doesn't carry actuation fields (out of
+        // this ticket's scope), so this asserts against `config.toml`
+        // directly.
+        let on_disk = std::fs::read_to_string(&server.config_path).unwrap();
+        server.shut_down().await;
+
+        assert!(!on_disk.contains("actuation_overrides"));
+    }
+
+    #[tokio::test]
+    async fn set_force_digital_over_real_dbus_persists_the_preference() {
+        let server = TestServer::start().await;
+
+        server
+            .proxy
+            .set_force_digital(true)
+            .await
+            .expect("SetForceDigital over D-Bus must succeed");
+
+        let on_disk = std::fs::read_to_string(&server.config_path).unwrap();
+        server.shut_down().await;
+
+        assert!(on_disk.contains("force_digital = true"));
     }
 }

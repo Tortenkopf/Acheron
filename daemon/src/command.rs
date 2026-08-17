@@ -14,13 +14,17 @@ use crate::input::Input;
 /// under `Mode key` press/release when the active Profile's
 /// `mode_key_role` is `LayerSwitch`). `active_toggles` is real as of ticket
 /// 17; `device_connected` is real as of ticket 20, reflecting the
-/// `CaptureSource`'s poll loop's current view.
+/// `CaptureSource`'s poll loop's current view. `capture_mode` (`"analog"`/
+/// `"digital"`) is hardcoded to `"digital"` as of ticket 21 — there is no
+/// real analog `CaptureSource` yet to report on; tickets 22/23 make it
+/// genuinely live.
 #[derive(Debug, Clone, PartialEq)]
 pub struct State {
     pub profile: String,
     pub layer: &'static str,
     pub active_toggles: Vec<Input>,
     pub device_connected: bool,
+    pub capture_mode: &'static str,
 }
 
 /// A GUI-originated mutation or read, as pushed through the dispatch task's
@@ -94,7 +98,52 @@ pub enum Command {
     /// alt-tabbing out of a game with a macro still going). Same underlying
     /// mechanism as `SwitchProfile`'s force-stop, minus the Profile change.
     /// Never fails: draining an already-empty `toggles` map is a no-op.
-    StopAllToggles { reply: oneshot::Sender<()> },
+    StopAllToggles {
+        reply: oneshot::Sender<()>,
+    },
+    /// Sets a per-key Actuation/Release point override on the active
+    /// Profile (ticket 17 §5/§7). Fails `InvalidRequest` if `input` isn't a
+    /// `Grid` variant, or if `release > actuation`.
+    SetActuationPoint {
+        input: Input,
+        actuation: u8,
+        release: u8,
+        reply: oneshot::Sender<Result<(), CommandError>>,
+    },
+    /// Removes a per-key override, reverting that key to the active
+    /// Profile's `default_actuation`. Fails `InvalidRequest` if `input`
+    /// isn't a `Grid` variant; idempotent otherwise (clearing an
+    /// already-unoverridden key succeeds with no effect).
+    ClearActuationPoint {
+        input: Input,
+        reply: oneshot::Sender<Result<(), CommandError>>,
+    },
+    /// Sets the active Profile's `default_actuation` — the Actuation/Release
+    /// point every Grid key uses unless it has its own override. Fails
+    /// `InvalidRequest` if `release > actuation`.
+    SetDefaultActuation {
+        actuation: u8,
+        release: u8,
+        reply: oneshot::Sender<Result<(), CommandError>>,
+    },
+    /// Clears every per-key override on the active Profile in one call/one
+    /// `config.toml` rewrite — the GUI's "reset all keys to Profile default"
+    /// affordance (ticket 17 §5), not 20 individual `ClearActuationPoint`
+    /// calls. Never fails on validation grounds (clearing an already-empty
+    /// `actuation_overrides` map is a no-op) — the `Result` reply exists
+    /// only for the same `config.toml`-write-failure case every other
+    /// persisting Command carries.
+    ResetActuationPoints {
+        reply: oneshot::Sender<Result<(), CommandError>>,
+    },
+    /// Sets `Config.force_digital` — the user-facing override that forces
+    /// Digital Capture mode even when Analog would otherwise unlock (ticket
+    /// 17 §4). For this ticket, only persists the flag; swapping the live
+    /// capture source on this call is ticket 23's job.
+    SetForceDigital {
+        force: bool,
+        reply: oneshot::Sender<Result<(), CommandError>>,
+    },
 }
 
 /// Errors a `Command` can fail with. Deliberately narrower than the D-Bus

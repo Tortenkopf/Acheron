@@ -268,7 +268,9 @@ class AcheronApplication(Gtk.Application):
             if status["daemon_running"]:
                 try:
                     config = self._client.get_config()
-                    profile, layer, _active_toggles, device_connected = self._client.get_state()
+                    profile, layer, _active_toggles, device_connected, _capture_mode = (
+                        self._client.get_state()
+                    )
                 except (DaemonError, GLib.Error):
                     # A rare race: the Daemon vanished between
                     # subscribe_daemon_running_changed reporting it up and

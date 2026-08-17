@@ -10,13 +10,13 @@ from .widget_tree import find_all, find_one
 
 def _build(stub, ui_state):
     config = stub.get_config()
-    profile, layer, _toggles, _connected = stub.get_state()
+    profile, layer, _toggles, _connected, _capture_mode = stub.get_state()
     return build_main_view(stub, config, profile, layer, lambda: None, ui_state)
 
 
 def _build_status(stub, status: str, ui_state=None):
     config = stub.get_config()
-    profile, layer, _toggles, _connected = stub.get_state()
+    profile, layer, _toggles, _connected, _capture_mode = stub.get_state()
     return build_status_wrapped_view(
         stub, config, profile, layer, status, lambda: None, ui_state or {"table_open": False}
     )

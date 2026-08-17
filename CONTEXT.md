@@ -51,6 +51,17 @@ The Trigger mode where the Action re-fires continuously for as long as the Input
 **Toggle**:
 The Trigger mode where a single press starts the Action running continuously (looping, for a Macro; held down, for a Keypress) until the same Input is pressed again.
 
+**Depth**:
+The 0-255 measurement of how far a grid key is physically pressed, available only while the Daemon is in analog Capture mode. `None`/absent for every Input without a depth sensor (the Mode key, thumbstick, wheel) and for a grid key while in digital Capture mode.
+_Avoid_: pressure, travel
+
+**Actuation point**:
+The Depth at which a grid key's Binding is considered pressed (fires a Down). Scoped per-Input per-Profile — shared across a Profile's Base and Held Layers, since it describes the key's physical travel, not what it does when triggered.
+_Avoid_: trigger point, threshold
+
+**Release point**:
+The (lower) Depth at which a grid key's Binding is considered released (fires an Up), paired with its Actuation point so a single boundary doesn't chatter (hysteresis).
+
 ### Runtime
 
 **Daemon**:
@@ -60,6 +71,10 @@ _Avoid_: driver, service, agent
 **GUI**:
 The interactive application through which the user edits Profiles, Bindings, and Macros, and monitors current state (active Profile, active Layer). Configures the Daemon; does not perform remapping itself.
 _Avoid_: app, client, frontend
+
+**Capture mode**:
+Which of the Daemon's two ways of reading the grid keys is currently active — **Analog** (via the device's `hidraw` interface, carrying Depth) or **Digital** (the original evdev passthrough, no Depth). Digital is the automatic degradation path if the analog unlock fails; a separate user-facing override can force Digital even when Analog would otherwise work — the user never selects Analog as a normal path, only switches it off.
+_Avoid_: driver mode (the research/prototype write-ups' working name for Analog), evdev mode (informal name for Digital)
 
 **Output suppression**:
 A connected client's request that the Daemon withhold all synthetic output while the request is active, without stopping anything internally — Trigger-mode firing, Macro looping, and a Toggle's running state continue unaffected, and only the write to the physical device is withheld. Distinct from a Toggle *stopping*: a suppressed Toggle is still active and resumes emitting the instant suppression clears. The GUI additionally stops every Toggle outright on its own window gaining focus (`StopAllToggles`, a separate call the GUI makes alongside suppression, not a side effect of suppression itself) — see spec.md's "Toggle behavior across Layer/Profile switches" and "Daemon output suppression" sections.
