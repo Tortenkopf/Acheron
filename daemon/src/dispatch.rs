@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use zbus::object_server::SignalEmitter;
 
@@ -44,6 +44,11 @@ use crate::input::Input;
 /// silently. The command channel closing is not fatal: it only means the
 /// D-Bus server side has gone away, and this task's other job (capture ->
 /// injector passthrough/remapping) still has work to do.
+// Ticket 22 grew this by one parameter (`actuation_tx`) past clippy's
+// default arg-count threshold — every parameter here is a distinct channel
+// handle or piece of startup state this task needs for the process's whole
+// lifetime, not something a struct would meaningfully group.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut rx_events: mpsc::Receiver<PhysicalEvent>,
     mut rx_connection: mpsc::Receiver<bool>,
@@ -52,7 +57,17 @@ pub async fn run(
     mut config: Config,
     config_path: PathBuf,
     signal_emitter: Option<SignalEmitter<'static>>,
+    actuation_tx: watch::Sender<HashMap<Input, ActuationPoint>>,
 ) -> io::Result<()> {
+    // Published once up front so the analog capture source's grid task
+    // (ticket 22/23) has a correct snapshot to threshold against from the
+    // moment it starts, not just from the first mutation onward.
+    actuation_tx.send_replace(
+        config
+            .active_profile()
+            .expect("load_or_seed validates active_profile names a real profile")
+            .resolved_actuation_points(),
+    );
     // Sole owner of every currently-running Toggle (spec.md: "Active
     // toggles: HashMap<Input, ActiveToggle>"), mutated only from this task —
     // no Mutex, matching the rest of the dispatch task's state.
@@ -101,7 +116,7 @@ pub async fn run(
             }
             cmd = rx_commands.recv(), if commands_open => {
                 match cmd {
-                    Some(cmd) => handle_command(&mut config, &config_path, &mut toggles, &active_layer, device_connected, &signal_emitter, cmd).await,
+                    Some(cmd) => handle_command(&mut config, &config_path, &mut toggles, &active_layer, device_connected, &signal_emitter, &actuation_tx, cmd).await,
                     None => commands_open = false,
                 }
             }
@@ -263,14 +278,21 @@ fn reject_non_grid_input(input: Input) -> Result<(), CommandError> {
 }
 
 /// Shared by `SetActuationPoint`/`SetDefaultActuation`: the hysteresis
-/// invariant ticket 17 §2 asks for — a Release point above its Actuation
-/// point would never fire an Up once the Down threshold is crossed.
+/// invariant ticket 17 §2 asks for — a Release point at or above its
+/// Actuation point defeats hysteresis entirely rather than merely
+/// narrowing it. Ticket 22's `capture::analog::observe` is what actually
+/// consumes these points against a live Depth stream: at `release ==
+/// actuation`, a key held at a perfectly steady Depth crosses both
+/// thresholds on every single report, chattering Down/Up forever on a
+/// motionless key (code-review finding on ticket 22 — this check
+/// pre-existed from ticket 21, but only became exploitable once ticket 22
+/// gave it a real consumer).
 fn reject_release_above_actuation(actuation: u8, release: u8) -> Result<(), CommandError> {
-    if release <= actuation {
+    if release < actuation {
         Ok(())
     } else {
         Err(CommandError::InvalidRequest(
-            "release point must not exceed the actuation point".to_string(),
+            "release point must be strictly below the actuation point".to_string(),
         ))
     }
 }
@@ -283,6 +305,26 @@ fn active_profile_mut(config: &mut Config) -> &mut Profile {
         .expect("load_or_seed validates active_profile names a real profile")
 }
 
+/// Republishes the active Profile's resolved Actuation-point snapshot
+/// (ticket 18 §5) — called after every successful mutation that can change
+/// it: `SetActuationPoint`/`ClearActuationPoint`/`SetDefaultActuation`/
+/// `ResetActuationPoints` (all touch the active Profile's own
+/// `actuation_overrides`/`default_actuation`) and `SwitchProfile` (changes
+/// which Profile is active). `send_replace` rather than `send`: this must
+/// not fail just because no `AnalogCaptureSource` grid task has subscribed
+/// yet (ticket 23 wires the real receiver; today's tests hold one only to
+/// keep the channel open).
+fn publish_actuation_snapshot(
+    config: &Config,
+    actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
+) {
+    let profile = config
+        .active_profile()
+        .expect("load_or_seed validates active_profile names a real profile");
+    actuation_tx.send_replace(profile.resolved_actuation_points());
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_command(
     config: &mut Config,
     config_path: &Path,
@@ -290,6 +332,7 @@ async fn handle_command(
     active_layer: &Layer,
     device_connected: bool,
     signal_emitter: &Option<SignalEmitter<'static>>,
+    actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
     cmd: Command,
 ) {
     match cmd {
@@ -463,6 +506,10 @@ async fn handle_command(
                 // across Layer/Profile switches" — no Toggle survives a
                 // Profile switch, regardless of which Profile started it.
                 stop_all_toggles(toggles).await;
+                // The new Profile's own Actuation points (ticket 18 §5) —
+                // the grid task must threshold against the newly active
+                // Profile's values immediately, not the previous one's.
+                publish_actuation_snapshot(config, actuation_tx);
             }
             // The reply is sent *before* the signal, deliberately: the
             // caller's own SwitchProfile call is typically a blocking D-Bus
@@ -513,6 +560,8 @@ async fn handle_command(
                         overrides.remove(&input);
                     }
                 }
+            } else {
+                publish_actuation_snapshot(config, actuation_tx);
             }
             let _ = reply.send(result);
         }
@@ -525,12 +574,14 @@ async fn handle_command(
                 .actuation_overrides
                 .remove(&input);
             let result = persist(config, config_path).await;
-            if result.is_err()
-                && let Some(prev) = previous
-            {
-                active_profile_mut(config)
-                    .actuation_overrides
-                    .insert(input, prev);
+            if result.is_err() {
+                if let Some(prev) = previous {
+                    active_profile_mut(config)
+                        .actuation_overrides
+                        .insert(input, prev);
+                }
+            } else {
+                publish_actuation_snapshot(config, actuation_tx);
             }
             let _ = reply.send(result);
         }
@@ -550,6 +601,8 @@ async fn handle_command(
             let result = persist(config, config_path).await;
             if result.is_err() {
                 active_profile_mut(config).default_actuation = previous;
+            } else {
+                publish_actuation_snapshot(config, actuation_tx);
             }
             let _ = reply.send(result);
         }
@@ -558,6 +611,8 @@ async fn handle_command(
             let result = persist(config, config_path).await;
             if result.is_err() {
                 active_profile_mut(config).actuation_overrides = previous;
+            } else {
+                publish_actuation_snapshot(config, actuation_tx);
             }
             let _ = reply.send(result);
         }
@@ -635,6 +690,14 @@ mod tests {
         PathBuf::from("/nonexistent/acheron-dispatch-test/config.toml")
     }
 
+    /// A fresh Actuation-point watch channel for tests that don't care about
+    /// its published value — `dispatch::run` requires the `Sender` half
+    /// unconditionally (ticket 22), even before ticket 23 wires a real
+    /// `AnalogCaptureSource` grid task to the paired `Receiver`.
+    fn actuation_channel() -> watch::Sender<HashMap<Input, ActuationPoint>> {
+        watch::channel(HashMap::new()).0
+    }
+
     async fn run_scripted(
         scripted: Vec<PhysicalEvent>,
         bindings: HashMap<Input, Binding>,
@@ -653,6 +716,7 @@ mod tests {
             config_with_bindings(bindings),
             unused_config_path(),
             None,
+            actuation_channel(),
         ));
 
         FakeCaptureSource::new(scripted)
@@ -819,6 +883,7 @@ mod tests {
             config_with_bindings(bindings),
             unused_config_path(),
             None,
+            actuation_channel(),
         ));
 
         // Real evdev autorepeat events land tens of milliseconds apart —
@@ -899,6 +964,7 @@ mod tests {
             config_with_bindings(bindings),
             unused_config_path(),
             None,
+            actuation_channel(),
         ));
 
         // Down starts a firing that immediately sends KeyDown, then sleeps
@@ -1056,6 +1122,7 @@ mod tests {
         cmd_tx: mpsc::Sender<Command>,
         event_tx: mpsc::Sender<PhysicalEvent>,
         conn_tx: mpsc::Sender<bool>,
+        actuation_rx: watch::Receiver<HashMap<Input, ActuationPoint>>,
         sink: RecordingSink,
         dispatch_handle: tokio::task::JoinHandle<io::Result<()>>,
         inj_handle: tokio::task::JoinHandle<io::Result<()>>,
@@ -1072,6 +1139,7 @@ mod tests {
             let (event_tx, event_rx) = mpsc::channel(8);
             let (conn_tx, conn_rx) = mpsc::channel(8);
             let (cmd_tx, cmd_rx) = mpsc::channel(8);
+            let (actuation_tx, actuation_rx) = watch::channel(HashMap::new());
             let dispatch_handle = tokio::spawn(run(
                 event_rx,
                 conn_rx,
@@ -1080,6 +1148,7 @@ mod tests {
                 config,
                 config_path.clone(),
                 None,
+                actuation_tx,
             ));
 
             CommandHarness {
@@ -1087,6 +1156,7 @@ mod tests {
                 config_path,
                 cmd_tx,
                 event_tx,
+                actuation_rx,
                 conn_tx,
                 sink,
                 dispatch_handle,
@@ -1266,6 +1336,13 @@ mod tests {
             let (reply, rx) = oneshot::channel();
             self.cmd_tx.send(Command::GetState(reply)).await.unwrap();
             rx.await.unwrap()
+        }
+
+        /// The latest resolved Actuation-point snapshot dispatch has
+        /// published (ticket 18 §5) — the seam an `AnalogCaptureSource` grid
+        /// task's `watch::Receiver` would read `.borrow()` from.
+        fn actuation_snapshot(&self) -> HashMap<Input, ActuationPoint> {
+            self.actuation_rx.borrow().clone()
         }
 
         async fn press(&self, input: Input) {
@@ -2246,6 +2323,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_actuation_point_rejects_a_release_point_equal_to_actuation() {
+        // Code-review finding on ticket 22: `release == actuation` used to
+        // pass this check, but `capture::analog::observe` would then
+        // chatter Down/Up forever on a key held at a perfectly steady
+        // Depth — hysteresis requires a strict gap, not just `<=`.
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .set_actuation_point(Input::Grid(1, 1), 128, 128)
+            .await
+            .expect_err("release == actuation must be rejected");
+        assert!(matches!(err, CommandError::InvalidRequest(_)));
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
     async fn clear_actuation_point_command_reverts_to_the_profile_default() {
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
 
@@ -2353,6 +2447,138 @@ mod tests {
                 .actuation_overrides
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn set_actuation_point_publishes_the_resolved_snapshot() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        // Published once, up front, before any Command — the default for
+        // every one of the 20 Grid keys. `dispatch::run`'s startup publish
+        // races this test's own setup (spawned as a separate task), same
+        // caveat every other cross-channel test in this module documents.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            harness.actuation_snapshot()[&Input::Grid(1, 1)],
+            ActuationPoint::default()
+        );
+
+        harness
+            .set_actuation_point(Input::Grid(1, 1), 200, 180)
+            .await
+            .expect("SetActuationPoint must succeed");
+
+        assert_eq!(
+            harness.actuation_snapshot()[&Input::Grid(1, 1)],
+            ActuationPoint {
+                actuation: 200,
+                release: 180,
+            }
+        );
+        // Every other key is untouched — still the Profile default.
+        assert_eq!(
+            harness.actuation_snapshot()[&Input::Grid(1, 2)],
+            ActuationPoint::default()
+        );
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn clear_actuation_point_publishes_the_reverted_snapshot() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness
+            .set_actuation_point(Input::Grid(1, 1), 200, 180)
+            .await
+            .unwrap();
+
+        harness
+            .clear_actuation_point(Input::Grid(1, 1))
+            .await
+            .expect("ClearActuationPoint must succeed");
+
+        assert_eq!(
+            harness.actuation_snapshot()[&Input::Grid(1, 1)],
+            ActuationPoint::default()
+        );
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn set_default_actuation_publishes_the_new_default_for_every_unoverridden_key() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        harness.set_default_actuation(140, 120).await.unwrap();
+
+        let snapshot = harness.actuation_snapshot();
+        assert_eq!(snapshot.len(), 20);
+        for point in snapshot.values() {
+            assert_eq!(
+                *point,
+                ActuationPoint {
+                    actuation: 140,
+                    release: 120,
+                }
+            );
+        }
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn reset_actuation_points_publishes_the_profile_default_for_every_key() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness
+            .set_actuation_point(Input::Grid(1, 1), 200, 180)
+            .await
+            .unwrap();
+
+        harness.reset_actuation_points().await.unwrap();
+
+        assert_eq!(
+            harness.actuation_snapshot()[&Input::Grid(1, 1)],
+            ActuationPoint::default()
+        );
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn switch_profile_publishes_the_new_profiles_own_actuation_points() {
+        let mut profiles = HashMap::new();
+        profiles.insert(DEFAULT_PROFILE_NAME.to_string(), Profile::default());
+        profiles.insert(
+            "Gaming".to_string(),
+            Profile {
+                default_actuation: ActuationPoint {
+                    actuation: 90,
+                    release: 60,
+                },
+                ..Default::default()
+            },
+        );
+        let config = Config {
+            schema_version: config::SCHEMA_VERSION,
+            active_profile: DEFAULT_PROFILE_NAME.to_string(),
+            profiles,
+            force_digital: false,
+        };
+        let harness = CommandHarness::spawn(config);
+
+        harness.switch_profile("Gaming").await.unwrap();
+
+        assert_eq!(
+            harness.actuation_snapshot()[&Input::Grid(1, 1)],
+            ActuationPoint {
+                actuation: 90,
+                release: 60,
+            }
+        );
+
+        harness.shut_down().await;
     }
 
     #[tokio::test]

@@ -1,8 +1,12 @@
 //! The `CaptureSource` seam: "produces a stream of normalized `PhysicalEvent`s
 //! into a shared channel" is the only contract anything downstream of the
-//! channel relies on (see issue 07 / ticket 13). `evdev_source` is the real
-//! implementation; `fake` is the scripted stand-in used by tests.
+//! channel relies on (see issue 07 / ticket 13). `evdev_source` is the
+//! Digital Capture mode implementation (evdev passthrough, no Depth);
+//! `analog` is the Analog Capture mode implementation (ticket 22: the same
+//! evdev nodes minus the grid, plus a `hidraw` grid task carrying Depth);
+//! `fake` is the scripted stand-in used by tests.
 
+pub mod analog;
 pub mod evdev_source;
 pub mod fake;
 

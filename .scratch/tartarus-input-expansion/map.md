@@ -75,6 +75,30 @@ Like the previous map, this one carries execution.
   was corrected from `17` to `17, 23` — both need real depth events flowing through a running
   Daemon, not just the settled model.
 
+- [Apply the analog data model to code](./issues/21-task-apply-analog-data-model-to-code.md) —
+  landed ticket 17's decided shapes mechanically into `config.rs`/`command.rs`/`dispatch.rs`/
+  `dbus` (`ActuationPoint`, `Config.force_digital`, `PhysicalEvent.depth`, five new D-Bus
+  methods), no hardware needed. Code review caught and fixed a cross-module regression:
+  `GetState()`'s new 5-tuple arity broke the GUI's positional unpacking; threaded `capture_mode`
+  through `daemon_client.py`/`daemon_stub.py`/`app.py` to fix it. Unblocks ticket 22. *(This
+  bullet was missed at the time ticket 21 resolved — added retroactively, caught by ticket 22's
+  own code review.)*
+- [Build the analog CaptureSource](./issues/22-task-build-analog-capture-source.md) — the
+  `hidraw` grid task landed: `/sys/class/hidraw` discovery, an unlock/confirm lifecycle sharing
+  `evdev_source`'s existing absence-retry bucket, a pure `observe()` hysteresis function and
+  `RepeatSchedule` for synthesized Hold-to-repeat (both unit-tested exhaustively, no hardware),
+  and `dispatch.rs` publishing a resolved per-key Actuation-point snapshot into a `watch`
+  channel on every mutation that touches it. `evdev_source`'s node loop generalized to an
+  explicit node subset so the grid task's Main+If02 evdev nodes share one `JoinSet`/presence
+  view with the grid task itself, per ticket 18 §1. Code review caught and fixed two real bugs:
+  `reject_release_above_actuation` accepted `release == actuation` (chatters Down/Up forever on
+  a motionless key once `observe()` actually consumes it), and `poll_readable` only checked
+  `POLLIN`, so a closed/hung-up fd spun in a tight busy-loop instead of ever detecting EOF —
+  caught by this ticket's own new force-release regression test. HITL verification (unlock
+  against the real device, 20-key threshold accuracy, repeat cadence) deferred to the user, who
+  chose to run it themselves; `daemon/examples/analog_probe.rs` is the tool for that. Unblocks
+  ticket 23.
+
 ## Not yet specified
 
 - **Composition between Chord/mouse-button/Stepper/Profile-Switch** — e.g. can a Chord's Action be a Stepper step; can a Stepper's forward/backward pair include a Chord as one side. Not sharp enough to ticket until those tickets have settled their own shape.

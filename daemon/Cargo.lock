@@ -9,6 +9,7 @@ dependencies = [
  "dirs",
  "evdev",
  "futures-util",
+ "libc",
  "serde",
  "tempfile",
  "tokio",

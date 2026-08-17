@@ -652,6 +652,7 @@ mod tests {
             let signal_emitter = SignalEmitter::new(&server_connection, "/com/acheron/Daemon")
                 .unwrap()
                 .into_owned();
+            let (actuation_tx, _actuation_rx) = tokio::sync::watch::channel(HashMap::new());
             let dispatch_handle = tokio::spawn(crate::dispatch::run(
                 event_rx,
                 conn_rx,
@@ -660,6 +661,7 @@ mod tests {
                 config,
                 config_path.clone(),
                 Some(signal_emitter),
+                actuation_tx,
             ));
 
             TestServer {
@@ -1491,6 +1493,7 @@ mod tests {
         let server_connection = server_connection.unwrap();
         let client_connection = client_connection.unwrap();
 
+        let (actuation_tx, _actuation_rx) = tokio::sync::watch::channel(HashMap::new());
         let dispatch_handle = tokio::spawn(crate::dispatch::run(
             event_rx,
             conn_rx,
@@ -1499,6 +1502,7 @@ mod tests {
             config,
             config_path,
             None,
+            actuation_tx,
         ));
 
         {

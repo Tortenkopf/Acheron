@@ -127,6 +127,28 @@ pub struct Profile {
 }
 
 impl Profile {
+    /// The Actuation/Release point every one of the 20 Grid keys resolves to
+    /// right now — `actuation_overrides` where set, `default_actuation`
+    /// otherwise (ticket 18 §5). Dispatch publishes this into a
+    /// `tokio::sync::watch` channel on every mutation that touches either
+    /// field, so the analog capture source's grid task can threshold against
+    /// current values without reading `Config` itself (single ownership).
+    pub fn resolved_actuation_points(&self) -> HashMap<Input, ActuationPoint> {
+        let mut resolved = HashMap::with_capacity(20);
+        for row in 1..=4u8 {
+            for col in 1..=5u8 {
+                let input = Input::Grid(row, col);
+                let point = self
+                    .actuation_overrides
+                    .get(&input)
+                    .copied()
+                    .unwrap_or(self.default_actuation);
+                resolved.insert(input, point);
+            }
+        }
+        resolved
+    }
+
     pub fn layer(&self, layer: Layer) -> &HashMap<Input, Binding> {
         match layer {
             Layer::Base => &self.base,
@@ -515,6 +537,42 @@ action = { type = "keypress", key = "KEY_F1" }
             }
         );
         assert!(profile.actuation_overrides.is_empty());
+    }
+
+    #[test]
+    fn resolved_actuation_points_covers_all_20_grid_keys_default_and_overridden() {
+        let mut profile = Profile {
+            default_actuation: ActuationPoint {
+                actuation: 100,
+                release: 80,
+            },
+            ..Default::default()
+        };
+        profile.actuation_overrides.insert(
+            Input::Grid(2, 3),
+            ActuationPoint {
+                actuation: 200,
+                release: 190,
+            },
+        );
+
+        let resolved = profile.resolved_actuation_points();
+
+        assert_eq!(resolved.len(), 20);
+        assert_eq!(
+            resolved[&Input::Grid(2, 3)],
+            ActuationPoint {
+                actuation: 200,
+                release: 190,
+            }
+        );
+        assert_eq!(
+            resolved[&Input::Grid(1, 1)],
+            ActuationPoint {
+                actuation: 100,
+                release: 80,
+            }
+        );
     }
 
     #[test]

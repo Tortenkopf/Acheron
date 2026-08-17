@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io;
 
 use acheron_daemon::capture::CaptureSource;
@@ -36,6 +37,12 @@ async fn main() -> io::Result<()> {
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
     let (connection_tx, connection_rx) = tokio::sync::mpsc::channel(8);
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(256);
+    // The Actuation-point snapshot seam (ticket 18 §5/ticket 22): dispatch
+    // publishes into `actuation_tx` on every mutation that touches the
+    // active Profile's Actuation points. `actuation_rx` is unused here for
+    // now — wiring it into a live `AnalogCaptureSource` grid task is ticket
+    // 23's job, once that source actually exists.
+    let (actuation_tx, _actuation_rx) = tokio::sync::watch::channel(HashMap::new());
 
     // Built before the dispatch task so a real `SignalEmitter` (ticket 18's
     // `ActiveLayerChanged`, pushed directly from the dispatch task on every
@@ -64,10 +71,11 @@ async fn main() -> io::Result<()> {
         config,
         config_path,
         Some(signal_emitter),
+        actuation_tx,
     ));
 
     let result = tokio::select! {
-        result = EvdevCaptureSource.run(event_tx, connection_tx) => report("capture", result),
+        result = EvdevCaptureSource::ALL.run(event_tx, connection_tx) => report("capture", result),
         result = inj_handle => report("injector", flatten(result)),
         result = dispatch_handle => report("dispatch", flatten(result)),
     };

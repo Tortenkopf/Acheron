@@ -87,6 +87,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scripts_analog_depth_on_grid_inputs_without_any_raw_byte_simulation() {
+        // Ticket 22: report-parsing and the threshold state machine
+        // (`capture::analog::observe`) are separately, already unit-tested
+        // pure functions, so `FakeCaptureSource` only needs to carry
+        // `depth: Some(_)` through unchanged — no `hidraw` report bytes
+        // involved, per ticket 17's widened `PhysicalEvent` shape.
+        let events = vec![
+            PhysicalEvent {
+                input: Input::Grid(2, 3),
+                state: EventState::Down,
+                depth: Some(150),
+            },
+            PhysicalEvent {
+                input: Input::Grid(2, 3),
+                state: EventState::Repeat,
+                depth: Some(200),
+            },
+            PhysicalEvent {
+                input: Input::Grid(2, 3),
+                state: EventState::Up,
+                depth: Some(90),
+            },
+        ];
+        let (tx, mut rx) = mpsc::channel(8);
+        let (connection_tx, _connection_rx) = mpsc::channel(8);
+        FakeCaptureSource::new(events.clone())
+            .run(tx, connection_tx)
+            .await
+            .unwrap();
+
+        for expected in events {
+            assert_eq!(rx.recv().await, Some(expected));
+        }
+        assert_eq!(rx.recv().await, None);
+    }
+
+    #[tokio::test]
     async fn scripted_connection_transitions_are_replayed_in_order_alongside_events() {
         let events = vec![
             ScriptedEvent::Connection(false),
