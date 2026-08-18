@@ -221,6 +221,16 @@ Like the previous map, this one carries execution.
   live `systemctl --user restart`) — spawned
   [Verify the udev-startup-race fix on a real cold reboot](./issues/29-task-verify-udev-startup-race-fix-on-hardware.md).
 
+- [Verify the udev-startup-race fix on a real cold reboot](./issues/29-task-verify-udev-startup-race-fix-on-hardware.md)
+  — live-verified across two cold boots, after catching and correcting a false-negative first
+  attempt: that boot's installed binary was stale (built before ticket 28's actual source edits,
+  confirmed missing the `retry_on_permission_denied` symbol entirely via `nm`/`strings`), so it
+  reproduced the pre-fix crash shape and wasn't a real test. After rebuilding and reinstalling
+  the genuine fix, both following cold boots showed the race still being hit (the retry
+  diagnostic fires once each time) but self-healing within the first attempt — one `Started`
+  line, no `PermissionDenied` crash, no restart — matching ticket 28's own two-boot
+  reproducibility bar. Ticket 28's fix is now fully live-hardware-verified.
+
 ## Not yet specified
 
 - **Composition between Chord/mouse-button/Stepper/Profile-Switch** — e.g. can a Chord's Action be a Stepper step; can a Stepper's forward/backward pair include a Chord as one side. Not sharp enough to ticket until those tickets have settled their own shape.
