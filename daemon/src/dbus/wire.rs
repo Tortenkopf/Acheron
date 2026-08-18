@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use evdev::KeyCode;
 use zbus::zvariant::{OwnedValue, Value};
 
+use crate::command::State;
 use crate::config::{
     Action, Binding, Config, Layer, MacroStepDto, ModeKeyRole, Modifiers, Profile, TriggerMode,
 };
@@ -280,6 +281,36 @@ pub fn config_to_dict(config: &Config) -> Dict {
     dict
 }
 
+/// `GetState()`'s live runtime snapshot (ticket 25) — keyed so a new field
+/// lands in existing clients for free, unlike the positional tuple it
+/// replaces, which broke `app.py`'s `rebuild()` the moment `capture_mode`
+/// was added (ticket 21). Flat scalars only, no nested recursion needed
+/// unlike `config_to_dict`.
+pub fn state_to_dict(state: &State) -> Dict {
+    let mut dict = Dict::new();
+    dict.insert("profile".to_string(), scalar(state.profile.clone()));
+    dict.insert("layer".to_string(), scalar(state.layer.to_string()));
+    dict.insert(
+        "active_toggles".to_string(),
+        scalar(
+            state
+                .active_toggles
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<String>>(),
+        ),
+    );
+    dict.insert(
+        "device_connected".to_string(),
+        scalar(state.device_connected),
+    );
+    dict.insert(
+        "capture_mode".to_string(),
+        scalar(state.capture_mode.to_string()),
+    );
+    dict
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +482,29 @@ mod tests {
             dict_get_string(&default_profile, "mode_key_role"),
             "layer_switch"
         );
+    }
+
+    #[test]
+    fn state_to_dict_keys_every_field_by_name() {
+        use crate::input::Input;
+
+        let state = State {
+            profile: "Gaming".to_string(),
+            layer: "held",
+            active_toggles: vec![Input::Grid(1, 1)],
+            device_connected: true,
+            capture_mode: "analog",
+        };
+
+        let dict = state_to_dict(&state);
+        assert_eq!(dict_get_string(&dict, "profile"), "Gaming");
+        assert_eq!(dict_get_string(&dict, "layer"), "held");
+        assert_eq!(
+            Vec::<String>::try_from(get(&dict, "active_toggles").unwrap().clone()).unwrap(),
+            vec!["grid_r1c1".to_string()]
+        );
+        assert!(bool::try_from(get(&dict, "device_connected").unwrap()).unwrap());
+        assert_eq!(dict_get_string(&dict, "capture_mode"), "analog");
     }
 
     #[test]

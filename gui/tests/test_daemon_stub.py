@@ -14,7 +14,13 @@ def test_fresh_stub_matches_the_seed_configs_shape():
         "active_profile": "Default",
         "profiles": {"Default": {"base": {}, "held": {}, "mode_key_role": "layer_switch"}},
     }
-    assert stub.get_state() == ("Default", "base", [], True, "digital")
+    assert stub.get_state() == {
+        "profile": "Default",
+        "layer": "base",
+        "active_toggles": [],
+        "device_connected": True,
+        "capture_mode": "digital",
+    }
 
 
 def test_set_binding_then_get_config_reflects_it():
@@ -73,7 +79,7 @@ def test_simulate_mode_key_press_and_release_drives_subscribed_callbacks():
     stub.simulate_mode_key_release()
 
     assert seen == ["held", "base"]
-    assert stub.get_state()[1] == "base"
+    assert stub.get_state()["layer"] == "base"
 
 
 def test_create_profile_adds_an_empty_profile():
@@ -128,7 +134,7 @@ def test_rename_profile_renames_and_updates_active_profile():
     assert "Default" not in config["profiles"]
     assert "Renamed" in config["profiles"]
     assert config["active_profile"] == "Renamed"
-    assert stub.get_state()[0] == "Renamed"
+    assert stub.get_state()["profile"] == "Renamed"
 
 
 def test_rename_profile_with_a_duplicate_new_name_raises_already_exists():
@@ -154,7 +160,7 @@ def test_switch_profile_changes_active_profile_and_notifies_subscribers():
 
     stub.switch_profile("Gaming")
 
-    assert stub.get_state()[0] == "Gaming"
+    assert stub.get_state()["profile"] == "Gaming"
     assert seen == ["Gaming"]
     assert stub.calls == [("create_profile", "Gaming"), ("switch_profile", "Gaming")]
 
@@ -170,8 +176,8 @@ def test_switch_profile_clears_active_toggles():
     stub = DaemonStub()
     stub.create_profile("Gaming")
     stub.simulate_toggle_started("grid_r1c1")
-    assert stub.get_state()[2] == ["grid_r1c1"]
+    assert stub.get_state()["active_toggles"] == ["grid_r1c1"]
 
     stub.switch_profile("Gaming")
 
-    assert stub.get_state()[2] == []
+    assert stub.get_state()["active_toggles"] == []

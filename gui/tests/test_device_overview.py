@@ -10,13 +10,15 @@ from .widget_tree import find_all, find_one
 
 def _build(stub, ui_state):
     config = stub.get_config()
-    profile, layer, _toggles, _connected, _capture_mode = stub.get_state()
+    state = stub.get_state()
+    profile, layer = state["profile"], state["layer"]
     return build_main_view(stub, config, profile, layer, lambda: None, ui_state)
 
 
 def _build_status(stub, status: str, ui_state=None):
     config = stub.get_config()
-    profile, layer, _toggles, _connected, _capture_mode = stub.get_state()
+    state = stub.get_state()
+    profile, layer = state["profile"], state["layer"]
     return build_status_wrapped_view(
         stub, config, profile, layer, status, lambda: None, ui_state or {"table_open": False}
     )
@@ -108,7 +110,7 @@ def test_clicking_a_sidebar_profile_button_switches_to_it():
 
     switch_btn.emit("clicked")
 
-    assert stub.get_state()[0] == "Gaming"
+    assert stub.get_state()["profile"] == "Gaming"
     assert ("switch_profile", "Gaming") in stub.calls
 
 
@@ -186,7 +188,7 @@ def test_tray_quick_switch_calls_switch_profile():
 
     gaming_btn.emit("clicked")
 
-    assert stub.get_state()[0] == "Gaming"
+    assert stub.get_state()["profile"] == "Gaming"
 
 
 def test_a_failed_tray_quick_switch_shows_an_error_and_keeps_the_popover_open():
@@ -202,7 +204,7 @@ def test_a_failed_tray_quick_switch_shows_an_error_and_keeps_the_popover_open():
 
     error_label = find_one(popover, lambda w: "error" in w.get_css_classes())
     assert error_label.get_visible()
-    assert stub.get_state()[0] == "Default"
+    assert stub.get_state()["profile"] == "Default"
 
 
 def test_switching_profile_via_the_sidebar_clears_active_toggles():
@@ -214,13 +216,13 @@ def test_switching_profile_via_the_sidebar_clears_active_toggles():
     stub = DaemonStub()
     stub.create_profile("Gaming")
     stub.simulate_toggle_started("grid_r1c1")
-    assert stub.get_state()[2] == ["grid_r1c1"]
+    assert stub.get_state()["active_toggles"] == ["grid_r1c1"]
 
     root = _build(stub, {"table_open": False})
     switch_btn = find_one(_profile_sidebar(root), lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Gaming")
     switch_btn.emit("clicked")
 
-    assert stub.get_state()[2] == []
+    assert stub.get_state()["active_toggles"] == []
 
 
 class _SwitchProfileFailsDaemonStub(DaemonStub):
@@ -242,7 +244,7 @@ def test_a_failed_switch_shows_an_error_in_the_sidebar_instead_of_swallowing_it(
     assert error_label.get_visible()
     assert error_label.get_label()
     # The failed switch must not be misreported as having happened.
-    assert stub.get_state()[0] == "Default"
+    assert stub.get_state()["profile"] == "Default"
 
 
 class _DeleteProfileFailsDaemonStub(DaemonStub):

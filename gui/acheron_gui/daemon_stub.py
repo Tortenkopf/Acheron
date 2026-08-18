@@ -69,14 +69,14 @@ class DaemonStub:
             "profiles": {name: copy.deepcopy(profile) for name, profile in self._profiles.items()},
         }
 
-    def get_state(self) -> tuple[str, str, list[str], bool, str]:
-        return (
-            self._active_profile,
-            self._layer,
-            list(self._active_toggles),
-            self._device_connected,
-            self._capture_mode,
-        )
+    def get_state(self) -> dict:
+        return {
+            "profile": self._active_profile,
+            "layer": self._layer,
+            "active_toggles": list(self._active_toggles),
+            "device_connected": self._device_connected,
+            "capture_mode": self._capture_mode,
+        }
 
     def set_binding(self, input_str: str, layer: str, binding: dict) -> None:
         # Deep-copied for the same reason: SetBinding's real wire encoding

@@ -153,30 +153,22 @@ impl Daemon {
         Ok(wire::config_to_dict(&config))
     }
 
-    /// The live runtime snapshot. `active_toggles` reflects the dispatch
+    /// The live runtime snapshot, keyed by field name (ticket 25 — a
+    /// positional tuple broke `app.py`'s `rebuild()` the moment `capture_mode`
+    /// was added in ticket 21). `active_toggles` reflects the dispatch
     /// task's real `HashMap<Input, ActiveToggle>` as of ticket 17. `layer`
     /// reflects the dispatch task's real active Layer as of ticket 18.
     /// `device_connected` reflects the `CaptureSource`'s poll loop's current
     /// view as of ticket 20. `capture_mode` (`"analog"`/`"digital"`) is real
     /// as of ticket 23 — see `command::State`'s doc comment.
-    async fn get_state(&self) -> Result<(String, String, Vec<String>, bool, String), DaemonError> {
+    async fn get_state(&self) -> Result<HashMap<String, OwnedValue>, DaemonError> {
         let (reply, rx) = oneshot::channel();
         self.commands
             .send(Command::GetState(reply))
             .await
             .map_err(dispatch_gone)?;
         let state = rx.await.map_err(dispatch_gone)?;
-        Ok((
-            state.profile,
-            state.layer.to_string(),
-            state
-                .active_toggles
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            state.device_connected,
-            state.capture_mode.to_string(),
-        ))
+        Ok(wire::state_to_dict(&state))
     }
 
     /// Level-sets whether the calling client wants Daemon output withheld —
@@ -550,7 +542,7 @@ mod tests {
     )]
     trait DaemonProxy {
         fn get_config(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
-        fn get_state(&self) -> zbus::Result<(String, String, Vec<String>, bool, String)>;
+        fn get_state(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
         fn set_binding(
             &self,
             input: &str,
@@ -886,10 +878,30 @@ mod tests {
     async fn get_state_over_real_dbus_returns_the_live_snapshot() {
         let server = TestServer::start().await;
 
-        let (profile, layer, active_toggles, device_connected, capture_mode) =
-            server.proxy.get_state().await.unwrap();
+        let state = server.proxy.get_state().await.unwrap();
 
         server.shut_down().await;
+
+        let profile: String = state.get("profile").unwrap().clone().try_into().unwrap();
+        let layer: String = state.get("layer").unwrap().clone().try_into().unwrap();
+        let active_toggles: Vec<String> = state
+            .get("active_toggles")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let device_connected: bool = state
+            .get("device_connected")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let capture_mode: String = state
+            .get("capture_mode")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
 
         assert_eq!(profile, DEFAULT_PROFILE_NAME);
         assert_eq!(layer, "base");
@@ -916,7 +928,13 @@ mod tests {
         let signal = signals.next().await.expect("signal must be delivered");
         assert!(!signal.args().unwrap().connected);
 
-        let (_, _, _, device_connected, _) = server.proxy.get_state().await.unwrap();
+        let state = server.proxy.get_state().await.unwrap();
+        let device_connected: bool = state
+            .get("device_connected")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
         assert!(!device_connected);
 
         server.set_device_connected(true).await;
@@ -1192,10 +1210,11 @@ mod tests {
         let signal = signals.next().await.expect("signal must be delivered");
         assert_eq!(signal.args().unwrap().name, "Gaming");
 
-        let (profile, ..) = server.proxy.get_state().await.unwrap();
+        let state = server.proxy.get_state().await.unwrap();
         drop(signals);
         server.shut_down().await;
 
+        let profile: String = state.get("profile").unwrap().clone().try_into().unwrap();
         assert_eq!(profile, "Gaming");
     }
 
@@ -1243,7 +1262,13 @@ mod tests {
         for _ in 0..5 {
             tokio::task::yield_now().await;
         }
-        let (_, _, active_toggles, _, _) = server.proxy.get_state().await.unwrap();
+        let state = server.proxy.get_state().await.unwrap();
+        let active_toggles: Vec<String> = state
+            .get("active_toggles")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
         assert_eq!(active_toggles, vec!["grid_r1c1".to_string()]);
 
         server
@@ -1252,7 +1277,13 @@ mod tests {
             .await
             .expect("SwitchProfile must succeed");
 
-        let (_, _, active_toggles, _, _) = server.proxy.get_state().await.unwrap();
+        let state = server.proxy.get_state().await.unwrap();
+        let active_toggles: Vec<String> = state
+            .get("active_toggles")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
         assert!(
             active_toggles.is_empty(),
             "the Toggle must be force-stopped by the switch"
@@ -1305,14 +1336,27 @@ mod tests {
         for _ in 0..5 {
             tokio::task::yield_now().await;
         }
-        let (_, _, active_toggles, _, _) = server.proxy.get_state().await.unwrap();
+        let state = server.proxy.get_state().await.unwrap();
+        let active_toggles: Vec<String> = state
+            .get("active_toggles")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
         assert_eq!(active_toggles, vec!["grid_r1c1".to_string()]);
 
         // The GUI's own focus-gain sequence: suppress first, then stop.
         server.proxy.set_output_suppressed(true).await.unwrap();
         server.proxy.stop_all_toggles().await.unwrap();
 
-        let (profile, _, active_toggles, _, _) = server.proxy.get_state().await.unwrap();
+        let state = server.proxy.get_state().await.unwrap();
+        let active_toggles: Vec<String> = state
+            .get("active_toggles")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let profile: String = state.get("profile").unwrap().clone().try_into().unwrap();
         assert!(
             active_toggles.is_empty(),
             "the Toggle must be force-stopped"
@@ -1414,7 +1458,13 @@ mod tests {
         for _ in 0..5 {
             tokio::task::yield_now().await;
         }
-        let (_, _, active_toggles, _, _) = server.proxy.get_state().await.unwrap();
+        let state = server.proxy.get_state().await.unwrap();
+        let active_toggles: Vec<String> = state
+            .get("active_toggles")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
         assert_eq!(active_toggles, vec!["grid_r1c1".to_string()]);
 
         server
@@ -1432,7 +1482,13 @@ mod tests {
             batches_at_suppression,
             "a running Toggle's output must not reach uinput while suppressed"
         );
-        let (_, _, active_toggles, _, _) = server.proxy.get_state().await.unwrap();
+        let state = server.proxy.get_state().await.unwrap();
+        let active_toggles: Vec<String> = state
+            .get("active_toggles")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
         assert_eq!(
             active_toggles,
             vec!["grid_r1c1".to_string()],
@@ -1456,7 +1512,13 @@ mod tests {
         for _ in 0..5 {
             tokio::task::yield_now().await;
         }
-        let (_, _, active_toggles, _, _) = server.proxy.get_state().await.unwrap();
+        let state = server.proxy.get_state().await.unwrap();
+        let active_toggles: Vec<String> = state
+            .get("active_toggles")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
         assert!(active_toggles.is_empty());
 
         server.shut_down().await;
@@ -1756,7 +1818,13 @@ mod tests {
         let signal = signals.next().await.unwrap();
         assert_eq!(signal.args().unwrap().mode, "analog");
 
-        let (_, _, _, _, capture_mode) = server.proxy.get_state().await.unwrap();
+        let state = server.proxy.get_state().await.unwrap();
+        let capture_mode: String = state
+            .get("capture_mode")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
         assert_eq!(capture_mode, "analog");
 
         server.shut_down().await;

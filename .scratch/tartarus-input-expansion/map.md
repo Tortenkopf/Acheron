@@ -133,6 +133,16 @@ Like the previous map, this one carries execution.
   [ticket 19](./issues/19-prototype-trigger-point-ux-and-live-depth.md) and
   [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) (both now also clear of 17).
 
+- [Decide the D-Bus GetState() wire shape](./issues/25-decide-dbus-state-wire-shape.md)
+  — `GetState()` moves off its positional 5-tuple onto a keyed dict, matching
+  `GetConfig()`'s existing convention, since only a keyed shape structurally
+  prevents the class of bug that broke `app.py`'s `rebuild()` in ticket 21 (a
+  new field silently changing the tuple's arity). Built in this session, not
+  deferred: `wire::state_to_dict()` mirrors `config_to_dict`'s pattern
+  server-side; `daemon_client.py`/`daemon_stub.py`/`app.py` and 26 Rust/
+  Python test call sites updated to match. All 171 Rust + 70 Python tests
+  pass.
+
 ## Not yet specified
 
 - **Composition between Chord/mouse-button/Stepper/Profile-Switch** — e.g. can a Chord's Action be a Stepper step; can a Stepper's forward/backward pair include a Chord as one side. Not sharp enough to ticket until those tickets have settled their own shape.
