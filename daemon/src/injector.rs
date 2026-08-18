@@ -4,6 +4,7 @@
 
 use std::fmt;
 use std::io;
+use std::time::Duration;
 
 use evdev::uinput::VirtualDevice;
 use evdev::{AttributeSet, InputEvent, KeyCode, KeyEvent, RelativeAxisCode, RelativeAxisEvent};
@@ -45,6 +46,41 @@ pub fn build_device() -> io::Result<VirtualDevice> {
         .with_keys(&keys)?
         .with_relative_axes(&axes)?
         .build()
+}
+
+/// Retries a fallible open on `PermissionDenied` alone, bounded by
+/// `attempts` with `delay` between each (ticket 28).
+///
+/// Written generically over `open`'s return type — rather than hardcoded to
+/// `build_device`/`VirtualDevice` — so the retry/backoff decision can be
+/// unit-tested with a plain fake instead of a real device open. `label` is
+/// only used for the one-time diagnostic on the first retry.
+pub async fn retry_on_permission_denied<T, F>(
+    label: &str,
+    mut open: F,
+    delay: Duration,
+    attempts: u32,
+) -> io::Result<T>
+where
+    F: FnMut() -> io::Result<T>,
+{
+    let mut last_err = None;
+    for attempt in 0..attempts {
+        match open() {
+            Ok(value) => return Ok(value),
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                if attempt == 0 {
+                    eprintln!(
+                        "acheron-daemon: {label} not accessible yet (permission denied), retrying: {err}"
+                    );
+                }
+                last_err = Some(err);
+                tokio::time::sleep(delay).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_err.expect("attempts is always > 0 at every call site"))
 }
 
 /// A write-command sent to the injector task — either a passthrough
@@ -348,5 +384,59 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(KeyCode::KEY_F1, 0)]
         );
+    }
+
+    #[tokio::test]
+    async fn retry_on_permission_denied_succeeds_once_the_open_stops_failing() {
+        let mut remaining_denials = 3;
+        let result = retry_on_permission_denied(
+            "fake",
+            || {
+                if remaining_denials > 0 {
+                    remaining_denials -= 1;
+                    Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                } else {
+                    Ok(42)
+                }
+            },
+            Duration::from_millis(0),
+            5,
+        )
+        .await;
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn retry_on_permission_denied_gives_up_after_the_attempt_bound() {
+        let mut calls = 0;
+        let result: io::Result<()> = retry_on_permission_denied(
+            "fake",
+            || {
+                calls += 1;
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            },
+            Duration::from_millis(0),
+            3,
+        )
+        .await;
+        assert_eq!(calls, 3);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn retry_on_permission_denied_does_not_retry_other_error_kinds() {
+        let mut calls = 0;
+        let result: io::Result<()> = retry_on_permission_denied(
+            "fake",
+            || {
+                calls += 1;
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            },
+            Duration::from_millis(0),
+            5,
+        )
+        .await;
+        assert_eq!(calls, 1);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
     }
 }

@@ -205,6 +205,22 @@ Like the previous map, this one carries execution.
   the checkbox, confirming the badge reads correctly on reopen. 177 Rust + 83 Python tests
   green. Ticket 26's build is now fully live-hardware-verified.
 
+- [Fix the acheron-daemon udev startup race](./issues/28-task-fix-acheron-daemon-udev-startup-race.md)
+  — the ticket's own working hypothesis (a race against `60-acheron-tartarus-pro.rules`
+  landing on the Tartarus's `hidraw` nodes) was wrong: that path is already handled softly by
+  the capture layer. Checking this system's real udev config instead (`getfacl /dev/uinput`,
+  `/usr/lib/udev/rules.d/60-steam-input.rules`) found the actual cause is `/dev/uinput`'s own
+  `uaccess`-tag ACL, granted when the login session activates — unordered against
+  `graphical-session.target` — racing `main()`'s first, previously-unguarded
+  `injector::build_device()` call. None of the ticket's three systemd/udev-ordering candidates
+  would have reliably fixed this, so no packaging/unit/udev-rule changes were made. Fixed in
+  code instead: `injector::retry_on_permission_denied`, generic and unit-tested, bounded at 5s
+  (25×200ms), wired into `main()`'s device build — mirrors the capture layer's existing
+  absence-retry precedent, just applied to the one startup call site that didn't have it yet.
+  180 Rust tests green. Not yet verified live (needs a real cold reboot, can't substitute a
+  live `systemctl --user restart`) — spawned
+  [Verify the udev-startup-race fix on a real cold reboot](./issues/29-task-verify-udev-startup-race-fix-on-hardware.md).
+
 ## Not yet specified
 
 - **Composition between Chord/mouse-button/Stepper/Profile-Switch** — e.g. can a Chord's Action be a Stepper step; can a Stepper's forward/backward pair include a Chord as one side. Not sharp enough to ticket until those tickets have settled their own shape.

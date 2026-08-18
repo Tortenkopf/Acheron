@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io;
+use std::time::Duration;
 
 use acheron_daemon::capture::supervisor;
 use acheron_daemon::config;
@@ -39,7 +40,20 @@ async fn main() -> io::Result<()> {
         std::process::exit(1);
     });
 
-    let device = injector::build_device()?;
+    // /dev/uinput's access comes from udev's `uaccess` tag, applied when the
+    // login session becomes active — not ordered against
+    // `graphical-session.target`, so the very first `acheron-daemon` start
+    // of a fresh session reliably lost this race on real hardware (ticket
+    // 28), turning `build_device()`'s `PermissionDenied` into a hard
+    // `main()` exit before the capture layer's own, already-soft handling
+    // of the *Tartarus's* permission gap ever got a chance to run.
+    let device = injector::retry_on_permission_denied(
+        "/dev/uinput",
+        injector::build_device,
+        Duration::from_millis(200),
+        25,
+    )
+    .await?;
     let (inj, inj_handle) = injector::spawn(device);
 
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
