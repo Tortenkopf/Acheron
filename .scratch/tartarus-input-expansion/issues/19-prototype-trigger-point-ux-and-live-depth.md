@@ -1,4 +1,5 @@
 Type: prototype
+Status: resolved
 Blocked by: 17, 23
 
 ## Question
@@ -50,4 +51,60 @@ Settle at least:
 
 ## Answer
 
-_(unresolved)_
+Prototyped three structurally different variants in a throwaway GTK4 app (real
+`binding_editor.py` widget on top, a variant-specific Actuation section below it,
+switchable via a bottom pill): **A** inline/one-marker/raw, **B** inline/two-marker/
+percent+badge, **C** a separate all-20-key calibration overview with presets. No real
+hardware in this environment, so a `Gtk.Scale` simulated the physical key (drag or
+auto-sweep) and a button flipped simulated capture mode to preview the digital fallback.
+Captured on the `prototype/19-trigger-point-depth-ux` branch (not on `main` — see that
+branch's commit for the full three-variant code); `main` keeps only this decision.
+
+**Winner: variant B**, refined over two rounds of live reaction:
+
+- **Editor surface**: inline in `binding_editor.py`, directly below the existing
+  Trigger-mode/Action controls, for the single Input currently open in the editor — not a
+  separate all-20 overview (that was variant C; rejected as an extra click for the common
+  case of tuning the key you're already looking at).
+- **The bar's width**: spans the full width of the editor/dialog (not a fixed narrow
+  control) — caught and fixed twice from live screenshots: first the fill (100% depth)
+  fell short of the bar's actual right edge because the fill math used a hardcoded pixel
+  constant while the bar itself had already stretched to its container's width; the fix
+  makes both the bar and its fill/marker math track the real allocated width (and stay
+  correct across a live window resize), rather than pinning the bar to a fixed size.
+- **Units**: percentage (e.g. "66%"), not raw `0`-`255` — raw felt like it needed
+  interpretation Actuation/percentage doesn't.
+- **Hysteresis**: two independent, explicitly draggable markers — green for Actuation
+  (fires Down), amber for Release (fires Up) — not one derived from the other. Dragging
+  enforces `release < actuation` by clamping. The legend text below the bar colors the
+  words "green"/"amber" themselves to match their markers, so the mapping reads at a
+  glance rather than requiring the reader to cross-reference a color swatch.
+- **Digital-mode fallback**: shown with an explanation, not hidden — the bar greys out
+  (dimmed, insensitive) and a warning ("No depth — analog capture unavailable") sits
+  centered *on top of* the greyed bar in a dark, legible pill, rather than as a separate
+  line of text below it (moved there after the first live reaction — a below-the-bar note
+  read as disconnected from what it was explaining).
+- **Discoverability**: a badge next to the "Actuation & release" heading doubles as a
+  *live* capture-mode indicator, not a static "this key supports analog" label — green
+  "analog" / warm-red "digital", flipping with the Daemon's actual reported mode. The
+  fold-in note in the prototype: this same badge belongs in Device Overview too, not only
+  this editor, so a user can tell at a glance which mode they're in without opening a
+  Binding.
+- **The D-Bus shape** (design sketch via the prototype's `SimDepth`/`CaptureModeState`,
+  not yet built against the real Daemon): a `StartDepthStream(input)` /
+  `StopDepthStream(input)` request pair, scoped to the requesting client's own bus
+  connection (auto-stopped on disconnect — mirrors `SetOutputSuppressed` being
+  request-scoped rather than globally toggled) plus a `DepthChanged(input, depth)` signal,
+  rate-limited to roughly 30Hz — well under the ~1ms-per-change rate ticket 13 measured on
+  real hardware, so the wire never gets the firehose the charting session's "always-on was
+  rejected" note warned about. Independent of `StopAllToggles`/output-suppression's
+  lifecycle (streaming depth doesn't need to suppress output, and vice versa). Starts when
+  the editor opens for a grid Input, stops when it closes, matching the charting session's
+  "on request, not always" call.
+- **`GetConfig()`'s wire dict**: still doesn't serialize `default_actuation`/
+  `actuation_overrides` — confirmed still open, deferred to the build ticket below.
+
+Spawned [Build the trigger-point UX and live-depth channel for real](./26-task-build-trigger-point-depth-ux.md)
+to land this design against the real Daemon D-Bus surface, `binding_editor.py`, and live
+hardware — this ticket settled the shape from a throwaway; nothing here is wired into the
+real GUI yet.

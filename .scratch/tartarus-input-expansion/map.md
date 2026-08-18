@@ -143,6 +143,23 @@ Like the previous map, this one carries execution.
   Python test call sites updated to match. All 171 Rust + 70 Python tests
   pass.
 
+- [Design trigger-point UX and live-depth channel](./issues/19-prototype-trigger-point-ux-and-live-depth.md)
+  — prototyped three variants (inline/one-marker/raw, inline/two-marker/percent+badge,
+  separate all-20-key overview) in a throwaway GTK4 app, captured on
+  `prototype/19-trigger-point-depth-ux` (not `main`). **Variant B won**, refined over two
+  rounds of live reaction: inline in `binding_editor.py` below the existing controls, two
+  independently draggable markers (green Actuation/amber Release, legend text colored to
+  match), percentage units, a bar that spans the editor's full width and stays correct
+  across a resize (two live-screenshot bugs caught and fixed in session), a badge that
+  doubles as a *live* analog/digital capture-mode indicator (green/warm-red) rather than a
+  static label, and a digital-mode fallback that greys the bar and overlays its warning
+  centered on top rather than as a separate line below. Sketches the D-Bus shape via the
+  prototype's `SimDepth`: a connection-scoped `StartDepthStream`/`StopDepthStream` pair
+  plus a `DepthChanged` signal at ~30Hz, independent of `StopAllToggles`/output-suppression,
+  live only while the editor is open. `GetConfig()` still doesn't serialize
+  `default_actuation`/`actuation_overrides`. None of this is wired into the real GUI/Daemon
+  yet — spawned [Build the trigger-point UX and live-depth channel for real](./issues/26-task-build-trigger-point-depth-ux.md).
+
 ## Not yet specified
 
 - **Composition between Chord/mouse-button/Stepper/Profile-Switch** — e.g. can a Chord's Action be a Stepper step; can a Stepper's forward/backward pair include a Chord as one side. Not sharp enough to ticket until those tickets have settled their own shape.
