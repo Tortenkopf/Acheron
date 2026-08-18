@@ -9,6 +9,7 @@
 pub mod analog;
 pub mod evdev_source;
 pub mod fake;
+pub mod supervisor;
 
 use crate::input::Input;
 use tokio::sync::mpsc;
@@ -21,6 +22,28 @@ pub enum EventState {
     Down,
     Repeat,
     Up,
+}
+
+/// Which physical capture path is currently live (ticket 17 §4 /
+/// `command::State::capture_mode`): `Analog` reads the 20 grid keys' Depth
+/// over `hidraw` (`capture::analog::AnalogCaptureSource`); `Digital` reads
+/// every Input, grid included, over evdev (`capture::evdev_source::
+/// EvdevCaptureSource`) — the automatic degradation path ticket 23's
+/// supervisor falls back to when Analog can't unlock, and the explicit
+/// `force_digital` override always selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureMode {
+    Analog,
+    Digital,
+}
+
+impl CaptureMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CaptureMode::Analog => "analog",
+            CaptureMode::Digital => "digital",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

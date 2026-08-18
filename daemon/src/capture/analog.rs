@@ -27,15 +27,17 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use evdev::Device;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
-use super::evdev_source;
+use super::evdev_source::{self, interruptible_sleep, poll_readable};
 use super::{CaptureSource, EventState, PhysicalEvent};
 use crate::config::ActuationPoint;
 use crate::input::{Input, Node};
@@ -122,9 +124,8 @@ fn unlock_cmd() -> [u8; RAZER_CMD_LEN] {
 }
 
 /// Built for parity with `prototype.py`'s `RELOCK_CMD` and to keep both
-/// commands' construction visibly identical; sending it (mode lifecycle,
-/// re-lock on shutdown) is ticket 23's job, not this module's.
-#[allow(dead_code)]
+/// commands' construction visibly identical; sent by `relock` below (ticket
+/// 23: mode lifecycle, re-lock on shutdown/swap-away-from-analog).
 fn relock_cmd() -> [u8; RAZER_CMD_LEN] {
     build_razer_cmd(
         TRANSACTION_ID,
@@ -305,36 +306,42 @@ fn send_unlock(control: &fs::File) -> io::Result<()> {
     }
 }
 
-/// Blocks up to `timeout_ms` for `fd` to become readable, retrying
-/// transparently on `EINTR` (a signal interrupting the syscall, not a real
-/// failure).
-fn poll_readable(fd: RawFd, timeout_ms: i32) -> io::Result<bool> {
-    loop {
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-        if ret < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(err);
-        }
-        // `POLLHUP`/`POLLERR` must count as "readable" too, not just
-        // `POLLIN` — caught by this module's own
-        // `a_dropped_connection_force_releases_...` test: once a peer
-        // closes and the buffer drains, `poll` can report `POLLHUP` alone
-        // (no `POLLIN` bit), and treating that as "not readable" spun this
-        // loop in a tight, immediately-returning busy-loop forever instead
-        // of ever calling `read()` to observe the EOF. A subsequent
-        // `read()` on a `POLLHUP`/`POLLERR` fd correctly returns `0` or an
-        // `Err`, which the caller already handles.
-        const READABLE: i16 = libc::POLLIN | libc::POLLHUP | libc::POLLERR;
-        return Ok(ret > 0 && pfd.revents & READABLE != 0);
+fn send_relock(control: &fs::File) -> io::Result<()> {
+    let mut buf = relock_cmd();
+    let ret = unsafe {
+        libc::ioctl(
+            control.as_raw_fd(),
+            hidiocsfeature(RAZER_CMD_LEN as u32) as libc::c_ulong,
+            buf.as_mut_ptr(),
+        )
+    };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
+}
+
+/// Best-effort, standalone relock: (re)discovers the control interface and
+/// sends `MODE_NORMAL` on a freshly opened fd, independent of any running
+/// grid task's own connection. Ticket 16 confirmed a relock from a fresh
+/// handle that never sent the unlock still succeeds — the same property that
+/// makes this safe to call unconditionally, whether or not this process ever
+/// actually unlocked the device: main.rs's SIGTERM/SIGINT handler and the
+/// supervisor's swap-away-from-analog path (ticket 23) both call this rather
+/// than threading a live control-fd handle across task boundaries, so a
+/// failure here (no udev access, device unplugged) is just reported, not
+/// fatal — there is nothing left to clean up in that case anyway.
+pub fn relock() -> io::Result<()> {
+    let interfaces = discover_hidraw();
+    let control_path = interfaces
+        .get(&CONTROL_INTERFACE)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+    let control_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(control_path)?;
+    send_relock(&control_file)
 }
 
 /// Waits up to `UNLOCK_TIMEOUT` for report `0x06` to arrive on the
@@ -370,16 +377,21 @@ fn wait_for_unlock_confirmation(analog: &mut fs::File) -> io::Result<bool> {
 
 /// The main relay loop once the unlock is confirmed: reads report `0x06`,
 /// thresholds each of the 20 depth bytes against the live Actuation-point
-/// snapshot, and synthesizes Hold-to-repeat. Returns `Ok(())` only once `tx`
-/// closes (clean shutdown); returns `Err` on any read failure, absent-device
-/// or genuine alike — the caller tells those apart via `is_grid_absent`. On
-/// an `Err` exit, force-releases every Grid key still tracked as held (see
-/// the trailing block below) before returning it.
+/// snapshot, and synthesizes Hold-to-repeat. Returns `Ok(())` once `tx`
+/// closes (clean shutdown) or `shutdown` is set (ticket 23, checked every
+/// `REPORT_POLL_TIMEOUT` tick); returns `Err` on any read failure,
+/// absent-device or genuine alike — the caller tells those apart via
+/// `is_grid_absent`. On an `Err` exit, force-releases every Grid key still
+/// tracked as held (see the trailing block below) before returning it —
+/// deliberately skipped on the two clean-stop paths, matching the existing
+/// "tx closed" case, since neither represents a dropped connection the next
+/// reopen needs protecting against.
 fn relay_grid_blocking(
     analog: &mut fs::File,
     schedule: RepeatSchedule,
     tx: &mpsc::Sender<PhysicalEvent>,
     actuation_rx: &mut watch::Receiver<HashMap<Input, ActuationPoint>>,
+    shutdown: &AtomicBool,
 ) -> io::Result<()> {
     let fd = analog.as_raw_fd();
     let mut key_states = [KeyState::Up; NUM_KEYS];
@@ -393,6 +405,9 @@ fn relay_grid_blocking(
     let mut snapshot = actuation_rx.borrow_and_update().clone();
 
     let result: io::Result<()> = 'relay: loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let timeout_ms = REPORT_POLL_TIMEOUT.as_millis() as i32;
         let readable = match poll_readable(fd, timeout_ms) {
             Ok(readable) => readable,
@@ -500,24 +515,32 @@ fn relay_grid_blocking(
 /// One full grid-task lifecycle cycle: discover, open, cache the repeat
 /// schedule, unlock, confirm, relay — falling back to the absence-retry
 /// bucket at every stage per ticket 18 §2/§3/§7, and only ever returning on
-/// clean shutdown or a genuine (non-absent) error.
+/// clean shutdown, `shutdown` being set (ticket 23), or a genuine
+/// (non-absent) error.
 fn grid_task_blocking(
     index: usize,
     tx: mpsc::Sender<PhysicalEvent>,
     connection_tx: mpsc::Sender<bool>,
     presence: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
     mut actuation_rx: watch::Receiver<HashMap<Input, ActuationPoint>>,
+    shutdown: Arc<AtomicBool>,
 ) -> io::Result<()> {
     // Reports absence and waits out one `POLL_INTERVAL` — every absence
     // exit below is this same pair, just reached from a different stage of
     // the lifecycle (discovery, either open, the unlock ioctl, the
-    // confirmation wait, or the relay loop itself).
+    // confirmation wait, or the relay loop itself). `interruptible_sleep`
+    // (ticket 23) gives up on the wait early the moment `shutdown` is set,
+    // so a swap/process-shutdown mid-retry doesn't have to wait out a full
+    // `POLL_INTERVAL`.
     let retry_after_absence = || {
         evdev_source::report_presence(&presence, index, false, &connection_tx);
-        std::thread::sleep(evdev_source::POLL_INTERVAL);
+        interruptible_sleep(evdev_source::POLL_INTERVAL, &shutdown);
     };
 
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let interfaces = discover_hidraw();
         let (Some(analog_path), Some(control_path)) = (
             interfaces.get(&ANALOG_INTERFACE),
@@ -578,7 +601,7 @@ fn grid_task_blocking(
 
         evdev_source::report_presence(&presence, index, true, &connection_tx);
 
-        match relay_grid_blocking(&mut analog_file, schedule, &tx, &mut actuation_rx) {
+        match relay_grid_blocking(&mut analog_file, schedule, &tx, &mut actuation_rx, &shutdown) {
             Ok(()) => return Ok(()),
             Err(err) if is_grid_absent(&err) => {
                 retry_after_absence();
@@ -597,15 +620,30 @@ fn grid_task_blocking(
 /// one more `JoinSet` task — the `hidraw` grid task — per ticket 18 §1.
 pub struct AnalogCaptureSource {
     actuation_rx: watch::Receiver<HashMap<Input, ActuationPoint>>,
+    /// Ticket 23: shared with every task this source spawns (the two evdev
+    /// nodes and the grid task alike). Setting it makes every task stop
+    /// cleanly — relay loop exits, grabs/fds drop — at the next poll tick or
+    /// absence-retry check, which the supervisor's live source-swap and
+    /// main.rs's SIGTERM/SIGINT shutdown path both depend on: starting the
+    /// other `CaptureSource` (or relocking) before this one has actually let
+    /// go risks an `EBUSY` on a still-held evdev grab.
+    shutdown: Arc<AtomicBool>,
 }
 
 impl AnalogCaptureSource {
     /// `actuation_rx` is the paired half of the `watch::Sender` dispatch
     /// publishes into (`dispatch::run`'s `actuation_tx` parameter, ticket 18
-    /// §5) — constructing and threading that pairing through `main.rs` is
-    /// ticket 23's job.
-    pub fn new(actuation_rx: watch::Receiver<HashMap<Input, ActuationPoint>>) -> Self {
-        Self { actuation_rx }
+    /// §5). `shutdown` is this attempt's own flag — the supervisor (ticket
+    /// 23) hands each `CaptureSource` attempt a fresh one and sets it to
+    /// request a clean stop.
+    pub fn new(
+        actuation_rx: watch::Receiver<HashMap<Input, ActuationPoint>>,
+        shutdown: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            actuation_rx,
+            shutdown,
+        }
     }
 }
 
@@ -629,8 +667,10 @@ impl CaptureSource for AnalogCaptureSource {
             presence.clone(),
             tx.clone(),
             connection_tx.clone(),
+            self.shutdown.clone(),
         );
         let actuation_rx = self.actuation_rx;
+        let grid_shutdown = self.shutdown.clone();
         tasks.spawn_blocking(move || {
             grid_task_blocking(
                 GRID_PRESENCE_INDEX,
@@ -638,9 +678,10 @@ impl CaptureSource for AnalogCaptureSource {
                 connection_tx,
                 presence,
                 actuation_rx,
+                grid_shutdown,
             )
         });
-        evdev_source::join_first(tasks).await
+        evdev_source::join_first(tasks, &self.shutdown).await
     }
 }
 
@@ -987,8 +1028,9 @@ mod tests {
         // about repeat timing, just the force-release-on-error path.
         let schedule = RepeatSchedule::new(5_000, 1_000);
 
+        let shutdown = AtomicBool::new(false);
         let handle = std::thread::spawn(move || {
-            relay_grid_blocking(&mut analog, schedule, &tx, &mut actuation_rx)
+            relay_grid_blocking(&mut analog, schedule, &tx, &mut actuation_rx, &shutdown)
         });
 
         let down = rx.blocking_recv().expect("the Down this report produces");

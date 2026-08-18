@@ -157,9 +157,8 @@ impl Daemon {
     /// task's real `HashMap<Input, ActiveToggle>` as of ticket 17. `layer`
     /// reflects the dispatch task's real active Layer as of ticket 18.
     /// `device_connected` reflects the `CaptureSource`'s poll loop's current
-    /// view as of ticket 20. `capture_mode` (`"analog"`/`"digital"`) is
-    /// hardcoded to `"digital"` as of ticket 21 — see `command::State`'s doc
-    /// comment.
+    /// view as of ticket 20. `capture_mode` (`"analog"`/`"digital"`) is real
+    /// as of ticket 23 — see `command::State`'s doc comment.
     async fn get_state(&self) -> Result<(String, String, Vec<String>, bool, String), DaemonError> {
         let (reply, rx) = oneshot::channel();
         self.commands
@@ -465,9 +464,8 @@ impl Daemon {
 
     /// The live setter for `Config.force_digital` (ticket 17 §4) — the
     /// user-facing override that forces Digital Capture mode even when
-    /// Analog would otherwise unlock. For this ticket, only persists the
-    /// flag; actually swapping the live capture source on this call is
-    /// ticket 23's job.
+    /// Analog would otherwise unlock. Persists the flag and (ticket 23)
+    /// actually swaps the live capture source.
     async fn set_force_digital(&self, force: bool) -> Result<(), DaemonError> {
         let (reply, rx) = oneshot::channel();
         self.commands
@@ -524,11 +522,10 @@ impl Daemon {
     /// Fires on Capture-mode transitions — `"analog"`/`"digital"` (ticket 17
     /// §4). Ticket 16 proved the actual mode can change under a *running*
     /// Daemon (survives suspend, not a power cycle), so this mirrors
-    /// `device_connection_changed` exactly. Nothing calls this yet in this
-    /// ticket — `command::State::capture_mode` is hardcoded, so there is no
-    /// real transition to report — but the signal needs to exist and be
-    /// wired into this trait/proxy now so ticket 23 can call it without
-    /// touching this file again.
+    /// `device_connection_changed` exactly. Called from
+    /// `dispatch::handle_capture_mode_change` as of ticket 23, whenever the
+    /// supervisor's `CaptureMode` push actually changes the dispatch task's
+    /// view.
     #[zbus(signal)]
     pub async fn capture_mode_changed(
         signal_emitter: &SignalEmitter<'_>,
@@ -598,6 +595,8 @@ mod tests {
         proxy: DaemonProxyProxy<'static>,
         event_tx: mpsc::Sender<PhysicalEvent>,
         conn_tx: mpsc::Sender<bool>,
+        capture_mode_tx: mpsc::Sender<crate::capture::CaptureMode>,
+        capture_control_rx: mpsc::Receiver<bool>,
         sink: RecordingSink,
         server_connection: Connection,
         dispatch_handle: tokio::task::JoinHandle<std::io::Result<()>>,
@@ -653,6 +652,8 @@ mod tests {
                 .unwrap()
                 .into_owned();
             let (actuation_tx, _actuation_rx) = tokio::sync::watch::channel(HashMap::new());
+            let (capture_mode_tx, capture_mode_rx) = mpsc::channel(8);
+            let (capture_control_tx, capture_control_rx) = mpsc::channel(8);
             let dispatch_handle = tokio::spawn(crate::dispatch::run(
                 event_rx,
                 conn_rx,
@@ -662,6 +663,8 @@ mod tests {
                 config_path.clone(),
                 Some(signal_emitter),
                 actuation_tx,
+                capture_mode_rx,
+                capture_control_tx,
             ));
 
             TestServer {
@@ -670,6 +673,8 @@ mod tests {
                 proxy,
                 event_tx,
                 conn_tx,
+                capture_mode_tx,
+                capture_control_rx,
                 sink,
                 server_connection,
                 dispatch_handle,
@@ -694,11 +699,19 @@ mod tests {
             self.conn_tx.send(connected).await.unwrap();
         }
 
-        async fn shut_down(self) -> Vec<Vec<evdev::InputEvent>> {
+        /// Stands in for the supervisor (ticket 23) reporting a capture-mode
+        /// transition.
+        async fn set_capture_mode(&self, mode: crate::capture::CaptureMode) {
+            self.capture_mode_tx.send(mode).await.unwrap();
+        }
+
+        async fn shut_down(mut self) -> Vec<Vec<evdev::InputEvent>> {
             drop(self.proxy);
             drop(self.server_connection);
             drop(self.event_tx);
             drop(self.conn_tx);
+            drop(self.capture_mode_tx);
+            self.capture_control_rx.close();
             self.dispatch_handle.await.unwrap().unwrap();
             self.inj_handle.await.unwrap().unwrap();
             self.sink.batches()
@@ -1494,6 +1507,8 @@ mod tests {
         let client_connection = client_connection.unwrap();
 
         let (actuation_tx, _actuation_rx) = tokio::sync::watch::channel(HashMap::new());
+        let (_capture_mode_tx, capture_mode_rx) = mpsc::channel(8);
+        let (capture_control_tx, _capture_control_rx) = mpsc::channel(8);
         let dispatch_handle = tokio::spawn(crate::dispatch::run(
             event_rx,
             conn_rx,
@@ -1503,6 +1518,8 @@ mod tests {
             config_path,
             None,
             actuation_tx,
+            capture_mode_rx,
+            capture_control_tx,
         ));
 
         {
@@ -1707,7 +1724,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_force_digital_over_real_dbus_persists_the_preference() {
-        let server = TestServer::start().await;
+        let mut server = TestServer::start().await;
 
         server
             .proxy
@@ -1715,9 +1732,33 @@ mod tests {
             .await
             .expect("SetForceDigital over D-Bus must succeed");
 
+        // Ticket 23: a successful persist also forwards the new value to
+        // whatever's listening on `capture_control_rx` — the real supervisor
+        // in production, this test's raw receiver end here — so the live
+        // swap actually gets triggered, not just the config write.
+        assert_eq!(server.capture_control_rx.recv().await, Some(true));
+
         let on_disk = std::fs::read_to_string(&server.config_path).unwrap();
         server.shut_down().await;
 
         assert!(on_disk.contains("force_digital = true"));
+    }
+
+    #[tokio::test]
+    async fn capture_mode_transitions_over_real_dbus_update_get_state_and_fire_the_signal() {
+        let server = TestServer::start().await;
+        let mut signals = server.proxy.receive_capture_mode_changed().await.unwrap();
+
+        server
+            .set_capture_mode(crate::capture::CaptureMode::Analog)
+            .await;
+
+        let signal = signals.next().await.unwrap();
+        assert_eq!(signal.args().unwrap().mode, "analog");
+
+        let (_, _, _, _, capture_mode) = server.proxy.get_state().await.unwrap();
+        assert_eq!(capture_mode, "analog");
+
+        server.shut_down().await;
     }
 }

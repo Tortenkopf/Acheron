@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use zbus::object_server::SignalEmitter;
 
-use crate::capture::{EventState, PhysicalEvent};
+use crate::capture::{CaptureMode, EventState, PhysicalEvent};
 use crate::command::{Command, CommandError, State};
 use crate::config::{
     self, ActuationPoint, Binding, Config, Layer, ModeKeyRole, Profile, TriggerMode,
@@ -58,6 +58,8 @@ pub async fn run(
     config_path: PathBuf,
     signal_emitter: Option<SignalEmitter<'static>>,
     actuation_tx: watch::Sender<HashMap<Input, ActuationPoint>>,
+    mut rx_capture_mode: mpsc::Receiver<CaptureMode>,
+    capture_control_tx: mpsc::Sender<bool>,
 ) -> io::Result<()> {
     // Published once up front so the analog capture source's grid task
     // (ticket 22/23) has a correct snapshot to threshold against from the
@@ -91,8 +93,16 @@ pub async fn run(
     // milliseconds of this task starting, so this only briefly matters at
     // startup.
     let mut device_connected = true;
+    // The dispatch task's live view of which capture path is running
+    // (ticket 23), updated from `rx_capture_mode` — the supervisor pushes a
+    // value on every mode transition, mirroring `device_connected` above.
+    // Starts optimistic as `Digital` for the same reason `device_connected`
+    // starts `true`: the supervisor reports its real startup choice within
+    // milliseconds, so this only briefly matters before the first push.
+    let mut capture_mode = CaptureMode::Digital;
     let mut commands_open = true;
     let mut connection_open = true;
+    let mut capture_mode_open = true;
     loop {
         tokio::select! {
             event = rx_events.recv() => {
@@ -114,9 +124,15 @@ pub async fn run(
                     None => connection_open = false,
                 }
             }
+            mode = rx_capture_mode.recv(), if capture_mode_open => {
+                match mode {
+                    Some(mode) => handle_capture_mode_change(&mut capture_mode, &signal_emitter, mode).await,
+                    None => capture_mode_open = false,
+                }
+            }
             cmd = rx_commands.recv(), if commands_open => {
                 match cmd {
-                    Some(cmd) => handle_command(&mut config, &config_path, &mut toggles, &active_layer, device_connected, &signal_emitter, &actuation_tx, cmd).await,
+                    Some(cmd) => handle_command(&mut config, &config_path, &mut toggles, &active_layer, device_connected, capture_mode, &signal_emitter, &actuation_tx, &capture_control_tx, cmd).await,
                     None => commands_open = false,
                 }
             }
@@ -215,6 +231,25 @@ async fn handle_connection_change(
     *device_connected = connected;
     if let Some(emitter) = signal_emitter {
         let _ = Daemon::device_connection_changed(emitter, connected).await;
+    }
+}
+
+/// Updates the dispatch task's view of which capture path is running
+/// (ticket 23) and emits `CaptureModeChanged` only on an actual transition —
+/// mirrors `handle_connection_change` above exactly, including skipping the
+/// push when `signal_emitter` is `None` (unit tests with no live D-Bus
+/// connection).
+async fn handle_capture_mode_change(
+    capture_mode: &mut CaptureMode,
+    signal_emitter: &Option<SignalEmitter<'static>>,
+    mode: CaptureMode,
+) {
+    if mode == *capture_mode {
+        return;
+    }
+    *capture_mode = mode;
+    if let Some(emitter) = signal_emitter {
+        let _ = Daemon::capture_mode_changed(emitter, mode.as_str()).await;
     }
 }
 
@@ -331,8 +366,10 @@ async fn handle_command(
     toggles: &mut HashMap<Input, ActiveToggle>,
     active_layer: &Layer,
     device_connected: bool,
+    capture_mode: CaptureMode,
     signal_emitter: &Option<SignalEmitter<'static>>,
     actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
+    capture_control_tx: &mpsc::Sender<bool>,
     cmd: Command,
 ) {
     match cmd {
@@ -345,9 +382,7 @@ async fn handle_command(
                 layer: active_layer.as_str(),
                 active_toggles: toggles.keys().copied().collect(),
                 device_connected,
-                // Hardcoded: there is no real analog `CaptureSource` yet to
-                // report on (tickets 22/23 make this genuinely live).
-                capture_mode: "digital",
+                capture_mode: capture_mode.as_str(),
             });
         }
         Command::SetBinding {
@@ -617,12 +652,16 @@ async fn handle_command(
             let _ = reply.send(result);
         }
         Command::SetForceDigital { force, reply } => {
-            // Persists the preference only — actually swapping the live
-            // capture source on this call is ticket 23's job.
             let previous = std::mem::replace(&mut config.force_digital, force);
             let result = persist(config, config_path).await;
             if result.is_err() {
                 config.force_digital = previous;
+            } else {
+                // Tells the supervisor (ticket 23) to actually swap the live
+                // capture source — only on a successful persist, matching
+                // every other mutating Command's "config.toml on disk always
+                // matches in-memory state" discipline.
+                let _ = capture_control_tx.send(force).await;
             }
             let _ = reply.send(result);
         }
@@ -692,10 +731,27 @@ mod tests {
 
     /// A fresh Actuation-point watch channel for tests that don't care about
     /// its published value — `dispatch::run` requires the `Sender` half
-    /// unconditionally (ticket 22), even before ticket 23 wires a real
-    /// `AnalogCaptureSource` grid task to the paired `Receiver`.
+    /// unconditionally (ticket 22), even for tests with no real
+    /// `AnalogCaptureSource` grid task on the paired `Receiver`.
     fn actuation_channel() -> watch::Sender<HashMap<Input, ActuationPoint>> {
         watch::channel(HashMap::new()).0
+    }
+
+    /// A fresh capture-mode `Receiver` for tests that don't care about the
+    /// supervisor pushing real transitions (ticket 23) — the paired `Sender`
+    /// is dropped immediately, so `dispatch::run`'s `rx_capture_mode.recv()`
+    /// arm just closes on its first poll, same as `commands_open`/
+    /// `connection_open` do when their own senders are dropped.
+    fn capture_mode_channel() -> mpsc::Receiver<CaptureMode> {
+        mpsc::channel(8).1
+    }
+
+    /// A fresh capture-control `Sender` for tests that don't exercise
+    /// `SetForceDigital`'s live supervisor swap (ticket 23) — sends into it
+    /// just fail silently once the paired `Receiver` (dropped here) is gone,
+    /// matching `dispatch::run`'s own `let _ = capture_control_tx.send(...)`.
+    fn capture_control_channel() -> mpsc::Sender<bool> {
+        mpsc::channel(8).0
     }
 
     async fn run_scripted(
@@ -717,6 +773,8 @@ mod tests {
             unused_config_path(),
             None,
             actuation_channel(),
+            capture_mode_channel(),
+            capture_control_channel(),
         ));
 
         FakeCaptureSource::new(scripted)
@@ -884,6 +942,8 @@ mod tests {
             unused_config_path(),
             None,
             actuation_channel(),
+            capture_mode_channel(),
+            capture_control_channel(),
         ));
 
         // Real evdev autorepeat events land tens of milliseconds apart —
@@ -965,6 +1025,8 @@ mod tests {
             unused_config_path(),
             None,
             actuation_channel(),
+            capture_mode_channel(),
+            capture_control_channel(),
         ));
 
         // Down starts a firing that immediately sends KeyDown, then sleeps
@@ -1149,6 +1211,8 @@ mod tests {
                 config_path.clone(),
                 None,
                 actuation_tx,
+                capture_mode_channel(),
+                capture_control_channel(),
             ));
 
             CommandHarness {

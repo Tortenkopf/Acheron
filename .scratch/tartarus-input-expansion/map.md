@@ -98,6 +98,40 @@ Like the previous map, this one carries execution.
   against the real device, 20-key threshold accuracy, repeat cadence) deferred to the user, who
   chose to run it themselves; `daemon/examples/analog_probe.rs` is the tool for that. Unblocks
   ticket 23.
+- [Verify the analog CaptureSource on hardware](./issues/24-task-verify-analog-capture-source-on-hardware.md)
+  — the joint HITL session ticket 22 skipped, done live. All five checklist items confirmed
+  against the real Tartarus Pro: unlock/report `0x06`, all 20 grid keys thresholding correctly
+  at 128/112, Hold-to-repeat cadence matching the live kernel `get_auto_repeat()` value,
+  permission-denied degrading silently, and Mode key/thumbstick/wheel passing through evdev
+  unaffected. No `capture/analog.rs` changes needed. Two tooling notes for
+  [ticket 23](./issues/23-task-wire-analog-supervisor-and-install.md): the device needs
+  re-locking between `analog_probe` runs (a second unlock while already in Analog Capture mode
+  produces no fresh report `0x06`, per ticket 16), and `analog_probe`/`AnalogCaptureSource`'s
+  capture tasks have no shutdown signal and block process exit forever once started (shared
+  pre-existing behavior with `EvdevCaptureSource`, harmless under a real process-signal
+  shutdown but worth knowing if ticket 23's shutdown path ever closes channels instead).
+  Unblocks ticket 23 (now also clear of ticket 22).
+- [Wire live source-swap, udev rule, and install.sh](./issues/23-task-wire-analog-supervisor-and-install.md)
+  — the analog fast-follow strand's build is now feature-complete and live-verified end to end.
+  New `capture::supervisor` owns which `CaptureSource` runs: startup attempts Analog with a
+  6-second grace fallback to Digital, `SetForceDigital`/a genuine reconnect swap it live, none of
+  it a background timer. Found and fixed two real bugs only reachable by actually running it: a
+  `tokio::main`-shutdown hang on SIGTERM/SIGINT (fixed with `std::process::exit`, not a graceful
+  return) and an infinite Digital/Analog thrash loop from a fresh Digital attempt's own
+  multi-node presence convergence looking like a reconnect (fixed with an `ever_connected` gate).
+  Also closed a design-time-only EVIOCGRAB hazard in ticket 18 §6's "stop one JoinSet and start
+  the other" by adding real cooperative shutdown (non-blocking + poll, a shared flag,
+  shutdown-aware draining) to both `evdev_source` and `analog`, confirmed live via zero leaked
+  fds across repeated swaps. udev rule installed at `packaging/60-acheron-tartarus-pro.rules`,
+  wired into `install.sh`'s new privileged step (not yet run for real on this machine — needs the
+  user's own `sudo`). Full live checklist passed: analog/digital both drive all 20 grid keys plus
+  thumbstick/wheel/Mode-key, `kill -9` recovery, a real power-cycle's permission reversion and
+  self-heal, and a clean SIGTERM relock, all against the physical device. One accepted residual
+  gap: an already-running Analog session that loses `hidraw` access without the process
+  restarting doesn't self-fall-back (only a fresh attempt's grace period does) — moot once the
+  udev rule is actually installed, since a replug then reapplies it automatically. Unblocks
+  [ticket 19](./issues/19-prototype-trigger-point-ux-and-live-depth.md) and
+  [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) (both now also clear of 17).
 
 ## Not yet specified
 

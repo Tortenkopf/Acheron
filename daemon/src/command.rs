@@ -15,9 +15,8 @@ use crate::input::Input;
 /// `mode_key_role` is `LayerSwitch`). `active_toggles` is real as of ticket
 /// 17; `device_connected` is real as of ticket 20, reflecting the
 /// `CaptureSource`'s poll loop's current view. `capture_mode` (`"analog"`/
-/// `"digital"`) is hardcoded to `"digital"` as of ticket 21 — there is no
-/// real analog `CaptureSource` yet to report on; tickets 22/23 make it
-/// genuinely live.
+/// `"digital"`) is real as of ticket 23, reflecting the supervisor's actual
+/// current `CaptureSource`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct State {
     pub profile: String,
@@ -138,8 +137,8 @@ pub enum Command {
     },
     /// Sets `Config.force_digital` — the user-facing override that forces
     /// Digital Capture mode even when Analog would otherwise unlock (ticket
-    /// 17 §4). For this ticket, only persists the flag; swapping the live
-    /// capture source on this call is ticket 23's job.
+    /// 17 §4). Persists the flag and (ticket 23, on a successful persist)
+    /// triggers the supervisor's live capture-source swap.
     SetForceDigital {
         force: bool,
         reply: oneshot::Sender<Result<(), CommandError>>,

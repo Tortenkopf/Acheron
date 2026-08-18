@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 evdev = { version = "0.13", features = ["serde"] }
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 tokio-util = { version = "0.7", default-features = false }
 serde = { version = "1", features = ["derive"] }
 toml = "1"

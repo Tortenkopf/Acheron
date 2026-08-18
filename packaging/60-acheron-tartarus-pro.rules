@@ -1,0 +1,16 @@
+# Grants the `plugdev` group read/write access to the Razer Tartarus Pro's
+# `hidraw` interfaces, so acheron-daemon (running as a normal user via the
+# systemd --user unit) can unlock/relock Analog Capture mode and read the
+# grid's depth stream (ticket 18 §8, ticket 12 §4.3) without root.
+#
+# Interface 1 streams report 0x06 (the depth data); interface 2 takes the
+# `set_device_mode` feature report (unlock/relock). Both interfaces are
+# granted the same rule — the daemon opens whichever one it needs by
+# `bInterfaceNumber`, not by hidraw node number (those aren't stable across
+# reboots/reconnects; see `capture::analog::discover_hidraw`).
+#
+# Installed to /etc/udev/rules.d/ by install.sh. The user running
+# acheron-daemon must be a member of the `plugdev` group (most desktop
+# distros already put the primary login user there) for this to take
+# effect.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="0244", MODE="0660", GROUP="plugdev"

@@ -16,10 +16,10 @@
 //!     *before* granting hidraw access — no `connected` line, no crash,
 //!     just silence until access is granted and the next poll succeeds)
 //!
-//! Usage (`/dev/hidraw0-2` need read/write access first — this crate's
-//! udev rule doesn't exist yet, that's ticket 23 — so either run this whole
-//! binary under `sudo`, or `sudo chmod 660 /dev/hidraw0 /dev/hidraw1
-//! /dev/hidraw2` first):
+//! Usage (`/dev/hidraw0-2` need read/write access first — either install
+//! `packaging/60-acheron-tartarus-pro.rules` via `install.sh` and be a
+//! member of the `plugdev` group, run this whole binary under `sudo`, or
+//! `sudo chmod 660 /dev/hidraw0 /dev/hidraw1 /dev/hidraw2` first):
 //!
 //!     cargo run --example analog_probe [duration_seconds]
 //!
@@ -29,6 +29,8 @@
 //! relock`) so the 20 Grid keys work normally again before unplugging or
 //! relying on them outside this probe.
 
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 
 use acheron_daemon::capture::analog::AnalogCaptureSource;
@@ -59,7 +61,7 @@ async fn main() {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
     let (connection_tx, mut connection_rx) = tokio::sync::mpsc::channel(8);
 
-    let source = AnalogCaptureSource::new(actuation_rx);
+    let source = AnalogCaptureSource::new(actuation_rx, Arc::new(AtomicBool::new(false)));
     tokio::spawn(async move {
         if let Err(err) = source.run(event_tx, connection_tx).await {
             eprintln!("AnalogCaptureSource exited with a fatal error: {err}");

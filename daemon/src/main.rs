@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 
-use acheron_daemon::capture::CaptureSource;
-use acheron_daemon::capture::evdev_source::EvdevCaptureSource;
+use acheron_daemon::capture::supervisor;
 use acheron_daemon::config;
 use acheron_daemon::dbus::Daemon;
 use acheron_daemon::{dispatch, injector};
@@ -16,10 +15,19 @@ use tokio::task::JoinError;
 /// channel `PhysicalEvent`s already flow through (issue 07's "D-Bus
 /// interleaving"), so it stays the sole owner of `Config`.
 ///
-/// No graceful-shutdown story exists yet either, so any of the three tasks
-/// finishing is treated as fatal: per issue 07/10, a genuine capture or
-/// injection error must exit the process so systemd's `Restart=on-failure`
-/// can recover it, rather than leaving the daemon silently inert.
+/// Capture runs inside `supervisor::run` (ticket 23) rather than a bare
+/// `EvdevCaptureSource::ALL.run(...)` call — it owns *which* `CaptureSource`
+/// (`AnalogCaptureSource`/`EvdevCaptureSource`) is currently live and swaps
+/// between them per `Config.force_digital`/a `SetForceDigital` call/a device
+/// reconnect, per ticket 18 §6. Any of the three top-level tasks (capture,
+/// injector, dispatch) finishing is still treated as fatal — per issue
+/// 07/10, a genuine capture or injection error must exit the process so
+/// systemd's `Restart=on-failure` can recover it, rather than leaving the
+/// daemon silently inert. A clean SIGTERM/SIGINT instead relocks the device
+/// (best-effort, harmless if it was never unlocked — ticket 16) and exits
+/// directly, without waiting on the capture task's blocking I/O threads to
+/// notice (ticket 24's tooling note: they have no shutdown signal of their
+/// own reason to join on a real process exit).
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let config_path = config::config_path();
@@ -39,10 +47,18 @@ async fn main() -> io::Result<()> {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(256);
     // The Actuation-point snapshot seam (ticket 18 §5/ticket 22): dispatch
     // publishes into `actuation_tx` on every mutation that touches the
-    // active Profile's Actuation points. `actuation_rx` is unused here for
-    // now — wiring it into a live `AnalogCaptureSource` grid task is ticket
-    // 23's job, once that source actually exists.
-    let (actuation_tx, _actuation_rx) = tokio::sync::watch::channel(HashMap::new());
+    // active Profile's Actuation points; the supervisor hands
+    // `actuation_rx` to every `AnalogCaptureSource` attempt it spawns
+    // (ticket 23).
+    let (actuation_tx, actuation_rx) = tokio::sync::watch::channel(HashMap::new());
+    // The capture-mode seam (ticket 23): the supervisor pushes its current
+    // `CaptureMode` on every transition; dispatch consumes it for
+    // `GetState`/`CaptureModeChanged`.
+    let (capture_mode_tx, capture_mode_rx) = tokio::sync::mpsc::channel(8);
+    // The capture-control seam (ticket 23): dispatch forwards every
+    // successful `SetForceDigital` value here so the supervisor can act on
+    // it live, without dispatch knowing anything about `CaptureSource`s.
+    let (capture_control_tx, capture_control_rx) = tokio::sync::mpsc::channel(8);
 
     // Built before the dispatch task so a real `SignalEmitter` (ticket 18's
     // `ActiveLayerChanged`, pushed directly from the dispatch task on every
@@ -63,6 +79,7 @@ async fn main() -> io::Result<()> {
             .map_err(io::Error::other)?
             .into_owned();
 
+    let force_digital = config.force_digital;
     let dispatch_handle = tokio::spawn(dispatch::run(
         event_rx,
         connection_rx,
@@ -72,14 +89,52 @@ async fn main() -> io::Result<()> {
         config_path,
         Some(signal_emitter),
         actuation_tx,
+        capture_mode_rx,
+        capture_control_tx,
     ));
 
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
     let result = tokio::select! {
-        result = EvdevCaptureSource::ALL.run(event_tx, connection_tx) => report("capture", result),
+        result = supervisor::run(event_tx, connection_tx, actuation_rx, capture_mode_tx, capture_control_rx, force_digital) => report("capture", result),
         result = inj_handle => report("injector", flatten(result)),
         result = dispatch_handle => report("dispatch", flatten(result)),
+        _ = sigterm.recv() => relock_and_exit("SIGTERM"),
+        _ = tokio::signal::ctrl_c() => relock_and_exit("SIGINT"),
     };
     result
+}
+
+/// The standing map decision (map Notes: "The Daemon also re-locks the
+/// device to mode 0x00 on clean shutdown"): best-effort — `analog::relock`
+/// is a no-op-safe idempotent send (ticket 16: a relock from a fresh handle
+/// that never sent the unlock still succeeds), so this doesn't need to know
+/// whether the supervisor's current source was actually Analog. A failure
+/// here (device unplugged, no `hidraw` access) is reported, not fatal —
+/// there's nothing left to clean up in that case anyway.
+///
+/// Ends the process with `std::process::exit` rather than returning —
+/// confirmed live (ticket 23) that returning normally is *not* harmless:
+/// `#[tokio::main]`'s generated wrapper drops the multi-thread `Runtime` at
+/// the end of `main`, and that `Drop` blocks waiting for every outstanding
+/// task — including the supervisor's `tokio::spawn`ed capture-source
+/// `JoinHandle` and its own `spawn_blocking` node/grid tasks, none of which
+/// SIGTERM/SIGINT ever asked to stop — to finish on their own. A grid task
+/// silently retrying a denied `hidraw` open forever (exactly ticket 23's own
+/// "udev rule missing" scenario) never finishes on its own, so the process
+/// hung indefinitely instead of exiting. `process::exit` skips Rust's
+/// destructors and the runtime's task-draining entirely, terminating
+/// immediately regardless — matching ticket 24's "harmless under a real
+/// process-signal shutdown" note, which only holds for an actual immediate
+/// exit, not a graceful drain nothing was told to start.
+fn relock_and_exit(signal_name: &str) -> ! {
+    eprintln!("acheron-daemon: received {signal_name}, relocking device and exiting");
+    if let Err(err) = acheron_daemon::capture::analog::relock() {
+        eprintln!(
+            "acheron-daemon: relock on shutdown failed (harmless if the device was never unlocked): {err}"
+        );
+    }
+    std::process::exit(0)
 }
 
 fn flatten(result: Result<io::Result<()>, JoinError>) -> io::Result<()> {
