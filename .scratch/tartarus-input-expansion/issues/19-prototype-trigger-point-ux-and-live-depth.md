@@ -44,6 +44,9 @@ Settle at least:
   depth to display — hidden, greyed, or shown with an explanation.
 - **Discoverability**: how a user learns their keypad has this at all, given Synapse users
   will expect it and everyone else won't know to look.
+- **`GetConfig()`'s wire dict** doesn't yet serialize `default_actuation`/
+  `actuation_overrides` — [ticket 21](./21-task-apply-analog-data-model-to-code.md) deferred
+  it here deliberately. Whatever binding-editor wiring this ticket lands needs to add it.
 
 ## Answer
 

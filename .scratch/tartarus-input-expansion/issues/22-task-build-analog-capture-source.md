@@ -216,3 +216,7 @@ or they run it themselves); they chose to verify it themselves, so `daemon/examp
 analog_probe.rs` above is what they'll use. None of the ticket's HITL checklist (unlock
 succeeds, 20-key threshold accuracy, repeat cadence, Main/If02 unaffected, permission-denied
 degrades silently) has been confirmed against the real device by this session.
+
+Follow-up: [ticket 24](./24-task-verify-analog-capture-source-on-hardware.md) picks this
+checklist back up as a cooperative session with the user, rather than leaving it to
+`analog_probe` run solo.
