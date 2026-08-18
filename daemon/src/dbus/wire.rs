@@ -309,6 +309,7 @@ pub fn config_to_dict(config: &Config) -> Dict {
         .map(|(name, profile)| (name.clone(), scalar(profile_to_dict(profile))))
         .collect();
     dict.insert("profiles".to_string(), scalar(profiles));
+    dict.insert("force_digital".to_string(), scalar(config.force_digital));
     dict
 }
 
@@ -513,6 +514,22 @@ mod tests {
             dict_get_string(&default_profile, "mode_key_role"),
             "layer_switch"
         );
+    }
+
+    /// Closes the gap ticket 27's live-hardware verification caught:
+    /// `force_digital` was never serialized, so `binding_editor.py`'s "Force
+    /// digital capture" checkbox could never reflect the Daemon's actual
+    /// persisted preference on reopen — it always constructed unchecked.
+    #[test]
+    fn config_to_dict_serializes_force_digital() {
+        let config = Config {
+            schema_version: 1,
+            active_profile: "Default".to_string(),
+            profiles: Default::default(),
+            force_digital: true,
+        };
+        let dict = config_to_dict(&config);
+        assert!(bool::try_from(get(&dict, "force_digital").unwrap()).unwrap());
     }
 
     /// Ticket 26: `config_to_dict` must serialize a Profile's

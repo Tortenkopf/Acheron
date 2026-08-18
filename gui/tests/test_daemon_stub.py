@@ -21,6 +21,7 @@ def test_fresh_stub_matches_the_seed_configs_shape():
                 "actuation_overrides": {},
             }
         },
+        "force_digital": False,
     }
     assert stub.get_state() == {
         "profile": "Default",

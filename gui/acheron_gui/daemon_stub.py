@@ -57,6 +57,7 @@ class DaemonStub:
         # Hardcoded, mirroring the real Daemon's ticket 21 stand-in — there
         # is no analog CaptureSource yet for either side to report on.
         self._capture_mode = "digital"
+        self._force_digital = False
         self._daemon_running = True
         self._device_connected = True
         self._layer_changed_callbacks: list[Callable[[str], None]] = []
@@ -82,6 +83,7 @@ class DaemonStub:
             "schema_version": self._schema_version,
             "active_profile": self._active_profile,
             "profiles": {name: copy.deepcopy(profile) for name, profile in self._profiles.items()},
+            "force_digital": self._force_digital,
         }
 
     def get_state(self) -> dict:
@@ -191,10 +193,11 @@ class DaemonStub:
         self.calls.append(("reset_actuation_points",))
 
     def set_force_digital(self, force: bool) -> None:
-        # Config-free on the stub too, mirroring `set_output_suppressed`:
-        # `GetConfig()` doesn't serialize `force_digital` on the real Daemon
-        # either (ticket 26), so there's nothing for this stub to reflect
-        # back — only what the GUI actually sent, for tests to assert.
+        # Ticket 27: `GetConfig()` now serializes `force_digital` (closing
+        # the gap that left the "Force digital capture" checkbox unable to
+        # reflect the real Daemon's persisted preference on reopen), so this
+        # stub tracks it too rather than only recording the call.
+        self._force_digital = force
         self.calls.append(("set_force_digital", force))
 
     def start_depth_stream(self, input_str: str, on_depth: Callable[[int], None]) -> None:

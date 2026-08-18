@@ -174,6 +174,54 @@ def test_reset_all_keys_to_profile_default_calls_reset_actuation_points():
     assert ("reset_actuation_points",) in stub.calls
 
 
+def test_set_as_profile_default_closes_the_popover_and_refreshes_the_cached_config():
+    # Ticket 27's live-hardware verification caught this: every Grid key's
+    # popover is pre-built once from a single `GetConfig()` snapshot, and
+    # there's no Daemon signal for a `default_actuation` change (unlike
+    # `capture_mode`) — so without forcing a rebuild here, a new default was
+    # invisible in any freshly opened popover until the whole GUI restarted.
+    stub = DaemonStub()
+    changed = []
+
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
+    popover = btn.get_popover()
+
+    button_labeled(popover, "Set as Profile default").emit("clicked")
+
+    assert changed == [1]
+
+
+def test_reset_all_keys_to_profile_default_closes_the_popover_and_refreshes_the_cached_config():
+    stub = DaemonStub()
+    changed = []
+
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
+    popover = btn.get_popover()
+
+    button_labeled(popover, "Reset all keys to Profile default").emit("clicked")
+
+    assert changed == [1]
+
+
+def test_reset_to_profile_default_does_not_close_the_popover():
+    # Unlike the two above, this only ever affects the current key, whose
+    # markers it already updates directly — no other popover's data goes
+    # stale, so it must not force a rebuild that would tear down live
+    # editing (matching the drag-driven `set_actuation_point` path, which
+    # is exercised continuously and would be unusable if every drag closed
+    # the popover).
+    stub = DaemonStub()
+    stub.set_actuation_point("grid_r1c1", 200, 180)
+    changed = []
+
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
+    popover = btn.get_popover()
+
+    button_labeled(popover, "Reset to Profile default").emit("clicked")
+
+    assert changed == []
+
+
 def test_force_digital_checkbox_calls_set_force_digital():
     stub = DaemonStub()
     editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
@@ -185,6 +233,25 @@ def test_force_digital_checkbox_calls_set_force_digital():
     check.set_active(True)
 
     assert ("set_force_digital", True) in stub.calls
+
+
+def test_force_digital_checkbox_seeds_from_the_persisted_preference():
+    # Ticket 27's live-hardware verification caught this: the checkbox
+    # always constructed unchecked regardless of the real Daemon's
+    # persisted `force_digital`, because `GetConfig()` never serialized it
+    # — so reopening the editor after checking it showed unchecked again.
+    stub = DaemonStub()
+    stub.set_force_digital(True)
+
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+    check = find_one(
+        editor,
+        lambda w: isinstance(w, Gtk.CheckButton) and w.get_label() == "Force digital capture (disable analog)",
+    )
+
+    assert check.get_active()
+    # Seeding the initial state must not itself re-send an unchanged value.
+    assert stub.calls == [("set_force_digital", True)]
 
 
 def test_badge_reflects_the_capture_mode_passed_in():

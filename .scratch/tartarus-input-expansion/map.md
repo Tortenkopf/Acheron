@@ -183,6 +183,28 @@ Like the previous map, this one carries execution.
   session's call. Spawned [Verify the trigger-point UX and live-depth channel on hardware]
   (./issues/27-task-verify-trigger-point-depth-ux-on-hardware.md).
 
+- [Verify the trigger-point UX and live-depth channel on hardware](./issues/27-task-verify-trigger-point-depth-ux-on-hardware.md)
+  — all four of ticket 26's checklist items confirmed live against the real Tartarus Pro,
+  after the user's own testing surfaced and this session fixed two real bugs. `GetConfig()`
+  never serialized `Config.force_digital`, so the "Force digital capture" checkbox always
+  constructed unchecked regardless of the Daemon's real persisted value — explained the
+  exact reported asymmetry (checking closed the dialog via a real transition; reopening
+  showed unchecked; checking again was a no-op since already-Digital, so no signal, no
+  close). Fixed by serializing it and seeding the checkbox from it
+  (`daemon/src/dbus/wire.rs`, `gui/acheron_gui/binding_editor.py`). Separately, "Set as
+  Profile default"/"Reset all keys to Profile default" only took effect after a full GUI
+  restart: every Grid key's popover is pre-built once from a single `GetConfig()` snapshot,
+  and unlike `capture_mode` there's no Daemon signal for a `default_actuation`/override
+  change, so nothing told the app its cache was stale. Fixed by threading the existing
+  `on_saved` (popdown + app `rebuild()`) callback into `build_actuation_section` and calling
+  it from those two handlers only — `set_actuation_point`/`clear_actuation_point` are
+  deliberately left non-closing since they only affect the current key and must survive
+  every drag-end. The Force-digital checkbox is confirmed a persistent override (stays
+  Digital across an unplug/replug until explicitly unchecked, by design); the live badge
+  check was done via the automatic unplug/replug Analog↔Digital fallback path instead of
+  the checkbox, confirming the badge reads correctly on reopen. 177 Rust + 83 Python tests
+  green. Ticket 26's build is now fully live-hardware-verified.
+
 ## Not yet specified
 
 - **Composition between Chord/mouse-button/Stepper/Profile-Switch** — e.g. can a Chord's Action be a Stepper step; can a Stepper's forward/backward pair include a Chord as one side. Not sharp enough to ticket until those tickets have settled their own shape.

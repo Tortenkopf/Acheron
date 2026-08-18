@@ -187,7 +187,9 @@ class DepthTrack(Gtk.Overlay):
         self._drag_index = None
 
 
-def build_actuation_section(client, config: dict, profile: str, inp: str, capture_mode: str) -> Gtk.Widget:
+def build_actuation_section(
+    client, config: dict, profile: str, inp: str, capture_mode: str, on_saved: Callable[[], None]
+) -> Gtk.Widget:
     """The real Actuation & release editor for a Grid key (ticket 19's
     settled variant B, landed for real by ticket 26): two draggable markers,
     a live depth bar fed by `StartDepthStream`/`DepthChanged`, a badge
@@ -204,6 +206,19 @@ def build_actuation_section(client, config: dict, profile: str, inp: str, captur
     per-popover subscription: unlike depth, mode transitions are rare enough
     that a rebuild-driven update is simplest and avoids leaking a fresh
     signal connection on every one of this editor's frequent eager rebuilds.
+
+    `on_saved` (ticket 27's live-hardware verification caught this): every
+    popover for every Grid key is pre-built once, from one `GetConfig()`
+    snapshot, during the app's own `rebuild()` — there is no Daemon signal
+    for actuation-point/default changes (unlike `capture_mode`), so without
+    forcing a rebuild, a `default_actuation`/override change made here was
+    invisible in *any* freshly opened popover (this one or another key's)
+    until the GUI was restarted. `set_actuation_point`/`clear_actuation_point`
+    only ever affect this one key and already update this popover's own
+    markers directly, so they're left alone; `set_default_actuation`/
+    `reset_actuation_points` affect other keys' popovers too, so they call
+    `on_saved()` on success, same as Save/Clear above — popping this popover
+    down and forcing the next one open to read fresh data.
     """
     profile_dict = config["profiles"][profile]
     default_actuation = profile_dict["default_actuation"]
@@ -314,6 +329,8 @@ def build_actuation_section(client, config: dict, profile: str, inp: str, captur
             client.set_default_actuation(markers[0]["value"], markers[1]["value"])
         except DaemonError as exc:
             show_error(exc)
+            return
+        on_saved()
 
     set_default_btn.connect("clicked", on_set_default)
     profile_row.append(set_default_btn)
@@ -326,12 +343,7 @@ def build_actuation_section(client, config: dict, profile: str, inp: str, captur
         except DaemonError as exc:
             show_error(exc)
             return
-        markers[0]["value"], markers[1]["value"] = (
-            default_actuation["actuation"],
-            default_actuation["release"],
-        )
-        track.sync_markers()
-        refresh_label()
+        on_saved()
 
     reset_all_btn.connect("clicked", on_reset_all)
     profile_row.append(reset_all_btn)
@@ -339,6 +351,11 @@ def build_actuation_section(client, config: dict, profile: str, inp: str, captur
 
     force_digital_check = Gtk.CheckButton(label="Force digital capture (disable analog)")
     force_digital_check.add_css_class("dim")
+    # Ticket 27: seeded from the real persisted preference (`GetConfig()`
+    # now serializes it) rather than always constructing unchecked — set
+    # before connecting "toggled" so seeding this doesn't itself fire
+    # `on_force_digital` and re-send an unchanged value to the Daemon.
+    force_digital_check.set_active(config.get("force_digital", False))
 
     def on_force_digital(b):
         client.set_force_digital(b.get_active())
@@ -551,6 +568,6 @@ def build_binding_editor(
     box.append(btn_row)
 
     if is_grid_input(inp):
-        box.append(build_actuation_section(client, config, profile, inp, capture_mode))
+        box.append(build_actuation_section(client, config, profile, inp, capture_mode, on_saved))
 
     return box
