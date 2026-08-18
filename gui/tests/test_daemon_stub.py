@@ -12,7 +12,15 @@ def test_fresh_stub_matches_the_seed_configs_shape():
     assert config == {
         "schema_version": 1,
         "active_profile": "Default",
-        "profiles": {"Default": {"base": {}, "held": {}, "mode_key_role": "layer_switch"}},
+        "profiles": {
+            "Default": {
+                "base": {},
+                "held": {},
+                "mode_key_role": "layer_switch",
+                "default_actuation": {"actuation": 128, "release": 112},
+                "actuation_overrides": {},
+            }
+        },
     }
     assert stub.get_state() == {
         "profile": "Default",
@@ -91,6 +99,8 @@ def test_create_profile_adds_an_empty_profile():
         "base": {},
         "held": {},
         "mode_key_role": "layer_switch",
+        "default_actuation": {"actuation": 128, "release": 112},
+        "actuation_overrides": {},
     }
     assert stub.calls == [("create_profile", "Gaming")]
 

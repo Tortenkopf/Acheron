@@ -50,6 +50,13 @@ def input_label(inp: str) -> str:
     return INPUT_LABELS[inp]
 
 
+def is_grid_input(inp: str) -> bool:
+    """Only Grid keys have depth/Actuation points (ticket 17 §3/ticket 26) —
+    the Mode key, thumbstick directions, and wheel events are all-or-nothing
+    evdev passthrough with no analog travel to threshold."""
+    return inp in LAYOUT_NUMBER
+
+
 TRIGGER_OPTIONS = [
     ("fire_once", "Fire-once"),
     ("hold_to_repeat", "Hold-to-repeat"),

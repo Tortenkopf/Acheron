@@ -96,6 +96,20 @@ class DaemonClient(Protocol):
 
     def stop_all_toggles(self) -> None: ...
 
+    def set_actuation_point(self, input_str: str, actuation: int, release: int) -> None: ...
+
+    def clear_actuation_point(self, input_str: str) -> None: ...
+
+    def set_default_actuation(self, actuation: int, release: int) -> None: ...
+
+    def reset_actuation_points(self) -> None: ...
+
+    def set_force_digital(self, force: bool) -> None: ...
+
+    def start_depth_stream(self, input_str: str, on_depth: Callable[[int], None]) -> None: ...
+
+    def stop_depth_stream(self, input_str: str) -> None: ...
+
     def subscribe_layer_changed(self, callback: Callable[[str], None]) -> None: ...
 
     def subscribe_profile_changed(self, callback: Callable[[str], None]) -> None: ...
@@ -103,6 +117,8 @@ class DaemonClient(Protocol):
     def subscribe_daemon_running_changed(self, callback: Callable[[bool], None]) -> None: ...
 
     def subscribe_device_connection_changed(self, callback: Callable[[bool], None]) -> None: ...
+
+    def subscribe_capture_mode_changed(self, callback: Callable[[str], None]) -> None: ...
 
 
 class DBusDaemonClient:
@@ -123,6 +139,14 @@ class DBusDaemonClient:
             INTERFACE,
             None,
         )
+        # `start_depth_stream`'s local routing seam (ticket 26): at most one
+        # editor is ever the live depth-stream target, mirroring the real
+        # Daemon's own last-write-wins `StartDepthStream` semantics — see
+        # that method's docstring for why this can't be a plain
+        # `_connect_signal` call made fresh per popover.
+        self._depth_callback: Callable[[int], None] | None = None
+        self._depth_target: str | None = None
+        self._depth_signal_connected = False
 
     def get_config(self) -> dict:
         (config,) = self._call("GetConfig", None)
@@ -162,6 +186,50 @@ class DBusDaemonClient:
     def stop_all_toggles(self) -> None:
         self._call("StopAllToggles", None)
 
+    def set_actuation_point(self, input_str: str, actuation: int, release: int) -> None:
+        self._call("SetActuationPoint", GLib.Variant("(syy)", (input_str, actuation, release)))
+
+    def clear_actuation_point(self, input_str: str) -> None:
+        self._call("ClearActuationPoint", GLib.Variant("(s)", (input_str,)))
+
+    def set_default_actuation(self, actuation: int, release: int) -> None:
+        self._call("SetDefaultActuation", GLib.Variant("(yy)", (actuation, release)))
+
+    def reset_actuation_points(self) -> None:
+        self._call("ResetActuationPoints", None)
+
+    def set_force_digital(self, force: bool) -> None:
+        self._call("SetForceDigital", GLib.Variant("(b)", (force,)))
+
+    def start_depth_stream(self, input_str: str, on_depth: Callable[[int], None]) -> None:
+        """Starts (or retargets) live depth streaming for `input_str`,
+        routing `DepthChanged` values matching it to `on_depth`. The
+        underlying `"g-signal"` listener is wired at most once, lazily, and
+        kept forever — `build_binding_editor` is rebuilt eagerly for every
+        Grid key on every app `rebuild()` (not lazily on popover open), so a
+        fresh `_connect_signal` call per call here would leak one GObject
+        signal connection per rebuild. Retargeting `_depth_callback`/
+        `_depth_target` instead mirrors the real Daemon's own single-current-
+        stream, last-write-wins shape (`StartDepthStream`'s docstring) — the
+        client side only ever needs to route to whichever editor most
+        recently asked, exactly like the server side only ever streams to
+        whichever connection most recently asked."""
+        self._depth_target = input_str
+        self._depth_callback = on_depth
+        if not self._depth_signal_connected:
+            self._connect_signal("DepthChanged", self._on_depth_changed)
+            self._depth_signal_connected = True
+        self._call("StartDepthStream", GLib.Variant("(s)", (input_str,)))
+
+    def stop_depth_stream(self, input_str: str) -> None:
+        self._depth_target = None
+        self._depth_callback = None
+        self._call("StopDepthStream", GLib.Variant("(s)", (input_str,)))
+
+    def _on_depth_changed(self, input_str: str, depth: int) -> None:
+        if self._depth_callback is not None and input_str == self._depth_target:
+            self._depth_callback(depth)
+
     def subscribe_layer_changed(self, callback: Callable[[str], None]) -> None:
         """Wires ticket 18's `ActiveLayerChanged` signal to `callback(layer)`
         — `Gio.DBusProxy` re-emits every D-Bus signal it receives as its own
@@ -199,11 +267,22 @@ class DBusDaemonClient:
         `callback(connected)`, same mechanism as `subscribe_layer_changed`."""
         self._connect_signal("DeviceConnectionChanged", callback)
 
-    def _connect_signal(self, wanted_signal_name: str, callback: Callable[[str], None]) -> None:
+    def subscribe_capture_mode_changed(self, callback: Callable[[str], None]) -> None:
+        """Wires ticket 17/23's `CaptureModeChanged` signal to
+        `callback(mode)` — called once, at the app level (`app.py`'s
+        `_wire_status_tracking`), same as `subscribe_device_connection_changed`,
+        not per-editor: a mode transition drives a full `rebuild()` rather
+        than a targeted in-place update, so the Actuation & release section's
+        badge only needs its *initial* value threaded in as a plain
+        parameter, not a live subscription of its own (ticket 26 — unlike
+        depth, which changes far too often for a rebuild-per-tick to be
+        usable)."""
+        self._connect_signal("CaptureModeChanged", callback)
+
+    def _connect_signal(self, wanted_signal_name: str, callback: Callable) -> None:
         def on_g_signal(_proxy, _sender_name, signal_name, parameters):
             if signal_name == wanted_signal_name:
-                (value,) = parameters.unpack()
-                callback(value)
+                callback(*parameters.unpack())
 
         self._proxy.connect("g-signal", on_g_signal)
 

@@ -11,9 +11,10 @@ pub mod wire;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures_util::StreamExt;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use zbus::interface;
 use zbus::object_server::SignalEmitter;
@@ -77,19 +78,51 @@ struct SuppressionState {
     watcher: Option<JoinHandle<()>>,
 }
 
+/// Ticket 26: which Grid Input, if any, the GUI's Actuation & release editor
+/// currently wants live depth for — a single current target rather than a
+/// set of subscribers, mirroring `SuppressionState`'s last-write-wins shape
+/// rather than `active_toggles`-style tracking, since exactly one editor
+/// popover is ever meaningfully open at a time in practice. `epoch` guards
+/// the same race `SetOutputSuppressed` already documents: a `StartDepthStream`
+/// racing a `StopDepthStream`/a newer `StartDepthStream` must never let the
+/// loser's pump task clobber the winner's already-stored state.
+struct DepthStreamState {
+    epoch: u64,
+    input: Option<Input>,
+    watcher: Option<JoinHandle<()>>,
+}
+
+/// `DepthChanged`'s rate limit (ticket 19's prototype modeled ~30Hz; ticket
+/// 13 measured the real device pushing changes roughly every 1ms while
+/// moving, so this is what actually keeps the signal off the wire's firehose
+/// the map's Notes warn against, not the capture layer's own publish rate).
+const DEPTH_STREAM_INTERVAL: Duration = Duration::from_millis(33);
+
 pub struct Daemon {
     commands: mpsc::Sender<Command>,
     injector: Injector,
     suppression: Arc<Mutex<SuppressionState>>,
+    depth_rx: watch::Receiver<HashMap<Input, u8>>,
+    depth_stream: Arc<Mutex<DepthStreamState>>,
 }
 
 impl Daemon {
-    pub fn new(commands: mpsc::Sender<Command>, injector: Injector) -> Self {
+    pub fn new(
+        commands: mpsc::Sender<Command>,
+        injector: Injector,
+        depth_rx: watch::Receiver<HashMap<Input, u8>>,
+    ) -> Self {
         Daemon {
             commands,
             injector,
             suppression: Arc::new(Mutex::new(SuppressionState {
                 epoch: 0,
+                watcher: None,
+            })),
+            depth_rx,
+            depth_stream: Arc::new(Mutex::new(DepthStreamState {
+                epoch: 0,
+                input: None,
                 watcher: None,
             })),
         }
@@ -99,6 +132,64 @@ impl Daemon {
         input
             .parse()
             .map_err(|_| DaemonError::InvalidBinding(format!("{input:?} is not a valid Input")))
+    }
+}
+
+/// Ticket 26's depth-pump task: one spawned per `StartDepthStream` call,
+/// aborted (not gracefully stopped) the moment it's superseded — by a
+/// `StopDepthStream`, a fresh `StartDepthStream`, or the owning connection
+/// disconnecting (`watch_disconnect`, shared with `SetOutputSuppressed`).
+/// Samples `depth_rx` at `DEPTH_STREAM_INTERVAL` rather than reacting to
+/// every `watch` change: the analog capture source overwrites it on every
+/// incoming report (sub-millisecond while a key is moving, per ticket 13),
+/// so reacting to every change would just reimplement the firehose the rate
+/// limit exists to avoid. A `None` snapshot entry for `input` (Digital mode,
+/// or no report has arrived yet for this key) simply skips that tick rather
+/// than emitting a stale/absent value.
+async fn run_depth_stream(
+    connection: zbus::Connection,
+    sender: Option<String>,
+    depth_rx: watch::Receiver<HashMap<Input, u8>>,
+    input: Input,
+    state: Arc<Mutex<DepthStreamState>>,
+    epoch: u64,
+) {
+    let Ok(emitter) = SignalEmitter::new(&connection, "/com/acheron/Daemon") else {
+        return;
+    };
+    // `interval_at`, not `interval`: the latter's first tick resolves
+    // immediately rather than after one `DEPTH_STREAM_INTERVAL`, which would
+    // let a since-superseded `StartDepthStream` race one signal out before
+    // its abort takes effect (observed in
+    // `start_depth_stream_over_real_dbus_retargeting_replaces_the_previous_stream`).
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + DEPTH_STREAM_INTERVAL,
+        DEPTH_STREAM_INTERVAL,
+    );
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let disconnect = watch_disconnect(connection.clone(), sender);
+    tokio::pin!(disconnect);
+
+    loop {
+        tokio::select! {
+            _ = &mut disconnect => break,
+            _ = interval.tick() => {
+                let depth = depth_rx.borrow().get(&input).copied();
+                if let Some(depth) = depth {
+                    let _ = Daemon::depth_changed(&emitter, &input.to_string(), depth).await;
+                }
+            }
+        }
+    }
+
+    // Mirrors `set_output_suppressed`'s disconnect-clear: only clear the
+    // shared state if this task's own epoch is still current — a since-
+    // superseded task's late cleanup must never clobber a newer call's
+    // already-stored watcher/input.
+    let mut state = state.lock().unwrap();
+    if state.epoch == epoch {
+        state.input = None;
+        state.watcher = None;
     }
 }
 
@@ -467,6 +558,90 @@ impl Daemon {
         rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
     }
 
+    /// Starts (or retargets) live depth streaming for `input` — the GUI's
+    /// Actuation & release editor's `DepthChanged` feed (ticket 19/26).
+    /// Connection-scoped and last-write-wins, mirroring
+    /// `SetOutputSuppressed`: a second `StartDepthStream` call, from this
+    /// connection or another, simply replaces the current target rather than
+    /// layering a second stream, and the stream auto-stops if the calling
+    /// connection disconnects without an explicit `StopDepthStream` (same
+    /// `watch_disconnect` this reuses). Config-free and bypasses dispatch
+    /// entirely, same as `SetOutputSuppressed` — it reads `depth_rx`, never
+    /// touches `Config`. Errors `InvalidBinding` if `input` isn't a `Grid`
+    /// variant, since only Grid keys ever have depth.
+    async fn start_depth_stream(
+        &self,
+        input: String,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> Result<(), DaemonError> {
+        let input = Self::parse_input(&input)?;
+        if !matches!(input, Input::Grid(_, _)) {
+            return Err(DaemonError::InvalidBinding(format!(
+                "{input} has no depth to stream"
+            )));
+        }
+        let sender = header.sender().map(ToString::to_string);
+
+        let epoch = {
+            let mut state = self.depth_stream.lock().unwrap();
+            state.epoch += 1;
+            if let Some(handle) = state.watcher.take() {
+                handle.abort();
+            }
+            state.input = Some(input);
+            state.epoch
+        };
+
+        let connection = connection.clone();
+        let depth_rx = self.depth_rx.clone();
+        let depth_stream = self.depth_stream.clone();
+        let handle = tokio::spawn(run_depth_stream(
+            connection,
+            sender,
+            depth_rx,
+            input,
+            depth_stream,
+            epoch,
+        ));
+
+        let mut state = self.depth_stream.lock().unwrap();
+        if state.epoch == epoch {
+            state.watcher = Some(handle);
+        } else {
+            handle.abort();
+        }
+        Ok(())
+    }
+
+    /// Stops live depth streaming. `input` is validated for symmetry with
+    /// `StartDepthStream` but otherwise unused: exactly one stream target
+    /// exists at a time (see `DepthStreamState`), so this always stops
+    /// whichever one is current, regardless of which connection started it —
+    /// the same "level-set, not a per-caller toggle" shape
+    /// `SetOutputSuppressed` already uses.
+    async fn stop_depth_stream(&self, input: String) -> Result<(), DaemonError> {
+        Self::parse_input(&input)?;
+        let mut state = self.depth_stream.lock().unwrap();
+        state.epoch += 1;
+        if let Some(handle) = state.watcher.take() {
+            handle.abort();
+        }
+        state.input = None;
+        Ok(())
+    }
+
+    /// Fires at most every `DEPTH_STREAM_INTERVAL` (~30Hz) while
+    /// `StartDepthStream` has an active target matching `input` (ticket
+    /// 19/26). `depth` is 0-255 raw travel, the same units `SetActuationPoint`
+    /// takes.
+    #[zbus(signal)]
+    pub async fn depth_changed(
+        signal_emitter: &SignalEmitter<'_>,
+        input: &str,
+        depth: u8,
+    ) -> zbus::Result<()>;
+
     /// Fires on active-Profile changes — every `SwitchProfile` call, as of
     /// ticket 19.
     #[zbus(signal)]
@@ -562,6 +737,8 @@ mod tests {
         fn set_default_actuation(&self, actuation: u8, release: u8) -> zbus::Result<()>;
         fn reset_actuation_points(&self) -> zbus::Result<()>;
         fn set_force_digital(&self, force: bool) -> zbus::Result<()>;
+        fn start_depth_stream(&self, input: &str) -> zbus::Result<()>;
+        fn stop_depth_stream(&self, input: &str) -> zbus::Result<()>;
 
         #[zbus(signal)]
         fn active_profile_changed(&self, name: String) -> zbus::Result<()>;
@@ -574,6 +751,9 @@ mod tests {
 
         #[zbus(signal)]
         fn capture_mode_changed(&self, mode: String) -> zbus::Result<()>;
+
+        #[zbus(signal)]
+        fn depth_changed(&self, input: String, depth: u8) -> zbus::Result<()>;
     }
 
     /// Spins up a real, in-process `zbus` peer-to-peer connection (no
@@ -588,6 +768,7 @@ mod tests {
         event_tx: mpsc::Sender<PhysicalEvent>,
         conn_tx: mpsc::Sender<bool>,
         capture_mode_tx: mpsc::Sender<crate::capture::CaptureMode>,
+        depth_tx: watch::Sender<HashMap<Input, u8>>,
         capture_control_rx: mpsc::Receiver<bool>,
         sink: RecordingSink,
         server_connection: Connection,
@@ -614,8 +795,9 @@ mod tests {
             let (event_tx, event_rx) = mpsc::channel(8);
             let (conn_tx, conn_rx) = mpsc::channel(8);
             let (cmd_tx, cmd_rx) = mpsc::channel(8);
+            let (depth_tx, depth_rx) = watch::channel(HashMap::new());
 
-            let daemon = Daemon::new(cmd_tx, inj.clone());
+            let daemon = Daemon::new(cmd_tx, inj.clone(), depth_rx);
             let guid = zbus::Guid::generate();
             let (server_transport, client_transport) = tokio::net::UnixStream::pair().unwrap();
 
@@ -666,12 +848,20 @@ mod tests {
                 event_tx,
                 conn_tx,
                 capture_mode_tx,
+                depth_tx,
                 capture_control_rx,
                 sink,
                 server_connection,
                 dispatch_handle,
                 inj_handle,
             }
+        }
+
+        /// Stands in for the `AnalogCaptureSource` grid task publishing a
+        /// fresh per-report depth snapshot (ticket 26) — the seam
+        /// `run_depth_stream`'s pump samples from.
+        fn set_depths(&self, depths: &[(Input, u8)]) {
+            self.depth_tx.send_replace(depths.iter().copied().collect());
         }
 
         async fn press(&self, input: Input) {
@@ -1551,8 +1741,9 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel(8);
         let (_conn_tx, conn_rx) = mpsc::channel(8);
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (_depth_tx, depth_rx) = watch::channel(HashMap::new());
 
-        let daemon = Daemon::new(cmd_tx, inj.clone());
+        let daemon = Daemon::new(cmd_tx, inj.clone(), depth_rx);
         let guid = zbus::Guid::generate();
         let (server_transport, client_transport) = tokio::net::UnixStream::pair().unwrap();
 
@@ -1826,6 +2017,101 @@ mod tests {
             .try_into()
             .unwrap();
         assert_eq!(capture_mode, "analog");
+
+        server.shut_down().await;
+    }
+
+    /// Ticket 26's core requirement: once `StartDepthStream(input)` is
+    /// called, live depth published into `depth_tx` (standing in here for
+    /// the real `AnalogCaptureSource`'s per-report publish) reaches a
+    /// subscribed client as `DepthChanged(input, depth)`, throttled to
+    /// `DEPTH_STREAM_INTERVAL`.
+    #[tokio::test]
+    async fn start_depth_stream_over_real_dbus_pushes_depth_changed_for_the_requested_input() {
+        let server = TestServer::start().await;
+        let mut signals = server.proxy.receive_depth_changed().await.unwrap();
+
+        server.set_depths(&[(Input::Grid(1, 1), 200), (Input::Grid(1, 2), 40)]);
+        server
+            .proxy
+            .start_depth_stream("grid_r1c1")
+            .await
+            .expect("StartDepthStream must succeed for a Grid Input");
+
+        let signal = tokio::time::timeout(std::time::Duration::from_millis(500), signals.next())
+            .await
+            .expect("a DepthChanged signal must arrive within the throttle window")
+            .expect("the signal stream must not have closed");
+        let args = signal.args().unwrap();
+        assert_eq!(args.input, "grid_r1c1");
+        assert_eq!(args.depth, 200);
+
+        drop(signals);
+        server.shut_down().await;
+    }
+
+    /// `StartDepthStream` is last-write-wins per connection, mirroring
+    /// `SetOutputSuppressed` — a second call retargets the stream rather than
+    /// layering a second one, and the previous target stops being reported.
+    #[tokio::test]
+    async fn start_depth_stream_over_real_dbus_retargeting_replaces_the_previous_stream() {
+        let server = TestServer::start().await;
+        let mut signals = server.proxy.receive_depth_changed().await.unwrap();
+
+        server.set_depths(&[(Input::Grid(1, 1), 10), (Input::Grid(1, 2), 20)]);
+        server.proxy.start_depth_stream("grid_r1c1").await.unwrap();
+        server.proxy.start_depth_stream("grid_r1c2").await.unwrap();
+
+        let signal = tokio::time::timeout(std::time::Duration::from_millis(500), signals.next())
+            .await
+            .expect("a DepthChanged signal must arrive")
+            .expect("the signal stream must not have closed");
+        assert_eq!(signal.args().unwrap().input, "grid_r1c2");
+
+        drop(signals);
+        server.shut_down().await;
+    }
+
+    /// `StopDepthStream` ends the pump — no further `DepthChanged` signals
+    /// arrive even though `depth_tx` keeps publishing.
+    #[tokio::test]
+    async fn stop_depth_stream_over_real_dbus_ends_further_signals() {
+        let server = TestServer::start().await;
+        let mut signals = server.proxy.receive_depth_changed().await.unwrap();
+
+        server.set_depths(&[(Input::Grid(1, 1), 10)]);
+        server.proxy.start_depth_stream("grid_r1c1").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(500), signals.next())
+            .await
+            .expect("the first signal must arrive")
+            .expect("the signal stream must not have closed");
+
+        server.proxy.stop_depth_stream("grid_r1c1").await.unwrap();
+        server.set_depths(&[(Input::Grid(1, 1), 250)]);
+
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_millis(150), signals.next()).await;
+        assert!(
+            outcome.is_err(),
+            "no DepthChanged signal must arrive after StopDepthStream"
+        );
+
+        drop(signals);
+        server.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn start_depth_stream_over_real_dbus_rejects_a_non_grid_input() {
+        let server = TestServer::start().await;
+
+        let err = server
+            .proxy
+            .start_depth_stream("mode_key")
+            .await
+            .expect_err("a non-Grid Input must be rejected");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.InvalidBinding")
+        );
 
         server.shut_down().await;
     }

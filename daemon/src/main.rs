@@ -51,6 +51,13 @@ async fn main() -> io::Result<()> {
     // `actuation_rx` to every `AnalogCaptureSource` attempt it spawns
     // (ticket 23).
     let (actuation_tx, actuation_rx) = tokio::sync::watch::channel(HashMap::new());
+    // The live-depth seam (ticket 26): the Analog grid task publishes every
+    // key's current depth into `depth_tx` on every incoming report; the
+    // D-Bus layer holds `depth_rx` and throttles it down to `DepthChanged`'s
+    // ~30Hz for whichever connection has an active `StartDepthStream`. Never
+    // touches `Config` or dispatch, mirroring `SetOutputSuppressed`'s
+    // Config-free bypass.
+    let (depth_tx, depth_rx) = tokio::sync::watch::channel(HashMap::new());
     // The capture-mode seam (ticket 23): the supervisor pushes its current
     // `CaptureMode` on every transition; dispatch consumes it for
     // `GetState`/`CaptureModeChanged`.
@@ -69,7 +76,10 @@ async fn main() -> io::Result<()> {
         .map_err(io::Error::other)?
         .name("com.acheron.Daemon")
         .map_err(io::Error::other)?
-        .serve_at("/com/acheron/Daemon", Daemon::new(cmd_tx, inj.clone()))
+        .serve_at(
+            "/com/acheron/Daemon",
+            Daemon::new(cmd_tx, inj.clone(), depth_rx),
+        )
         .map_err(io::Error::other)?
         .build()
         .await
@@ -96,7 +106,7 @@ async fn main() -> io::Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     let result = tokio::select! {
-        result = supervisor::run(event_tx, connection_tx, actuation_rx, capture_mode_tx, capture_control_rx, force_digital) => report("capture", result),
+        result = supervisor::run(event_tx, connection_tx, actuation_rx, depth_tx, capture_mode_tx, capture_control_rx, force_digital) => report("capture", result),
         result = inj_handle => report("injector", flatten(result)),
         result = dispatch_handle => report("dispatch", flatten(result)),
         _ = sigterm.recv() => relock_and_exit("SIGTERM"),

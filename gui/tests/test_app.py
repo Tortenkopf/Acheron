@@ -130,7 +130,7 @@ def test_status_tracking_starts_conservative_before_any_signal_is_pumped():
     # applying it via `GLib.idle_add` — same reentrancy guard
     # `_wire_focus_tracking` uses — so nothing's visible in `status` until
     # that's pumped, even though `DaemonStub` starts running+connected.
-    assert status == {"daemon_running": False, "device_connected": False}
+    assert status == {"daemon_running": False, "device_connected": False, "capture_mode": "digital"}
 
 
 def test_status_tracking_reflects_the_daemon_already_running_on_launch():
@@ -150,7 +150,7 @@ def test_status_tracking_reflects_the_daemon_stopping_and_restarting():
 
     stub.simulate_daemon_stopped()
     _pump_idle_callbacks()
-    assert status == {"daemon_running": False, "device_connected": False}
+    assert status == {"daemon_running": False, "device_connected": False, "capture_mode": "digital"}
 
     stub.simulate_daemon_started()
     _pump_idle_callbacks()
@@ -164,11 +164,11 @@ def test_status_tracking_reflects_device_connection_changes_while_running():
 
     stub.simulate_device_disconnected()
     _pump_idle_callbacks()
-    assert status == {"daemon_running": True, "device_connected": False}
+    assert status == {"daemon_running": True, "device_connected": False, "capture_mode": "digital"}
 
     stub.simulate_device_connected()
     _pump_idle_callbacks()
-    assert status == {"daemon_running": True, "device_connected": True}
+    assert status == {"daemon_running": True, "device_connected": True, "capture_mode": "digital"}
 
 
 def test_status_tracking_forces_device_connected_false_when_the_daemon_stops():
@@ -184,12 +184,12 @@ def test_status_tracking_forces_device_connected_false_when_the_daemon_stops():
     stub.simulate_device_disconnected()
     stub.simulate_device_connected()
     _pump_idle_callbacks()
-    assert status == {"daemon_running": True, "device_connected": True}
+    assert status == {"daemon_running": True, "device_connected": True, "capture_mode": "digital"}
 
     stub.simulate_daemon_stopped()
     _pump_idle_callbacks()
 
-    assert status == {"daemon_running": False, "device_connected": False}
+    assert status == {"daemon_running": False, "device_connected": False, "capture_mode": "digital"}
 
 
 def test_status_tracking_calls_on_change_for_every_transition_deferred_via_idle_add():

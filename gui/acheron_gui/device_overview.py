@@ -343,6 +343,7 @@ def make_input_button(
     h=52,
     sensitive: bool = True,
     insensitive_reason: str | None = None,
+    capture_mode: str = "digital",
 ) -> Gtk.MenuButton:
     binding = config["profiles"][profile][layer].get(inp)
     inner = Gtk.Label(label=f"{input_label(inp)}\n{action_summary(binding)}", justify=Gtk.Justification.CENTER)
@@ -360,7 +361,7 @@ def make_input_button(
         popover.popdown()
         on_change()
 
-    editor = build_binding_editor(client, config, profile, layer, inp, on_saved)
+    editor = build_binding_editor(client, config, profile, layer, inp, on_saved, capture_mode)
     popover.set_child(editor)
     btn.set_popover(popover)
     return btn
@@ -374,6 +375,7 @@ def build_main_view(
     on_change: Callable[[], None],
     ui_state: dict,
     status: str | None = None,
+    capture_mode: str = "digital",
 ) -> Gtk.Widget:
     selected_layer = ui_state.setdefault("selected_layer", "base")
     mode_key_role = config["profiles"][profile]["mode_key_role"]
@@ -381,7 +383,17 @@ def build_main_view(
 
     def input_btn(inp: str, w=76, h=52, sensitive=True, insensitive_reason=None) -> Gtk.MenuButton:
         return make_input_button(
-            client, config, profile, selected_layer, inp, on_change, w, h, sensitive, insensitive_reason
+            client,
+            config,
+            profile,
+            selected_layer,
+            inp,
+            on_change,
+            w,
+            h,
+            sensitive,
+            insensitive_reason,
+            capture_mode,
         )
 
     root = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
@@ -494,7 +506,14 @@ def build_status_badge(status: str) -> Gtk.Box:
 
 
 def build_status_wrapped_view(
-    client, config: dict, profile: str, layer: str, status: str, on_change: Callable[[], None], ui_state: dict
+    client,
+    config: dict,
+    profile: str,
+    layer: str,
+    status: str,
+    on_change: Callable[[], None],
+    ui_state: dict,
+    capture_mode: str = "digital",
 ) -> Gtk.Widget:
     """Wraps `build_main_view`'s whole Device Overview (profile sidebar,
     grid, Action Table, tray mock — all one widget tree, per ticket 09) with
@@ -516,7 +535,7 @@ def build_status_wrapped_view(
     the tray status line's placement the way reaching into the built tree
     from outside could.
     """
-    root = build_main_view(client, config, profile, layer, on_change, ui_state, status)
+    root = build_main_view(client, config, profile, layer, on_change, ui_state, status, capture_mode)
 
     outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
     outer.append(build_status_badge(status))

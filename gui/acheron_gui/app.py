@@ -90,6 +90,20 @@ CSS = """
 .status-badge { font-size: 1.05em; }
 .dim-overlay { background-color: alpha(black, 0.45); border-radius: 6px; }
 .dim-overlay-label { color: white; font-weight: bold; }
+/* Ticket 26: the real Actuation & release editor (binding_editor.py),
+   ported from ticket 19's prototype/19-trigger-point-depth-ux variant B. */
+.actuation-section { padding: 8px; margin-top: 4px; background-color: alpha(currentColor, 0.05); border-radius: 6px; }
+.sub-heading { font-weight: bold; }
+.badge { border-radius: 999px; padding: 0px 6px; font-size: smaller; font-weight: bold; }
+.badge-analog { background-color: #2ecc71; color: black; }
+.badge-digital { background-color: #c0392b; color: white; }
+.digital-note-overlay { color: #e5883b; font-size: smaller; font-weight: bold; background-color: alpha(black, 0.55); border-radius: 4px; padding: 2px 8px; }
+.marker-legend { font-size: smaller; opacity: 0.8; }
+.depth-track-bg { background-color: alpha(currentColor, 0.12); border-radius: 4px; }
+.depth-track-fill { background-color: #4a90e2; border-radius: 4px; }
+.depth-track-dim { opacity: 0.35; }
+.marker-actuation { background-color: #2ecc71; }
+.marker-release { background-color: #e6991a; }
 """
 
 
@@ -154,8 +168,9 @@ def _wire_focus_tracking(window, client: DaemonClient) -> None:
 
 def _wire_status_tracking(client: DaemonClient, on_change: Callable[[], None]) -> dict:
     """Subscribes to ticket 20's Daemon-presence and device-connection
-    signals and keeps a live `{"daemon_running": bool, "device_connected":
-    bool}` dict in sync, calling `on_change()` on every transition.
+    signals (plus ticket 26's `CaptureModeChanged`) and keeps a live
+    `{"daemon_running": bool, "device_connected": bool, "capture_mode":
+    str}` dict in sync, calling `on_change()` on every transition.
 
     Both start `False` — conservative until the first real signal lands,
     since `subscribe_daemon_running_changed`'s underlying `Gio.bus_watch_name`
@@ -175,7 +190,7 @@ def _wire_status_tracking(client: DaemonClient, on_change: Callable[[], None]) -
     `_started`/`simulate_device_disconnected`/`_connected`, no real
     `Gtk.Application` main loop needed.
     """
-    status = {"daemon_running": False, "device_connected": False}
+    status = {"daemon_running": False, "device_connected": False, "capture_mode": "digital"}
 
     def on_running_changed(running: bool) -> None:
         def apply():
@@ -195,8 +210,25 @@ def _wire_status_tracking(client: DaemonClient, on_change: Callable[[], None]) -
 
         GLib.idle_add(apply)
 
+    def on_capture_mode_changed(mode: str) -> None:
+        # Ticket 26: the Actuation & release editor's badge needs to flip
+        # live while an editor popover is open. A full `rebuild()` (same as
+        # every other live signal here) is the simplest way to get that —
+        # unlike depth (~30Hz, handled by `binding_editor.py`'s own
+        # map/unmap-scoped `StartDepthStream` subscription instead), a
+        # capture-mode transition is rare enough that closing whatever
+        # popover happens to be open is an acceptable, already-established
+        # tradeoff (every other status transition here does the same).
+        def apply():
+            status["capture_mode"] = mode
+            on_change()
+            return GLib.SOURCE_REMOVE
+
+        GLib.idle_add(apply)
+
     client.subscribe_daemon_running_changed(on_running_changed)
     client.subscribe_device_connection_changed(on_device_connection_changed)
+    client.subscribe_capture_mode_changed(on_capture_mode_changed)
     return status
 
 
@@ -272,6 +304,7 @@ class AcheronApplication(Gtk.Application):
                     profile = state["profile"]
                     layer = state["layer"]
                     device_connected = state["device_connected"]
+                    capture_mode = state["capture_mode"]
                 except (DaemonError, GLib.Error):
                     # A rare race: the Daemon vanished between
                     # subscribe_daemon_running_changed reporting it up and
@@ -291,6 +324,7 @@ class AcheronApplication(Gtk.Application):
                     last_known["profile"] = profile
                     last_known["layer"] = layer
                     status["device_connected"] = device_connected
+                    status["capture_mode"] = capture_mode
             current_status = compute_status(status["daemon_running"], status["device_connected"])
             content_box.append(
                 build_status_wrapped_view(
@@ -301,6 +335,7 @@ class AcheronApplication(Gtk.Application):
                     current_status,
                     rebuild,
                     ui_state,
+                    status["capture_mode"],
                 )
             )
 

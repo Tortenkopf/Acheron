@@ -29,8 +29,8 @@ use std::fs;
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use evdev::Device;
@@ -391,6 +391,7 @@ fn relay_grid_blocking(
     schedule: RepeatSchedule,
     tx: &mpsc::Sender<PhysicalEvent>,
     actuation_rx: &mut watch::Receiver<HashMap<Input, ActuationPoint>>,
+    depth_tx: &watch::Sender<HashMap<Input, u8>>,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
     let fd = analog.as_raw_fd();
@@ -465,6 +466,20 @@ fn relay_grid_blocking(
                         Some(EventState::Repeat) | None => {}
                     }
                 }
+                // Ticket 26: every 20-key depth sample, not just Down/Up/
+                // Repeat transitions — the GUI's live Actuation & release bar
+                // needs the raw travel while a key sits between the release
+                // and actuation points, where `observe()` reports no
+                // transition at all. `watch::Sender::send_replace` is a
+                // cheap keep-latest overwrite; the D-Bus layer's own
+                // ~30Hz-throttled pump (ticket 26) is what turns this
+                // per-report cadence (sub-millisecond while moving, per
+                // ticket 13) into the rate-limited `DepthChanged` signal.
+                depth_tx.send_replace(
+                    (0..NUM_KEYS)
+                        .map(|i| (grid_input_for_byte(i), last_depth[i]))
+                        .collect(),
+                );
             }
         }
 
@@ -523,6 +538,7 @@ fn grid_task_blocking(
     connection_tx: mpsc::Sender<bool>,
     presence: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
     mut actuation_rx: watch::Receiver<HashMap<Input, ActuationPoint>>,
+    depth_tx: watch::Sender<HashMap<Input, u8>>,
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<()> {
     // Reports absence and waits out one `POLL_INTERVAL` — every absence
@@ -601,7 +617,14 @@ fn grid_task_blocking(
 
         evdev_source::report_presence(&presence, index, true, &connection_tx);
 
-        match relay_grid_blocking(&mut analog_file, schedule, &tx, &mut actuation_rx, &shutdown) {
+        match relay_grid_blocking(
+            &mut analog_file,
+            schedule,
+            &tx,
+            &mut actuation_rx,
+            &depth_tx,
+            &shutdown,
+        ) {
             Ok(()) => return Ok(()),
             Err(err) if is_grid_absent(&err) => {
                 retry_after_absence();
@@ -620,6 +643,10 @@ fn grid_task_blocking(
 /// one more `JoinSet` task — the `hidraw` grid task — per ticket 18 §1.
 pub struct AnalogCaptureSource {
     actuation_rx: watch::Receiver<HashMap<Input, ActuationPoint>>,
+    /// Ticket 26: the live per-key depth snapshot this source publishes on
+    /// every incoming report — the paired half of the D-Bus layer's own
+    /// `depth_rx`, which throttles it down to `DepthChanged`'s ~30Hz.
+    depth_tx: watch::Sender<HashMap<Input, u8>>,
     /// Ticket 23: shared with every task this source spawns (the two evdev
     /// nodes and the grid task alike). Setting it makes every task stop
     /// cleanly — relay loop exits, grabs/fds drop — at the next poll tick or
@@ -633,15 +660,18 @@ pub struct AnalogCaptureSource {
 impl AnalogCaptureSource {
     /// `actuation_rx` is the paired half of the `watch::Sender` dispatch
     /// publishes into (`dispatch::run`'s `actuation_tx` parameter, ticket 18
-    /// §5). `shutdown` is this attempt's own flag — the supervisor (ticket
-    /// 23) hands each `CaptureSource` attempt a fresh one and sets it to
-    /// request a clean stop.
+    /// §5). `depth_tx` is the paired half of the D-Bus layer's `depth_rx`
+    /// (ticket 26). `shutdown` is this attempt's own flag — the supervisor
+    /// (ticket 23) hands each `CaptureSource` attempt a fresh one and sets it
+    /// to request a clean stop.
     pub fn new(
         actuation_rx: watch::Receiver<HashMap<Input, ActuationPoint>>,
+        depth_tx: watch::Sender<HashMap<Input, u8>>,
         shutdown: Arc<AtomicBool>,
     ) -> Self {
         Self {
             actuation_rx,
+            depth_tx,
             shutdown,
         }
     }
@@ -670,6 +700,7 @@ impl CaptureSource for AnalogCaptureSource {
             self.shutdown.clone(),
         );
         let actuation_rx = self.actuation_rx;
+        let depth_tx = self.depth_tx;
         let grid_shutdown = self.shutdown.clone();
         tasks.spawn_blocking(move || {
             grid_task_blocking(
@@ -678,6 +709,7 @@ impl CaptureSource for AnalogCaptureSource {
                 connection_tx,
                 presence,
                 actuation_rx,
+                depth_tx,
                 grid_shutdown,
             )
         });
@@ -1022,6 +1054,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
         let (actuation_tx, mut actuation_rx) =
             watch::channel(Profile::default().resolved_actuation_points());
+        let (depth_tx, _depth_rx) = watch::channel(HashMap::new());
         // A delay comfortably past this test's critical section (EOF must
         // be detected within one `REPORT_POLL_TIMEOUT` tick, ~8ms) but
         // still short enough to keep the suite fast — this test isn't
@@ -1030,7 +1063,14 @@ mod tests {
 
         let shutdown = AtomicBool::new(false);
         let handle = std::thread::spawn(move || {
-            relay_grid_blocking(&mut analog, schedule, &tx, &mut actuation_rx, &shutdown)
+            relay_grid_blocking(
+                &mut analog,
+                schedule,
+                &tx,
+                &mut actuation_rx,
+                &depth_tx,
+                &shutdown,
+            )
         });
 
         let down = rx.blocking_recv().expect("the Down this report produces");

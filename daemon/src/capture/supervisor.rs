@@ -23,8 +23,8 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
@@ -66,6 +66,7 @@ pub async fn run(
     event_tx: mpsc::Sender<PhysicalEvent>,
     connection_tx: mpsc::Sender<bool>,
     actuation_rx: watch::Receiver<HashMap<Input, ActuationPoint>>,
+    depth_tx: watch::Sender<HashMap<Input, u8>>,
     mode_tx: mpsc::Sender<CaptureMode>,
     mut control_rx: mpsc::Receiver<bool>,
     force_digital: bool,
@@ -84,7 +85,11 @@ pub async fn run(
         let (inner_conn_tx, mut inner_conn_rx) = mpsc::channel::<bool>(8);
         let mut handle: JoinHandle<io::Result<()>> = match mode {
             CaptureMode::Analog => {
-                let source = AnalogCaptureSource::new(actuation_rx.clone(), shutdown.clone());
+                let source = AnalogCaptureSource::new(
+                    actuation_rx.clone(),
+                    depth_tx.clone(),
+                    shutdown.clone(),
+                );
                 tokio::spawn(source.run(event_tx.clone(), inner_conn_tx))
             }
             CaptureMode::Digital => {

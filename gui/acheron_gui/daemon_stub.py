@@ -37,12 +37,21 @@ from .daemon_client import AlreadyExistsError, InvalidBindingError, NotFoundErro
 
 
 class DaemonStub:
+    _SEED_PROFILE = {
+        "base": {},
+        "held": {},
+        "mode_key_role": "layer_switch",
+        # Matches `ActuationPoint::default()` (daemon/src/config.rs) — the
+        # same 128/112 placeholder the real Daemon seeds a fresh Profile
+        # with (ticket 26).
+        "default_actuation": {"actuation": 128, "release": 112},
+        "actuation_overrides": {},
+    }
+
     def __init__(self, active_profile: str = "Default"):
         self._schema_version = 1
         self._active_profile = active_profile
-        self._profiles: dict[str, dict] = {
-            active_profile: {"base": {}, "held": {}, "mode_key_role": "layer_switch"}
-        }
+        self._profiles: dict[str, dict] = {active_profile: copy.deepcopy(self._SEED_PROFILE)}
         self._layer = "base"
         self._active_toggles: list[str] = []
         # Hardcoded, mirroring the real Daemon's ticket 21 stand-in — there
@@ -54,6 +63,12 @@ class DaemonStub:
         self._profile_changed_callbacks: list[Callable[[str], None]] = []
         self._running_changed_callbacks: list[Callable[[bool], None]] = []
         self._device_connection_changed_callbacks: list[Callable[[bool], None]] = []
+        self._capture_mode_changed_callbacks: list[Callable[[str], None]] = []
+        # Ticket 26: mirrors `DBusDaemonClient`'s single-current-target
+        # depth-stream routing (see `start_depth_stream`'s docstring there)
+        # rather than a list of subscribers.
+        self._depth_target: str | None = None
+        self._depth_callback: Callable[[int], None] | None = None
         # Recorded for tests that want to assert what the GUI actually sent,
         # not just the resulting state.
         self.calls: list[tuple] = []
@@ -101,7 +116,7 @@ class DaemonStub:
     def create_profile(self, name: str) -> None:
         if name in self._profiles:
             raise AlreadyExistsError(f"a Profile named {name!r} already exists")
-        self._profiles[name] = {"base": {}, "held": {}, "mode_key_role": "layer_switch"}
+        self._profiles[name] = copy.deepcopy(self._SEED_PROFILE)
         self.calls.append(("create_profile", name))
 
     def delete_profile(self, name: str) -> None:
@@ -151,6 +166,56 @@ class DaemonStub:
         self._active_toggles = []
         self.calls.append(("stop_all_toggles",))
 
+    def set_actuation_point(self, input_str: str, actuation: int, release: int) -> None:
+        if release > actuation:
+            raise InvalidBindingError("release must not exceed actuation")
+        overrides = self._profiles[self._active_profile]["actuation_overrides"]
+        overrides[input_str] = {"actuation": actuation, "release": release}
+        self.calls.append(("set_actuation_point", input_str, actuation, release))
+
+    def clear_actuation_point(self, input_str: str) -> None:
+        self._profiles[self._active_profile]["actuation_overrides"].pop(input_str, None)
+        self.calls.append(("clear_actuation_point", input_str))
+
+    def set_default_actuation(self, actuation: int, release: int) -> None:
+        if release > actuation:
+            raise InvalidBindingError("release must not exceed actuation")
+        self._profiles[self._active_profile]["default_actuation"] = {
+            "actuation": actuation,
+            "release": release,
+        }
+        self.calls.append(("set_default_actuation", actuation, release))
+
+    def reset_actuation_points(self) -> None:
+        self._profiles[self._active_profile]["actuation_overrides"] = {}
+        self.calls.append(("reset_actuation_points",))
+
+    def set_force_digital(self, force: bool) -> None:
+        # Config-free on the stub too, mirroring `set_output_suppressed`:
+        # `GetConfig()` doesn't serialize `force_digital` on the real Daemon
+        # either (ticket 26), so there's nothing for this stub to reflect
+        # back — only what the GUI actually sent, for tests to assert.
+        self.calls.append(("set_force_digital", force))
+
+    def start_depth_stream(self, input_str: str, on_depth: Callable[[int], None]) -> None:
+        self._depth_target = input_str
+        self._depth_callback = on_depth
+        self.calls.append(("start_depth_stream", input_str))
+
+    def stop_depth_stream(self, input_str: str) -> None:
+        self._depth_target = None
+        self._depth_callback = None
+        self.calls.append(("stop_depth_stream", input_str))
+
+    def simulate_depth(self, input_str: str, depth: int) -> None:
+        """Stands in for a real `DepthChanged(input, depth)` signal (ticket
+        26) — only delivered if `input_str` matches the currently active
+        `start_depth_stream` target, mirroring the real Daemon's single-
+        current-stream semantics (`daemon_client.DBusDaemonClient.
+        start_depth_stream`'s docstring)."""
+        if input_str == self._depth_target and self._depth_callback is not None:
+            self._depth_callback(depth)
+
     def subscribe_layer_changed(self, callback: Callable[[str], None]) -> None:
         self._layer_changed_callbacks.append(callback)
 
@@ -169,6 +234,9 @@ class DaemonStub:
 
     def subscribe_device_connection_changed(self, callback: Callable[[bool], None]) -> None:
         self._device_connection_changed_callbacks.append(callback)
+
+    def subscribe_capture_mode_changed(self, callback: Callable[[str], None]) -> None:
+        self._capture_mode_changed_callbacks.append(callback)
 
     def simulate_daemon_stopped(self) -> None:
         """Stands in for `com.acheron.Daemon`'s bus name vanishing (ticket
@@ -204,6 +272,15 @@ class DaemonStub:
         self._device_connected = True
         for callback in self._device_connection_changed_callbacks:
             callback(True)
+
+    def simulate_capture_mode(self, mode: str) -> None:
+        """Stands in for a real `CaptureModeChanged` signal (ticket 17/23)
+        — there's no analog `CaptureSource`/supervisor in GUI tests either."""
+        if mode == self._capture_mode:
+            return
+        self._capture_mode = mode
+        for callback in self._capture_mode_changed_callbacks:
+            callback(mode)
 
     def simulate_mode_key_press(self) -> None:
         self._set_layer("held")

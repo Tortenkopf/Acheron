@@ -20,7 +20,8 @@ use zbus::zvariant::{OwnedValue, Value};
 
 use crate::command::State;
 use crate::config::{
-    Action, Binding, Config, Layer, MacroStepDto, ModeKeyRole, Modifiers, Profile, TriggerMode,
+    Action, ActuationPoint, Binding, Config, Layer, MacroStepDto, ModeKeyRole, Modifiers, Profile,
+    TriggerMode,
 };
 
 /// The `a{sv}` shape every `Action`/`MacroStep`/`Binding`/`Config` entity
@@ -250,6 +251,24 @@ fn bindings_to_dict(bindings: &std::collections::HashMap<crate::input::Input, Bi
         .collect()
 }
 
+/// `ActuationPoint` marshals as a flat two-field `a{sv}` (issue 08's `Binding`
+/// convention: bundle related scalars into one dict rather than two parallel
+/// arguments), reused identically for a Profile's `default_actuation` and
+/// each entry of `actuation_overrides`.
+fn actuation_point_to_dict(point: ActuationPoint) -> Dict {
+    let mut dict = Dict::new();
+    dict.insert("actuation".to_string(), scalar(point.actuation));
+    dict.insert("release".to_string(), scalar(point.release));
+    dict
+}
+
+fn actuation_overrides_to_dict(overrides: &HashMap<crate::input::Input, ActuationPoint>) -> Dict {
+    overrides
+        .iter()
+        .map(|(input, point)| (input.to_string(), scalar(actuation_point_to_dict(*point))))
+        .collect()
+}
+
 fn profile_to_dict(profile: &Profile) -> Dict {
     let mut dict = Dict::new();
     dict.insert("base".to_string(), scalar(bindings_to_dict(&profile.base)));
@@ -257,6 +276,18 @@ fn profile_to_dict(profile: &Profile) -> Dict {
     dict.insert(
         "mode_key_role".to_string(),
         scalar(mode_key_role_str(profile.mode_key_role).to_string()),
+    );
+    // Ticket 26: still missing as of ticket 21, which deliberately deferred
+    // it — the Actuation & release editor needs both to seed its markers
+    // and its "reset to Profile default" affordance from the real Config
+    // rather than a hardcoded guess.
+    dict.insert(
+        "default_actuation".to_string(),
+        scalar(actuation_point_to_dict(profile.default_actuation)),
+    );
+    dict.insert(
+        "actuation_overrides".to_string(),
+        scalar(actuation_overrides_to_dict(&profile.actuation_overrides)),
     );
     dict
 }
@@ -481,6 +512,86 @@ mod tests {
         assert_eq!(
             dict_get_string(&default_profile, "mode_key_role"),
             "layer_switch"
+        );
+    }
+
+    /// Ticket 26: `config_to_dict` must serialize a Profile's
+    /// `default_actuation`/`actuation_overrides` — deliberately deferred by
+    /// ticket 21, closing the gap this ticket's `binding_editor.py` section
+    /// needs to seed its markers from the real Config.
+    #[test]
+    fn config_to_dict_serializes_default_actuation_and_actuation_overrides() {
+        use crate::input::Input;
+        use std::collections::HashMap as StdHashMap;
+
+        let mut overrides = StdHashMap::new();
+        overrides.insert(
+            Input::Grid(2, 3),
+            ActuationPoint {
+                actuation: 200,
+                release: 180,
+            },
+        );
+        let mut profiles = StdHashMap::new();
+        profiles.insert(
+            "Default".to_string(),
+            Profile {
+                default_actuation: ActuationPoint {
+                    actuation: 128,
+                    release: 112,
+                },
+                actuation_overrides: overrides,
+                ..Default::default()
+            },
+        );
+        let config = Config {
+            schema_version: 1,
+            active_profile: "Default".to_string(),
+            profiles,
+            force_digital: false,
+        };
+
+        let dict = config_to_dict(&config);
+        let profiles_dict: Dict = get(&dict, "profiles").unwrap().clone().try_into().unwrap();
+        let default_profile: Dict = profiles_dict
+            .get("Default")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+
+        let default_actuation: Dict = get(&default_profile, "default_actuation")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            u8::try_from(get(&default_actuation, "actuation").unwrap()).unwrap(),
+            128
+        );
+        assert_eq!(
+            u8::try_from(get(&default_actuation, "release").unwrap()).unwrap(),
+            112
+        );
+
+        let overrides_dict: Dict = get(&default_profile, "actuation_overrides")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let override_point: Dict = overrides_dict
+            .get("grid_r2c3")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            u8::try_from(get(&override_point, "actuation").unwrap()).unwrap(),
+            200
+        );
+        assert_eq!(
+            u8::try_from(get(&override_point, "release").unwrap()).unwrap(),
+            180
         );
     }
 

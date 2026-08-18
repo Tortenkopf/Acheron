@@ -367,7 +367,12 @@ def test_running_connected_status_enables_the_grid_with_no_dim_overlay():
 
     root = _device_overview_root(outer)
     assert root.get_sensitive()
-    assert find_all(outer, lambda w: isinstance(w, Gtk.Overlay)) == []
+    # Scoped to the dim-overlay specifically (its "dim-overlay" CSS class),
+    # not `Gtk.Overlay` generally — ticket 26's Actuation & release section
+    # legitimately builds its own `Gtk.Overlay`s (the live depth bar, the
+    # digital-mode fallback note) inside every Grid key's editor, which a
+    # bare `isinstance` check would now always find regardless of status.
+    assert find_all(outer, lambda w: "dim-overlay" in w.get_css_classes()) == []
 
 
 def test_not_running_status_disables_the_grid_under_its_own_message():

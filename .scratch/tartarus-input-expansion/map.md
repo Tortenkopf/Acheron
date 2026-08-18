@@ -160,6 +160,29 @@ Like the previous map, this one carries execution.
   `default_actuation`/`actuation_overrides`. None of this is wired into the real GUI/Daemon
   yet — spawned [Build the trigger-point UX and live-depth channel for real](./issues/26-task-build-trigger-point-depth-ux.md).
 
+- [Build the trigger-point UX and live-depth channel for real](./issues/26-task-build-trigger-point-depth-ux.md)
+  — landed all four scope items. Daemon: `StartDepthStream`/`StopDepthStream`/`DepthChanged`
+  modeled as a single current stream target (epoch/disconnect-watcher, mirroring
+  `SetOutputSuppressed`'s shape, Config-free and bypassing dispatch); `AnalogCaptureSource`
+  gained a `depth_tx` publishing all 20 keys' depth on every report, threaded through
+  supervisor/main.rs opposite `actuation_tx`. `GetConfig()` now serializes
+  `default_actuation`/`actuation_overrides` (ticket 21's deferred gap, closed). The real
+  Actuation & release section in `binding_editor.py` ports the prototype's `DepthTrack`
+  widget almost unchanged, gated to Grid Inputs only, wired to all five existing Set/Clear/
+  Reset D-Bus methods plus the new depth pair. Found and fixed the same "eager rebuild"
+  hazard twice, two different ways: depth streaming (~30Hz, must track one open popover)
+  uses a client-side single-current-target routing seam started/stopped from the section's
+  own `map`/`unmap`; capture-mode (rare, badge-only) is threaded as a plain parameter fed by
+  a new app-level `CaptureModeChanged` subscription driving the existing full-`rebuild()`
+  pattern instead — either approach done per-widget would have leaked one signal connection
+  per rebuild. 176 Rust + 79 Python tests green; a `tokio::time::interval` first-tick-
+  immediately race (letting a superseded `StartDepthStream` sneak one stray signal out) was
+  caught by its own new test and fixed with `interval_at`. **Live-hardware verification not
+  done this session** — a real Daemon and Tartarus Pro were available, but swapping the
+  user's live input-device driver out from under them unasked was judged out of this
+  session's call. Spawned [Verify the trigger-point UX and live-depth channel on hardware]
+  (./issues/27-task-verify-trigger-point-depth-ux-on-hardware.md).
+
 ## Not yet specified
 
 - **Composition between Chord/mouse-button/Stepper/Profile-Switch** — e.g. can a Chord's Action be a Stepper step; can a Stepper's forward/backward pair include a Chord as one side. Not sharp enough to ticket until those tickets have settled their own shape.
