@@ -1,4 +1,5 @@
 Type: grilling
+Status: resolved
 
 ## Question
 
@@ -15,3 +16,29 @@ Finalize mouse-button output support **and** full keyboard-key output support, t
 Out of scope for this ticket (per the map): cursor movement, synthetic scroll output, capturing from a real external mouse.
 
 **Correction from [Lock the v1.0 feature list](./08-decide-v1-feature-list.md)**: the picker's "entire keyboard" scope must also include **multimedia/consumer-control keys** (Vol+/-, Mute, Mic mute, Play/Pause, Next/Prev track) — these surfaced from the Synapse catalog as an in-scope v1.0 item, and are almost certainly already-advertised standard evdev `KEY_*` codes (`KEY_VOLUMEUP`, `KEY_PLAYPAUSE`, etc.) via the same `all_injectable_key_codes()` sweep that makes mouse-button output already work — verify live alongside the other "verify, don't assume" bullets above, don't assume. Also: "canned text" macros (Synapse's snippet-typing feature) are almost certainly already achievable for free once this ticket's full keyboard range lands, by building a Macro of per-character Keypresses — confirm that reading holds, and separately judge whether a convenience "type this text" input (auto-expanding to per-character steps) is worth building for v1.0 or left as a manual key-by-key build; this is a GUI-nicety question for this ticket's own grilling session, not a reason to reopen it here.
+
+## Answer
+
+**Live-hardware verification (all confirmed against the real Daemon + Tartarus Pro, zero Daemon changes needed):**
+
+- Mouse-button output via `Action::Keypress{key: BTN_LEFT}` — a real left-click landed.
+- Non-alphanumeric keys round-trip end-to-end across every category: lock key (`KEY_CAPSLOCK` toggled correctly), function key (`KEY_F5` refreshed a browser tab), navigation cluster (`KEY_HOME` jumped cursor to line start), misc (`KEY_INSERT` accepted, `KEY_ESC` closed a dialog), multimedia/consumer-control (`KEY_VOLUMEUP` raised system volume, `KEY_PLAYPAUSE` toggled media) — confirms evdev's uniform `FromStr`/`Display` parsing holds everywhere, including the multimedia correction folded in from ticket 08.
+- Modifier-combination interaction with a mouse-button Action (Ctrl+Click) — worked correctly (opened a link in a new tab), reusing the exact same `Modifiers` mechanism as a keyboard Keypress, no special-casing.
+- Macro steps (`MacroStepDto::KeyDown`/`KeyUp`) use the identical `evdev::KeyCode` typing as `Action::Keypress`'s `key` field — no wrinkle, corroborated by the user's own real "MnM" profile already using `KeyDown(BTN_RIGHT)` in a live Macro.
+- **Edge case resolved**: a Binding with `key = KEY_LEFTCTRL` *and* `modifiers.ctrl = true` (double `KeyDown`/`KeyUp` on the same code) is harmless — captured the raw evdev stream from the virtual device across 4 real presses, each showed exactly one down/one up transition. The kernel's `EV_KEY` state-dedup in the input core silently drops a same-value repeat. No GUI guard needed.
+- **New finding**: a modifier used as a bare Keypress *main key* under Fire-once does **not** work as a real held-Ctrl-for-chording — confirmed live it did not act like Ctrl. Root cause (code reading, not a per-key bug): every Trigger mode only ever runs canned instant pulses; none holds a key for the physical press's duration. Toggle is the sole exception (it tracks and force-releases `held` keys on stop) and is the proven correct pattern for "hold until pressed again" — confirmed via the user's own working `Toggle` + `KeyDown(BTN_RIGHT)`-only Macro (mouse-look toggle, MnM profile, thumbstick_left).
+- **New finding, escalated to its own ticket**: that same "no held-key tracking outside Toggle" gap means an *unbalanced* Macro (`KeyDown` with no matching `KeyUp`) under Fire-once or Hold-to-repeat can strand a key/button held down **forever** — reproduced live with `KEY_LEFTCTRL`, requiring a full reboot to clear (releasing/re-pressing the grid key and even changing the binding did nothing, since `dispatch.rs::fire()` ignores the physical Input's `Up` entirely for those two Trigger modes). Spawned [ticket 33](./33-fix-fire-once-hold-to-repeat-stuck-key.md) for the real fix; documented as an immediate mitigation in the README footgun list below.
+
+**Design decisions:**
+
+- **Mouse buttons exposed**: Left/Right/Middle plus Side/Extra, labeled by their observable function — **Back**/**Forward** — rather than `BTN_SIDE`/`BTN_EXTRA`.
+- **Keyboard scope**: no exclusions. The full range is fair game, same as letters/digits already implicitly were — Acheron is a remap tool, not a policy layer, and doesn't guard against other self-inflicted footguns either (bad Chords, unbounded Macro loops).
+- **GUI picker**: spawned [Prototype the key/mouse-button picker UX](./32-prototype-key-mouse-button-picker-ux.md) — explores both a graphical keyboard-layout picker and a category-sorted menu alternative, since a full keyboard rendering may not fit the binding editor's space budget.
+- **Modifiers as main-key targets**: stay exposed in the picker (consistent with "no exclusions"), but the picker/README note that a bare modifier there is a near-instant pulse under Fire-once/Hold-to-repeat, and that Toggle with a single-`KeyDown` Macro is the correct pattern for a real held modifier.
+- **Canned-text macros**: left as a manual per-character build for v1.0 — a clean fast-follow GUI nicety once the picker ships, not a blocker.
+- **README footgun list** (documentation, ships alongside the picker):
+  - A single-`KeyDown`-with-no-matching-`KeyUp` Macro under Fire-once/Hold-to-repeat strands that key/button held down until [ticket 33](./33-fix-fire-once-hold-to-repeat-stuck-key.md) lands — use **Toggle** instead for "hold until pressed again."
+  - Binding a grid key to a desktop-reserved key (`KEY_POWER`, `KEY_SLEEP`, `KEY_SYSRQ`, etc.) is accepted with no warning and does exactly what the real key does.
+  - A Toggle wrapping a Macro with no `Delay` steps loops as fast as the injector allows (mitigated by the existing 20ms floor, but still a rapid-fire flood, not a gentle repeat).
+
+Spawned tickets: [32](./32-prototype-key-mouse-button-picker-ux.md) (picker UX prototype), [33](./33-fix-fire-once-hold-to-repeat-stuck-key.md) (stuck-key fix, out of this ticket's own scope).

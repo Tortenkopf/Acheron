@@ -13,3 +13,7 @@ Settle at least:
 - **Interaction with in-flight tickets**: confirm this doesn't collide with [Design Chord Bindings](./01-decide-chord-bindings.md) or [Design Profile Switch](./05-decide-profile-switch-action.md) — a named Macro should compose as a drop-in replacement for today's inline Macro wherever `Action::Macro` is used, without needing changes to either.
 
 Once resolved, update CONTEXT.md's **Macro** entry to describe the named/reusable shape (currently describes only the inline form).
+
+## Comments
+
+Note added by [Design the Stepper list-stepping construct](./03-decide-stepper-list-stepping.md)'s resolution: Stepper landed on the same "named entity, defined once in a library, reassignable to a Binding" shape (global library, silent reassignment, no per-entry scoping). [Prototype the Stepper library and list-editing UX](./31-prototype-stepper-library-ux.md) is deliberately blocked on this ticket — when resolving here, check whether its GUI prototype should also cover Stepper's library picker, or whether they genuinely diverge enough (item-reordering, pair-assignment vs. single-Binding assignment) to stay separate.
