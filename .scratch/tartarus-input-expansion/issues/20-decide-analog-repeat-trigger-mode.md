@@ -1,5 +1,6 @@
 Type: grilling
 Blocked by: 17, 23
+Status: resolved
 
 ## Question
 
@@ -52,4 +53,53 @@ Settle at least:
 
 ## Answer
 
-_(unresolved)_
+`TriggerMode` gets a fourth variant, `AnalogRepeat` — a separate, explicitly-chosen mode, never
+a silent depth-modulation of existing Hold-to-repeat Bindings (which would change an existing
+Binding's behavior out from under the user the moment Analog Capture mode turns on).
+
+**Start/stop**: gated by a small, **fixed, hardcoded deadzone** — deliberately *not* the key's
+own tunable Actuation/Release points. Reusing the Actuation point would waste however much of
+the key's travel the user set it to on "off," and the whole point of this mode is to feel like a
+real analog axis using (close to) the key's full physical travel. Structurally this reuses the
+existing `observe()`-shaped Depth→transition hysteresis, just with hardcoded constants standing
+in for the per-key `ActuationPoint` it normally reads from Config.
+
+**Rate curve**: linear, mapped across the key's full 0–255 Depth range (not renormalized to an
+actuation/release band). Bounds (min/max Hz) are hardcoded dispatch.rs constants, not
+per-Binding configurable, for this fast-follow — see the fog note below for future tunability.
+
+**Each fire**: a Down+Up pulse of a fixed short duration, not Depth-scaled — only the *frequency*
+of taps varies with Depth, not how long each tap holds the key down.
+
+**Full deflection**: above a fixed near-full-travel threshold, the key holds down solid
+(continuous Down, no further tapping) rather than continuing to fire at the curve's max rate —
+what a driving-sim player actually wants for full throttle.
+
+**Digital Capture mode fallback**: a Binding set to Analog-repeat has no Depth once the Daemon
+degrades to Digital. Falls back to plain Hold-to-repeat at the kernel-autorepeat cadence — the
+same behavior every other grid key already has in Digital mode, rather than doing nothing or
+firing at one arbitrary fixed rate.
+
+**Applicability**: grid-key Bindings only. The GUI greys out "Analog-repeat" as a Trigger-mode
+option for non-Grid Inputs, mirroring the existing `is_grid_input()` gate already used for the
+Actuation & release section — structurally prevents the nonsensical case rather than needing a
+runtime fallback for an Input with no Depth sensor.
+
+**Architecture**: `dispatch.rs` takes its own receiver on the existing `depth_tx` watch channel
+(report-rate, already flowing to the D-Bus layer for `DepthChanged` — mirrors how it already
+holds `actuation_tx`), rather than relying on `PhysicalEvent.depth` as carried by the capture
+layer's own synthesized `Repeat` events, which are throttled to the (coarser) kernel-autorepeat
+cadence and would cap how responsive the rate curve could feel. Analog-repeat runs as a **new
+per-Input background task** — its own `HashMap<Input, _>` tracking alongside the existing
+`toggles`/`in_flight` maps — spawned when Depth crosses the fixed deadzone going up, cancelled
+crossing back down, recomputing its own next sleep duration from the latest Depth on every tick.
+Structurally closer to `ActiveToggle`'s existing spawned-task-per-Input shape than to
+Hold-to-repeat's reactive branch in `fire()`, since the rate has to vary continuously between
+whatever discrete events the capture layer happens to emit.
+
+**Numbers** (deadzone threshold, min/max Hz, fire duration, hold-solid threshold): left
+TBD — tuned live against the real device by the build ticket, not decided blind here. Spawned
+[Build and tune Analog-repeat on hardware](./39-task-build-analog-repeat.md).
+
+CONTEXT.md gained the Analog-repeat glossary entry; the Trigger-mode entry's "one of Fire-once,
+Hold-to-repeat, or Toggle" is corrected to name all four.

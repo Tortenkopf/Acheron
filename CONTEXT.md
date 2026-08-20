@@ -51,7 +51,7 @@ An Action that emits a virtual-gamepad button press rather than a keyboard/mouse
 _Avoid_: gamepad (the kernel's own vocabulary for the device class, not Acheron's domain term), joystick (reserved for the broader "Controller/Joystick" strand name, not this Action specifically)
 
 **Trigger mode**:
-Governs how a Binding fires once its Input is pressed. One of Fire-once, Hold-to-repeat, or Toggle. Applies to every Binding, regardless of whether its Action is a Keypress or a Macro — except a Stepper's forward/backward Bindings, which disallow Toggle: there is no coherent continuously-running state for a cursor advance the way there is for a held Keypress or a looping Macro.
+Governs how a Binding fires once its Input is pressed. One of Fire-once, Hold-to-repeat, Toggle, or Analog-repeat. Applies to every Binding, regardless of whether its Action is a Keypress or a Macro — except a Stepper's forward/backward Bindings, which disallow Toggle: there is no coherent continuously-running state for a cursor advance the way there is for a held Keypress or a looping Macro. Analog-repeat is further restricted to grid-key Bindings only, since it requires Depth.
 _Avoid_: trigger type, activation mode
 
 **Fire-once**:
@@ -62,6 +62,10 @@ The Trigger mode where the Action re-fires continuously for as long as the Input
 
 **Toggle**:
 The Trigger mode where a single press starts the Action running continuously (looping, for a Macro; held down, for a Keypress) until the same Input is pressed again.
+
+**Analog-repeat**:
+The Trigger mode, grid-key-only, where the Action re-fires at a rate that varies continuously with Depth — slower near the deadzone, faster near full travel — rather than at Hold-to-repeat's fixed cadence. Starts once Depth crosses a small fixed deadzone (deliberately *not* the key's own Actuation point, so the rate curve gets the key's full travel range) and holds the key down solid, without further tapping, above a fixed near-full-travel threshold. Falls back to plain Hold-to-repeat when the Daemon is in Digital Capture mode (no Depth available). User-facing feature name: "Simulated Analog Key-Interlacing," for keyboard-driven driving sims and similar games where a player would otherwise hand-interlace keypresses to steer or accelerate.
+_Avoid_: Simulated Analog Key-Interlacing (reserved for the user-facing/README name, not this domain term), analog mode (see Capture mode — a distinct concept)
 
 **Depth**:
 The 0-255 measurement of how far a grid key is physically pressed, available only while the Daemon is in analog Capture mode. `None`/absent for every Input without a depth sensor (the Mode key, thumbstick, wheel) and for a grid key while in digital Capture mode.
