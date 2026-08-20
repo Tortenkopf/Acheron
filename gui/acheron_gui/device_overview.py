@@ -31,7 +31,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from gi.repository import Gtk
+from gi.repository import Gtk, Pango
 
 from .action_table import build_action_table
 from .binding_editor import action_summary, build_binding_editor
@@ -340,17 +340,43 @@ def make_input_button(
     inp: str,
     on_change: Callable[[], None],
     w=76,
-    h=52,
+    h=99,
     sensitive: bool = True,
     insensitive_reason: str | None = None,
     capture_mode: str = "digital",
 ) -> Gtk.MenuButton:
     binding = config["profiles"][profile][layer].get(inp)
-    inner = Gtk.Label(label=f"{input_label(inp)}\n{action_summary(binding)}", justify=Gtk.Justification.CENTER)
+    inner = Gtk.Label(label=f"{input_label(inp)}\n{action_summary(binding, inp)}", justify=Gtk.Justification.CENTER)
     inner.set_wrap(True)
+    # Plain `wrap=True` alone only breaks at whitespace (`Pango.WrapMode.WORD`,
+    # the Gtk.Label default). Every summary string does have at least one
+    # legal break (the space before "[trigger]"/"(default)"), so ordinary
+    # content ("passthrough (Q)", "Ctrl+A  [1x]") already wraps cleanly on
+    # that alone — WORD_CHAR is only the fallback for the one run that has
+    # none: a multi-modifier chord like "Ctrl+Shift+Alt+Super+F12" is one
+    # unbroken token, live-verified to force the button (and its Grid cell)
+    # to ~300px wide under plain WORD wrap instead of wrapping at all. Not
+    # paired with `max-width-chars`: that caps the label's *natural* width
+    # request globally, which sounded right for the chord case but live
+    # verification (a real screenshot) showed it also forces ordinary
+    # "passthrough" into an ugly mid-word "passthr/ough" split, since 7-8
+    # chars isn't enough room for an 11-letter word. Leaving natural width
+    # uncapped means ordinary content wraps at its own word boundaries as
+    # before, and only the rare no-space chord run falls back to a character
+    # split inside a button that's already `w`-wide — the same "floor, not
+    # ceiling" tradeoff already accepted for `h` below, not a new one.
+    inner.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
     btn = Gtk.MenuButton()
     btn.set_child(inner)
     btn.set_size_request(w, h)
+    # A MenuButton's default halign is FILL: inside a plain Gtk.Box (the Mode
+    # key and key-20's paddle, both appended straight to `stick_col` rather
+    # than gridded), that stretches it to the box's full cross-width — the
+    # diamond's ~160px, not this button's own 52px — live-verified via a
+    # real screenshot as the actual cause of the oversized Mode-key oval,
+    # not missing wrapping. A Gtk.Grid cell (every other caller) already
+    # sizes to its own column, so this is a no-op there.
+    btn.set_halign(Gtk.Align.CENTER)
     btn.add_css_class("bound" if binding else "empty")
     btn.set_sensitive(sensitive)
     if not sensitive and insensitive_reason:
@@ -381,7 +407,7 @@ def build_main_view(
     mode_key_role = config["profiles"][profile]["mode_key_role"]
     mode_key_bindable = mode_key_role == "bound"
 
-    def input_btn(inp: str, w=76, h=52, sensitive=True, insensitive_reason=None) -> Gtk.MenuButton:
+    def input_btn(inp: str, w=76, h=99, sensitive=True, insensitive_reason=None) -> Gtk.MenuButton:
         return make_input_button(
             client,
             config,

@@ -50,6 +50,39 @@ def input_label(inp: str) -> str:
     return INPUT_LABELS[inp]
 
 
+# The default output each Input produces with no Binding set, covering every
+# entry in ALL_INPUTS — mirrors `daemon/src/input.rs`'s `GRID_KEYS`/
+# `key_code_for_input` table for the keyed Inputs (a fixed hardware fact with
+# no D-Bus call to fetch it from, ticket 06); `wheel_scroll_up`/
+# `wheel_scroll_down` have no discrete keycode there (they inject as `EV_REL`
+# scroll, matching `key_code_for_input`'s own `None` for those two) so they
+# name the actual behavior instead.
+_GRID_DEFAULT_KEYS = [
+    ["1", "2", "3", "4", "5"],
+    ["Tab", "Q", "W", "E", "R"],
+    ["Caps Lock", "A", "S", "D", "F"],
+    ["Shift", "Z", "X", "C", "Space"],
+]
+
+INPUT_DEFAULT_LABEL = {
+    grid_input(r, c): _GRID_DEFAULT_KEYS[r - 1][c - 1]
+    for r in range(1, GRID_ROWS + 1)
+    for c in range(1, GRID_COLS + 1)
+}
+INPUT_DEFAULT_LABEL.update(
+    {
+        "mode_key": "Alt",
+        "thumbstick_up": "↑",
+        "thumbstick_down": "↓",
+        "thumbstick_left": "←",
+        "thumbstick_right": "→",
+        "wheel_middle": "Middle Click",
+        "wheel_scroll_up": "Scroll",
+        "wheel_scroll_down": "Scroll",
+    }
+)
+
+
 def is_grid_input(inp: str) -> bool:
     """Only Grid keys have depth/Actuation points (ticket 17 §3/ticket 26) —
     the Mode key, thumbstick directions, and wheel events are all-or-nothing

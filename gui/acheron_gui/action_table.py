@@ -29,7 +29,7 @@ def build_table_row(
     expander = Gtk.Expander()
     header = Gtk.Box(spacing=12)
     header.append(Gtk.Label(label=input_label(inp), width_chars=8, xalign=0))
-    header.append(Gtk.Label(label=action_summary(binding), hexpand=True, xalign=0))
+    header.append(Gtk.Label(label=action_summary(binding, inp), hexpand=True, xalign=0))
     expander.set_label_widget(header)
     expander.set_child(build_binding_editor(client, config, profile, layer, inp, on_change))
 

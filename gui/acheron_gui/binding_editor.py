@@ -20,12 +20,19 @@ from gi.repository import Gtk, GLib
 
 from .daemon_client import DaemonError
 from .gtk_utils import clear_children
-from .inputs import ACTION_TYPES, TRIGGER_OPTIONS, TRIGGER_SHORT, input_label, is_grid_input
+from .inputs import ACTION_TYPES, INPUT_DEFAULT_LABEL, TRIGGER_OPTIONS, TRIGGER_SHORT, input_label, is_grid_input
 
 
-def action_summary(binding: dict | None) -> str:
+def action_summary(binding: dict | None, inp: str) -> str:
     if not binding:
-        return "passthrough"
+        # No "passthrough" qualifier: it's jargon the user doesn't need, it's
+        # too long to fit the smaller (52px) buttons, and — once a running
+        # Daemon is in analog mode — it's no longer even accurate for the
+        # grid (those 20 keys are synthesized from depth thresholds then,
+        # not literal evdev passthrough; only the Mode key/thumbstick/wheel
+        # stay on raw evdev regardless of capture mode). Just name the
+        # actual default output instead, which is true either way.
+        return INPUT_DEFAULT_LABEL[inp]
     if binding["type"] == "keypress":
         mods = "+".join(m.capitalize() for m in binding.get("modifiers", []))
         key = binding["key"].replace("KEY_", "")
