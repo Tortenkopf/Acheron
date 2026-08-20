@@ -27,7 +27,7 @@ An assignment from one Input to an Action, scoped to a specific Profile and Laye
 _Avoid_: mapping, keybind (as a bare synonym — "keybind" refers to a Binding whose Action is a Keypress)
 
 **Action**:
-What a Binding produces when triggered — either a Keypress or a Macro.
+What a Binding produces when triggered — a Keypress, a Macro, a Stepper step, a Profile Switch, or a Controller button press.
 _Avoid_: output, effect
 
 **Keypress**:
@@ -39,12 +39,16 @@ A Binding whose trigger is a *set* of two or more Inputs pressed together (open-
 _Avoid_: combo, simultaneous binding, key combination (reserved for a Keypress's modifier combination — see Keypress)
 
 **Macro**:
-An Action that is a hand-specified sequence of Keypresses, each with its own delay before the next fires.
-_Avoid_: script, sequence
+An Action that fires a named, reusable sequence of Keypresses, each with its own delay before the next fires. Macro definitions live in one global, named library — defined once (`MacroId`, a slug frozen at creation and never rewritten, paired with a separately-editable display name), then referenced by any number of Bindings across any Profile at once (ordinary shared reuse, not exclusive-owner reassignment like Stepper). Deleting a Macro still referenced by a Binding is refused, so a dangling reference is structurally impossible.
+_Avoid_: script, sequence, inline macro (the pre-library form this replaced)
 
 **Stepper**:
 An Action that advances or retreats a cursor through a user-defined ordered list of items, firing the newly-selected item on every step — one motion per physical activation, never a separate select-then-confirm. Requires a *pair* of Bindings pointing at the same named Stepper list, one carrying the forward step and one the backward step (primary intended use is the scroll wheel's up/down, but any two Inputs qualify). Stepper lists live in one global, named library — defined once, reassignable to a different Input pair at any time; only one pair may reference a given list at once, and assigning it to a new pair silently moves it off the old one. A list item is a type distinct from Action, restricted to a single fire-once keyboard key or mouse-button (designed to extend to joystick/controller buttons later) — never a Macro or another Stepper. Stepping past either end of the list wraps around. The current position is per-list runtime state only, independent of Profile and Layer, and always resets to the list's first item on a Daemon restart — never written to `config.toml`. Trigger mode governs the step itself (Fire-once or Hold-to-repeat); Toggle is disallowed (see Trigger mode).
 _Avoid_: cycle, carousel, weapon wheel (the primary use case, not the concept), select-then-confirm (the interaction model it deliberately isn't)
+
+**Controller**:
+An Action that emits a virtual-gamepad button press rather than a keyboard/mouse one, via a second `uinput` device (distinct from the existing keyboard device) advertising the standard Linux Gamepad Spec capability set. Reuses Binding/Trigger-mode/dispatch exactly like Keypress — no special-casing, and no hardcoded correspondence between a physical Input and a gamepad button code; any Input may be assigned any button. Currently covers buttons only — axis output (e.g. the thumbstick as an analog stick, depth-driven triggers) is a distinct, not-yet-designed capability, not part of this term yet.
+_Avoid_: gamepad (the kernel's own vocabulary for the device class, not Acheron's domain term), joystick (reserved for the broader "Controller/Joystick" strand name, not this Action specifically)
 
 **Trigger mode**:
 Governs how a Binding fires once its Input is pressed. One of Fire-once, Hold-to-repeat, or Toggle. Applies to every Binding, regardless of whether its Action is a Keypress or a Macro — except a Stepper's forward/backward Bindings, which disallow Toggle: there is no coherent continuously-running state for a cursor advance the way there is for a held Keypress or a looping Macro.
