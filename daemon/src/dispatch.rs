@@ -25,7 +25,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
 use zbus::object_server::SignalEmitter;
 
 use crate::capture::{CaptureMode, EventState, PhysicalEvent};
@@ -34,7 +33,7 @@ use crate::config::{
     self, ActuationPoint, Binding, Config, Layer, ModeKeyRole, Profile, TriggerMode,
 };
 use crate::dbus::Daemon;
-use crate::executor::{self, ActiveToggle};
+use crate::executor::{self, ActiveToggle, FiringHandle};
 use crate::injector::Injector;
 use crate::input::Input;
 
@@ -80,7 +79,7 @@ pub async fn run(
     // Macro's raw uinput writes for the first are still in flight — two
     // concurrent firings racing on the shared Injector channel could
     // interleave their KeyDown/KeyUp steps out of order on the wire.
-    let mut in_flight: HashMap<Input, JoinHandle<()>> = HashMap::new();
+    let mut in_flight: HashMap<Input, FiringHandle> = HashMap::new();
     // The one piece of momentary Layer runtime state (ticket 18) — not part
     // of `Config`, reset to `Base` whenever this task starts.
     let mut active_layer = Layer::Base;
@@ -145,7 +144,7 @@ async fn handle_event(
     injector: &Injector,
     config: &Config,
     toggles: &mut HashMap<Input, ActiveToggle>,
-    in_flight: &mut HashMap<Input, JoinHandle<()>>,
+    in_flight: &mut HashMap<Input, FiringHandle>,
     active_layer: &mut Layer,
     signal_emitter: &Option<SignalEmitter<'static>>,
     event: PhysicalEvent,
@@ -258,13 +257,16 @@ async fn handle_capture_mode_change(
 /// `Repeat` (the device's own evdev autorepeat, no separate repeat-interval
 /// config); Toggle starts its own looping task on `Down` (stopping is
 /// handled earlier, in `handle_event`, before a Binding is even looked up).
-/// Every other combination (a bound Input's `Up`, or `Repeat` for
-/// Fire-once/Toggle) is ignored outright — no passthrough of the original
-/// key for a bound Input, matching the pre-ticket-17 Fire-once behavior.
+/// `Repeat` for Fire-once/Toggle is ignored outright — no passthrough of the
+/// original key for a bound Input, matching the pre-ticket-17 Fire-once
+/// behavior. `Up` for Fire-once/Hold-to-repeat is ticket 33's stuck-key fix:
+/// force-releases anything that Input's most recent firing left down (a
+/// no-op for an already-self-released, balanced Macro); Toggle's own `Up` is
+/// still a no-op, since a Toggle's stop is a second `Down`, not a release.
 async fn fire(
     injector: &Injector,
     toggles: &mut HashMap<Input, ActiveToggle>,
-    in_flight: &mut HashMap<Input, JoinHandle<()>>,
+    in_flight: &mut HashMap<Input, FiringHandle>,
     input: Input,
     binding: &Binding,
     state: EventState,
@@ -293,6 +295,12 @@ async fn fire(
         (TriggerMode::Toggle, EventState::Down) => {
             let steps = executor::compile(&binding.action);
             toggles.insert(input, ActiveToggle::spawn(injector.clone(), steps));
+            Ok(())
+        }
+        (TriggerMode::FireOnce | TriggerMode::HoldToRepeat, EventState::Up) => {
+            if let Some(firing) = in_flight.get(&input) {
+                firing.force_release_stuck(injector).await;
+            }
             Ok(())
         }
         _ => Ok(()),
@@ -992,6 +1000,82 @@ mod tests {
             assert_eq!((down_code, down_value), (evdev::KeyCode::KEY_F1, 1));
             assert_eq!((up_code, up_value), (evdev::KeyCode::KEY_F1, 0));
         }
+    }
+
+    #[tokio::test]
+    async fn hold_to_repeats_unbalanced_macro_is_force_released_on_physical_up() {
+        // Ticket 33's reproduction, verbatim: a single-step Macro
+        // (`KeyDown` with no matching `KeyUp`) under Hold-to-repeat, used to
+        // fake a sustained "hold" — pre-fix, this left KEY_LEFTCTRL held at
+        // the OS level forever, surviving even a rebind, requiring a reboot.
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::HoldToRepeat,
+                action: Action::Macro {
+                    steps: vec![MacroStepDto::KeyDown(evdev::KeyCode::KEY_LEFTCTRL)],
+                },
+            },
+        );
+
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone());
+        let (tx, rx) = mpsc::channel(8);
+        let (_conn_tx, conn_rx) = mpsc::channel(8);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        let dispatch_handle = tokio::spawn(run(
+            rx,
+            conn_rx,
+            cmd_rx,
+            inj.clone(),
+            config_with_bindings(bindings),
+            unused_config_path(),
+            None,
+            actuation_channel(),
+            capture_mode_channel(),
+            capture_control_channel(),
+        ));
+
+        tx.send(PhysicalEvent {
+            input: Input::Grid(1, 1),
+            state: EventState::Down,
+            depth: None,
+        })
+        .await
+        .unwrap();
+        // Let the one-step firing (no Delay) finish before the physical
+        // release lands — the realistic case, since a physical press/release
+        // cycle vastly outlasts an instant single-step Macro.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        tx.send(PhysicalEvent {
+            input: Input::Grid(1, 1),
+            state: EventState::Up,
+            depth: None,
+        })
+        .await
+        .unwrap();
+
+        drop(tx);
+        dispatch_handle.await.unwrap().unwrap();
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+
+        let batches = sink.batches();
+
+        // The firing's own KeyDown, then a force-released KeyUp triggered by
+        // the physical Up — no stuck key, no reboot needed.
+        assert_eq!(batches.len(), 2);
+        let evdev::EventSummary::Key(_, code, value) = batches[0][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_LEFTCTRL, 1));
+        let evdev::EventSummary::Key(_, code, value) = batches[1][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_LEFTCTRL, 0));
     }
 
     #[tokio::test(start_paused = true)]

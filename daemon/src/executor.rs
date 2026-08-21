@@ -12,6 +12,7 @@
 //! running Toggles never interleave raw `uinput` writes.
 
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use evdev::KeyCode;
@@ -79,18 +80,34 @@ pub fn compile(action: &Action) -> Vec<MacroStep> {
     }
 }
 
-/// Walks `steps` once, in order, sleeping between `Delay` steps. Shared by
-/// a one-shot firing and each lap of a Toggle's loop. Returns `Err` only
-/// when the injector task itself has died (a genuine, fatal Daemon
-/// condition, not something this firing should retry).
-async fn run_once(injector: &Injector, steps: &[MacroStep]) -> Result<(), InjectorClosed> {
+/// Walks `steps` once, in order, sleeping between `Delay` steps — shared
+/// shape with `execute_step`'s Toggle-loop version, but tracking `held` in a
+/// cross-task-visible `Mutex` rather than a loop-private `&mut` since a
+/// one-shot firing's `held` set must survive the spawned task to be readable
+/// from the dispatch task later (ticket 33's stuck-key fix: force-released
+/// on the bound Input's physical `Up`, not just on an explicit stop).
+/// `held` only ever mirrors reality (a write suppression withheld), same
+/// rationale as `execute_step`. Returns `Err` only when the injector task
+/// itself has died (a genuine, fatal Daemon condition, not something this
+/// firing should retry).
+async fn run_once(
+    injector: &Injector,
+    steps: &[MacroStep],
+    held: &Mutex<HashSet<KeyCode>>,
+) -> Result<(), InjectorClosed> {
     for step in steps {
         match step {
             MacroStep::KeyDown(key) => {
-                injector.set_key_state(*key, true).await?;
+                let applied = injector.set_key_state(*key, true).await?;
+                if applied {
+                    held.lock().expect("held mutex poisoned").insert(*key);
+                }
             }
             MacroStep::KeyUp(key) => {
-                injector.set_key_state(*key, false).await?;
+                let applied = injector.set_key_state(*key, false).await?;
+                if applied {
+                    held.lock().expect("held mutex poisoned").remove(key);
+                }
             }
             MacroStep::Delay(duration) => tokio::time::sleep(*duration).await,
         }
@@ -98,13 +115,65 @@ async fn run_once(injector: &Injector, steps: &[MacroStep]) -> Result<(), Inject
     Ok(())
 }
 
+/// A spawned Fire-once/Hold-to-repeat firing, as tracked in dispatch's
+/// `HashMap<Input, FiringHandle>`. `held` mirrors `ActiveToggle`'s own
+/// `held: HashSet<Key>` discipline, just shared with the dispatch task
+/// instead of kept loop-private, since ticket 33's fix needs to read (and
+/// force-release) it from the outside, on the bound Input's physical `Up`.
+pub struct FiringHandle {
+    handle: JoinHandle<()>,
+    held: Arc<Mutex<HashSet<KeyCode>>>,
+}
+
+impl FiringHandle {
+    /// Whether the firing's steps have finished walking — used by `fire()`'s
+    /// existing same-Input overlap guard, unchanged from the old bare
+    /// `JoinHandle<()>` check.
+    pub fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    /// Awaits the firing's own task to completion — a test-only convenience
+    /// (dispatch never awaits a firing directly; it only ever polls
+    /// `is_finished()` or force-releases via `force_release_stuck`).
+    #[cfg(test)]
+    async fn join(self) {
+        let _ = self.handle.await;
+    }
+
+    /// Ticket 33's fix: force-releases (bypassing suppression, same as
+    /// `ActiveToggle::stop`'s force-release) every key this firing still has
+    /// down, then forgets them. A normal *balanced* Fire-once/Hold-to-repeat
+    /// Macro has already self-released by the time a physical `Up` calls
+    /// this (`held` is empty — a no-op); an *unbalanced* one (a bare
+    /// `KeyDown` with no matching `KeyUp`, used to fake a sustained "hold")
+    /// is exactly what this releases, instead of leaving it stuck at the OS
+    /// level until reboot.
+    pub async fn force_release_stuck(&self, injector: &Injector) {
+        let stuck: Vec<KeyCode> = self
+            .held
+            .lock()
+            .expect("held mutex poisoned")
+            .drain()
+            .collect();
+        for key in stuck {
+            let _ = injector.force_release_key(key).await;
+        }
+    }
+}
+
 /// Spawns a one-shot firing: walks `steps` exactly once. Used for Fire-once
 /// (on `Down`) and Hold-to-repeat (on `Down` and every subsequent `Repeat`)
-/// — both fire-and-forget from the dispatch task's point of view.
-pub fn spawn_fire_once(injector: Injector, steps: Vec<MacroStep>) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let _ = run_once(&injector, &steps).await;
-    })
+/// — fire-and-forget from the dispatch task's point of view, except for the
+/// `held` handle it hands back so a later physical `Up` can force-release
+/// anything left stuck (ticket 33).
+pub fn spawn_fire_once(injector: Injector, steps: Vec<MacroStep>) -> FiringHandle {
+    let held = Arc::new(Mutex::new(HashSet::new()));
+    let held_task = held.clone();
+    let handle = tokio::spawn(async move {
+        let _ = run_once(&injector, &steps, &held_task).await;
+    });
+    FiringHandle { handle, held }
 }
 
 /// A running Toggle, as tracked in dispatch's `HashMap<Input, ActiveToggle>`
@@ -302,7 +371,7 @@ mod tests {
             modifiers: Modifiers::default(),
             key: KeyCode::KEY_F1,
         });
-        spawn_fire_once(inj.clone(), steps).await.unwrap();
+        spawn_fire_once(inj.clone(), steps).join().await;
 
         drop(inj);
         inj_handle.await.unwrap().unwrap();
