@@ -1,4 +1,5 @@
 Type: prototype
+Status: resolved
 
 ## Question
 
@@ -13,3 +14,15 @@ Settle at least:
 - **Discoverability of the "any Input, any button" freedom** — since there's no hardcoded correspondence, the UI should make it obvious this is intentional (not a bug/gap) rather than confusing about why, say, a grid key can be assigned `BTN_START`.
 
 Use the `/prototype` skill. Once resolved, spawn the real build ticket (Daemon: new `Action::ControllerButton` variant + second `uinput` device in `injector.rs` + allowlist validation in `SetBinding`; GUI: the real picker), matching the decide → prototype → build pattern used for Chord (01 → 30 → build) and the trigger-point UX (17 → 19 → 26 → 27).
+
+## Answer
+
+Two variants prototyped (Gamepad Diagram, Category List); **variant A (Gamepad Diagram) won**, refined over three rounds of live reaction:
+
+- **Layout**: variant A — a labeled visual controller face (`Gtk.Fixed`, approximate real gamepad geometry) for the 17 named buttons (d-pad diamond, ABXY diamond, shoulders/triggers, stick clicks, Select/Start/Mode), plus a separate collapsed "Extra buttons (Trigger-Happy 1-40) ▸" section that expands into an 8-wide grid — kept apart from the diagram exactly per this ticket's own steer, so the 40-slot range never crowds it. Round 1 found the initial hand-placed geometry genuinely broken on live reaction: the shoulder/trigger buttons (LT/LB, RT/RB) overlapped the D-pad and the Y button (touching/overlapping x-ranges with no real vertical clearance), and R3 sat at an arbitrary x=260 instead of centered under South (A) the way L3 was already correctly centered under D-pad Down. Round 2 fixed both — the ABXY/D-pad diamonds moved down, the shoulder/trigger row moved further up and outward for real clearance, R3 re-centered under A — confirmed clean.
+- **Where it lives**: independent pickers under one Action-kind dropdown ("Keypress" / "Controller Button"), not a shared container — `Action::Keypress` and `Action::ControllerButton` are already separate enum variants, not one field, so there's nothing to share at that level. The picker *component shape* (label + collapsed summary + expandable panel) mirrors ticket 32 variant A's, just with a different catalog.
+- **Sane defaults without hardcoding**: **no** — settled the opposite way from the ticket's own suggestion. An early build carried a per-physical-Input "Suggested: `<button>` — Use" chip (Mode key → `BTN_MODE`, thumbstick directions → `BTN_DPAD_*`, grid keys cycling through the named buttons then the Extra range). Cut in round 3 after live reaction judged it unnecessary noise — the diagram already makes "pick anything" fast without a nudge. Pickers now open on a plain starting value with zero built-in opinion about what a given Input "should" be.
+- **Reuse of ticket 32's infrastructure**: structural, not code-level (ticket 32's prototype code lives only on its own throwaway branch, nothing to import from). Both this ticket's variants mirror ticket 32's two variants shape-for-shape (A: collapsed-summary-expands-to-panel; B: MenuButton + search/category popover) with `GAMEPAD_CATEGORIES` swapped in for `KEY_CATEGORIES` — the same "search + category popover" component (variant B) demonstrably generalizes across catalogs. Worth extracting into one shared picker module (parameterized by catalog) once both this ticket's and ticket 32's build tickets land, not before.
+- **Discoverability of "any Input, any button"**: also settled to **no explicit note**, for the same reason as the defaults question — an early build carried an italic "Any Input can be assigned any controller button — nothing is hardcoded" line under every picker instance, cut in round 3 as unneeded: the picker never grays out or restricts anything regardless of which Input is being edited, so the freedom is already self-evident from using it, not something that needed spelling out.
+
+Prototype: `prototype/38-controller-button-picker-ux` (not `main`). Spawned [Build the controller-button picker UX and Action::ControllerButton for real](./43-task-build-controller-button-picker-ux.md).
