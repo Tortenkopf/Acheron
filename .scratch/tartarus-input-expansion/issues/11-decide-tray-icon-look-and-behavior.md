@@ -35,3 +35,42 @@ Grilling session, 2026-08-20. Two grounding facts found before asking anything, 
 
 Spawns [Build and verify the real tray icon](./issues/36-task-build-tray-icon.md) — design is now fully specified; that ticket wires `AppIndicator3`/`AyatanaAppIndicator3` for real (replacing `build_tray_mock`), builds the three placeholder SVGs, and live-verifies against a real GNOME Shell panel (this machine now has the typelib installed).
 
+## Reopened — 2026-08-21, during ticket 36's build session
+
+**The library choice this ticket built on top of is unusable as designed.** Confirmed directly in this Python environment: `AyatanaAppIndicator3`'s typelib hard-depends on GTK **3.0**, and `gi` refuses to load GTK 3.0 and GTK 4.0 in the same process, in either import order —
+
+```
+gi.require_version('Gtk','4.0'); from gi.repository import Gtk
+gi.require_version('AyatanaAppIndicator3','0.1')
+→ gi.RepositoryError: Requiring namespace 'Gtk' version '3.0', but '4.0' is already loaded
+```
+
+reversing the import order fails the same way. `acheron_gui/app.py` is GTK4 (`gi.require_version("Gtk", "4.0")`), so `AppIndicator3`/`AyatanaAppIndicator3` cannot be loaded in-process alongside it — not a packaging gap, a hard incompatibility. Neither this ticket's own grilling session nor [ticket 10's research](./10-research-de-display-server-compatibility.md) actually imported the library next to GTK4 to check; both reasoned from the D-Bus-level `StatusNotifierItem` portability story, which is real, but doesn't cover the in-process GTK version conflict.
+
+This invalidates this ticket's "library choice is settled, only look/feel is undecided" framing — the framing itself needs redeciding, not just re-verifying. Everything else this ticket settled (minimize-to-tray lifecycle, menu contents, icon states, tooltip, no left/right-click distinction) is about *StatusNotifierItem* as a protocol and stays valid regardless of which library/process implements it.
+
+Two realistic paths, surfaced before reopening (user chose to resolve this as its own session rather than decide inline while building ticket 36):
+- **Separate GTK3 helper process**: a small second process hosts the real `AppIndicator3` icon + `libdbusmenu-gtk3` menu (both already installed: `gir1.2-ayatanaappindicator3-0.1`, `libdbusmenu-gtk3-4`), talking to the Daemon/systemd over D-Bus directly for status/actions, and to the main GTK4 app only for Show-Window/Quit via GApplication's built-in D-Bus activation/actions. Reuses real, spec-correct SNI+menu code; adds a second process to manage/package/autostart.
+- **Hand-rolled in-process SNI service**: implement `org.kde.StatusNotifierItem` and `com.canonical.dbusmenu` directly over `Gio.DBus`, no GTK3 involved, single process. More net-new protocol code to get right against GNOME Shell's specific `ubuntu-appindicators` extension, higher bug risk, no process-management complexity.
+
+Status set back to `reopened` rather than `resolved`; [ticket 36](./issues/36-task-build-tray-icon.md) is blocked on this being resolved again.
+
+### Resolution — grilling session, 2026-08-21
+
+**Hand-rolled, in-process `org.kde.StatusNotifierItem` service — no `AppIndicator3`, no GTK3, no second process.** Chosen over the separate-GTK3-helper-process alternative after establishing the actual protocol facts (sourced directly from the interface XML the GNOME `ubuntu-appindicators` extension implements, mirroring KDE's canonical spec — `org.kde.StatusNotifierItem`, `org.kde.StatusNotifierWatcher`, `com.canonical.dbusmenu`, all fetched from `github.com/ubuntu/gnome-shell-extension-appindicator/interfaces-xml/`): the GTK3 dependency lives entirely inside `libappindicator`'s client convenience wrapper, not in the protocol itself. GNOME Shell has **no native SNI support at all** — it depends wholly on the `ubuntu-appindicators`/"AppIndicator and KStatusNotifierItem Support" extension acting as both Watcher and Host, and that extension only cares that *something* on the session bus correctly implements `org.kde.StatusNotifierItem` and calls `RegisterStatusNotifierItem` — it has no idea what produced that D-Bus object. So hand-rolling costs zero desktop-compatibility ground versus the original `AppIndicator3` plan: extension still required under GNOME (verified live on this machine either way), still asserted-but-unverified-native on KDE/XFCE (no such hardware available to actually test, same bar ticket 10 already accepted).
+
+**What the service actually is**, confirmed against the real interface definitions:
+- `org.kde.StatusNotifierItem` — exported by the GUI process itself (the "item"). Relevant properties: `Category`, `Id`, `Title`, `Status` (always reported `"Active"` — no `NeedsAttention`/blinking use, matches the original answer's decision not to have an attention-icon variant), `IconName` + `IconThemePath` (the direct equivalent of `set_icon_theme_path` — the three placeholder SVGs plan carries over unchanged), `Menu` (an object path), `ItemIsMenu`. Methods `Activate`/`SecondaryActivate`/`ContextMenu`/`Scroll` all just take x/y — reconfirms the original answer's finding that there's no real click-vs-menu behavior to design. Signals `NewIcon`/`NewStatus`/`NewTitle` push live icon-state changes to the host.
+- `org.kde.StatusNotifierWatcher` — a well-known bus name; the item calls `RegisterStatusNotifierItem` on it once at GUI launch.
+- `com.canonical.dbusmenu` — a second object, pointed to by `Menu`, backing the actual popup: `GetLayout`/`GetGroupProperties`/`GetProperty`/`Event`/`AboutToShow` methods, `LayoutUpdated`/`ItemsPropertiesUpdated` signals. This is the real net-new protocol surface (a revisioned tree of items with properties) — everything except a static tree implementation is out of scope here (`AboutToShow` always reports `needUpdate=False`, no lazy-populated submenus needed).
+- **Tooltip caveat, new finding**: the extension's own consumer XML has `ToolTip`/`NewToolTip` commented out with the note *"we don't support tooltip, so no need to go through it"* — under GNOME specifically, a tray tooltip will not visibly render regardless of implementation. Still exported (spec-correct, works under KDE/XFCE hosts that do support it, costs nothing), but ticket 36's live-verification checklist can't confirm it visually on this machine — drop that one checklist item rather than treat it as a bug if it's silently a no-op under GNOME.
+
+**Implementation choices settled alongside the architecture:**
+- **`python3-dasbus`** for the D-Bus service (a standard Ubuntu `main`-repo package, already present on this dev machine, same tier as the now-unneeded `gir1.2-ayatanaappindicator3-0.1`) — its declarative class-based interface export meaningfully reduces the hand-written GVariant marshaling needed for the DBusMenu layout protocol's nested tuple structures, over raw `Gio.DBus` (which would need hand-written introspection XML too, despite PyGObject/Gio already being a hard dependency).
+- **Menu content — full rebuild + `LayoutUpdated` revision bump** on any relevant change (Profile created/renamed/deleted, Daemon pause/resume, status transition), rather than incremental `ItemsPropertiesUpdated` deltas against stable item ids — mirrors this codebase's existing full-rebuild convention (`app.py`'s own `rebuild()` on every Config/state change; ticket 26's explicit choice of full-rebuild for rare transitions like `CaptureModeChanged`). Nothing in this menu updates at a frequency that would make incremental patching worth its extra bookkeeping.
+- **State source — the tray hooks into `app.py`'s existing `status`/`rebuild()`**, exposing an `update(config, profile, status)` call invoked alongside the main window's own rebuild rather than running independent D-Bus subscriptions. One source of truth, no duplicate signal wiring.
+- **Lifecycle simplifies for free**: minimize-to-tray stays exactly as originally decided (window-close hides, only the tray's own Quit exits), but Show Window and Quit are now trivial in-process calls (`win.present()` / `self.quit()`) — the GApplication D-Bus-activation bridge the two-process alternative would have needed is moot once everything is one process.
+- `SystemdClient` gains `stop_daemon()`/`start_daemon()` (`StopUnit`/`StartUnit` over the same session-bus proxy `DBusSystemdClient` already holds) alongside its existing `ensure_daemon_started()`, for the Pause/Resume menu item.
+
+Ticket 36 rewritten to match this design (dasbus-based in-process service, not `AppIndicator3`) and unblocked.
+
