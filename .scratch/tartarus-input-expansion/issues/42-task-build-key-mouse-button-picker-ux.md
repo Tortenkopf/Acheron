@@ -1,4 +1,5 @@
 Type: task
+Status: resolved
 
 ## Question
 
@@ -13,3 +14,23 @@ Scope, per ticket 32's Answer:
 - **Window/popover sizing discipline**: apply ticket 32's two live-verified GTK4 findings if this picker (or anything nearby) ends up inside a `Gtk.ScrolledWindow` or grows any `wrap=True` label — `propagate_natural_width(True)` and `max_width_chars` are not optional extras, they're what makes natural sizing actually track content.
 
 Live-hardware verification: confirm the full key range (not just ticket 02's sample) round-trips through `config.toml`/D-Bus/real output for a handful of keys per category, especially the multimedia set and F13–F24 (never live-tested before, only asserted reachable via the same `all_injectable_key_codes()` sweep).
+
+## Answer
+
+Landed as a new `gui/acheron_gui/key_picker.py` module, wired into `binding_editor.py`, replacing the free-text `Gtk.Entry` for both mount points.
+
+**"Driven off the real `evdev::KeyCode` set" — checked before writing any catalog code**: a dedicated research pass confirmed the GUI has no binding to evdev's `KeyCode` enum at all (no `python-evdev` import anywhere in `gui/`, no D-Bus method enumerates valid keys) and that the Daemon itself validates keys only via `evdev::KeyCode`'s `FromStr` round-trip, not a curated list (`all_injectable_key_codes()` just advertises raw `0..=KEY_MAX`, confirmed in `daemon/src/input.rs`). So, like the prototype, this build is necessarily a hand-maintained catalog — but every one of its ~110 entries was individually cross-checked against the real `evdev` crate's `scancodes.rs` source (not just asserted), including the riskier-looking ones (`KEY_MICMUTE`, `KEY_F13`-`KEY_F24`, `KEY_SYSRQ`, `BTN_SIDE`/`BTN_EXTRA`, …) — all real.
+
+**Ported from `prototype/32-key-mouse-button-picker-ux`'s winning variant A almost unchanged**: same row layout, same `_UNIT_PX = 28.5`/12px sizing, same physical Left/Middle/Right+gap+Back/Forward mouse strip, same F13–F24 toggle. `build_inline_key_picker(current_code, on_change, warn_predicate)` returns `(widget, refresh_warning)` rather than taking a `field_label` — the component owns only the toggle/warning/panel, so the caller wraps it in its own existing `labeled_row(label, widget)` (reused unchanged from the rest of `binding_editor.py`) instead of the picker hardcoding "Key" vs. "Value".
+
+**Modifier warning gated on Trigger mode (new vs. the prototype)**: `warn_predicate` lets the caller decide whether the bare-modifier warning applies, since the component can't see Trigger mode itself. The Keypress `key` field passes `lambda: TRIGGER_OPTIONS[trigger_dd.get_selected()][0] != "toggle"`; `trigger_dd` outlives every `render_action_editor()` rebuild (unlike `editor_slot`'s children), so its `notify::selected` listener is disconnected-then-reconnected each rebuild (a `_trigger_handler` id dict) rather than left to accumulate one stale listener per rebuild, mirroring this codebase's existing single-current-target precedent (`capture_mode`/depth-stream routing).
+
+**Macro step reuse, with the warning deliberately suppressed**: the same component now backs the "+ Add step" row's KeyDown/KeyUp value (previously a bare `Gtk.Entry` reused for both key names and Delay's ms text). `warn_predicate=lambda: False` there — a KeyDown-only Macro step *is* the warning's own recommended workaround for holding a modifier via Toggle, so warning about it at that exact mount point would be actively wrong. The value slot rebuilds on `step_kind_dd` changes (key picker for KeyDown/KeyUp, a plain numeric `Gtk.Entry` for Delay); no reordering/inline-editing of already-added steps added — that's ticket 41's scope, not this one's.
+
+**Window/popover sizing**: the modifier-warning label keeps its `max_width_chars=48` (ticket 32's round-4 finding); no `Gtk.ScrolledWindow` was introduced by this ticket (the picker mounts directly in the existing Popover/Expander, neither of which wraps it in one), so `propagate_natural_width` doesn't apply here. Exact popover-space re-tuning is deferred to the live session below — this repo has no screenshot tooling installed, and per this map's own ticket 26 precedent ("swapping the user's live input-device driver out from under them unasked was judged out of this session's call"), grabbing screenshots of the user's live desktop unasked was judged the same kind of call.
+
+**Code review caught one real bug**: `action_summary()`'s keypress branch only ever stripped the `"KEY_"` prefix, so a mouse-button binding — now one click away via the picker, rather than requiring hand-typing `BTN_LEFT` — displayed as the raw wire code (`"BTN_LEFT  [1x]"`) instead of a readable label. Fixed by routing `BTN_*` codes through `key_picker.LABEL_BY_CODE` (`"Mouse Left  [1x]"`), leaving `KEY_*` formatting unchanged.
+
+**Tests**: 18 new Python tests (11 in new `test_key_picker.py` covering the catalog/component directly, 7 in `test_binding_editor.py` covering the wiring — mouse-button round-trip, Trigger-mode-gated warning, handler-disconnect survives repeated action-kind switching, Macro step reuse both with and without the warning, Delay-mode swap, the `action_summary` fix), plus updating the two pre-existing tests that drove the old `Gtk.Entry` directly. 106 Python + 188 Rust tests green, no Rust changes.
+
+**Live-hardware verification not done this session** — no physical Tartarus Pro access from this session, and this map's own ticket 26 precedent is not to touch the user's live Daemon/GUI/input device unasked. Spawned [Verify the key/mouse-button picker UX on hardware](./44-task-verify-key-mouse-button-picker-ux-on-hardware.md).

@@ -8,11 +8,6 @@ from acheron_gui.inputs import ACTION_TYPES, TRIGGER_OPTIONS
 from .widget_tree import button_labeled, find_all, find_one
 
 
-def _entry_labeled(root, label_text):
-    row = find_one(root, lambda w: isinstance(w, Gtk.Box) and _row_label_text(w) == label_text)
-    return find_one(row, lambda w: isinstance(w, Gtk.Entry))
-
-
 def _dropdown_labeled(root, label_text):
     row = find_one(root, lambda w: isinstance(w, Gtk.Box) and _row_label_text(w) == label_text)
     return find_one(row, lambda w: isinstance(w, Gtk.DropDown))
@@ -21,6 +16,36 @@ def _dropdown_labeled(root, label_text):
 def _row_label_text(box):
     child = box.get_first_child()
     return child.get_label() if isinstance(child, Gtk.Label) else None
+
+
+def _key_picker_row(root, label_text):
+    return find_one(root, lambda w: isinstance(w, Gtk.Box) and _row_label_text(w) == label_text)
+
+
+def _key_picker_toggle(root, label_text):
+    row = _key_picker_row(root, label_text)
+    return find_one(row, lambda w: isinstance(w, Gtk.Button) and "key-picker-toggle" in w.get_css_classes())
+
+
+def _pick_key(root, label_text, key_label):
+    """Expands the picker labeled `label_text` (e.g. "Key"/"Value") and
+    clicks the keycap button labeled `key_label` (e.g. "F1", "Left")."""
+    _key_picker_toggle(root, label_text).emit("clicked")
+    row = _key_picker_row(root, label_text)
+    button_labeled(row, key_label).emit("clicked")
+
+
+def _pick_first_modifier(root, label_text):
+    """Every modifier keycap label ("Ctrl"/"Shift"/"Alt"/"Super") appears
+    twice (Left/Right) — this clicks whichever comes first, which is enough
+    to exercise the modifier-selected path."""
+    _key_picker_toggle(root, label_text).emit("clicked")
+    row = _key_picker_row(root, label_text)
+    find_all(row, lambda w: isinstance(w, Gtk.Button) and "keycap-mod" in w.get_css_classes())[0].emit("clicked")
+
+
+def _has_warning(root) -> bool:
+    return find_all(root, lambda w: "warning" in w.get_css_classes()) != []
 
 
 def test_clicking_an_unbound_key_opens_editor_defaulted_to_fire_once_keypress():
@@ -42,9 +67,7 @@ def test_saving_a_keypress_binding_calls_set_binding_and_closes_popover():
     btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
     popover = btn.get_popover()
 
-    key_entry = _entry_labeled(popover, "Key")
-    key_entry.set_text("KEY_F1")
-    key_entry.emit("changed")
+    _pick_key(popover, "Key", "F1")
 
     button_labeled(popover, "Save").emit("clicked")
 
@@ -103,6 +126,14 @@ def test_bound_input_shows_bound_css_class_and_summary():
     assert "Ctrl+F1" in label.get_label()
 
 
+def test_action_summary_shows_a_friendly_label_for_a_mouse_button_key():
+    # Ticket 42's picker makes BTN_LEFT one click away — action_summary must
+    # not show the raw wire code once it's this reachable.
+    assert action_summary(
+        {"trigger": "fire_once", "type": "keypress", "key": "BTN_LEFT", "modifiers": []}, "grid_r1c1"
+    ) == "Mouse Left  [1x]"
+
+
 def test_editing_targets_the_held_layer_independently_of_base():
     stub = DaemonStub()
     changed = []
@@ -112,9 +143,7 @@ def test_editing_targets_the_held_layer_independently_of_base():
     heading = find_one(popover, lambda w: "heading" in w.get_css_classes())
     assert heading.get_label() == "Default / held / 1"
 
-    key_entry = _entry_labeled(popover, "Key")
-    key_entry.set_text("KEY_F1")
-    key_entry.emit("changed")
+    _pick_key(popover, "Key", "F1")
     button_labeled(popover, "Save").emit("clicked")
 
     assert stub.calls == [
@@ -386,3 +415,102 @@ def test_depth_track_set_live_value_updates_the_fill_and_tolerates_none():
     track.set_live_value(None)
     assert track.live_value is None
     assert not track.fill.get_visible()
+
+
+# --- Key/mouse-button picker (ticket 42) ---
+
+
+def test_saving_a_mouse_button_binding_round_trips_the_btn_code():
+    stub = DaemonStub()
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    _pick_key(editor, "Key", "Left")
+    button_labeled(editor, "Save").emit("clicked")
+
+    assert stub.calls == [
+        (
+            "set_binding",
+            "grid_r1c1",
+            "base",
+            {"trigger": "fire_once", "type": "keypress", "key": "BTN_LEFT", "modifiers": []},
+        )
+    ]
+
+
+def test_modifier_warning_shows_for_fire_once_key_and_hides_for_toggle():
+    stub = DaemonStub()
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    _pick_first_modifier(editor, "Key")
+    assert _has_warning(editor)
+
+    trigger_dd = _dropdown_labeled(editor, "Trigger mode")
+    trigger_dd.set_selected([k for k, _ in TRIGGER_OPTIONS].index("toggle"))
+    assert not _has_warning(editor)
+
+    trigger_dd.set_selected([k for k, _ in TRIGGER_OPTIONS].index("fire_once"))
+    assert _has_warning(editor)
+
+
+def test_trigger_mode_warning_wiring_survives_repeated_action_kind_switching():
+    # Ticket 42: the Trigger-mode dropdown outlives every render_action_editor()
+    # rebuild, so its "notify::selected" listener is disconnected and
+    # reconnected on each rebuild (see build_binding_editor's _trigger_handler)
+    # rather than left to accumulate — exercised here by cycling kinds
+    # several times before checking the warning still responds correctly.
+    stub = DaemonStub()
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    action_dd = _dropdown_labeled(editor, "Action")
+    for _ in range(3):
+        action_dd.set_selected([k for k, _ in ACTION_TYPES].index("macro"))
+        action_dd.set_selected([k for k, _ in ACTION_TYPES].index("keypress"))
+
+    _pick_first_modifier(editor, "Key")
+    assert _has_warning(editor)
+
+    trigger_dd = _dropdown_labeled(editor, "Trigger mode")
+    trigger_dd.set_selected([k for k, _ in TRIGGER_OPTIONS].index("toggle"))
+    assert not _has_warning(editor)
+
+
+def test_macro_step_keydown_value_uses_the_picker_and_records_the_key_code():
+    stub = DaemonStub()
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    action_dd = _dropdown_labeled(editor, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("macro"))
+
+    _pick_key(editor, "Value", "F2")
+    button_labeled(editor, "+ Add step").emit("clicked")
+
+    assert find_one(editor, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "KeyDown KEY_F2") is not None
+
+
+def test_macro_step_keydown_value_never_shows_the_modifier_warning():
+    # A KeyDown-only step *is* ticket 02's own recommended workaround for
+    # holding a modifier via Toggle — warning about it here would be wrong.
+    stub = DaemonStub()
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    action_dd = _dropdown_labeled(editor, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("macro"))
+
+    _pick_first_modifier(editor, "Value")
+
+    assert not _has_warning(editor)
+
+
+def test_macro_step_kind_switch_to_delay_swaps_the_picker_for_a_plain_entry():
+    stub = DaemonStub()
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    action_dd = _dropdown_labeled(editor, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("macro"))
+
+    step_kind_dd = _dropdown_labeled(editor, "New step")
+    step_kind_dd.set_selected(2)  # Delay (ms)
+
+    value_row = _key_picker_row(editor, "Value")
+    assert find_all(value_row, lambda w: isinstance(w, Gtk.Entry)) != []
+    assert find_all(value_row, lambda w: "key-picker-toggle" in w.get_css_classes()) == []

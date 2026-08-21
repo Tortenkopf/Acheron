@@ -104,6 +104,15 @@ CSS = """
 .depth-track-dim { opacity: 0.35; }
 .marker-actuation { background-color: #2ecc71; }
 .marker-release { background-color: #e6991a; }
+/* Ticket 42: the real key/mouse-button picker (key_picker.py), ported from
+   ticket 32's winning variant A prototype. */
+.warning { background-color: alpha(#e6991a, 0.18); border-radius: 6px; padding: 6px 8px; font-size: smaller; }
+.picker-panel { padding: 8px; background-color: alpha(currentColor, 0.05); border-radius: 6px; }
+.section-label { font-size: smaller; opacity: 0.65; font-weight: bold; }
+.keycap { min-height: 25px; padding: 2px 4px; font-size: 12px; }
+.keycap-mod { background-color: alpha(#4a90e2, 0.22); }
+.keycap-mouse { background-color: alpha(#8e44ad, 0.22); }
+.keycap-mm { background-color: alpha(#27ae60, 0.22); }
 """
 
 

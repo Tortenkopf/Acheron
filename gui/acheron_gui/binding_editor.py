@@ -21,6 +21,7 @@ from gi.repository import Gtk, GLib
 from .daemon_client import DaemonError
 from .gtk_utils import clear_children
 from .inputs import ACTION_TYPES, INPUT_DEFAULT_LABEL, TRIGGER_OPTIONS, TRIGGER_SHORT, input_label, is_grid_input
+from .key_picker import LABEL_BY_CODE, build_inline_key_picker
 
 
 def action_summary(binding: dict | None, inp: str) -> str:
@@ -35,7 +36,13 @@ def action_summary(binding: dict | None, inp: str) -> str:
         return INPUT_DEFAULT_LABEL[inp]
     if binding["type"] == "keypress":
         mods = "+".join(m.capitalize() for m in binding.get("modifiers", []))
-        key = binding["key"].replace("KEY_", "")
+        raw_key = binding["key"]
+        # Ticket 42: the real picker makes a mouse-button Key one click away
+        # (previously only reachable by hand-typing "BTN_LEFT" into the free
+        # -text field) — a bare `.replace("KEY_", "")` leaves those raw
+        # ("BTN_LEFT") instead of a readable label, so BTN_ codes go through
+        # key_picker's own catalog instead.
+        key = LABEL_BY_CODE.get(raw_key, raw_key) if raw_key.startswith("BTN_") else raw_key.replace("KEY_", "")
         chord = f"{mods}+{key}" if mods else key
         return f"{chord}  [{TRIGGER_SHORT[binding['trigger']]}]"
     if binding["type"] == "profile_switch":
@@ -453,8 +460,18 @@ def build_binding_editor(
         else {"target": profile},
     }
 
+    # Ticket 42: the keypress Key field's modifier warning also depends on
+    # Trigger mode, which the picker component can't see on its own — a
+    # single current handler on trigger_dd (which outlives every
+    # render_action_editor() rebuild, unlike editor_slot's own children)
+    # avoids piling up one stale listener per rebuild.
+    _trigger_handler: dict = {"id": None}
+
     def render_action_editor():
         clear_children(editor_slot)
+        if _trigger_handler["id"] is not None:
+            trigger_dd.disconnect(_trigger_handler["id"])
+            _trigger_handler["id"] = None
 
         kind = ACTION_TYPES[action_dd.get_selected()][0]
         # Profile Switch has no coherent held/toggled meaning (ticket 05) —
@@ -464,9 +481,17 @@ def build_binding_editor(
             trigger_dd.set_selected([k for k, _ in TRIGGER_OPTIONS].index("fire_once"))
 
         if kind == "keypress":
-            key_entry = Gtk.Entry(text=draft["keypress"].get("key", "KEY_A"))
-            key_entry.connect("changed", lambda e: draft["keypress"].__setitem__("key", e.get_text()))
-            editor_slot.append(labeled_row("Key", key_entry))
+            def on_key_changed(code: str) -> None:
+                draft["keypress"]["key"] = code
+
+            def key_warn_predicate() -> bool:
+                return TRIGGER_OPTIONS[trigger_dd.get_selected()][0] != "toggle"
+
+            key_picker, refresh_key_warning = build_inline_key_picker(
+                draft["keypress"].get("key", "KEY_A"), on_key_changed, key_warn_predicate
+            )
+            editor_slot.append(labeled_row("Key", key_picker))
+            _trigger_handler["id"] = trigger_dd.connect("notify::selected", lambda *_: refresh_key_warning())
 
             mod_box = Gtk.Box(spacing=8)
             mods = set(draft["keypress"].get("modifiers", []))
@@ -525,21 +550,48 @@ def build_binding_editor(
             render_steps()
             editor_slot.append(steps_list)
 
-            add_box = Gtk.Box(spacing=6)
+            add_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
             step_kind_dd = Gtk.DropDown(model=Gtk.StringList.new(["KeyDown", "KeyUp", "Delay (ms)"]))
-            value_entry = Gtk.Entry(text="KEY_A", width_chars=10)
-            add_box.append(step_kind_dd)
-            add_box.append(value_entry)
+            add_box.append(labeled_row("New step", step_kind_dd))
+
+            value_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            add_box.append(value_slot)
+
+            new_step_value = {"key": "KEY_A", "ms_text": "0"}
+
+            def render_value_slot():
+                clear_children(value_slot)
+                if step_kind_dd.get_selected() == 2:
+                    ms_entry = Gtk.Entry(text=new_step_value["ms_text"], width_chars=10)
+                    ms_entry.connect("changed", lambda e: new_step_value.__setitem__("ms_text", e.get_text()))
+                    value_slot.append(labeled_row("Value", ms_entry))
+                else:
+                    def on_value_key_changed(code: str) -> None:
+                        new_step_value["key"] = code
+
+                    # Ticket 02's bare-modifier warning doesn't apply here —
+                    # a KeyDown-only step *is* that warning's own recommended
+                    # workaround (a Toggle-driven single KeyDown-only Macro
+                    # step), so it's suppressed for this mount point rather
+                    # than reused unconditionally.
+                    value_picker, _refresh = build_inline_key_picker(
+                        new_step_value["key"], on_value_key_changed, warn_predicate=lambda: False
+                    )
+                    value_slot.append(labeled_row("Value", value_picker))
+
+            step_kind_dd.connect("notify::selected", lambda *_: render_value_slot())
+            render_value_slot()
+
             add_btn = Gtk.Button(label="+ Add step")
 
             def on_add(b):
                 kind_i = step_kind_dd.get_selected()
-                val = value_entry.get_text()
                 if kind_i == 0:
-                    step = {"type": "key_down", "key": val}
+                    step = {"type": "key_down", "key": new_step_value["key"]}
                 elif kind_i == 1:
-                    step = {"type": "key_up", "key": val}
+                    step = {"type": "key_up", "key": new_step_value["key"]}
                 else:
+                    val = new_step_value["ms_text"]
                     step = {"type": "delay_ms", "ms": int(val) if val.isdigit() else 0}
                 draft["steps"].append(step)
                 render_steps()
