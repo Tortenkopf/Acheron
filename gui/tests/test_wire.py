@@ -18,6 +18,15 @@ def test_keypress_with_no_modifiers_omits_the_modifiers_field():
     assert "modifiers" not in variant_dict
 
 
+def test_profile_switch_binding_round_trips_through_a_variant():
+    binding = {"trigger": "fire_once", "type": "profile_switch", "target": "Gaming"}
+
+    variant_dict = wire.binding_to_variant(binding)
+    unpacked = {k: v.unpack() for k, v in variant_dict.items()}
+
+    assert unpacked == binding
+
+
 def test_macro_binding_round_trips_through_a_variant():
     binding = {
         "trigger": "toggle",

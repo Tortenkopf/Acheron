@@ -77,6 +77,11 @@ pub fn compile(action: &Action) -> Vec<MacroStep> {
                 MacroStepDto::Delay(ms) => MacroStep::Delay(Duration::from_millis(*ms)),
             })
             .collect(),
+        Action::ProfileSwitch { .. } => {
+            unreachable!(
+                "Action::ProfileSwitch is intercepted in dispatch::handle_event before compile is ever called"
+            )
+        }
     }
 }
 

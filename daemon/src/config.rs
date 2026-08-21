@@ -201,8 +201,11 @@ pub enum TriggerMode {
     Toggle,
 }
 
-/// CONTEXT.md: Action. Both variants compile into the shared executor's
-/// `Vec<executor::MacroStep>` (ticket 17's `executor::compile`).
+/// CONTEXT.md: Action. `Keypress`/`Macro` compile into the shared executor's
+/// `Vec<executor::MacroStep>` (ticket 17's `executor::compile`);
+/// `ProfileSwitch` (ticket 34) has no `MacroStep` form at all — it's
+/// intercepted in `dispatch::handle_event` before `compile` is ever called,
+/// the same way `Command::SwitchProfile` mutates `Config` directly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Action {
@@ -213,6 +216,14 @@ pub enum Action {
     },
     Macro {
         steps: Vec<MacroStepDto>,
+    },
+    /// Switches the active Profile when fired (ticket 05/34). Validated
+    /// (`SetBinding` and `load_or_seed`, via `parse`'s
+    /// `InvalidProfileSwitchTrigger` check) to only ever pair with
+    /// `TriggerMode::FireOnce` — a held/toggled Profile switch has no
+    /// coherent meaning.
+    ProfileSwitch {
+        target: String,
     },
 }
 
@@ -251,6 +262,7 @@ pub enum ConfigError {
     InvalidSchemaVersion(String),
     UnsupportedSchemaVersion(i64),
     InvalidActiveProfile(String),
+    InvalidProfileSwitchTrigger,
 }
 
 impl fmt::Display for ConfigError {
@@ -275,6 +287,10 @@ impl fmt::Display for ConfigError {
             ConfigError::InvalidActiveProfile(name) => write!(
                 f,
                 "config.toml's active_profile {name:?} does not name a profile in [profiles]"
+            ),
+            ConfigError::InvalidProfileSwitchTrigger => write!(
+                f,
+                "config.toml contains an Action::ProfileSwitch Binding whose trigger is not fire_once"
             ),
         }
     }
@@ -315,6 +331,17 @@ fn parse(contents: &str) -> Result<Config, ConfigError> {
     let config: Config = toml::from_str(contents).map_err(ConfigError::Parse)?;
     if !config.profiles.contains_key(&config.active_profile) {
         return Err(ConfigError::InvalidActiveProfile(config.active_profile));
+    }
+    let has_invalid_profile_switch_trigger = config.profiles.values().any(|profile| {
+        [&profile.base, &profile.held].into_iter().any(|bindings| {
+            bindings.values().any(|binding| {
+                matches!(binding.action, Action::ProfileSwitch { .. })
+                    && binding.trigger != TriggerMode::FireOnce
+            })
+        })
+    });
+    if has_invalid_profile_switch_trigger {
+        return Err(ConfigError::InvalidProfileSwitchTrigger);
     }
     Ok(config)
 }
@@ -573,6 +600,45 @@ action = { type = "keypress", key = "KEY_F1" }
                 release: 80,
             }
         );
+    }
+
+    #[test]
+    fn parses_a_fire_once_profile_switch_binding() {
+        let toml = r#"
+schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base.grid_r1c1]
+trigger = "fire_once"
+action = { type = "profile_switch", target = "Gaming" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let binding = &config.profiles["Default"].base[&Input::Grid(1, 1)];
+        assert_eq!(
+            binding.action,
+            Action::ProfileSwitch {
+                target: "Gaming".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn refuses_to_start_when_a_profile_switch_binding_is_not_fire_once() {
+        let (_dir, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base.grid_r1c1]
+trigger = "toggle"
+action = { type = "profile_switch", target = "Gaming" }
+"#;
+        fs::write(&path, original).unwrap();
+
+        let err = load_or_seed(&path).expect_err("a Toggle Profile Switch must refuse to start");
+        assert!(matches!(err, ConfigError::InvalidProfileSwitchTrigger));
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 
     #[test]

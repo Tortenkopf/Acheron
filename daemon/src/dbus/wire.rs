@@ -196,6 +196,10 @@ pub fn action_to_dict(action: &Action) -> Dict {
             let steps: Vec<Dict> = steps.iter().map(macro_step_to_dict).collect();
             dict.insert("steps".to_string(), scalar(steps));
         }
+        Action::ProfileSwitch { target } => {
+            dict.insert("type".to_string(), scalar("profile_switch".to_string()));
+            dict.insert("target".to_string(), scalar(target.clone()));
+        }
     }
     dict
 }
@@ -222,6 +226,9 @@ pub fn action_from_dict(dict: &Dict) -> Result<Action, String> {
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Action::Macro { steps })
         }
+        "profile_switch" => Ok(Action::ProfileSwitch {
+            target: get_str(dict, "target")?.to_string(),
+        }),
         other => Err(format!("{other:?} is not a valid Action type")),
     }
 }
@@ -395,6 +402,20 @@ mod tests {
 
         let dict = action_to_dict(&action);
         assert_eq!(dict_get_string(&dict, "type"), "macro");
+
+        let round_tripped = action_from_dict(&dict).unwrap();
+        assert_eq!(round_tripped, action);
+    }
+
+    #[test]
+    fn profile_switch_action_round_trips_through_a_dict() {
+        let action = Action::ProfileSwitch {
+            target: "Gaming".to_string(),
+        };
+
+        let dict = action_to_dict(&action);
+        assert_eq!(dict_get_string(&dict, "type"), "profile_switch");
+        assert_eq!(dict_get_string(&dict, "target"), "Gaming");
 
         let round_tripped = action_from_dict(&dict).unwrap();
         assert_eq!(round_tripped, action);

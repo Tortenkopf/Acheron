@@ -1,8 +1,9 @@
 from gi.repository import Gtk
 
-from acheron_gui.binding_editor import DepthTrack, build_binding_editor
+from acheron_gui.binding_editor import DepthTrack, action_summary, build_binding_editor
 from acheron_gui.daemon_stub import DaemonStub
 from acheron_gui.device_overview import make_input_button
+from acheron_gui.inputs import ACTION_TYPES, TRIGGER_OPTIONS
 
 from .widget_tree import button_labeled, find_all, find_one
 
@@ -10,6 +11,11 @@ from .widget_tree import button_labeled, find_all, find_one
 def _entry_labeled(root, label_text):
     row = find_one(root, lambda w: isinstance(w, Gtk.Box) and _row_label_text(w) == label_text)
     return find_one(row, lambda w: isinstance(w, Gtk.Entry))
+
+
+def _dropdown_labeled(root, label_text):
+    row = find_one(root, lambda w: isinstance(w, Gtk.Box) and _row_label_text(w) == label_text)
+    return find_one(row, lambda w: isinstance(w, Gtk.DropDown))
 
 
 def _row_label_text(box):
@@ -120,6 +126,75 @@ def test_editing_targets_the_held_layer_independently_of_base():
         )
     ]
     assert "grid_r1c1" not in stub.get_config()["profiles"]["Default"]["base"]
+
+
+# --- Profile Switch (ticket 34) ---
+
+
+def test_saving_a_profile_switch_binding_calls_set_binding_with_fire_once_and_the_chosen_target():
+    stub = DaemonStub()
+    stub.create_profile("Gaming")
+    stub.calls.clear()
+    changed = []
+
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
+    popover = btn.get_popover()
+
+    action_dd = _dropdown_labeled(popover, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("profile_switch"))
+
+    target_dd = _dropdown_labeled(popover, "Target Profile")
+    profile_names = sorted(stub.get_config()["profiles"].keys())
+    target_dd.set_selected(profile_names.index("Gaming"))
+
+    button_labeled(popover, "Save").emit("clicked")
+
+    assert stub.calls == [
+        (
+            "set_binding",
+            "grid_r1c1",
+            "base",
+            {"trigger": "fire_once", "type": "profile_switch", "target": "Gaming"},
+        )
+    ]
+    assert changed == [1]
+
+
+def test_selecting_profile_switch_disables_and_forces_the_trigger_dropdown_to_fire_once():
+    stub = DaemonStub()
+    stub.create_profile("Gaming")
+
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+    popover = btn.get_popover()
+
+    trigger_dd = _dropdown_labeled(popover, "Trigger mode")
+    trigger_dd.set_selected([k for k, _ in TRIGGER_OPTIONS].index("toggle"))
+
+    action_dd = _dropdown_labeled(popover, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("profile_switch"))
+
+    assert not trigger_dd.get_sensitive()
+    assert TRIGGER_OPTIONS[trigger_dd.get_selected()][0] == "fire_once"
+
+
+def test_profile_switch_action_summary_shows_the_target_with_no_trigger_suffix():
+    assert action_summary(
+        {"trigger": "fire_once", "type": "profile_switch", "target": "Gaming"}, "grid_r1c1"
+    ) == "→ Gaming"
+
+
+def test_bound_profile_switch_shows_the_target_in_the_grid_button_label():
+    stub = DaemonStub()
+    stub.create_profile("Gaming")
+    stub.set_binding(
+        "grid_r1c1", "base", {"trigger": "fire_once", "type": "profile_switch", "target": "Gaming"}
+    )
+
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    assert "bound" in btn.get_css_classes()
+    label = btn.get_child()
+    assert "→ Gaming" in label.get_label()
 
 
 # --- Actuation & release (ticket 26) ---

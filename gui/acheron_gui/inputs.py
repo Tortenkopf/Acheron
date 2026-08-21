@@ -96,4 +96,4 @@ TRIGGER_OPTIONS = [
     ("toggle", "Toggle"),
 ]
 TRIGGER_SHORT = {"fire_once": "1x", "hold_to_repeat": "hold", "toggle": "toggle"}
-ACTION_TYPES = [("keypress", "Keypress"), ("macro", "Macro")]
+ACTION_TYPES = [("keypress", "Keypress"), ("macro", "Macro"), ("profile_switch", "Profile Switch")]

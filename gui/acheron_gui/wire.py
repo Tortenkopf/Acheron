@@ -49,6 +49,8 @@ def action_to_variant(action: dict) -> dict[str, GLib.Variant]:
     if kind == "macro":
         steps = [macro_step_to_variant(step) for step in action["steps"]]
         return {"type": GLib.Variant("s", "macro"), "steps": GLib.Variant("aa{sv}", steps)}
+    if kind == "profile_switch":
+        return {"type": GLib.Variant("s", "profile_switch"), "target": GLib.Variant("s", action["target"])}
     raise ValueError(f"{kind!r} is not a valid Action type")
 
 

@@ -30,7 +30,7 @@ use zbus::object_server::SignalEmitter;
 use crate::capture::{CaptureMode, EventState, PhysicalEvent};
 use crate::command::{Command, CommandError, State};
 use crate::config::{
-    self, ActuationPoint, Binding, Config, Layer, ModeKeyRole, Profile, TriggerMode,
+    self, Action, ActuationPoint, Binding, Config, Layer, ModeKeyRole, Profile, TriggerMode,
 };
 use crate::dbus::Daemon;
 use crate::executor::{self, ActiveToggle, FiringHandle};
@@ -108,11 +108,13 @@ pub async fn run(
                 let Some(event) = event else { break };
                 handle_event(
                     &injector,
-                    &config,
+                    &mut config,
+                    &config_path,
                     &mut toggles,
                     &mut in_flight,
                     &mut active_layer,
                     &signal_emitter,
+                    &actuation_tx,
                     event,
                 )
                 .await?;
@@ -140,13 +142,16 @@ pub async fn run(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_event(
     injector: &Injector,
-    config: &Config,
+    config: &mut Config,
+    config_path: &Path,
     toggles: &mut HashMap<Input, ActiveToggle>,
     in_flight: &mut HashMap<Input, FiringHandle>,
     active_layer: &mut Layer,
     signal_emitter: &Option<SignalEmitter<'static>>,
+    actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
     event: PhysicalEvent,
 ) -> io::Result<()> {
     let profile = config
@@ -170,15 +175,37 @@ async fn handle_event(
         return Ok(());
     }
 
+    // Cloned rather than matched by reference: an `Action::ProfileSwitch`
+    // Binding needs `config` mutably below, and `binding` would otherwise
+    // still be borrowing it immutably through `profile`/`bindings` (ticket
+    // 34).
     let bindings = profile.layer(*active_layer);
-    match bindings.get(&event.input) {
+    let binding = bindings.get(&event.input).cloned();
+    match binding {
         Some(binding) => {
+            if let Action::ProfileSwitch { target } = binding.action {
+                // Validated (`SetBinding`/`load_or_seed`) to only ever pair
+                // with Fire-once, so only `Down` fires it — mirrors `fire`'s
+                // own `(FireOnce, Down)` arm, but this Action has no
+                // `MacroStep` form to compile/spawn, so it's handled here
+                // instead of reaching `fire`/`executor::compile` at all.
+                if event.state == EventState::Down {
+                    let succeeded =
+                        switch_profile(config, config_path, toggles, actuation_tx, target.clone())
+                            .await
+                            .is_ok();
+                    if succeeded && let Some(emitter) = signal_emitter {
+                        let _ = Daemon::active_profile_changed(emitter, &target).await;
+                    }
+                }
+                return Ok(());
+            }
             fire(
                 injector,
                 toggles,
                 in_flight,
                 event.input,
-                binding,
+                &binding,
                 event.state,
             )
             .await
@@ -367,6 +394,70 @@ fn publish_actuation_snapshot(
     actuation_tx.send_replace(profile.resolved_actuation_points());
 }
 
+/// Shared by `Command::SwitchProfile` and firing an `Action::ProfileSwitch`
+/// Binding (ticket 34): switches `config.active_profile`, persists, and (on
+/// success) force-stops every active Toggle and republishes the new
+/// Profile's Actuation-point snapshot — the same effects `SwitchProfile`
+/// always had. Reply/`ActiveProfileChanged` handling deliberately stays with
+/// each caller: `Command::SwitchProfile` has a D-Bus reply to send (and its
+/// own reply-before-signal reentrancy-hazard ordering), while a Binding
+/// firing has no reply at all. Self-reference (`name` already active) is not
+/// special-cased — it still persists, force-stops Toggles, and republishes,
+/// an intentional no-op-except-for-Toggles per ticket 05's design.
+async fn switch_profile(
+    config: &mut Config,
+    config_path: &Path,
+    toggles: &mut HashMap<Input, ActiveToggle>,
+    actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
+    name: String,
+) -> Result<(), CommandError> {
+    if !config.profiles.contains_key(&name) {
+        return Err(CommandError::NotFound);
+    }
+    let previous = std::mem::replace(&mut config.active_profile, name);
+    let result = persist(config, config_path).await;
+    if result.is_err() {
+        config.active_profile = previous;
+    } else {
+        stop_all_toggles(toggles).await;
+        publish_actuation_snapshot(config, actuation_tx);
+    }
+    result
+}
+
+/// Every `Action::ProfileSwitch { target }` across every Profile's Base/Held
+/// Binding map that targets `old_name` is repointed at `new_name` (ticket
+/// 34) — a rename must not silently leave a dangling or wrong reference
+/// behind. Chords don't exist in code yet (ticket 01 is still a design
+/// ticket, not built), so only `base`/`held` are scanned.
+fn cascade_rename_profile_switch_targets(config: &mut Config, old_name: &str, new_name: &str) {
+    for profile in config.profiles.values_mut() {
+        for bindings in [&mut profile.base, &mut profile.held] {
+            for binding in bindings.values_mut() {
+                if let Action::ProfileSwitch { target } = &mut binding.action
+                    && target == old_name
+                {
+                    *target = new_name.to_string();
+                }
+            }
+        }
+    }
+}
+
+/// Whether any Profile's Base/Held Binding map contains an
+/// `Action::ProfileSwitch { target }` naming `name` — `DeleteProfile`
+/// refuses while this is true, so a dangling reference can never exist
+/// (ticket 34).
+fn profile_switch_references(config: &Config, name: &str) -> bool {
+    config.profiles.values().any(|profile| {
+        [&profile.base, &profile.held].into_iter().any(|bindings| {
+            bindings.values().any(|binding| {
+                matches!(&binding.action, Action::ProfileSwitch { target } if target == name)
+            })
+        })
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_command(
     config: &mut Config,
@@ -399,6 +490,14 @@ async fn handle_command(
             binding,
             reply,
         } => {
+            if matches!(binding.action, Action::ProfileSwitch { .. })
+                && binding.trigger != TriggerMode::FireOnce
+            {
+                let _ = reply.send(Err(CommandError::InvalidRequest(
+                    "a Profile Switch Binding must use Fire-once".to_string(),
+                )));
+                return;
+            }
             let previous = active_profile_mut(config)
                 .layer_mut(layer)
                 .insert(input, binding);
@@ -481,6 +580,12 @@ async fn handle_command(
                 )));
                 return;
             }
+            if profile_switch_references(config, &name) {
+                let _ = reply.send(Err(CommandError::InvalidRequest(format!(
+                    "Profile {name:?} is still referenced by a Profile Switch Binding"
+                ))));
+                return;
+            }
             let Some(previous) = config.profiles.remove(&name) else {
                 let _ = reply.send(Err(CommandError::NotFound));
                 return;
@@ -514,46 +619,34 @@ async fn handle_command(
                 let _ = reply.send(Ok(()));
                 return;
             }
+            // Snapshotting the whole map (rather than just the renamed
+            // Profile, as before ticket 34) is what makes the cascade below
+            // cleanly reversible on a persist failure — any other Profile's
+            // Bindings can now change too, not just the renamed entry.
+            let previous_profiles = config.profiles.clone();
+            let previous_active = config.active_profile.clone();
+
             let profile = config
                 .profiles
                 .remove(&old_name)
                 .expect("just checked old_name exists");
-            config.profiles.insert(new_name.clone(), profile.clone());
-            let was_active = config.active_profile == old_name;
-            if was_active {
+            config.profiles.insert(new_name.clone(), profile);
+            if config.active_profile == old_name {
                 config.active_profile = new_name.clone();
             }
+            cascade_rename_profile_switch_targets(config, &old_name, &new_name);
+
             let result = persist(config, config_path).await;
             if result.is_err() {
-                config.profiles.remove(&new_name);
-                config.profiles.insert(old_name.clone(), profile);
-                if was_active {
-                    config.active_profile = old_name;
-                }
+                config.profiles = previous_profiles;
+                config.active_profile = previous_active;
             }
             let _ = reply.send(result);
         }
         Command::SwitchProfile { name, reply } => {
-            if !config.profiles.contains_key(&name) {
-                let _ = reply.send(Err(CommandError::NotFound));
-                return;
-            }
-            let previous = std::mem::replace(&mut config.active_profile, name.clone());
-            let result = persist(config, config_path).await;
+            let result =
+                switch_profile(config, config_path, toggles, actuation_tx, name.clone()).await;
             let succeeded = result.is_ok();
-            if !succeeded {
-                config.active_profile = previous;
-            } else {
-                // Force-stop every active Toggle before the new Profile's
-                // state is considered live, per spec.md's "Toggle behavior
-                // across Layer/Profile switches" — no Toggle survives a
-                // Profile switch, regardless of which Profile started it.
-                stop_all_toggles(toggles).await;
-                // The new Profile's own Actuation points (ticket 18 §5) —
-                // the grid task must threshold against the newly active
-                // Profile's values immediately, not the previous one's.
-                publish_actuation_snapshot(config, actuation_tx);
-            }
             // The reply is sent *before* the signal, deliberately: the
             // caller's own SwitchProfile call is typically a blocking D-Bus
             // round-trip (e.g. the GUI's `call_sync`) still waiting on this
@@ -1945,6 +2038,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_binding_rejects_a_profile_switch_binding_that_is_not_fire_once() {
+        for trigger in [TriggerMode::HoldToRepeat, TriggerMode::Toggle] {
+            let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+            let err = harness
+                .set_binding(
+                    Input::Grid(1, 1),
+                    Layer::Base,
+                    Binding {
+                        trigger,
+                        action: Action::ProfileSwitch {
+                            target: "Gaming".to_string(),
+                        },
+                    },
+                )
+                .await
+                .expect_err("a non-Fire-once Profile Switch Binding must be rejected");
+            assert!(matches!(err, CommandError::InvalidRequest(_)));
+
+            let config = harness.get_config().await;
+            harness.shut_down().await;
+            assert!(
+                !config.profiles[DEFAULT_PROFILE_NAME]
+                    .base
+                    .contains_key(&Input::Grid(1, 1)),
+                "the rejected Binding must not have been applied"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn leaving_bound_role_stops_an_active_toggle_on_the_mode_key() {
         // A code-review-caught edge case: a Toggle can only ever have been
         // started on the Mode key while `Bound`. Once `LayerSwitch` takes
@@ -2114,6 +2238,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_profile_command_rejects_deleting_a_profile_still_referenced_by_a_profile_switch_binding()
+     {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness.create_profile("Gaming").await.unwrap();
+        harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::FireOnce,
+                    action: Action::ProfileSwitch {
+                        target: "Gaming".to_string(),
+                    },
+                },
+            )
+            .await
+            .expect("SetBinding must succeed");
+
+        let err = harness
+            .delete_profile("Gaming")
+            .await
+            .expect_err("deleting a still-referenced Profile must fail");
+        assert!(matches!(err, CommandError::InvalidRequest(_)));
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+        assert!(
+            config.profiles.contains_key("Gaming"),
+            "the refused delete must not have removed the Profile"
+        );
+    }
+
+    #[tokio::test]
     async fn rename_profile_command_renames_the_active_profile_and_updates_active_profile() {
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
 
@@ -2151,6 +2308,71 @@ mod tests {
 
         assert_eq!(config.active_profile, DEFAULT_PROFILE_NAME);
         assert!(config.profiles.contains_key("Editing"));
+    }
+
+    #[tokio::test]
+    async fn rename_profile_command_cascades_every_cross_profile_profile_switch_reference() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness.create_profile("Gaming").await.unwrap();
+        // A Binding on the (non-renamed) active Profile targeting "Gaming",
+        // plus a self-referencing Binding stored on "Gaming" itself — the
+        // cascade must reach both, not just the renamed Profile's own
+        // Bindings.
+        harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::FireOnce,
+                    action: Action::ProfileSwitch {
+                        target: "Gaming".to_string(),
+                    },
+                },
+            )
+            .await
+            .expect("SetBinding must succeed");
+        harness
+            .switch_profile("Gaming")
+            .await
+            .expect("SwitchProfile must succeed");
+        harness
+            .set_binding(
+                Input::Grid(1, 2),
+                Layer::Held,
+                Binding {
+                    trigger: TriggerMode::FireOnce,
+                    action: Action::ProfileSwitch {
+                        target: "Gaming".to_string(),
+                    },
+                },
+            )
+            .await
+            .expect("SetBinding must succeed");
+        harness
+            .switch_profile(DEFAULT_PROFILE_NAME)
+            .await
+            .expect("SwitchProfile must succeed");
+
+        harness
+            .rename_profile("Gaming", "Renamed")
+            .await
+            .expect("RenameProfile must succeed");
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+
+        assert_eq!(
+            config.profiles[DEFAULT_PROFILE_NAME].base[&Input::Grid(1, 1)].action,
+            Action::ProfileSwitch {
+                target: "Renamed".to_string(),
+            }
+        );
+        assert_eq!(
+            config.profiles["Renamed"].held[&Input::Grid(1, 2)].action,
+            Action::ProfileSwitch {
+                target: "Renamed".to_string(),
+            }
+        );
     }
 
     #[tokio::test]
@@ -2353,6 +2575,77 @@ mod tests {
             panic!("expected a key event");
         };
         assert_eq!((code, value), (evdev::KeyCode::KEY_A, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn firing_a_profile_switch_binding_switches_the_active_profile_and_force_stops_toggles() {
+        // Mirrors switch_profile_force_stops_every_active_toggle_with_exact_key_release
+        // above, but drives the switch through a real PhysicalEvent firing an
+        // Action::ProfileSwitch Binding (ticket 34) instead of the
+        // Command::SwitchProfile D-Bus path — `handle_event`'s interception
+        // must produce the exact same effects the shared `switch_profile`
+        // gives `Command::SwitchProfile`.
+        let mut base = HashMap::new();
+        base.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::Toggle,
+                action: Action::Macro {
+                    steps: vec![
+                        MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
+                        MacroStepDto::Delay(50),
+                    ],
+                },
+            },
+        );
+        base.insert(
+            Input::Grid(1, 2),
+            Binding {
+                trigger: TriggerMode::FireOnce,
+                action: Action::ProfileSwitch {
+                    target: "Gaming".to_string(),
+                },
+            },
+        );
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            DEFAULT_PROFILE_NAME.to_string(),
+            Profile {
+                base,
+                ..Default::default()
+            },
+        );
+        profiles.insert("Gaming".to_string(), Profile::default());
+        let config = Config {
+            schema_version: config::SCHEMA_VERSION,
+            active_profile: DEFAULT_PROFILE_NAME.to_string(),
+            profiles,
+            force_digital: false,
+        };
+        let harness = CommandHarness::spawn(config);
+
+        harness.press(Input::Grid(1, 1)).await;
+        tokio::time::advance(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            harness.get_state().await.active_toggles,
+            vec![Input::Grid(1, 1)]
+        );
+
+        harness.press(Input::Grid(1, 2)).await;
+        tokio::task::yield_now().await;
+
+        let state = harness.get_state().await;
+        assert_eq!(state.profile, "Gaming");
+        assert!(
+            state.active_toggles.is_empty(),
+            "firing a Profile Switch Binding must force-stop every active Toggle, same as Command::SwitchProfile"
+        );
+
+        let on_disk = std::fs::read_to_string(&harness.config_path).unwrap();
+        harness.shut_down().await;
+        let reparsed: Config = toml::from_str(&on_disk).unwrap();
+        assert_eq!(reparsed.active_profile, "Gaming");
     }
 
     #[tokio::test(start_paused = true)]

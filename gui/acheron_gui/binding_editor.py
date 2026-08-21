@@ -38,6 +38,11 @@ def action_summary(binding: dict | None, inp: str) -> str:
         key = binding["key"].replace("KEY_", "")
         chord = f"{mods}+{key}" if mods else key
         return f"{chord}  [{TRIGGER_SHORT[binding['trigger']]}]"
+    if binding["type"] == "profile_switch":
+        # No Trigger-mode suffix: ProfileSwitch is validation-locked to
+        # Fire-once (ticket 34), so it would always read the same "[1x]"
+        # every other binding kind's suffix actually varies by.
+        return f"→ {binding['target']}"
     steps = binding.get("steps", [])
     return f"Macro ({len(steps)} steps)  [{TRIGGER_SHORT[binding['trigger']]}]"
 
@@ -443,12 +448,21 @@ def build_binding_editor(
         if starting["type"] == "keypress"
         else {"key": "KEY_A", "modifiers": []},
         "steps": list(starting.get("steps", [])) if starting["type"] == "macro" else [],
+        "profile_switch": {"target": starting.get("target", profile)}
+        if starting["type"] == "profile_switch"
+        else {"target": profile},
     }
 
     def render_action_editor():
         clear_children(editor_slot)
 
         kind = ACTION_TYPES[action_dd.get_selected()][0]
+        # Profile Switch has no coherent held/toggled meaning (ticket 05) —
+        # locked to Fire-once here and again, defensively, in on_save.
+        trigger_dd.set_sensitive(kind != "profile_switch")
+        if kind == "profile_switch":
+            trigger_dd.set_selected([k for k, _ in TRIGGER_OPTIONS].index("fire_once"))
+
         if kind == "keypress":
             key_entry = Gtk.Entry(text=draft["keypress"].get("key", "KEY_A"))
             key_entry.connect("changed", lambda e: draft["keypress"].__setitem__("key", e.get_text()))
@@ -471,6 +485,20 @@ def build_binding_editor(
                 cb.connect("toggled", on_mod)
                 mod_box.append(cb)
             editor_slot.append(mod_box)
+        elif kind == "profile_switch":
+            profile_names = sorted(config["profiles"].keys())
+            target_dd = Gtk.DropDown(model=Gtk.StringList.new(profile_names))
+            current_target = draft["profile_switch"].get("target", profile)
+            if current_target not in profile_names:
+                current_target = profile_names[0]
+            draft["profile_switch"]["target"] = current_target
+            target_dd.set_selected(profile_names.index(current_target))
+
+            def on_target_changed(dd, *_):
+                draft["profile_switch"]["target"] = profile_names[dd.get_selected()]
+
+            target_dd.connect("notify::selected", on_target_changed)
+            editor_slot.append(labeled_row("Target Profile", target_dd))
         else:
             steps_list = Gtk.ListBox()
             steps_list.add_css_class("boxed-list")
@@ -539,6 +567,14 @@ def build_binding_editor(
                 "type": "keypress",
                 "key": draft["keypress"].get("key", "KEY_A"),
                 "modifiers": draft["keypress"].get("modifiers", []),
+            }
+        elif kind == "profile_switch":
+            binding = {
+                # Always Fire-once regardless of the (disabled) dropdown's
+                # own selection — the Daemon rejects anything else anyway.
+                "trigger": "fire_once",
+                "type": "profile_switch",
+                "target": draft["profile_switch"].get("target", profile),
             }
         else:
             binding = {
