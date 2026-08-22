@@ -56,3 +56,21 @@ def test_macro_step_to_variant_round_trips_every_step_kind():
         variant_dict = wire.macro_step_to_variant(step)
         unpacked = {k: v.unpack() for k, v in variant_dict.items()}
         assert unpacked == step
+
+
+def test_step_binding_round_trips_through_a_variant():
+    binding = {"trigger": "fire_once", "type": "step", "stepper_id": "weapon-wheel", "direction": "forward"}
+
+    variant_dict = wire.binding_to_variant(binding)
+    unpacked = {k: v.unpack() for k, v in variant_dict.items()}
+
+    assert unpacked == binding
+
+
+def test_stepper_item_to_variant_round_trips():
+    item = {"type": "key", "key": "KEY_A"}
+
+    variant_dict = wire.stepper_item_to_variant(item)
+    unpacked = {k: v.unpack() for k, v in variant_dict.items()}
+
+    assert unpacked == item

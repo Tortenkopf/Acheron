@@ -57,6 +57,14 @@ def action_summary(binding: dict | None, inp: str, macros: dict) -> str:
         raw_button = binding["button"]
         button = CONTROLLER_LABEL_BY_CODE.get(raw_button, raw_button)
         return f"Btn: {button}  [{TRIGGER_SHORT[binding['trigger']]}]"
+    if binding["type"] == "step":
+        # Ticket 54 landed the Daemon/wire side only — no library dict is
+        # threaded in here yet (unlike `macros`), so this shows the raw
+        # `stepper_id` rather than a resolved display name, mirroring
+        # ticket 51's identical "raw id until the real picker lands" stance
+        # for Macro. Ticket 55 builds the real Stepper library UI.
+        arrow = "↑" if binding["direction"] == "forward" else "↓"
+        return f"Step {arrow} {binding['stepper_id']}  [{TRIGGER_SHORT[binding['trigger']]}]"
     # Ticket 52: resolves the library entry's display name rather than the
     # raw macro_id (ticket 51 deferred this — it needed `macros` threaded
     # in, which now happens here). Falls back to the raw id if the entry is
@@ -457,8 +465,21 @@ def build_binding_editor(
     trigger_dd.set_selected([k for k, _ in TRIGGER_OPTIONS].index(starting["trigger"]))
     box.append(labeled_row("Trigger mode", trigger_dd))
 
+    known_action_kinds = [k for k, _ in ACTION_TYPES]
+    # `Action::Step` (ticket 03/54) has no editor built here yet (ticket
+    # 55's job) and isn't offered in `ACTION_TYPES` — but the Daemon can
+    # already hand back a Step Binding (a hand-edited config.toml, or any
+    # other `com.acheron.Daemon` caller), and this popover must not crash
+    # trying to look an unknown `starting["type"]` up in a list that
+    # doesn't contain it. Falls back to index 0 for the dropdown itself;
+    # `unsupported_kind` (below) keeps Save disabled until the user
+    # explicitly picks a real Action kind, so simply opening this popover
+    # can never silently clobber the existing Binding with an unrelated
+    # default.
+    unsupported_kind = starting["type"] not in known_action_kinds
+
     action_dd = Gtk.DropDown(model=Gtk.StringList.new([lbl for _, lbl in ACTION_TYPES]))
-    action_dd.set_selected([k for k, _ in ACTION_TYPES].index(starting["type"]))
+    action_dd.set_selected(0 if unsupported_kind else known_action_kinds.index(starting["type"]))
     box.append(labeled_row("Action", action_dd))
 
     editor_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -614,6 +635,23 @@ def build_binding_editor(
 
     action_dd.connect("notify::selected", lambda *_: render_action_editor())
     render_action_editor()
+    if unsupported_kind:
+        # See `unsupported_kind`'s definition above — render_action_editor()
+        # just built an ordinary (misleadingly unrelated) editor for
+        # whatever kind index 0 is, so Save is force-disabled again here and
+        # a banner explains the mismatch. Clear still works normally (it
+        # doesn't depend on `kind` at all), and picking a different Action
+        # above re-enables Save via render_action_editor()'s own reset.
+        save_btn.set_sensitive(False)
+        editor_slot.append(
+            Gtk.Label(
+                label=f"This Input's current Binding type ({starting['type']!r}) has no editor here "
+                "yet — pick a different Action above to replace it, or use Clear below to remove it.",
+                xalign=0,
+                wrap=True,
+                css_classes=["dim"],
+            )
+        )
 
     def show_error(exc: Exception):
         error_label.set_label(str(exc))

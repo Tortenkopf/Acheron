@@ -94,6 +94,11 @@ pub fn compile(action: &Action, macros: &HashMap<MacroId, MacroDef>) -> Vec<Macr
                 "Action::ProfileSwitch is intercepted in dispatch::handle_event before compile is ever called"
             )
         }
+        Action::Step { .. } => {
+            unreachable!(
+                "Action::Step's steps depend on Daemon-owned runtime cursor state, resolved by dispatch::compile_action before this generic compile is ever reached for it"
+            )
+        }
         // Same shape as a plain, unmodified Keypress (ticket 14's Answer: "a
         // controller-button press is the same shape as a Keypress: compile a
         // down/up pair, inject it") — only the target uinput device differs,

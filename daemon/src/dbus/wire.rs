@@ -21,7 +21,7 @@ use zbus::zvariant::{OwnedValue, Value};
 use crate::command::State;
 use crate::config::{
     Action, ActuationPoint, Binding, Config, Layer, MacroDef, MacroId, MacroStepDto, ModeKeyRole,
-    Modifiers, Profile, TriggerMode,
+    Modifiers, Profile, StepDirection, StepperDef, StepperId, StepperItem, TriggerMode,
 };
 
 /// The `a{sv}` shape every `Action`/`MacroStep`/`Binding`/`Config` entity
@@ -88,6 +88,21 @@ pub fn mode_key_role_from_str(s: &str) -> Result<ModeKeyRole, String> {
         "layer_switch" => Ok(ModeKeyRole::LayerSwitch),
         "bound" => Ok(ModeKeyRole::Bound),
         other => Err(format!("{other:?} is not a valid mode-key role")),
+    }
+}
+
+fn direction_str(direction: StepDirection) -> &'static str {
+    match direction {
+        StepDirection::Forward => "forward",
+        StepDirection::Backward => "backward",
+    }
+}
+
+fn direction_from_str(s: &str) -> Result<StepDirection, String> {
+    match s {
+        "forward" => Ok(StepDirection::Forward),
+        "backward" => Ok(StepDirection::Backward),
+        other => Err(format!("{other:?} is not a valid Stepper direction")),
     }
 }
 
@@ -192,6 +207,14 @@ pub fn action_to_dict(action: &Action) -> Dict {
             dict.insert("type".to_string(), scalar("controller_button".to_string()));
             dict.insert("button".to_string(), scalar(key_to_string(*button)));
         }
+        Action::Step { stepper, direction } => {
+            dict.insert("type".to_string(), scalar("step".to_string()));
+            dict.insert("stepper_id".to_string(), scalar(stepper.to_string()));
+            dict.insert(
+                "direction".to_string(),
+                scalar(direction_str(*direction).to_string()),
+            );
+        }
     }
     dict
 }
@@ -219,6 +242,10 @@ pub fn action_from_dict(dict: &Dict) -> Result<Action, String> {
         }),
         "controller_button" => Ok(Action::ControllerButton {
             button: key_from_str(get_str(dict, "button")?)?,
+        }),
+        "step" => Ok(Action::Step {
+            stepper: StepperId::from(get_str(dict, "stepper_id")?),
+            direction: direction_from_str(get_str(dict, "direction")?)?,
         }),
         other => Err(format!("{other:?} is not a valid Action type")),
     }
@@ -309,6 +336,47 @@ fn macros_to_dict(macros: &HashMap<MacroId, MacroDef>) -> Dict {
         .collect()
 }
 
+/// A `StepperItem` marshals the same `"type"`-tagged shape as an `Action` —
+/// today's sole `Key` variant carries `"key"`, mirroring `MacroStepDto`'s
+/// `key_down`/`key_up` fields (ticket 03/54 — CONTEXT.md: Stepper).
+pub fn stepper_item_to_dict(item: &StepperItem) -> Dict {
+    let mut dict = Dict::new();
+    match item {
+        StepperItem::Key { key } => {
+            dict.insert("type".to_string(), scalar("key".to_string()));
+            dict.insert("key".to_string(), scalar(key_to_string(*key)));
+        }
+    }
+    dict
+}
+
+pub fn stepper_item_from_dict(dict: &Dict) -> Result<StepperItem, String> {
+    match get_str(dict, "type")? {
+        "key" => Ok(StepperItem::Key {
+            key: key_from_str(get_str(dict, "key")?)?,
+        }),
+        other => Err(format!("{other:?} is not a valid StepperItem type")),
+    }
+}
+
+/// A `StepperDef` marshals as a flat two-field `a{sv}`, mirroring
+/// `macro_def_to_dict` exactly — its `name` plus its `items` (reusing
+/// `stepper_item_to_dict`'s array-of-dicts shape).
+fn stepper_def_to_dict(def: &StepperDef) -> Dict {
+    let mut dict = Dict::new();
+    dict.insert("name".to_string(), scalar(def.name.clone()));
+    let items: Vec<Dict> = def.items.iter().map(stepper_item_to_dict).collect();
+    dict.insert("items".to_string(), scalar(items));
+    dict
+}
+
+fn steppers_to_dict(steppers: &HashMap<StepperId, StepperDef>) -> Dict {
+    steppers
+        .iter()
+        .map(|(stepper_id, def)| (stepper_id.to_string(), scalar(stepper_def_to_dict(def))))
+        .collect()
+}
+
 /// `GetConfig()`'s full-document return: `schema_version`/`active_profile`
 /// as scalars, `profiles` recursively reusing `binding_to_dict`'s
 /// conventions (issue 08); each Profile now also carries `held` alongside
@@ -329,6 +397,10 @@ pub fn config_to_dict(config: &Config) -> Dict {
     dict.insert("profiles".to_string(), scalar(profiles));
     dict.insert("force_digital".to_string(), scalar(config.force_digital));
     dict.insert("macros".to_string(), scalar(macros_to_dict(&config.macros)));
+    dict.insert(
+        "steppers".to_string(),
+        scalar(steppers_to_dict(&config.steppers)),
+    );
     dict
 }
 
@@ -359,7 +431,22 @@ pub fn state_to_dict(state: &State) -> Dict {
         "capture_mode".to_string(),
         scalar(state.capture_mode.to_string()),
     );
+    dict.insert(
+        "stepper_cursors".to_string(),
+        scalar(stepper_cursors_to_dict(&state.stepper_cursors)),
+    );
     dict
+}
+
+/// `State.stepper_cursors`' wire shape — a flat `stepper_id -> current index`
+/// dict (ticket 03/54: "threaded into `GetState()` for the GUI's benefit, the
+/// same way `capture_mode` is"). `u64`, not `u8`/`u32`, matching every other
+/// bare integer this module marshals (`macro_step_to_dict`'s `"ms"`).
+fn stepper_cursors_to_dict(cursors: &HashMap<StepperId, usize>) -> Dict {
+    cursors
+        .iter()
+        .map(|(stepper_id, index)| (stepper_id.to_string(), scalar(*index as u64)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -414,6 +501,36 @@ mod tests {
 
         let round_tripped = action_from_dict(&dict).unwrap();
         assert_eq!(round_tripped, action);
+    }
+
+    #[test]
+    fn step_action_round_trips_through_a_dict() {
+        let action = Action::Step {
+            stepper: StepperId::from("weapon-wheel"),
+            direction: StepDirection::Backward,
+        };
+
+        let dict = action_to_dict(&action);
+        assert_eq!(dict_get_string(&dict, "type"), "step");
+        assert_eq!(dict_get_string(&dict, "stepper_id"), "weapon-wheel");
+        assert_eq!(dict_get_string(&dict, "direction"), "backward");
+
+        let round_tripped = action_from_dict(&dict).unwrap();
+        assert_eq!(round_tripped, action);
+    }
+
+    #[test]
+    fn stepper_item_round_trips_through_a_dict() {
+        let item = StepperItem::Key {
+            key: KeyCode::BTN_LEFT,
+        };
+
+        let dict = stepper_item_to_dict(&item);
+        assert_eq!(dict_get_string(&dict, "type"), "key");
+        assert_eq!(dict_get_string(&dict, "key"), "BTN_LEFT");
+
+        let round_tripped = stepper_item_from_dict(&dict).unwrap();
+        assert_eq!(round_tripped, item);
     }
 
     #[test]
@@ -475,6 +592,14 @@ mod tests {
     }
 
     #[test]
+    fn every_direction_round_trips_through_its_wire_string() {
+        for direction in [StepDirection::Forward, StepDirection::Backward] {
+            let s = direction_str(direction);
+            assert_eq!(direction_from_str(s).unwrap(), direction);
+        }
+    }
+
+    #[test]
     fn action_from_dict_rejects_an_unknown_type_tag() {
         let mut dict = Dict::new();
         dict.insert("type".to_string(), scalar("bogus".to_string()));
@@ -517,6 +642,7 @@ mod tests {
             profiles,
             force_digital: false,
             macros: StdHashMap::new(),
+            steppers: StdHashMap::new(),
         };
 
         let dict = config_to_dict(&config);
@@ -573,6 +699,7 @@ mod tests {
             profiles: Default::default(),
             force_digital: true,
             macros: HashMap::new(),
+            steppers: HashMap::new(),
         };
         let dict = config_to_dict(&config);
         assert!(bool::try_from(get(&dict, "force_digital").unwrap()).unwrap());
@@ -600,6 +727,7 @@ mod tests {
             profiles: Default::default(),
             force_digital: false,
             macros,
+            steppers: HashMap::new(),
         };
 
         let dict = config_to_dict(&config);
@@ -614,6 +742,49 @@ mod tests {
         let steps: Vec<OwnedValue> =
             Vec::try_from(get(&macro_dict, "steps").unwrap().clone()).unwrap();
         assert_eq!(steps.len(), 3);
+    }
+
+    /// Ticket 54: `config_to_dict` must serialize `Config.steppers` — the
+    /// global Stepper-list library, keyed by `stepper_id` string, mirroring
+    /// `config_to_dict_serializes_macros` exactly.
+    #[test]
+    fn config_to_dict_serializes_steppers() {
+        let mut steppers = HashMap::new();
+        steppers.insert(
+            StepperId::from("weapon-wheel"),
+            StepperDef {
+                name: "Weapon Wheel".to_string(),
+                items: vec![
+                    StepperItem::Key {
+                        key: KeyCode::KEY_1,
+                    },
+                    StepperItem::Key {
+                        key: KeyCode::KEY_2,
+                    },
+                ],
+            },
+        );
+        let config = Config {
+            schema_version: 1,
+            active_profile: "Default".to_string(),
+            profiles: Default::default(),
+            force_digital: false,
+            macros: HashMap::new(),
+            steppers,
+        };
+
+        let dict = config_to_dict(&config);
+        let steppers_dict: Dict = get(&dict, "steppers").unwrap().clone().try_into().unwrap();
+        let stepper_dict: Dict = steppers_dict
+            .get("weapon-wheel")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(dict_get_string(&stepper_dict, "name"), "Weapon Wheel");
+        let items: Vec<OwnedValue> =
+            Vec::try_from(get(&stepper_dict, "items").unwrap().clone()).unwrap();
+        assert_eq!(items.len(), 2);
     }
 
     /// Ticket 26: `config_to_dict` must serialize a Profile's
@@ -651,6 +822,7 @@ mod tests {
             profiles,
             force_digital: false,
             macros: StdHashMap::new(),
+            steppers: StdHashMap::new(),
         };
 
         let dict = config_to_dict(&config);
@@ -701,12 +873,15 @@ mod tests {
     fn state_to_dict_keys_every_field_by_name() {
         use crate::input::Input;
 
+        let mut stepper_cursors = HashMap::new();
+        stepper_cursors.insert(StepperId::from("weapon-wheel"), 2usize);
         let state = State {
             profile: "Gaming".to_string(),
             layer: "held",
             active_toggles: vec![Input::Grid(1, 1)],
             device_connected: true,
             capture_mode: "analog",
+            stepper_cursors,
         };
 
         let dict = state_to_dict(&state);
@@ -718,6 +893,15 @@ mod tests {
         );
         assert!(bool::try_from(get(&dict, "device_connected").unwrap()).unwrap());
         assert_eq!(dict_get_string(&dict, "capture_mode"), "analog");
+        let cursors_dict: Dict = get(&dict, "stepper_cursors")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            u64::try_from(cursors_dict.get("weapon-wheel").unwrap().clone()).unwrap(),
+            2
+        );
     }
 
     #[test]

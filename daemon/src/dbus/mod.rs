@@ -21,7 +21,7 @@ use zbus::object_server::SignalEmitter;
 use zbus::zvariant::OwnedValue;
 
 use crate::command::{Command, CommandError};
-use crate::config::MacroId;
+use crate::config::{MacroId, StepperId};
 use crate::injector::Injector;
 use crate::input::Input;
 
@@ -533,6 +533,93 @@ impl Daemon {
         rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
     }
 
+    /// Creates a new Stepper library entry (ticket 03/54) — atomic/
+    /// immediately-applied/immediately-persisted, mirroring `create_macro`
+    /// exactly. A Stepper's identity is a `StepperId` slug derived from
+    /// `name` and frozen; the return value is that assigned id.
+    async fn create_stepper(
+        &self,
+        name: String,
+        items: Vec<HashMap<String, OwnedValue>>,
+    ) -> Result<String, DaemonError> {
+        let items = items
+            .iter()
+            .map(wire::stepper_item_from_dict)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DaemonError::InvalidBinding)?;
+
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::CreateStepper { name, items, reply })
+            .await
+            .map_err(dispatch_gone)?;
+        let stepper_id = rx
+            .await
+            .map_err(dispatch_gone)?
+            .map_err(DaemonError::from)?;
+        Ok(stepper_id.to_string())
+    }
+
+    /// Renames a Stepper — a pure display-name field write; the `StepperId`
+    /// itself never changes. Errors `NotFound` if `stepper_id` doesn't
+    /// exist.
+    async fn rename_stepper(
+        &self,
+        stepper_id: String,
+        new_name: String,
+    ) -> Result<(), DaemonError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::RenameStepper {
+                stepper_id: StepperId::from(stepper_id),
+                new_name,
+                reply,
+            })
+            .await
+            .map_err(dispatch_gone)?;
+        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+    }
+
+    /// Deletes a Stepper. Errors `NotFound` if it doesn't exist, or
+    /// `InvalidBinding` if any Binding anywhere still references it.
+    async fn delete_stepper(&self, stepper_id: String) -> Result<(), DaemonError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::DeleteStepper {
+                stepper_id: StepperId::from(stepper_id),
+                reply,
+            })
+            .await
+            .map_err(dispatch_gone)?;
+        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+    }
+
+    /// Overwrites a Stepper's item list in place, mirroring
+    /// `set_macro_steps` exactly. Errors `NotFound` if `stepper_id` doesn't
+    /// exist.
+    async fn set_stepper_items(
+        &self,
+        stepper_id: String,
+        items: Vec<HashMap<String, OwnedValue>>,
+    ) -> Result<(), DaemonError> {
+        let items = items
+            .iter()
+            .map(wire::stepper_item_from_dict)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DaemonError::InvalidBinding)?;
+
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::SetStepperItems {
+                stepper_id: StepperId::from(stepper_id),
+                items,
+                reply,
+            })
+            .await
+            .map_err(dispatch_gone)?;
+        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+    }
+
     /// Switches the active Profile, force-stopping every currently running
     /// Toggle as part of the switch before the new Profile's state becomes
     /// active (ticket 19). Errors `NotFound` if `name` doesn't name a real
@@ -830,6 +917,18 @@ mod tests {
             macro_id: &str,
             steps: Vec<HashMap<String, OwnedValue>>,
         ) -> zbus::Result<()>;
+        fn create_stepper(
+            &self,
+            name: &str,
+            items: Vec<HashMap<String, OwnedValue>>,
+        ) -> zbus::Result<String>;
+        fn rename_stepper(&self, stepper_id: &str, new_name: &str) -> zbus::Result<()>;
+        fn delete_stepper(&self, stepper_id: &str) -> zbus::Result<()>;
+        fn set_stepper_items(
+            &self,
+            stepper_id: &str,
+            items: Vec<HashMap<String, OwnedValue>>,
+        ) -> zbus::Result<()>;
         fn switch_profile(&self, name: &str) -> zbus::Result<()>;
         fn stop_all_toggles(&self) -> zbus::Result<()>;
         fn set_actuation_point(&self, input: &str, actuation: u8, release: u8) -> zbus::Result<()>;
@@ -888,6 +987,7 @@ mod tests {
                 profiles,
                 force_digital: false,
                 macros: HashMap::new(),
+                steppers: HashMap::new(),
             };
             crate::config::write(&config_path, &config).unwrap();
 
@@ -992,6 +1092,24 @@ mod tests {
                 .create_macro(name, steps)
                 .await
                 .expect("CreateMacro must succeed")
+        }
+
+        /// `create_macro`'s exact mirror for the Stepper library — creates a
+        /// Stepper via a real `CreateStepper` D-Bus round-trip and returns
+        /// its assigned `stepper_id` (ticket 03/54: `SetBinding` rejects an
+        /// `Action::Step` naming an unknown `stepper_id`, so these tests
+        /// must create the entry for real first).
+        async fn create_stepper(
+            &self,
+            name: &str,
+            items: Vec<crate::config::StepperItem>,
+        ) -> String {
+            let items: Vec<HashMap<String, OwnedValue>> =
+                items.iter().map(wire::stepper_item_to_dict).collect();
+            self.proxy
+                .create_stepper(name, items)
+                .await
+                .expect("CreateStepper must succeed")
         }
 
         /// Stands in for the `CaptureSource`'s poll loop reporting a
@@ -1661,6 +1779,270 @@ mod tests {
         server.shut_down().await;
     }
 
+    #[tokio::test]
+    async fn create_stepper_over_real_dbus_derives_a_slug_and_persists_it() {
+        let server = TestServer::start().await;
+
+        let stepper_id = server
+            .create_stepper(
+                "Weapon Wheel",
+                vec![crate::config::StepperItem::Key {
+                    key: evdev::KeyCode::KEY_1,
+                }],
+            )
+            .await;
+        assert_eq!(stepper_id, "weapon-wheel");
+
+        let config = server.proxy.get_config().await.unwrap();
+        let on_disk = std::fs::read_to_string(&server.config_path).unwrap();
+        server.shut_down().await;
+
+        let steppers: wire::Dict = config.get("steppers").unwrap().clone().try_into().unwrap();
+        let def: wire::Dict = steppers
+            .get("weapon-wheel")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let name: String = def.get("name").unwrap().clone().try_into().unwrap();
+        assert_eq!(name, "Weapon Wheel");
+        assert!(on_disk.contains("[steppers.weapon-wheel]"));
+    }
+
+    #[tokio::test]
+    async fn rename_stepper_over_real_dbus_changes_the_name_not_the_stepper_id() {
+        let server = TestServer::start().await;
+        let stepper_id = server.create_stepper("Old Name", vec![]).await;
+
+        server
+            .proxy
+            .rename_stepper(&stepper_id, "New Name")
+            .await
+            .expect("RenameStepper must succeed");
+
+        let config = server.proxy.get_config().await.unwrap();
+        server.shut_down().await;
+
+        let steppers: wire::Dict = config.get("steppers").unwrap().clone().try_into().unwrap();
+        let def: wire::Dict = steppers
+            .get(&stepper_id)
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let name: String = def.get("name").unwrap().clone().try_into().unwrap();
+        assert_eq!(name, "New Name");
+    }
+
+    #[tokio::test]
+    async fn set_stepper_items_over_real_dbus_overwrites_items_and_persists() {
+        let server = TestServer::start().await;
+        let stepper_id = server
+            .create_stepper(
+                "Test stepper",
+                vec![crate::config::StepperItem::Key {
+                    key: evdev::KeyCode::KEY_1,
+                }],
+            )
+            .await;
+
+        let new_items: Vec<wire::Dict> = vec![
+            wire::stepper_item_to_dict(&crate::config::StepperItem::Key {
+                key: evdev::KeyCode::KEY_2,
+            }),
+            wire::stepper_item_to_dict(&crate::config::StepperItem::Key {
+                key: evdev::KeyCode::KEY_3,
+            }),
+        ];
+        server
+            .proxy
+            .set_stepper_items(&stepper_id, new_items)
+            .await
+            .expect("SetStepperItems must succeed");
+
+        let config = server.proxy.get_config().await.unwrap();
+        let on_disk = std::fs::read_to_string(&server.config_path).unwrap();
+        server.shut_down().await;
+
+        let steppers: wire::Dict = config.get("steppers").unwrap().clone().try_into().unwrap();
+        let def: wire::Dict = steppers
+            .get(&stepper_id)
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let name: String = def.get("name").unwrap().clone().try_into().unwrap();
+        assert_eq!(name, "Test stepper");
+        assert!(on_disk.contains("[steppers.test-stepper]"));
+    }
+
+    #[tokio::test]
+    async fn set_stepper_items_over_real_dbus_on_an_unknown_stepper_id_returns_not_found() {
+        let server = TestServer::start().await;
+
+        let err = server
+            .proxy
+            .set_stepper_items("nonexistent", vec![])
+            .await
+            .expect_err("setting items on an unknown Stepper must fail");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.NotFound")
+        );
+
+        server.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn delete_stepper_over_real_dbus_rejects_deleting_a_referenced_stepper() {
+        let server = TestServer::start().await;
+        let stepper_id = server
+            .create_stepper(
+                "Test stepper",
+                vec![crate::config::StepperItem::Key {
+                    key: evdev::KeyCode::KEY_1,
+                }],
+            )
+            .await;
+        let binding = wire::binding_to_dict(&crate::config::Binding {
+            trigger: crate::config::TriggerMode::FireOnce,
+            action: crate::config::Action::Step {
+                stepper: crate::config::StepperId::from(stepper_id.clone()),
+                direction: crate::config::StepDirection::Forward,
+            },
+        });
+        server
+            .proxy
+            .set_binding("grid_r1c1", "base", binding)
+            .await
+            .expect("SetBinding referencing a real stepper_id must succeed");
+
+        let err = server
+            .proxy
+            .delete_stepper(&stepper_id)
+            .await
+            .expect_err("deleting a still-referenced Stepper must fail");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.InvalidBinding")
+        );
+
+        server
+            .proxy
+            .clear_binding("grid_r1c1", "base")
+            .await
+            .unwrap();
+        server
+            .proxy
+            .delete_stepper(&stepper_id)
+            .await
+            .expect("deleting an unreferenced Stepper must now succeed");
+
+        server.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn delete_stepper_over_real_dbus_on_an_unknown_stepper_id_returns_not_found() {
+        let server = TestServer::start().await;
+
+        let err = server
+            .proxy
+            .delete_stepper("nonexistent")
+            .await
+            .expect_err("deleting an unknown Stepper must fail");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.NotFound")
+        );
+
+        server.shut_down().await;
+    }
+
+    /// Ticket 03/54's end-to-end live demo, exercised without real hardware:
+    /// a real `PhysicalEvent` Down on a Step Binding advances `GetState()`'s
+    /// `stepper_cursors` and injects the newly-selected item's key.
+    #[tokio::test]
+    async fn step_binding_over_real_dbus_advances_the_cursor_and_injects_the_new_item() {
+        let server = TestServer::start().await;
+        let stepper_id = server
+            .create_stepper(
+                "Weapon Wheel",
+                vec![
+                    crate::config::StepperItem::Key {
+                        key: evdev::KeyCode::KEY_1,
+                    },
+                    crate::config::StepperItem::Key {
+                        key: evdev::KeyCode::KEY_2,
+                    },
+                ],
+            )
+            .await;
+        let binding = wire::binding_to_dict(&crate::config::Binding {
+            trigger: crate::config::TriggerMode::FireOnce,
+            action: crate::config::Action::Step {
+                stepper: crate::config::StepperId::from(stepper_id.clone()),
+                direction: crate::config::StepDirection::Forward,
+            },
+        });
+        server
+            .proxy
+            .set_binding("grid_r1c1", "base", binding)
+            .await
+            .expect("SetBinding with a Step payload must succeed");
+
+        server.press(Input::Grid(1, 1)).await;
+        let state = server.proxy.get_state().await.unwrap();
+        let batches = server.shut_down().await;
+
+        let cursors: wire::Dict = state
+            .get("stepper_cursors")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let cursor: u64 = cursors
+            .get(&stepper_id)
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(cursor, 1);
+
+        assert_eq!(batches.len(), 2, "one press batch + one release batch");
+        let evdev::EventSummary::Key(_, code, value) = batches[0][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_2, 1));
+    }
+
+    #[tokio::test]
+    async fn set_binding_over_real_dbus_rejects_a_toggle_step_binding() {
+        let server = TestServer::start().await;
+        let stepper_id = server
+            .create_stepper(
+                "Weapon Wheel",
+                vec![crate::config::StepperItem::Key {
+                    key: evdev::KeyCode::KEY_1,
+                }],
+            )
+            .await;
+        let binding = wire::binding_to_dict(&crate::config::Binding {
+            trigger: crate::config::TriggerMode::Toggle,
+            action: crate::config::Action::Step {
+                stepper: crate::config::StepperId::from(stepper_id),
+                direction: crate::config::StepDirection::Forward,
+            },
+        });
+
+        let err = server
+            .proxy
+            .set_binding("grid_r1c1", "base", binding)
+            .await
+            .expect_err("a Toggle Step Binding must be rejected");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.InvalidBinding")
+        );
+
+        server.shut_down().await;
+    }
+
     /// Ticket 19's live demo, exercised without real hardware: creating a
     /// second Profile, switching to it over real D-Bus, and getting the
     /// `ActiveProfileChanged` push a subscribed client (the GUI/tray) relies
@@ -2032,6 +2414,7 @@ mod tests {
             profiles,
             force_digital: false,
             macros: HashMap::new(),
+            steppers: HashMap::new(),
         };
         crate::config::write(&config_path, &config).unwrap();
 

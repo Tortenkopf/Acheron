@@ -23,6 +23,7 @@ def test_fresh_stub_matches_the_seed_configs_shape():
         },
         "force_digital": False,
         "macros": {},
+        "steppers": {},
     }
     assert stub.get_state() == {
         "profile": "Default",
@@ -30,6 +31,7 @@ def test_fresh_stub_matches_the_seed_configs_shape():
         "active_toggles": [],
         "device_connected": True,
         "capture_mode": "digital",
+        "stepper_cursors": {},
     }
 
 
@@ -280,6 +282,160 @@ def test_set_binding_with_an_unknown_macro_id_raises_invalid_binding():
         stub.set_binding(
             "grid_r1c1", "base", {"trigger": "fire_once", "type": "macro", "macro_id": "nonexistent"}
         )
+
+
+def test_create_stepper_derives_a_slug_and_persists_it():
+    stub = DaemonStub()
+
+    stepper_id = stub.create_stepper("Weapon Wheel", [{"type": "key", "key": "KEY_1"}])
+
+    assert stepper_id == "weapon-wheel"
+    assert stub.get_config()["steppers"]["weapon-wheel"] == {
+        "name": "Weapon Wheel",
+        "items": [{"type": "key", "key": "KEY_1"}],
+    }
+    assert stub.calls == [
+        ("create_stepper", "Weapon Wheel", [{"type": "key", "key": "KEY_1"}])
+    ]
+
+
+def test_create_stepper_rejects_an_empty_or_whitespace_name():
+    stub = DaemonStub()
+
+    for name in ["", "   "]:
+        with pytest.raises(InvalidBindingError):
+            stub.create_stepper(name, [])
+
+
+def test_rename_stepper_rejects_an_empty_or_whitespace_new_name():
+    stub = DaemonStub()
+    stepper_id = stub.create_stepper("Test stepper", [])
+
+    for new_name in ["", "   "]:
+        with pytest.raises(InvalidBindingError):
+            stub.rename_stepper(stepper_id, new_name)
+
+
+def test_create_stepper_appends_a_numeric_suffix_on_slug_collision():
+    stub = DaemonStub()
+
+    first = stub.create_stepper("Weapon Wheel", [])
+    second = stub.create_stepper("Weapon Wheel", [])
+
+    assert first == "weapon-wheel"
+    assert second == "weapon-wheel-2"
+
+
+def test_rename_stepper_changes_the_name_not_the_stepper_id():
+    stub = DaemonStub()
+    stepper_id = stub.create_stepper("Old Name", [])
+
+    stub.rename_stepper(stepper_id, "New Name")
+
+    assert stub.get_config()["steppers"][stepper_id]["name"] == "New Name"
+
+
+def test_rename_stepper_on_an_unknown_stepper_id_raises_not_found():
+    stub = DaemonStub()
+
+    with pytest.raises(NotFoundError):
+        stub.rename_stepper("nonexistent", "New Name")
+
+
+def test_delete_stepper_removes_an_unreferenced_stepper():
+    stub = DaemonStub()
+    stepper_id = stub.create_stepper("Test stepper", [])
+
+    stub.delete_stepper(stepper_id)
+
+    assert stepper_id not in stub.get_config()["steppers"]
+
+
+def test_delete_stepper_still_referenced_by_a_binding_raises_invalid_binding():
+    stub = DaemonStub()
+    stepper_id = stub.create_stepper("Test stepper", [{"type": "key", "key": "KEY_1"}])
+    stub.set_binding(
+        "grid_r1c1",
+        "base",
+        {"trigger": "fire_once", "type": "step", "stepper_id": stepper_id, "direction": "forward"},
+    )
+
+    with pytest.raises(InvalidBindingError):
+        stub.delete_stepper(stepper_id)
+
+    stub.clear_binding("grid_r1c1", "base")
+    stub.delete_stepper(stepper_id)
+    assert stepper_id not in stub.get_config()["steppers"]
+
+
+def test_delete_stepper_on_an_unknown_stepper_id_raises_not_found():
+    stub = DaemonStub()
+
+    with pytest.raises(NotFoundError):
+        stub.delete_stepper("nonexistent")
+
+
+def test_set_stepper_items_overwrites_items_and_leaves_the_name_alone():
+    stub = DaemonStub()
+    stepper_id = stub.create_stepper("Test stepper", [{"type": "key", "key": "KEY_1"}])
+
+    stub.set_stepper_items(stepper_id, [{"type": "key", "key": "KEY_2"}])
+
+    assert stub.get_config()["steppers"][stepper_id] == {
+        "name": "Test stepper",
+        "items": [{"type": "key", "key": "KEY_2"}],
+    }
+    assert ("set_stepper_items", stepper_id, [{"type": "key", "key": "KEY_2"}]) in stub.calls
+
+
+def test_set_stepper_items_on_an_unknown_stepper_id_raises_not_found():
+    stub = DaemonStub()
+
+    with pytest.raises(NotFoundError):
+        stub.set_stepper_items("nonexistent", [])
+
+
+def test_set_binding_with_an_unknown_stepper_id_raises_invalid_binding():
+    stub = DaemonStub()
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_binding(
+            "grid_r1c1",
+            "base",
+            {"trigger": "fire_once", "type": "step", "stepper_id": "nonexistent", "direction": "forward"},
+        )
+
+
+def test_set_binding_rejects_a_toggle_step_binding():
+    stub = DaemonStub()
+    stepper_id = stub.create_stepper("Test stepper", [{"type": "key", "key": "KEY_1"}])
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_binding(
+            "grid_r1c1",
+            "base",
+            {"trigger": "toggle", "type": "step", "stepper_id": stepper_id, "direction": "forward"},
+        )
+
+
+def test_set_binding_silently_moves_a_stepper_direction_off_its_old_input():
+    stub = DaemonStub()
+    stepper_id = stub.create_stepper("Test stepper", [{"type": "key", "key": "KEY_1"}])
+    forward = {"trigger": "fire_once", "type": "step", "stepper_id": stepper_id, "direction": "forward"}
+
+    stub.set_binding("wheel_scroll_up", "base", forward)
+    stub.set_binding("grid_r1c1", "base", forward)
+
+    bindings = stub.get_config()["profiles"]["Default"]["base"]
+    assert "wheel_scroll_up" not in bindings
+    assert bindings["grid_r1c1"] == forward
+
+
+def test_get_state_reports_zero_for_a_stepper_never_yet_stepped():
+    stub = DaemonStub()
+    stepper_id = stub.create_stepper("Test stepper", [{"type": "key", "key": "KEY_1"}])
+
+    assert stub.get_state()["stepper_cursors"] == {stepper_id: 0}
 
 
 def test_switch_profile_changes_active_profile_and_notifies_subscribers():

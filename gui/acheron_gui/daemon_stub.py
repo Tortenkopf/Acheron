@@ -55,6 +55,12 @@ class DaemonStub:
         self._profiles: dict[str, dict] = {active_profile: copy.deepcopy(self._SEED_PROFILE)}
         # Ticket 51: the global Macro library — macro_id -> {"name", "steps"}.
         self._macros: dict[str, dict] = {}
+        # Ticket 03/54: the global Stepper-list library — stepper_id ->
+        # {"name", "items"}, plus each one's Daemon-side-only runtime cursor
+        # (stepper_id -> current index), mirroring the real Daemon's
+        # never-persisted, always-resets-on-restart state.
+        self._steppers: dict[str, dict] = {}
+        self._stepper_cursors: dict[str, int] = {}
         self._layer = "base"
         self._active_toggles: list[str] = []
         # Hardcoded, mirroring the real Daemon's ticket 21 stand-in — there
@@ -88,6 +94,7 @@ class DaemonStub:
             "profiles": {name: copy.deepcopy(profile) for name, profile in self._profiles.items()},
             "force_digital": self._force_digital,
             "macros": {macro_id: copy.deepcopy(m) for macro_id, m in self._macros.items()},
+            "steppers": {stepper_id: copy.deepcopy(s) for stepper_id, s in self._steppers.items()},
         }
 
     def get_state(self) -> dict:
@@ -97,6 +104,12 @@ class DaemonStub:
             "active_toggles": list(self._active_toggles),
             "device_connected": self._device_connected,
             "capture_mode": self._capture_mode,
+            # Every library entry gets a reported cursor, defaulting to `0`
+            # ("the list's first item") for one never yet stepped — mirrors
+            # the real Daemon's `GetState()` shape (ticket 03/54).
+            "stepper_cursors": {
+                stepper_id: self._stepper_cursors.get(stepper_id, 0) for stepper_id in self._steppers
+            },
         }
 
     def set_binding(self, input_str: str, layer: str, binding: dict) -> None:
@@ -106,6 +119,26 @@ class DaemonStub:
             raise InvalidBindingError(
                 f"{binding.get('macro_id')!r} does not name a Macro in the library"
             )
+        if binding.get("type") == "step":
+            stepper_id = binding.get("stepper_id")
+            if stepper_id not in self._steppers:
+                raise InvalidBindingError(f"{stepper_id!r} does not name a Stepper in the library")
+            if binding.get("trigger") == "toggle":
+                raise InvalidBindingError("Toggle is not allowed for a Stepper Binding")
+            # Ticket 03's Answer: assigning a Stepper list to a new Input
+            # silently moves it off its old one — no reject-at-save step,
+            # mirroring the real Daemon's `take_stepper_direction_elsewhere`.
+            direction = binding.get("direction")
+            for profile in self._profiles.values():
+                for layer_bindings in (profile["base"], profile["held"]):
+                    for other_input in [
+                        other
+                        for other, other_binding in layer_bindings.items()
+                        if other_binding.get("type") == "step"
+                        and other_binding.get("stepper_id") == stepper_id
+                        and other_binding.get("direction") == direction
+                    ]:
+                        del layer_bindings[other_input]
         # Deep-copied for the same reason: SetBinding's real wire encoding
         # (wire.py) copies every field into a GLib.Variant, decoupled from
         # the caller's dict, so mutating `binding` afterward must not reach
@@ -152,22 +185,39 @@ class DaemonStub:
             self._active_profile = new_name
 
     @staticmethod
-    def _slug_base(name: str) -> str:
+    def _slug_base(name: str, fallback: str = "macro") -> str:
         # Mirrors daemon/src/config.rs's `slug_base`: lowercase, runs of
         # non-alphanumeric characters collapsed to one hyphen, trimmed,
-        # falling back to a fixed placeholder if nothing alphanumeric
-        # survives.
+        # falling back to `fallback` if nothing alphanumeric survives.
+        # Shared by both libraries, like the Rust side (ticket 03/54).
         slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-        return slug or "macro"
+        return slug or fallback
 
     def _unique_macro_id(self, name: str) -> str:
-        base = self._slug_base(name)
+        base = self._slug_base(name, "macro")
         if base not in self._macros:
             return base
         n = 2
         while f"{base}-{n}" in self._macros:
             n += 1
         return f"{base}-{n}"
+
+    def _unique_stepper_id(self, name: str) -> str:
+        base = self._slug_base(name, "stepper")
+        if base not in self._steppers:
+            return base
+        n = 2
+        while f"{base}-{n}" in self._steppers:
+            n += 1
+        return f"{base}-{n}"
+
+    def _stepper_referenced(self, stepper_id: str) -> bool:
+        return any(
+            binding.get("type") == "step" and binding.get("stepper_id") == stepper_id
+            for profile in self._profiles.values()
+            for layer in ("base", "held")
+            for binding in profile[layer].values()
+        )
 
     def _macro_referenced(self, macro_id: str) -> bool:
         return any(
@@ -206,6 +256,37 @@ class DaemonStub:
             raise NotFoundError(f"no Macro with id {macro_id!r}")
         self._macros[macro_id]["steps"] = copy.deepcopy(steps)
         self.calls.append(("set_macro_steps", macro_id, copy.deepcopy(steps)))
+
+    def create_stepper(self, name: str, items: list[dict]) -> str:
+        if not name.strip():
+            raise InvalidBindingError("Stepper name can't be empty")
+        stepper_id = self._unique_stepper_id(name)
+        self._steppers[stepper_id] = {"name": name, "items": copy.deepcopy(items)}
+        self.calls.append(("create_stepper", name, copy.deepcopy(items)))
+        return stepper_id
+
+    def rename_stepper(self, stepper_id: str, new_name: str) -> None:
+        if stepper_id not in self._steppers:
+            raise NotFoundError(f"no Stepper with id {stepper_id!r}")
+        if not new_name.strip():
+            raise InvalidBindingError("Stepper name can't be empty")
+        self._steppers[stepper_id]["name"] = new_name
+        self.calls.append(("rename_stepper", stepper_id, new_name))
+
+    def delete_stepper(self, stepper_id: str) -> None:
+        if stepper_id not in self._steppers:
+            raise NotFoundError(f"no Stepper with id {stepper_id!r}")
+        if self._stepper_referenced(stepper_id):
+            raise InvalidBindingError(f"Stepper {stepper_id!r} is still referenced by a Binding")
+        del self._steppers[stepper_id]
+        self._stepper_cursors.pop(stepper_id, None)
+        self.calls.append(("delete_stepper", stepper_id))
+
+    def set_stepper_items(self, stepper_id: str, items: list[dict]) -> None:
+        if stepper_id not in self._steppers:
+            raise NotFoundError(f"no Stepper with id {stepper_id!r}")
+        self._steppers[stepper_id]["items"] = copy.deepcopy(items)
+        self.calls.append(("set_stepper_items", stepper_id, copy.deepcopy(items)))
 
     def switch_profile(self, name: str) -> None:
         if name not in self._profiles:

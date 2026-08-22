@@ -98,6 +98,14 @@ class DaemonClient(Protocol):
 
     def set_macro_steps(self, macro_id: str, steps: list[dict]) -> None: ...
 
+    def create_stepper(self, name: str, items: list[dict]) -> str: ...
+
+    def rename_stepper(self, stepper_id: str, new_name: str) -> None: ...
+
+    def delete_stepper(self, stepper_id: str) -> None: ...
+
+    def set_stepper_items(self, stepper_id: str, items: list[dict]) -> None: ...
+
     def switch_profile(self, name: str) -> None: ...
 
     def set_output_suppressed(self, suppressed: bool) -> None: ...
@@ -201,6 +209,23 @@ class DBusDaemonClient:
         variant_steps = [wire.macro_step_to_variant(step) for step in steps]
         parameters = GLib.Variant("(saa{sv})", (macro_id, variant_steps))
         self._call("SetMacroSteps", parameters)
+
+    def create_stepper(self, name: str, items: list[dict]) -> str:
+        variant_items = [wire.stepper_item_to_variant(item) for item in items]
+        parameters = GLib.Variant("(saa{sv})", (name, variant_items))
+        (stepper_id,) = self._call("CreateStepper", parameters)
+        return stepper_id
+
+    def rename_stepper(self, stepper_id: str, new_name: str) -> None:
+        self._call("RenameStepper", GLib.Variant("(ss)", (stepper_id, new_name)))
+
+    def delete_stepper(self, stepper_id: str) -> None:
+        self._call("DeleteStepper", GLib.Variant("(s)", (stepper_id,)))
+
+    def set_stepper_items(self, stepper_id: str, items: list[dict]) -> None:
+        variant_items = [wire.stepper_item_to_variant(item) for item in items]
+        parameters = GLib.Variant("(saa{sv})", (stepper_id, variant_items))
+        self._call("SetStepperItems", parameters)
 
     def switch_profile(self, name: str) -> None:
         self._call("SwitchProfile", GLib.Variant("(s)", (name,)))

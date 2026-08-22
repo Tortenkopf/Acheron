@@ -4,9 +4,13 @@
 //! copy). The D-Bus-facing `dbus` module builds these and decodes the
 //! replies; it never touches `Config` directly.
 
+use std::collections::HashMap;
+
 use tokio::sync::oneshot;
 
-use crate::config::{Binding, Config, Layer, MacroId, MacroStepDto, ModeKeyRole};
+use crate::config::{
+    Binding, Config, Layer, MacroId, MacroStepDto, ModeKeyRole, StepperId, StepperItem,
+};
 use crate::input::Input;
 
 /// The live runtime snapshot `GetState()` returns. `layer` reflects the
@@ -24,6 +28,13 @@ pub struct State {
     pub active_toggles: Vec<Input>,
     pub device_connected: bool,
     pub capture_mode: &'static str,
+    /// Every Stepper library entry's Daemon-side-only runtime cursor (ticket
+    /// 03/54 — CONTEXT.md: Stepper), keyed by `StepperId`, one entry per
+    /// entry in `Config.steppers` (defaulting to `0`, "the list's first
+    /// item," for one never yet stepped) — threaded into `GetState()` for
+    /// the GUI's benefit, the same way `capture_mode` is. Never persisted;
+    /// always resets to all-zero on a fresh Daemon start.
+    pub stepper_cursors: HashMap<StepperId, usize>,
 }
 
 /// A GUI-originated mutation or read, as pushed through the dispatch task's
@@ -183,6 +194,44 @@ pub enum Command {
     SetMacroSteps {
         macro_id: MacroId,
         steps: Vec<MacroStepDto>,
+        reply: oneshot::Sender<Result<(), CommandError>>,
+    },
+    /// Creates a new Stepper library entry (ticket 03/54), mirroring
+    /// `CreateMacro` exactly — a `StepperId` is derived from `name` via the
+    /// slug algorithm (`config::unique_stepper_id`) and frozen; the reply
+    /// carries that assigned id back to the caller. Fails `InvalidRequest`
+    /// if `name` is empty/whitespace. No `AlreadyExists` case — a slug
+    /// collision is resolved automatically (numeric suffix), never rejected.
+    CreateStepper {
+        name: String,
+        items: Vec<StepperItem>,
+        reply: oneshot::Sender<Result<StepperId, CommandError>>,
+    },
+    /// Renames a Stepper — a pure `StepperDef.name` field write, the
+    /// `StepperId` itself never changes, mirroring `RenameMacro` exactly.
+    /// Fails `NotFound` if `stepper_id` doesn't exist, or `InvalidRequest`
+    /// if `new_name` is empty/whitespace.
+    RenameStepper {
+        stepper_id: StepperId,
+        new_name: String,
+        reply: oneshot::Sender<Result<(), CommandError>>,
+    },
+    /// Deletes a Stepper. Fails `NotFound` if it doesn't exist, or
+    /// `InvalidRequest` if any Binding anywhere (`base`/`held`, any Profile,
+    /// either direction) still references its `StepperId` — mirrors
+    /// `DeleteMacro`'s identical reasoning, making a dangling `stepper_id`
+    /// structurally impossible.
+    DeleteStepper {
+        stepper_id: StepperId,
+        reply: oneshot::Sender<Result<(), CommandError>>,
+    },
+    /// Overwrites a Stepper's item list — a pure `StepperDef.items` field
+    /// write, the `StepperId` and `name` untouched, mirroring
+    /// `SetMacroSteps` exactly. Fails `NotFound` if `stepper_id` doesn't
+    /// exist.
+    SetStepperItems {
+        stepper_id: StepperId,
+        items: Vec<StepperItem>,
         reply: oneshot::Sender<Result<(), CommandError>>,
     },
 }

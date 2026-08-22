@@ -49,6 +49,16 @@ pub struct Config {
     /// config with no Macros at all still parses.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub macros: HashMap<MacroId, MacroDef>,
+    /// The global, named Stepper-list library (ticket 03/54 — CONTEXT.md:
+    /// Stepper). One shared map across every Profile; unlike `macros`, at
+    /// most one forward/backward Input pair may reference a given
+    /// `StepperId` at a time — enforced by `SetBinding` silently moving a
+    /// list off its old pair rather than rejecting (ticket 03's Answer), not
+    /// by anything in this type. Purely additive — `Action::Step` is
+    /// net-new, so a pre-ticket-54 `config.toml` has no `[steppers]` table
+    /// at all and still parses.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub steppers: HashMap<StepperId, StepperDef>,
 }
 
 impl Config {
@@ -63,6 +73,7 @@ impl Config {
             profiles,
             force_digital: false,
             macros: HashMap::new(),
+            steppers: HashMap::new(),
         }
     }
 
@@ -243,6 +254,27 @@ pub enum Action {
     /// against `input::gamepad_button_codes()`'s curated 57-entry allowlist
     /// — unlike Keypress's `key`, which accepts any `KeyCode` at all.
     ControllerButton { button: KeyCode },
+    /// Advances or retreats a Stepper list's Daemon-side runtime cursor and
+    /// fires the newly-selected item, in one motion (ticket 03/54 —
+    /// CONTEXT.md: Stepper). References a `StepperDef` in `Config.steppers`
+    /// rather than carrying item content directly, same reference-not-inline
+    /// shape as `Action::Macro`. Validated (`SetBinding` and `load_or_seed`,
+    /// via `parse`'s `UnknownStepper`/`InvalidStepTrigger` checks) to name a
+    /// real `StepperId` and to never pair with `TriggerMode::Toggle` — a
+    /// cursor advance has no coherent continuously-running state.
+    Step {
+        stepper: StepperId,
+        direction: StepDirection,
+    },
+}
+
+/// `Action::Step`'s direction field (ticket 03's Answer: "one variant with a
+/// direction field, not two separate variants").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepDirection {
+    Forward,
+    Backward,
 }
 
 /// A Keypress's modifier chord (e.g. Ctrl+Shift+T). Per issue 06: ctrl,
@@ -320,14 +352,74 @@ pub struct MacroDef {
     pub steps: Vec<MacroStepDto>,
 }
 
-/// The lowercase/hyphenated base of a `MacroId` slug, derived from a
-/// user-supplied Macro name (ticket 15's Answer): every ASCII alphanumeric
+/// A Stepper's identity (CONTEXT.md: Stepper; ticket 03's Answer) — a slug
+/// derived from `StepperDef.name` at creation time, then frozen, exactly
+/// mirroring `MacroId`'s identity model (ticket 15) for consistency across
+/// the two libraries: opaque/decoupled from `name` so `RenameStepper` is a
+/// pure field write, no scan/cascade.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StepperId(String);
+
+impl StepperId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for StepperId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<String> for StepperId {
+    fn from(id: String) -> Self {
+        StepperId(id)
+    }
+}
+
+impl From<&str> for StepperId {
+    fn from(id: &str) -> Self {
+        StepperId(id.to_string())
+    }
+}
+
+/// A single Stepper list item (ticket 03's Answer — CONTEXT.md: Stepper): "a
+/// dedicated type distinct from `Action` — restricted to a single fire-once
+/// keyboard key or mouse-button, never a Macro or another Stepper — enforced
+/// structurally." Mouse-button output needs no separate variant — ticket 02
+/// confirmed live that a mouse button is just another `evdev::KeyCode`
+/// (`BTN_LEFT`/etc.), the same way `Action::Keypress.key` already covers it.
+/// A dedicated enum (rather than a bare `KeyCode` field on `StepperDef`) so
+/// a later joystick/controller-button variant can be added — ticket 03's
+/// Answer: "deliberately designed to extend to joystick/controller buttons
+/// later" — without reshaping every existing list entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StepperItem {
+    Key { key: KeyCode },
+}
+
+/// A library entry in `Config.steppers` (ticket 03/54 — CONTEXT.md:
+/// Stepper). `name` is the editable display name (`RenameStepper`); `items`
+/// is the ordered list a bound pair's forward/backward steps walk. Mirrors
+/// `MacroDef`'s shape exactly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StepperDef {
+    pub name: String,
+    pub items: Vec<StepperItem>,
+}
+
+/// The lowercase/hyphenated base of a library-entry slug, derived from a
+/// user-supplied name (ticket 15's Answer): every ASCII alphanumeric
 /// character is kept (lowercased), every run of anything else collapses to
-/// one `-`, and leading/trailing `-` are trimmed. Falls back to a fixed
-/// placeholder if that leaves nothing (e.g. a name with no alphanumeric
-/// characters at all) — `unique_macro_id` still guarantees the final result
-/// is collision-free.
-fn slug_base(name: &str) -> String {
+/// one `-`, and leading/trailing `-` are trimmed. Falls back to `fallback`
+/// if that leaves nothing (e.g. a name with no alphanumeric characters at
+/// all) — `unique_macro_id`/`unique_stepper_id` still guarantee the final
+/// result is collision-free. Shared by both libraries; `fallback` is the
+/// only thing that differs between them (`"macro"`/`"stepper"`).
+fn slug_base(name: &str, fallback: &str) -> String {
     let mut result = String::with_capacity(name.len());
     let mut last_was_hyphen = true; // suppresses a leading hyphen
     for ch in name.chars() {
@@ -343,17 +435,17 @@ fn slug_base(name: &str) -> String {
         result.pop();
     }
     if result.is_empty() {
-        result.push_str("macro");
+        result.push_str(fallback);
     }
     result
 }
 
-/// Appends `-2`, `-3`, ... to `slug_base(name)` until the result isn't
-/// already a key in `config.macros` — ticket 15's Answer's worked example:
-/// `screenshot-combo`, `screenshot-combo-2`. Used by `CreateMacro`'s
+/// Appends `-2`, `-3`, ... to `slug_base(name, "macro")` until the result
+/// isn't already a key in `config.macros` — ticket 15's Answer's worked
+/// example: `screenshot-combo`, `screenshot-combo-2`. Used by `CreateMacro`'s
 /// dispatch handler to derive a new, frozen `MacroId`.
 pub(crate) fn unique_macro_id(config: &Config, name: &str) -> MacroId {
-    let base = slug_base(name);
+    let base = slug_base(name, "macro");
     if !config.macros.contains_key(&MacroId(base.clone())) {
         return MacroId(base);
     }
@@ -362,6 +454,23 @@ pub(crate) fn unique_macro_id(config: &Config, name: &str) -> MacroId {
         let candidate = format!("{base}-{n}");
         if !config.macros.contains_key(&MacroId(candidate.clone())) {
             return MacroId(candidate);
+        }
+        n += 1;
+    }
+}
+
+/// `unique_macro_id`'s exact mirror for the Stepper library — used by
+/// `CreateStepper`'s dispatch handler to derive a new, frozen `StepperId`.
+pub(crate) fn unique_stepper_id(config: &Config, name: &str) -> StepperId {
+    let base = slug_base(name, "stepper");
+    if !config.steppers.contains_key(&StepperId(base.clone())) {
+        return StepperId(base);
+    }
+    let mut n = 2u32;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if !config.steppers.contains_key(&StepperId(candidate.clone())) {
+            return StepperId(candidate);
         }
         n += 1;
     }
@@ -378,6 +487,8 @@ pub enum ConfigError {
     InvalidProfileSwitchTrigger,
     InvalidControllerButton(String),
     UnknownMacro(String),
+    UnknownStepper(String),
+    InvalidStepTrigger,
 }
 
 impl fmt::Display for ConfigError {
@@ -414,6 +525,14 @@ impl fmt::Display for ConfigError {
             ConfigError::UnknownMacro(macro_id) => write!(
                 f,
                 "config.toml contains an Action::Macro Binding whose macro_id {macro_id:?} does not name a Macro in [macros]"
+            ),
+            ConfigError::UnknownStepper(stepper_id) => write!(
+                f,
+                "config.toml contains an Action::Step Binding whose stepper {stepper_id:?} does not name a Stepper in [steppers]"
+            ),
+            ConfigError::InvalidStepTrigger => write!(
+                f,
+                "config.toml contains an Action::Step Binding whose trigger is toggle"
             ),
         }
     }
@@ -497,6 +616,32 @@ fn parse(contents: &str) -> Result<Config, ConfigError> {
     });
     if let Some(macro_id) = dangling_macro_id {
         return Err(ConfigError::UnknownMacro(macro_id.to_string()));
+    }
+    let dangling_stepper_id = config.profiles.values().find_map(|profile| {
+        [&profile.base, &profile.held]
+            .into_iter()
+            .find_map(|bindings| {
+                bindings.values().find_map(|binding| match &binding.action {
+                    Action::Step { stepper, .. } if !config.steppers.contains_key(stepper) => {
+                        Some(stepper.clone())
+                    }
+                    _ => None,
+                })
+            })
+    });
+    if let Some(stepper_id) = dangling_stepper_id {
+        return Err(ConfigError::UnknownStepper(stepper_id.to_string()));
+    }
+    let has_invalid_step_trigger = config.profiles.values().any(|profile| {
+        [&profile.base, &profile.held].into_iter().any(|bindings| {
+            bindings.values().any(|binding| {
+                matches!(binding.action, Action::Step { .. })
+                    && binding.trigger == TriggerMode::Toggle
+            })
+        })
+    });
+    if has_invalid_step_trigger {
+        return Err(ConfigError::InvalidStepTrigger);
     }
     Ok(config)
 }
@@ -945,9 +1090,10 @@ action = { type = "macro", macro_id = "screenshot-combo" }
 
     #[test]
     fn slug_base_lowercases_and_hyphenates() {
-        assert_eq!(slug_base("Screenshot Combo"), "screenshot-combo");
-        assert_eq!(slug_base("  weird!!__Name--"), "weird-name");
-        assert_eq!(slug_base("こんにちは"), "macro");
+        assert_eq!(slug_base("Screenshot Combo", "macro"), "screenshot-combo");
+        assert_eq!(slug_base("  weird!!__Name--", "macro"), "weird-name");
+        assert_eq!(slug_base("こんにちは", "macro"), "macro");
+        assert_eq!(slug_base("こんにちは", "stepper"), "stepper");
     }
 
     #[test]
@@ -975,5 +1121,123 @@ action = { type = "macro", macro_id = "screenshot-combo" }
 
         let third = unique_macro_id(&config, "Screenshot Combo");
         assert_eq!(third, MacroId::from("screenshot-combo-3"));
+    }
+
+    #[test]
+    fn unique_stepper_id_appends_a_numeric_suffix_on_collision() {
+        let mut config = Config::seed();
+        let first = unique_stepper_id(&config, "Weapon Wheel");
+        assert_eq!(first, StepperId::from("weapon-wheel"));
+        config.steppers.insert(
+            first.clone(),
+            StepperDef {
+                name: "Weapon Wheel".to_string(),
+                items: vec![],
+            },
+        );
+
+        let second = unique_stepper_id(&config, "Weapon Wheel");
+        assert_eq!(second, StepperId::from("weapon-wheel-2"));
+    }
+
+    #[test]
+    fn a_pre_ticket_54_config_defaults_an_empty_stepper_library() {
+        // A config.toml written before ticket 54 has no `[steppers]` table
+        // at all — `Action::Step` is net-new, so it must still parse,
+        // defaulting to an empty library, per `Config.steppers`'s own
+        // `#[serde(default)]`.
+        let toml = r#"
+schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base.grid_r1c1]
+trigger = "fire_once"
+action = { type = "keypress", key = "KEY_F1" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.steppers.is_empty());
+    }
+
+    #[test]
+    fn parses_a_step_binding_shape() {
+        let toml = r#"
+schema_version = 1
+active_profile = "Default"
+
+[steppers.weapon-wheel]
+name = "Weapon Wheel"
+items = [
+  { type = "key", key = "KEY_1" }, { type = "key", key = "KEY_2" },
+]
+
+[profiles.Default.base.wheel_scroll_up]
+trigger = "fire_once"
+action = { type = "step", stepper = "weapon-wheel", direction = "forward" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let binding =
+            &config.profiles["Default"].base[&Input::Wheel(crate::input::WheelEvent::ScrollUp)];
+        assert_eq!(
+            binding.action,
+            Action::Step {
+                stepper: StepperId::from("weapon-wheel"),
+                direction: StepDirection::Forward,
+            }
+        );
+        let def = &config.steppers[&StepperId::from("weapon-wheel")];
+        assert_eq!(def.name, "Weapon Wheel");
+        assert_eq!(
+            def.items,
+            vec![
+                StepperItem::Key {
+                    key: KeyCode::KEY_1
+                },
+                StepperItem::Key {
+                    key: KeyCode::KEY_2
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn refuses_to_start_when_a_step_binding_names_an_unknown_stepper() {
+        let (_dir, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base.grid_r1c1]
+trigger = "fire_once"
+action = { type = "step", stepper = "does-not-exist", direction = "forward" }
+"#;
+        fs::write(&path, original).unwrap();
+
+        let err = load_or_seed(&path).expect_err("a dangling stepper id must refuse to start");
+        assert!(matches!(err, ConfigError::UnknownStepper(id) if id == "does-not-exist"));
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn refuses_to_start_when_a_step_binding_is_toggle() {
+        let (_dir, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"schema_version = 1
+active_profile = "Default"
+
+[steppers.weapon-wheel]
+name = "Weapon Wheel"
+items = [{ type = "key", key = "KEY_1" }]
+
+[profiles.Default.base.grid_r1c1]
+trigger = "toggle"
+action = { type = "step", stepper = "weapon-wheel", direction = "forward" }
+"#;
+        fs::write(&path, original).unwrap();
+
+        let err = load_or_seed(&path).expect_err("a Toggle Step Binding must refuse to start");
+        assert!(matches!(err, ConfigError::InvalidStepTrigger));
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 }

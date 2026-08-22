@@ -31,7 +31,7 @@ use crate::capture::{CaptureMode, EventState, PhysicalEvent};
 use crate::command::{Command, CommandError, State};
 use crate::config::{
     self, Action, ActuationPoint, Binding, Config, Layer, MacroDef, MacroId, ModeKeyRole, Profile,
-    TriggerMode,
+    StepDirection, StepperDef, StepperId, StepperItem, TriggerMode,
 };
 use crate::dbus::Daemon;
 use crate::executor::{self, ActiveToggle, FiringHandle};
@@ -81,6 +81,12 @@ pub async fn run(
     // concurrent firings racing on the shared Injector channel could
     // interleave their KeyDown/KeyUp steps out of order on the wire.
     let mut in_flight: HashMap<Input, FiringHandle> = HashMap::new();
+    // Every Stepper library entry's Daemon-side-only runtime cursor (ticket
+    // 03/54), owned exclusively by this task — an absent entry means "at the
+    // list's first item," matching the always-resets-to-first-item-on-
+    // restart semantics for free rather than needing an explicit
+    // zero-fill-on-startup pass.
+    let mut stepper_cursors: HashMap<StepperId, usize> = HashMap::new();
     // The one piece of momentary Layer runtime state (ticket 18) — not part
     // of `Config`, reset to `Base` whenever this task starts.
     let mut active_layer = Layer::Base;
@@ -113,6 +119,7 @@ pub async fn run(
                     &config_path,
                     &mut toggles,
                     &mut in_flight,
+                    &mut stepper_cursors,
                     &mut active_layer,
                     &signal_emitter,
                     &actuation_tx,
@@ -134,7 +141,7 @@ pub async fn run(
             }
             cmd = rx_commands.recv(), if commands_open => {
                 match cmd {
-                    Some(cmd) => handle_command(&mut config, &config_path, &mut toggles, &active_layer, device_connected, capture_mode, &signal_emitter, &actuation_tx, &capture_control_tx, cmd).await,
+                    Some(cmd) => handle_command(&mut config, &config_path, &mut toggles, &mut stepper_cursors, &active_layer, device_connected, capture_mode, &signal_emitter, &actuation_tx, &capture_control_tx, cmd).await,
                     None => commands_open = false,
                 }
             }
@@ -150,6 +157,7 @@ async fn handle_event(
     config_path: &Path,
     toggles: &mut HashMap<Input, ActiveToggle>,
     in_flight: &mut HashMap<Input, FiringHandle>,
+    stepper_cursors: &mut HashMap<StepperId, usize>,
     active_layer: &mut Layer,
     signal_emitter: &Option<SignalEmitter<'static>>,
     actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
@@ -209,6 +217,8 @@ async fn handle_event(
                 &binding,
                 event.state,
                 &config.macros,
+                &config.steppers,
+                stepper_cursors,
             )
             .await
         }
@@ -281,6 +291,63 @@ async fn handle_capture_mode_change(
     }
 }
 
+/// Compiles a Binding's `Action` into the flat step sequence `fire` spawns —
+/// `executor::compile` for every ordinary Action, or `resolve_step` for
+/// `Action::Step`, whose steps depend on Daemon-owned runtime cursor state
+/// `executor::compile` has no access to (ticket 03/54).
+fn compile_action(
+    action: &Action,
+    macros: &HashMap<MacroId, MacroDef>,
+    steppers: &HashMap<StepperId, StepperDef>,
+    stepper_cursors: &mut HashMap<StepperId, usize>,
+) -> Vec<executor::MacroStep> {
+    match action {
+        Action::Step { stepper, direction } => {
+            resolve_step(steppers, stepper_cursors, stepper, *direction)
+        }
+        other => executor::compile(other, macros),
+    }
+}
+
+/// Advances/retreats a Stepper's per-list cursor (Daemon-side-only runtime
+/// state, ticket 03/54 — CONTEXT.md: Stepper) and compiles the
+/// newly-selected item into a bare `KeyDown`/`KeyUp` pair — "one motion
+/// moves the cursor and fires," ticket 03's Answer's firing semantics. A
+/// missing cursor entry means "at the list's first item" (index 0), matching
+/// `stepper_cursors`'s own always-resets-to-first-item-on-restart
+/// convention. Wraps at either end. A `stepper` with zero items compiles to
+/// no steps at all — nothing to select, nothing to fire, cursor left
+/// untouched.
+fn resolve_step(
+    steppers: &HashMap<StepperId, StepperDef>,
+    stepper_cursors: &mut HashMap<StepperId, usize>,
+    stepper: &StepperId,
+    direction: StepDirection,
+) -> Vec<executor::MacroStep> {
+    let def = steppers.get(stepper).expect(
+        "SetBinding/config::parse validate every Action::Step references an existing StepperDef",
+    );
+    let len = def.items.len();
+    if len == 0 {
+        return Vec::new();
+    }
+    let current = stepper_cursors
+        .get(stepper)
+        .copied()
+        .unwrap_or(0)
+        .min(len - 1);
+    let next = match direction {
+        StepDirection::Forward => (current + 1) % len,
+        StepDirection::Backward => (current + len - 1) % len,
+    };
+    stepper_cursors.insert(stepper.clone(), next);
+    let StepperItem::Key { key } = def.items[next];
+    vec![
+        executor::MacroStep::KeyDown(key),
+        executor::MacroStep::KeyUp(key),
+    ]
+}
+
 /// Branches on `TriggerMode` x event state, per ticket 17: Fire-once fires
 /// only on `Down`; Hold-to-repeat fires on `Down` and every subsequent
 /// `Repeat` (the device's own evdev autorepeat, no separate repeat-interval
@@ -292,6 +359,7 @@ async fn handle_capture_mode_change(
 /// force-releases anything that Input's most recent firing left down (a
 /// no-op for an already-self-released, balanced Macro); Toggle's own `Up` is
 /// still a no-op, since a Toggle's stop is a second `Down`, not a release.
+#[allow(clippy::too_many_arguments)]
 async fn fire(
     injector: &Injector,
     toggles: &mut HashMap<Input, ActiveToggle>,
@@ -300,6 +368,8 @@ async fn fire(
     binding: &Binding,
     state: EventState,
     macros: &HashMap<MacroId, MacroDef>,
+    steppers: &HashMap<StepperId, StepperDef>,
+    stepper_cursors: &mut HashMap<StepperId, usize>,
 ) -> io::Result<()> {
     match (binding.trigger, state) {
         (TriggerMode::FireOnce, EventState::Down)
@@ -311,19 +381,22 @@ async fn fire(
             // HoldToRepeat autorepeat) means this one is dropped rather than
             // queued: the previous firing already reproduces the intended
             // effect, and queuing would only build an ever-growing backlog
-            // while the key stays held.
+            // while the key stays held. For a Stepper Binding this also
+            // means a dropped firing must never advance the cursor — nothing
+            // fired, so nothing moved — which is exactly what falls out of
+            // `compile_action` only running once this guard has passed.
             if let Some(handle) = in_flight.get(&input)
                 && !handle.is_finished()
             {
                 return Ok(());
             }
-            let steps = executor::compile(&binding.action, macros);
+            let steps = compile_action(&binding.action, macros, steppers, stepper_cursors);
             let handle = executor::spawn_fire_once(injector.clone(), steps);
             in_flight.insert(input, handle);
             Ok(())
         }
         (TriggerMode::Toggle, EventState::Down) => {
-            let steps = executor::compile(&binding.action, macros);
+            let steps = compile_action(&binding.action, macros, steppers, stepper_cursors);
             toggles.insert(input, ActiveToggle::spawn(injector.clone(), steps));
             Ok(())
         }
@@ -475,11 +548,68 @@ fn macro_references(config: &Config, macro_id: &MacroId) -> bool {
     })
 }
 
+/// Whether any Profile's Base/Held Binding map contains an `Action::Step {
+/// stepper }` naming `stepper_id` (either direction) — `DeleteStepper`
+/// refuses while this is true, so a dangling reference can never exist
+/// (ticket 03/54), mirroring `macro_references`'s identical shape.
+fn stepper_references(config: &Config, stepper_id: &StepperId) -> bool {
+    config.profiles.values().any(|profile| {
+        [&profile.base, &profile.held].into_iter().any(|bindings| {
+            bindings.values().any(|binding| {
+                matches!(&binding.action, Action::Step { stepper, .. } if stepper == stepper_id)
+            })
+        })
+    })
+}
+
+/// Removes every other Binding, across every Profile/Layer, whose `Action`
+/// is `Action::Step { stepper, direction }` matching the one `SetBinding` is
+/// about to set — ticket 03's Answer: "assigning it to a new pair silently
+/// moves it off its old one," no reject-at-save step, since at most one
+/// Input may ever carry a given (stepper, direction) at a time. `except`
+/// (the Input `SetBinding` is currently writing) is left untouched even if
+/// it already matches, so re-saving the same Input's own trigger mode isn't
+/// mistaken for a conflicting second owner. Returns what was removed so
+/// `SetBinding` can restore it if the persist that follows fails, mirroring
+/// every other mutating Command's rollback-on-failure discipline.
+fn take_stepper_direction_elsewhere(
+    config: &mut Config,
+    stepper: &StepperId,
+    direction: StepDirection,
+    except: (&str, Layer, Input),
+) -> Vec<(String, Layer, Input, Binding)> {
+    let mut removed = Vec::new();
+    for (profile_name, profile) in config.profiles.iter_mut() {
+        for layer in [Layer::Base, Layer::Held] {
+            let bindings = profile.layer_mut(layer);
+            let matching: Vec<Input> = bindings
+                .iter()
+                .filter(|(input, binding)| {
+                    (profile_name.as_str(), layer, **input) != except
+                        && matches!(
+                            &binding.action,
+                            Action::Step { stepper: s, direction: d }
+                                if s == stepper && *d == direction
+                        )
+                })
+                .map(|(&input, _)| input)
+                .collect();
+            for input in matching {
+                if let Some(binding) = bindings.remove(&input) {
+                    removed.push((profile_name.clone(), layer, input, binding));
+                }
+            }
+        }
+    }
+    removed
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_command(
     config: &mut Config,
     config_path: &Path,
     toggles: &mut HashMap<Input, ActiveToggle>,
+    stepper_cursors: &mut HashMap<StepperId, usize>,
     active_layer: &Layer,
     device_connected: bool,
     capture_mode: CaptureMode,
@@ -493,12 +623,22 @@ async fn handle_command(
             let _ = reply.send(config.clone());
         }
         Command::GetState(reply) => {
+            // Every library entry gets a reported cursor, defaulting to `0`
+            // ("the list's first item") for one never yet stepped — richer
+            // for the GUI than only reporting entries this task has actually
+            // touched (ticket 03/54).
+            let stepper_cursors = config
+                .steppers
+                .keys()
+                .map(|id| (id.clone(), stepper_cursors.get(id).copied().unwrap_or(0)))
+                .collect();
             let _ = reply.send(State {
                 profile: config.active_profile.clone(),
                 layer: active_layer.as_str(),
                 active_toggles: toggles.keys().copied().collect(),
                 device_connected,
                 capture_mode: capture_mode.as_str(),
+                stepper_cursors,
             });
         }
         Command::SetBinding {
@@ -531,6 +671,37 @@ async fn handle_command(
                 ))));
                 return;
             }
+            if let Action::Step { stepper, .. } = &binding.action {
+                if !config.steppers.contains_key(stepper) {
+                    let _ = reply.send(Err(CommandError::InvalidRequest(format!(
+                        "{stepper:?} does not name a Stepper in the library"
+                    ))));
+                    return;
+                }
+                if binding.trigger == TriggerMode::Toggle {
+                    let _ = reply.send(Err(CommandError::InvalidRequest(
+                        "Toggle is not allowed for a Stepper Binding".to_string(),
+                    )));
+                    return;
+                }
+            }
+            // Ticket 03's Answer: assigning a Stepper list to a new Input
+            // silently moves it off its old one — no reject-at-save step,
+            // since at most one Input may carry a given (stepper, direction)
+            // at a time. Collected before the target insert below so both
+            // can roll back together on a persist failure.
+            let moved_stepper_bindings =
+                if let Action::Step { stepper, direction } = &binding.action {
+                    let active_profile = config.active_profile.clone();
+                    take_stepper_direction_elsewhere(
+                        config,
+                        stepper,
+                        *direction,
+                        (&active_profile, layer, input),
+                    )
+                } else {
+                    Vec::new()
+                };
             let previous = active_profile_mut(config)
                 .layer_mut(layer)
                 .insert(input, binding);
@@ -546,6 +717,15 @@ async fn handle_command(
                     }
                     None => {
                         bindings.remove(&input);
+                    }
+                }
+                for (profile_name, moved_layer, moved_input, moved_binding) in
+                    moved_stepper_bindings
+                {
+                    if let Some(profile) = config.profiles.get_mut(&profile_name) {
+                        profile
+                            .layer_mut(moved_layer)
+                            .insert(moved_input, moved_binding);
                     }
                 }
             }
@@ -879,6 +1059,111 @@ async fn handle_command(
             }
             let _ = reply.send(result);
         }
+        Command::CreateStepper { name, items, reply } => {
+            if name.trim().is_empty() {
+                let _ = reply.send(Err(CommandError::InvalidRequest(
+                    "Stepper name can't be empty".to_string(),
+                )));
+                return;
+            }
+            let stepper_id = config::unique_stepper_id(config, &name);
+            config
+                .steppers
+                .insert(stepper_id.clone(), config::StepperDef { name, items });
+            let result = persist(config, config_path).await;
+            if result.is_err() {
+                config.steppers.remove(&stepper_id);
+            }
+            let _ = reply.send(result.map(|()| stepper_id));
+        }
+        Command::RenameStepper {
+            stepper_id,
+            new_name,
+            reply,
+        } => {
+            if new_name.trim().is_empty() {
+                let _ = reply.send(Err(CommandError::InvalidRequest(
+                    "Stepper name can't be empty".to_string(),
+                )));
+                return;
+            }
+            let Some(def) = config.steppers.get_mut(&stepper_id) else {
+                let _ = reply.send(Err(CommandError::NotFound));
+                return;
+            };
+            let previous = std::mem::replace(&mut def.name, new_name);
+            let result = persist(config, config_path).await;
+            if result.is_err() {
+                config
+                    .steppers
+                    .get_mut(&stepper_id)
+                    .expect("just written above")
+                    .name = previous;
+            }
+            let _ = reply.send(result);
+        }
+        Command::DeleteStepper { stepper_id, reply } => {
+            if stepper_references(config, &stepper_id) {
+                let _ = reply.send(Err(CommandError::InvalidRequest(format!(
+                    "{stepper_id:?} is still referenced by a Step Binding"
+                ))));
+                return;
+            }
+            let Some(previous) = config.steppers.remove(&stepper_id) else {
+                let _ = reply.send(Err(CommandError::NotFound));
+                return;
+            };
+            let result = persist(config, config_path).await;
+            if result.is_err() {
+                config.steppers.insert(stepper_id, previous);
+            } else {
+                // The runtime cursor is Daemon-side-only state, not part of
+                // `config`/`persist` — dropped here, on a successful delete,
+                // so a later `CreateStepper` that happens to land on the
+                // same freed slug (`unique_stepper_id` reassigns it once
+                // nothing occupies it) starts at the list's first item
+                // rather than inheriting a stale position from the deleted
+                // entry (code-review finding).
+                stepper_cursors.remove(&stepper_id);
+            }
+            let _ = reply.send(result);
+        }
+        Command::SetStepperItems {
+            stepper_id,
+            items,
+            reply,
+        } => {
+            let Some(def) = config.steppers.get_mut(&stepper_id) else {
+                let _ = reply.send(Err(CommandError::NotFound));
+                return;
+            };
+            let previous = std::mem::replace(&mut def.items, items);
+            let new_len = config.steppers[&stepper_id].items.len();
+            let result = persist(config, config_path).await;
+            if result.is_err() {
+                config
+                    .steppers
+                    .get_mut(&stepper_id)
+                    .expect("just written above")
+                    .items = previous;
+            } else if new_len == 0 {
+                // Nothing left to point at — dropping the entry lets
+                // `resolve_step`'s zero-items short-circuit and `GetState`'s
+                // own default both agree on "index 0" for free, the same
+                // convention a never-yet-stepped cursor already uses.
+                stepper_cursors.remove(&stepper_id);
+            } else {
+                // A shrink can leave a stored cursor pointing past the new
+                // end — clamped here (mirroring `resolve_step`'s own
+                // `.min(len - 1)` guard) so `GetState`'s reported position
+                // never outruns the list it's a position *in*, even before
+                // this Stepper is next fired (code-review finding).
+                if let Some(cursor) = stepper_cursors.get_mut(&stepper_id) {
+                    *cursor = (*cursor).min(new_len - 1);
+                }
+            }
+            let _ = reply.send(result);
+        }
     }
 }
 
@@ -942,6 +1227,7 @@ mod tests {
             profiles,
             force_digital: false,
             macros,
+            steppers: HashMap::new(),
         }
     }
 
@@ -1710,6 +1996,66 @@ mod tests {
             rx.await.unwrap()
         }
 
+        async fn create_stepper(
+            &self,
+            name: &str,
+            items: Vec<crate::config::StepperItem>,
+        ) -> Result<StepperId, CommandError> {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::CreateStepper {
+                    name: name.to_string(),
+                    items,
+                    reply,
+                })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
+        async fn rename_stepper(
+            &self,
+            stepper_id: StepperId,
+            new_name: &str,
+        ) -> Result<(), CommandError> {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::RenameStepper {
+                    stepper_id,
+                    new_name: new_name.to_string(),
+                    reply,
+                })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
+        async fn delete_stepper(&self, stepper_id: StepperId) -> Result<(), CommandError> {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::DeleteStepper { stepper_id, reply })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
+        async fn set_stepper_items(
+            &self,
+            stepper_id: StepperId,
+            items: Vec<crate::config::StepperItem>,
+        ) -> Result<(), CommandError> {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::SetStepperItems {
+                    stepper_id,
+                    items,
+                    reply,
+                })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
         async fn switch_profile(&self, name: &str) -> Result<(), CommandError> {
             let (reply, rx) = oneshot::channel();
             self.cmd_tx
@@ -1818,6 +2164,28 @@ mod tests {
                 .send(PhysicalEvent {
                     input,
                     state: EventState::Down,
+                    depth: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn release(&self, input: Input) {
+            self.event_tx
+                .send(PhysicalEvent {
+                    input,
+                    state: EventState::Up,
+                    depth: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn repeat(&self, input: Input) {
+            self.event_tx
+                .send(PhysicalEvent {
+                    input,
+                    state: EventState::Repeat,
                     depth: None,
                 })
                 .await
@@ -2903,6 +3271,738 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_stepper_command_derives_a_slug_and_persists_it() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let stepper_id = harness
+            .create_stepper(
+                "Weapon Wheel",
+                vec![crate::config::StepperItem::Key {
+                    key: evdev::KeyCode::KEY_1,
+                }],
+            )
+            .await
+            .expect("CreateStepper must succeed");
+        assert_eq!(stepper_id, StepperId::from("weapon-wheel"));
+
+        let on_disk = std::fs::read_to_string(&harness.config_path).unwrap();
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+
+        let def = &config.steppers[&stepper_id];
+        assert_eq!(def.name, "Weapon Wheel");
+        assert_eq!(
+            def.items,
+            vec![crate::config::StepperItem::Key {
+                key: evdev::KeyCode::KEY_1
+            }]
+        );
+        assert!(on_disk.contains("weapon-wheel"));
+    }
+
+    #[tokio::test]
+    async fn create_stepper_command_appends_a_numeric_suffix_on_slug_collision() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let first = harness
+            .create_stepper("Weapon Wheel", vec![])
+            .await
+            .unwrap();
+        let second = harness
+            .create_stepper("Weapon Wheel", vec![])
+            .await
+            .unwrap();
+
+        harness.shut_down().await;
+
+        assert_eq!(first, StepperId::from("weapon-wheel"));
+        assert_eq!(second, StepperId::from("weapon-wheel-2"));
+    }
+
+    #[tokio::test]
+    async fn create_stepper_command_rejects_an_empty_or_whitespace_name() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        for name in ["", "   "] {
+            let err = harness
+                .create_stepper(name, vec![])
+                .await
+                .expect_err("an empty/whitespace Stepper name must fail");
+            assert!(matches!(err, CommandError::InvalidRequest(_)));
+        }
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn rename_stepper_command_changes_the_name_not_the_stepper_id() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        let stepper_id = harness.create_stepper("Old Name", vec![]).await.unwrap();
+
+        harness
+            .rename_stepper(stepper_id.clone(), "New Name")
+            .await
+            .expect("RenameStepper must succeed");
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+
+        assert_eq!(config.steppers[&stepper_id].name, "New Name");
+    }
+
+    #[tokio::test]
+    async fn rename_stepper_command_on_an_unknown_stepper_id_returns_not_found() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .rename_stepper(StepperId::from("nonexistent"), "New Name")
+            .await
+            .expect_err("renaming an unknown Stepper must fail");
+        assert!(matches!(err, CommandError::NotFound));
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn delete_stepper_command_rejects_deleting_a_stepper_still_referenced_by_a_binding() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        let stepper_id = harness
+            .create_stepper(
+                "Weapon Wheel",
+                vec![crate::config::StepperItem::Key {
+                    key: evdev::KeyCode::KEY_1,
+                }],
+            )
+            .await
+            .unwrap();
+        harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::FireOnce,
+                    action: Action::Step {
+                        stepper: stepper_id.clone(),
+                        direction: StepDirection::Forward,
+                    },
+                },
+            )
+            .await
+            .expect("SetBinding referencing a real stepper_id must succeed");
+
+        let err = harness
+            .delete_stepper(stepper_id.clone())
+            .await
+            .expect_err("deleting a still-referenced Stepper must fail");
+        assert!(matches!(err, CommandError::InvalidRequest(_)));
+
+        harness
+            .clear_binding(Input::Grid(1, 1), Layer::Base)
+            .await
+            .unwrap();
+        harness
+            .delete_stepper(stepper_id)
+            .await
+            .expect("deleting an unreferenced Stepper must now succeed");
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn delete_stepper_command_on_an_unknown_stepper_id_returns_not_found() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .delete_stepper(StepperId::from("nonexistent"))
+            .await
+            .expect_err("deleting an unknown Stepper must fail");
+        assert!(matches!(err, CommandError::NotFound));
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn set_stepper_items_command_overwrites_items_and_persists_but_leaves_name_alone() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        let stepper_id = harness
+            .create_stepper(
+                "Weapon Wheel",
+                vec![crate::config::StepperItem::Key {
+                    key: evdev::KeyCode::KEY_1,
+                }],
+            )
+            .await
+            .unwrap();
+
+        harness
+            .set_stepper_items(
+                stepper_id.clone(),
+                vec![
+                    crate::config::StepperItem::Key {
+                        key: evdev::KeyCode::KEY_2,
+                    },
+                    crate::config::StepperItem::Key {
+                        key: evdev::KeyCode::KEY_3,
+                    },
+                ],
+            )
+            .await
+            .expect("SetStepperItems must succeed");
+
+        let on_disk = std::fs::read_to_string(&harness.config_path).unwrap();
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+
+        let def = &config.steppers[&stepper_id];
+        assert_eq!(def.name, "Weapon Wheel");
+        assert_eq!(
+            def.items,
+            vec![
+                crate::config::StepperItem::Key {
+                    key: evdev::KeyCode::KEY_2
+                },
+                crate::config::StepperItem::Key {
+                    key: evdev::KeyCode::KEY_3
+                },
+            ]
+        );
+        assert!(on_disk.contains("weapon-wheel"));
+    }
+
+    #[tokio::test]
+    async fn set_stepper_items_command_on_an_unknown_stepper_id_returns_not_found() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .set_stepper_items(StepperId::from("nonexistent"), vec![])
+            .await
+            .expect_err("setting items on an unknown Stepper must fail");
+        assert!(matches!(err, CommandError::NotFound));
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn set_binding_rejects_a_step_action_naming_an_unknown_stepper_id() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::FireOnce,
+                    action: Action::Step {
+                        stepper: StepperId::from("nonexistent"),
+                        direction: StepDirection::Forward,
+                    },
+                },
+            )
+            .await
+            .expect_err("SetBinding with an unknown stepper_id must fail");
+        assert!(matches!(err, CommandError::InvalidRequest(_)));
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn set_binding_rejects_a_toggle_step_binding() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        let stepper_id = harness
+            .create_stepper(
+                "Weapon Wheel",
+                vec![crate::config::StepperItem::Key {
+                    key: evdev::KeyCode::KEY_1,
+                }],
+            )
+            .await
+            .unwrap();
+
+        let err = harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::Toggle,
+                    action: Action::Step {
+                        stepper: stepper_id,
+                        direction: StepDirection::Forward,
+                    },
+                },
+            )
+            .await
+            .expect_err("a Toggle Step Binding must be rejected");
+        assert!(matches!(err, CommandError::InvalidRequest(_)));
+
+        harness.shut_down().await;
+    }
+
+    /// Ticket 03's Answer: assigning a Stepper list to a new Input pair
+    /// silently moves it off its old one — no reject-at-save step. Only the
+    /// same direction is moved; the other direction, bound elsewhere, is
+    /// left untouched.
+    #[tokio::test]
+    async fn set_binding_silently_moves_a_stepper_direction_off_its_old_input() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        let stepper_id = harness
+            .create_stepper(
+                "Weapon Wheel",
+                vec![crate::config::StepperItem::Key {
+                    key: evdev::KeyCode::KEY_1,
+                }],
+            )
+            .await
+            .unwrap();
+        let step_binding = |direction| Binding {
+            trigger: TriggerMode::FireOnce,
+            action: Action::Step {
+                stepper: stepper_id.clone(),
+                direction,
+            },
+        };
+
+        harness
+            .set_binding(
+                Input::Wheel(crate::input::WheelEvent::ScrollUp),
+                Layer::Base,
+                step_binding(StepDirection::Forward),
+            )
+            .await
+            .unwrap();
+        harness
+            .set_binding(
+                Input::Wheel(crate::input::WheelEvent::ScrollDown),
+                Layer::Base,
+                step_binding(StepDirection::Backward),
+            )
+            .await
+            .unwrap();
+
+        // Reassign Forward to a new pair of Inputs.
+        harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                step_binding(StepDirection::Forward),
+            )
+            .await
+            .expect("reassigning Forward to a new Input must succeed");
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+
+        let default_profile = &config.profiles[config::DEFAULT_PROFILE_NAME];
+        assert!(
+            !default_profile
+                .base
+                .contains_key(&Input::Wheel(crate::input::WheelEvent::ScrollUp)),
+            "the old Forward Binding must be silently removed"
+        );
+        assert_eq!(
+            default_profile.base[&Input::Grid(1, 1)].action,
+            Action::Step {
+                stepper: stepper_id.clone(),
+                direction: StepDirection::Forward,
+            }
+        );
+        // Backward, untouched by the Forward-only reassignment.
+        assert_eq!(
+            default_profile.base[&Input::Wheel(crate::input::WheelEvent::ScrollDown)].action,
+            Action::Step {
+                stepper: stepper_id,
+                direction: StepDirection::Backward,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn fire_once_step_binding_advances_the_cursor_forward_and_fires_the_new_item() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        let stepper_id = harness
+            .create_stepper(
+                "Weapon Wheel",
+                vec![
+                    crate::config::StepperItem::Key {
+                        key: evdev::KeyCode::KEY_1,
+                    },
+                    crate::config::StepperItem::Key {
+                        key: evdev::KeyCode::KEY_2,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::FireOnce,
+                    action: Action::Step {
+                        stepper: stepper_id.clone(),
+                        direction: StepDirection::Forward,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        // Reset to the list's first item (index 0); the first step must
+        // move to index 1 and fire KEY_2 — "the newly-selected item," not
+        // the resting position.
+        harness.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        let state = harness.get_state().await;
+        assert_eq!(state.stepper_cursors[&stepper_id], 1);
+
+        let batches = harness.shut_down().await;
+        assert_eq!(batches.len(), 2, "one press batch + one release batch");
+        let evdev::EventSummary::Key(_, code, value) = batches[0][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_2, 1));
+        let evdev::EventSummary::Key(_, code, value) = batches[1][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_2, 0));
+    }
+
+    #[tokio::test]
+    async fn step_binding_wraps_around_at_either_end() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        let stepper_id = harness
+            .create_stepper(
+                "Weapon Wheel",
+                vec![
+                    crate::config::StepperItem::Key {
+                        key: evdev::KeyCode::KEY_1,
+                    },
+                    crate::config::StepperItem::Key {
+                        key: evdev::KeyCode::KEY_2,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::FireOnce,
+                    action: Action::Step {
+                        stepper: stepper_id.clone(),
+                        direction: StepDirection::Backward,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        // Backward from index 0 wraps to the last item (index 1 of a
+        // 2-item list) rather than clamping or panicking.
+        harness.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        let state = harness.get_state().await;
+        harness.shut_down().await;
+        assert_eq!(state.stepper_cursors[&stepper_id], 1);
+    }
+
+    #[tokio::test]
+    async fn hold_to_repeat_step_binding_advances_the_cursor_on_every_repeat() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        let stepper_id = harness
+            .create_stepper(
+                "Weapon Wheel",
+                vec![
+                    crate::config::StepperItem::Key {
+                        key: evdev::KeyCode::KEY_1,
+                    },
+                    crate::config::StepperItem::Key {
+                        key: evdev::KeyCode::KEY_2,
+                    },
+                    crate::config::StepperItem::Key {
+                        key: evdev::KeyCode::KEY_3,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::HoldToRepeat,
+                    action: Action::Step {
+                        stepper: stepper_id.clone(),
+                        direction: StepDirection::Forward,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        harness.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        harness.repeat(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        let state = harness.get_state().await;
+        harness.shut_down().await;
+        // Down, then one Repeat = two advances from index 0: 0 -> 1 -> 2.
+        assert_eq!(state.stepper_cursors[&stepper_id], 2);
+    }
+
+    #[tokio::test]
+    async fn get_state_reports_zero_for_a_stepper_never_yet_stepped() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        let stepper_id = harness
+            .create_stepper(
+                "Weapon Wheel",
+                vec![crate::config::StepperItem::Key {
+                    key: evdev::KeyCode::KEY_1,
+                }],
+            )
+            .await
+            .unwrap();
+
+        let state = harness.get_state().await;
+        harness.shut_down().await;
+
+        assert_eq!(state.stepper_cursors[&stepper_id], 0);
+    }
+
+    /// Regression test for a `/code-review` finding: `DeleteStepper` used to
+    /// leave the deleted Stepper's runtime cursor sitting in
+    /// `stepper_cursors` — since `unique_stepper_id` can reassign a freed
+    /// slug to a brand-new, unrelated `CreateStepper` call, a stale nonzero
+    /// cursor would leak into that new entry's very first `GetState()`,
+    /// violating "always resets to the list's first item."
+    #[tokio::test]
+    async fn delete_stepper_command_clears_its_runtime_cursor() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        let stepper_id = harness
+            .create_stepper(
+                "Weapon Wheel",
+                vec![
+                    crate::config::StepperItem::Key {
+                        key: evdev::KeyCode::KEY_1,
+                    },
+                    crate::config::StepperItem::Key {
+                        key: evdev::KeyCode::KEY_2,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::FireOnce,
+                    action: Action::Step {
+                        stepper: stepper_id.clone(),
+                        direction: StepDirection::Forward,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        harness.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(harness.get_state().await.stepper_cursors[&stepper_id], 1);
+
+        harness
+            .clear_binding(Input::Grid(1, 1), Layer::Base)
+            .await
+            .unwrap();
+        harness.delete_stepper(stepper_id.clone()).await.unwrap();
+
+        // A brand-new, unrelated Stepper that happens to land on the exact
+        // same freed slug must start at index 0, not inherit the deleted
+        // entry's stale cursor.
+        let reused_id = harness
+            .create_stepper("Weapon Wheel", vec![])
+            .await
+            .unwrap();
+        assert_eq!(reused_id, stepper_id);
+        let state = harness.get_state().await;
+        harness.shut_down().await;
+        assert_eq!(state.stepper_cursors[&reused_id], 0);
+    }
+
+    /// Regression test for a `/code-review` finding: `SetStepperItems`
+    /// shrinking a list used to leave a stored cursor pointing past the new
+    /// end, so `GetState()` reported an out-of-range index until the
+    /// Stepper was next fired (only `resolve_step` clamped).
+    #[tokio::test]
+    async fn set_stepper_items_clamps_a_cursor_left_stranded_by_a_shrink() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        let stepper_id = harness
+            .create_stepper(
+                "Weapon Wheel",
+                vec![
+                    crate::config::StepperItem::Key {
+                        key: evdev::KeyCode::KEY_1,
+                    },
+                    crate::config::StepperItem::Key {
+                        key: evdev::KeyCode::KEY_2,
+                    },
+                    crate::config::StepperItem::Key {
+                        key: evdev::KeyCode::KEY_3,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::FireOnce,
+                    action: Action::Step {
+                        stepper: stepper_id.clone(),
+                        direction: StepDirection::Forward,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        // Advance to index 2 (the last item of the 3-item list).
+        harness.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        harness.release(Input::Grid(1, 1)).await;
+        harness.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(harness.get_state().await.stepper_cursors[&stepper_id], 2);
+
+        // Shrink to a single item — the stranded index-2 cursor must be
+        // clamped immediately, not just on the Stepper's next fire.
+        harness
+            .set_stepper_items(
+                stepper_id.clone(),
+                vec![crate::config::StepperItem::Key {
+                    key: evdev::KeyCode::KEY_9,
+                }],
+            )
+            .await
+            .unwrap();
+        let state = harness.get_state().await;
+        harness.shut_down().await;
+        assert_eq!(state.stepper_cursors[&stepper_id], 0);
+    }
+
+    /// Companion to the shrink-clamp test above: shrinking a Stepper's item
+    /// list to zero must drop its cursor entirely, matching a never-yet-
+    /// stepped/never-created list's own `GetState()` default.
+    #[tokio::test]
+    async fn set_stepper_items_to_empty_resets_the_cursor_to_the_default() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        let stepper_id = harness
+            .create_stepper(
+                "Weapon Wheel",
+                vec![
+                    crate::config::StepperItem::Key {
+                        key: evdev::KeyCode::KEY_1,
+                    },
+                    crate::config::StepperItem::Key {
+                        key: evdev::KeyCode::KEY_2,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::FireOnce,
+                    action: Action::Step {
+                        stepper: stepper_id.clone(),
+                        direction: StepDirection::Forward,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        harness.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(harness.get_state().await.stepper_cursors[&stepper_id], 1);
+
+        harness
+            .set_stepper_items(stepper_id.clone(), vec![])
+            .await
+            .unwrap();
+        let state = harness.get_state().await;
+        harness.shut_down().await;
+        assert_eq!(state.stepper_cursors[&stepper_id], 0);
+    }
+
+    #[tokio::test]
+    async fn fire_once_step_binding_produces_no_extra_output_on_physical_release() {
+        // Mirrors `fire_once_binding_ignores_repeat_and_up_fires_only_on_down`
+        // for a Stepper: a Step compiles to an already-balanced
+        // KeyDown/KeyUp pair, so the physical `Up`'s force-release check
+        // (ticket 33) finds nothing left held and produces no extra output.
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        let stepper_id = harness
+            .create_stepper(
+                "Weapon Wheel",
+                vec![crate::config::StepperItem::Key {
+                    key: evdev::KeyCode::KEY_1,
+                }],
+            )
+            .await
+            .unwrap();
+        harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::FireOnce,
+                    action: Action::Step {
+                        stepper: stepper_id,
+                        direction: StepDirection::Forward,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        harness.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        harness.release(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        let batches = harness.shut_down().await;
+        assert_eq!(batches.len(), 2, "one press batch + one release batch");
+    }
+
+    #[tokio::test]
     async fn set_binding_rejects_a_macro_action_naming_an_unknown_macro_id() {
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
 
@@ -2975,6 +4075,7 @@ mod tests {
             profiles,
             force_digital: false,
             macros: HashMap::new(),
+            steppers: HashMap::new(),
         };
         let harness = CommandHarness::spawn(config);
 
@@ -3048,6 +4149,7 @@ mod tests {
             profiles,
             force_digital: false,
             macros,
+            steppers: HashMap::new(),
         };
         let harness = CommandHarness::spawn(config);
 
@@ -3133,6 +4235,7 @@ mod tests {
             profiles,
             force_digital: false,
             macros,
+            steppers: HashMap::new(),
         };
         let harness = CommandHarness::spawn(config);
 
@@ -3195,6 +4298,7 @@ mod tests {
             profiles,
             force_digital: false,
             macros,
+            steppers: HashMap::new(),
         };
         let harness = CommandHarness::spawn(config);
 
@@ -3522,6 +4626,7 @@ mod tests {
             profiles,
             force_digital: false,
             macros: HashMap::new(),
+            steppers: HashMap::new(),
         };
         let harness = CommandHarness::spawn(config);
 
