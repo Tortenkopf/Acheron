@@ -121,6 +121,17 @@ def build_modifier_warning() -> Gtk.Widget:
 
 _UNIT_PX = 28.5  # ticket 32 round 3's settled size (30px -> 5% shrink)
 
+
+def _letter_row_entries(letters: str, width: float = 1.0) -> list[tuple[str, str, float]]:
+    """Shared shape for a keyboard row's letter span: code must be the
+    uppercase evdev name (`KEY_A`, not `KEY_a`) — ticket 44 found one of these
+    inlined with a lowercase `code` (label uppercased, code left lowercase),
+    which the real Daemon correctly rejected. Centralized so that bug class
+    can't recur per-row.
+    """
+    return [(f"KEY_{c.upper()}", c.upper(), width) for c in letters]
+
+
 _FN_ROW = [("KEY_ESC", "Esc", 1.4)] + [(f"KEY_F{i}", f"F{i}", 1.0) for i in range(1, 13)]
 _FN_ROW_HI = [(f"KEY_F{i}", f"F{i}", 1.0) for i in range(13, 25)]
 _NUM_ROW = (
@@ -130,17 +141,17 @@ _NUM_ROW = (
 )
 _QWERTY_ROW = (
     [("KEY_TAB", "Tab", 1.5)]
-    + [(f"KEY_{c.upper()}", c.upper(), 1.0) for c in "qwertyuiop"]
+    + _letter_row_entries("qwertyuiop")
     + [("KEY_LEFTBRACE", "[", 1.0), ("KEY_RIGHTBRACE", "]", 1.0), ("KEY_BACKSLASH", "\\", 1.5)]
 )
 _HOME_ROW = (
     [("KEY_CAPSLOCK", "Caps", 1.8)]
-    + [(f"KEY_{c.upper()}", c.upper(), 1.0) for c in "asdfghjkl"]
+    + _letter_row_entries("asdfghjkl")
     + [("KEY_SEMICOLON", ";", 1.0), ("KEY_APOSTROPHE", "'", 1.0), ("KEY_ENTER", "Enter", 2.2)]
 )
 _BOTTOM_ROW = (
     [("KEY_LEFTSHIFT", "Shift", 2.3)]
-    + [(f"KEY_{c.upper()}", c.upper(), 1.0) for c in "zxcvbnm"]
+    + _letter_row_entries("zxcvbnm")
     + [("KEY_COMMA", ",", 1.0), ("KEY_DOT", ".", 1.0), ("KEY_SLASH", "/", 1.0), ("KEY_RIGHTSHIFT", "Shift", 2.3)]
 )
 _SPACE_ROW = [

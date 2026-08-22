@@ -5,7 +5,7 @@ from acheron_gui.daemon_stub import DaemonStub
 from acheron_gui.device_overview import build_main_view, build_status_wrapped_view, compute_status
 from acheron_gui.inputs import ALL_INPUTS
 
-from .widget_tree import find_all, find_one
+from .widget_tree import editor_content, find_all, find_one
 
 
 def _build(stub, ui_state):
@@ -302,7 +302,7 @@ def test_clicking_the_held_tab_switches_which_layer_is_shown_and_edited():
 
     rebuilt = _build(stub, ui_state)
     grid_r1c1_btn = find_one(rebuilt, lambda w: "bound" in w.get_css_classes() if isinstance(w, Gtk.Button) else False)
-    heading = find_one(grid_r1c1_btn.binding_editor_window.get_child(), lambda w: "heading" in w.get_css_classes())
+    heading = find_one(editor_content(grid_r1c1_btn), lambda w: "heading" in w.get_css_classes())
     assert heading.get_label() == "Default / held / 1"
 
 

@@ -5,7 +5,7 @@ from acheron_gui.daemon_stub import DaemonStub
 from acheron_gui.device_overview import make_input_button
 from acheron_gui.inputs import ACTION_TYPES, TRIGGER_OPTIONS
 
-from .widget_tree import button_labeled, find_all, find_one
+from .widget_tree import button_labeled, editor_content, find_all, find_one
 
 
 def _dropdown_labeled(root, label_text):
@@ -50,7 +50,7 @@ def test_clicking_an_unbound_key_opens_editor_defaulted_to_fire_once_keypress():
     btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
 
     assert "empty" in btn.get_css_classes()
-    popover = btn.binding_editor_window.get_child()
+    popover = editor_content(btn)
     heading = find_one(popover, lambda w: "heading" in w.get_css_classes())
     assert heading.get_label() == "Default / base / 1"
 
@@ -60,7 +60,7 @@ def test_saving_a_keypress_binding_calls_set_binding_and_closes_popover():
     changed = []
 
     btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
-    popover = btn.binding_editor_window.get_child()
+    popover = editor_content(btn)
 
     _pick_key(popover, "Key", "F1")
 
@@ -85,7 +85,7 @@ def test_clearing_an_existing_binding_calls_clear_binding():
     changed = []
 
     btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
-    popover = btn.binding_editor_window.get_child()
+    popover = editor_content(btn)
 
     button_labeled(popover, "Clear (passthrough)").emit("clicked")
 
@@ -98,7 +98,7 @@ def test_clearing_an_already_passthrough_input_is_a_noop_but_still_closes():
     changed = []
 
     btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
-    popover = btn.binding_editor_window.get_child()
+    popover = editor_content(btn)
 
     button_labeled(popover, "Clear (passthrough)").emit("clicked")
 
@@ -134,7 +134,7 @@ def test_editing_targets_the_held_layer_independently_of_base():
     changed = []
 
     btn = make_input_button(stub, stub.get_config(), "Default", "held", "grid_r1c1", lambda: changed.append(1))
-    popover = btn.binding_editor_window.get_child()
+    popover = editor_content(btn)
     heading = find_one(popover, lambda w: "heading" in w.get_css_classes())
     assert heading.get_label() == "Default / held / 1"
 
@@ -162,7 +162,7 @@ def test_saving_a_profile_switch_binding_calls_set_binding_with_fire_once_and_th
     changed = []
 
     btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
-    popover = btn.binding_editor_window.get_child()
+    popover = editor_content(btn)
 
     action_dd = _dropdown_labeled(popover, "Action")
     action_dd.set_selected([k for k, _ in ACTION_TYPES].index("profile_switch"))
@@ -189,7 +189,7 @@ def test_selecting_profile_switch_disables_and_forces_the_trigger_dropdown_to_fi
     stub.create_profile("Gaming")
 
     btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
-    popover = btn.binding_editor_window.get_child()
+    popover = editor_content(btn)
 
     trigger_dd = _dropdown_labeled(popover, "Trigger mode")
     trigger_dd.set_selected([k for k, _ in TRIGGER_OPTIONS].index("toggle"))
@@ -283,7 +283,7 @@ def test_set_as_profile_default_closes_the_popover_and_refreshes_the_cached_conf
     changed = []
 
     btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
-    popover = btn.binding_editor_window.get_child()
+    popover = editor_content(btn)
 
     button_labeled(popover, "Set as Profile default").emit("clicked")
 
@@ -295,7 +295,7 @@ def test_reset_all_keys_to_profile_default_closes_the_popover_and_refreshes_the_
     changed = []
 
     btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
-    popover = btn.binding_editor_window.get_child()
+    popover = editor_content(btn)
 
     button_labeled(popover, "Reset all keys to Profile default").emit("clicked")
 
@@ -314,7 +314,7 @@ def test_reset_to_profile_default_does_not_close_the_popover():
     changed = []
 
     btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
-    popover = btn.binding_editor_window.get_child()
+    popover = editor_content(btn)
 
     button_labeled(popover, "Reset to Profile default").emit("clicked")
 

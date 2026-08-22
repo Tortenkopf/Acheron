@@ -60,3 +60,11 @@ def find_one(root: Gtk.Widget, predicate: Callable[[Gtk.Widget], bool]) -> Gtk.W
 
 def button_labeled(root: Gtk.Widget, label: str) -> Gtk.Button:
     return find_one(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == label)
+
+
+def editor_content(btn: Gtk.Widget) -> Gtk.Widget:
+    """The Binding-editor content of a Device Overview grid button. Since
+    ticket 44's Popover->Window conversion, that's `btn.binding_editor_window
+    .get_child()` rather than a `Gtk.Popover`; centralized here so the
+    accessor only needs updating in one place if it changes again."""
+    return btn.binding_editor_window.get_child()
