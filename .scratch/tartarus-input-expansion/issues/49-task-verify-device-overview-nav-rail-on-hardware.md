@@ -1,4 +1,5 @@
 Type: task
+Status: resolved
 
 ## Question
 
@@ -13,3 +14,9 @@ Checklist:
 - Click "Library" and confirm the content area fully replaces with the placeholder (no grid, no layer bar, no Chords slot visible) while the Profile sidebar and switcher stay put; click back to "Grid" and confirm everything returns.
 - With the window at a normal (non-maximized) size, measure the Profile sidebar's real allocated width while Grid is showing and again while Library is showing (e.g. via GTK inspector or a quick `get_allocation()` probe) — confirm it's the same in both, matching ticket 47's prototype-measured 197px and its live `set_hexpand(False)` fix.
 - Confirm the tray mock (`build_tray_mock`) still renders sensibly alongside the new layout and its "Quick switch" popover still works.
+
+## Answer
+
+Live-verified against the real Daemon (already running HEAD, no rebuild needed — ticket 48 made no Rust changes) and the connected Tartarus Pro. No GUI-automation/screenshot tooling exists (confirmed, same gap ticket 48 hit), so the GUI was launched (`gui/.venv/bin/python3 gui/main.py`) for the user to drive directly; the whole checklist was run by the user at the machine and reported back as passing with no bugs found — the joint HITL session ticket 48 itself skipped came back clean, unlike its ticket-42→44 sibling. All seven items confirmed: default Grid destination with sidebar/switcher/separator/layer-bar/grid+thumbstick/Chords-placeholder all present; Profile CRUD (create/rename/switch/delete) round-trips against the real Daemon with the active-Profile delete button staying disabled; Base/Held tab auto-follow works on a real physical Mode-key hold/release; a real grid-key Binding saves through the modal editor and persists to `config.toml`; Library fully replaces the content area and Grid returns intact; the Profile sidebar's width holds steady across both destinations (ticket 47's 197px, `set_hexpand(False)` fix confirmed live); the tray mock and its Quick-switch popover still work.
+
+Checked `config.toml` afterward for session cruft per ticket 34's cleanup precedent: it showed the "Testing" profile as active with a leftover `grid_r1c3` binding from the editor-save step. Flagged to the user rather than assumed — "Testing" turned out to be their actual daily-driver profile, not a session artifact; the throwaway profile created for this ticket's own Profile-CRUD check had already been deleted by the user during the session. No cleanup needed, no code changes, no test changes. Ticket 48's build is now fully live-hardware-verified.
