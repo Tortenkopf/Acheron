@@ -151,9 +151,6 @@ def test_profile_sidebar_does_not_widen_between_destinations():
 
 
 def _profile_sidebar(root: Gtk.Widget) -> Gtk.Widget:
-    """Scopes a search to the left-hand Profile sidebar specifically — a
-    Profile's name button is also duplicated in the tray mock's "Quick
-    switch" popover, so an unscoped label search would match both."""
     heading = find_one(root, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "Profiles")
     return heading.get_parent()
 
@@ -246,42 +243,11 @@ def test_renaming_the_active_profile_via_its_popover_calls_rename_profile():
     assert ("rename_profile", "Default", "Renamed") in stub.calls
 
 
-def test_tray_quick_switch_calls_switch_profile():
-    stub = DaemonStub()
-    stub.create_profile("Gaming")
-
-    root = _build(stub, {})
-    quick_switch = find_one(root, lambda w: isinstance(w, Gtk.MenuButton) and w.get_label() == "Quick switch ▾")
-    popover = _popover_of(quick_switch)
-    gaming_btn = find_one(popover, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Gaming")
-
-    gaming_btn.emit("clicked")
-
-    assert stub.get_state()["profile"] == "Gaming"
-
-
-def test_a_failed_tray_quick_switch_shows_an_error_and_keeps_the_popover_open():
-    stub = _SwitchProfileFailsDaemonStub()
-    stub.create_profile("Gaming")
-
-    root = _build(stub, {})
-    quick_switch = find_one(root, lambda w: isinstance(w, Gtk.MenuButton) and w.get_label() == "Quick switch ▾")
-    popover = _popover_of(quick_switch)
-    gaming_btn = find_one(popover, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Gaming")
-
-    gaming_btn.emit("clicked")
-
-    error_label = find_one(popover, lambda w: "error" in w.get_css_classes())
-    assert error_label.get_visible()
-    assert stub.get_state()["profile"] == "Default"
-
-
 def test_switching_profile_via_the_sidebar_clears_active_toggles():
     # The GUI-level half of ticket 19's live demo: a Toggle left running in
     # the first Profile must be gone from GetState() the instant the switch
-    # (from either the sidebar or the tray) lands — exact-key-release is the
-    # Daemon's own tested responsibility, not something this GUI-level test
-    # can observe.
+    # lands — exact-key-release is the Daemon's own tested responsibility,
+    # not something this GUI-level test can observe.
     stub = DaemonStub()
     stub.create_profile("Gaming")
     stub.simulate_toggle_started("grid_r1c1")
@@ -479,14 +445,3 @@ def test_status_badge_shows_the_right_label_per_state():
         badge = find_one(outer, lambda w: "status-badge" in w.get_css_classes())
         label = find_one(badge, lambda w: isinstance(w, Gtk.Label))
         assert label_text in label.get_label()
-
-
-def test_tray_mock_gets_a_status_line_inserted_right_after_its_heading():
-    stub = DaemonStub()
-
-    outer = _build_status(stub, "running_disconnected")
-
-    tray_box = find_one(outer, lambda w: "tray-mock" in w.get_css_classes())
-    heading = tray_box.get_first_child()
-    status_line = heading.get_next_sibling()
-    assert "Daemon running — device disconnected" in status_line.get_label()

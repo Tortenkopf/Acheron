@@ -4,6 +4,7 @@ from acheron_gui.app import (
     _ensure_daemon_started_on_launch,
     _wire_focus_tracking,
     _wire_status_tracking,
+    _wire_window_close_to_hide,
 )
 from acheron_gui.daemon_stub import DaemonStub
 
@@ -257,3 +258,45 @@ def test_dbus_systemd_client_does_not_connect_at_construction_time():
     client = DBusSystemdClient()
 
     assert client._proxy is None
+
+
+class _FakeCloseableWindow:
+    """Stands in for a real `Gtk.ApplicationWindow`'s titlebar-close
+    gesture — headless tests have no window manager to actually click a
+    close button, so this is the seam `_wire_window_close_to_hide` is
+    tested against, mirroring `_FakeFocusWindow`'s own role above."""
+
+    def __init__(self):
+        self._handlers: list = []
+        self.visible = True
+
+    def connect(self, signal_name: str, callback) -> None:
+        assert signal_name == "close-request"
+        self._handlers.append(callback)
+
+    def set_visible(self, visible: bool) -> None:
+        self.visible = visible
+
+    def simulate_close_request(self):
+        return [handler(self) for handler in self._handlers]
+
+
+def test_close_request_hides_the_window_instead_of_destroying_it():
+    window = _FakeCloseableWindow()
+    _wire_window_close_to_hide(window)
+
+    window.simulate_close_request()
+
+    assert window.visible is False
+
+
+def test_close_request_handler_returns_true_to_stop_the_default_close():
+    # Ticket 36: `True` here is what stops GTK's own default handler from
+    # destroying the window (which would drop it from the Gtk.Application's
+    # window list and quit the process) — see the function's own docstring.
+    window = _FakeCloseableWindow()
+    _wire_window_close_to_hide(window)
+
+    results = window.simulate_close_request()
+
+    assert results == [True]

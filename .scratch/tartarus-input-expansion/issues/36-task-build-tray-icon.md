@@ -1,4 +1,5 @@
 Type: task
+Status: resolved
 
 ## Question
 
@@ -63,4 +64,40 @@ icon reflects it, Quit actually exits the GUI process while leaving the Daemon r
 window-close hides rather than quits.
 
 ## Answer
+
+Built as specified: a hand-rolled `org.kde.StatusNotifierItem` + `com.canonical.dbusmenu` service
+via dasbus (`gui/acheron_gui/tray.py`, `tray_menu.py`), registered once at launch, hooked into
+`app.py`'s existing `status`/`rebuild()` rather than an independent D-Bus subscription; Show
+Window/Quit as plain in-process calls; `DBusSystemdClient` gained `stop_daemon()`/`start_daemon()`
+for Pause/Resume; a `close-request` handler hides the window instead of destroying it (unit-tested
+via a fake window — no real WM close button in a headless test — the missing test for this was
+added: `test_close_request_hides_the_window_instead_of_destroying_it` /
+`test_close_request_handler_returns_true_to_stop_the_default_close`). 155 tests passing.
+
+**Real bug found and fixed via live testing**: this ticket's own note above (icon at
+`icons/scalable/apps/<name>.svg`, the standard freedesktop theme layout) doesn't work. The actual
+GNOME Shell consumer isn't `Gtk.IconTheme` at all — the `ubuntu-appindicators` extension looks
+icons up through its own `St.IconTheme`, constructed as `set_search_path([IconThemePath])` with no
+theme-name or size/context subdirectory expectation (`appIndicator.js`'s `_createIconTheme`/
+`_getIconData`). Checked the hard way: a headless `Gtk.IconTheme.has_icon()` probe said a nested
+`hicolor/scalable/apps/` layout should resolve, the real panel still showed the generic
+"icon not found" fallback for it, and only flat `icons/<name>.svg` files (no subdirectories at all)
+made the real green/orange/red circle actually render. Corrected in code and comment
+(`tray.py`'s `ICON_THEME_PATH`); the ticket's own "later commissioned icon" drop-in slot is now
+`gui/acheron_gui/icons/<name>.svg`, not the nested path originally noted.
+
+**Live-verified** against the real GNOME Shell panel and the real Daemon: SNI registration
+(`RegisteredStatusNotifierItems` picks it up), the icon actually renders and transitions between
+`acheron-running-connected` (green) and `acheron-not-running` (red) — driven by cycling the real
+Pause/Resume Daemon action, which also confirmed Pause/Resume actually stops/starts the real
+`acheron-daemon.service` unit (not just a UI toggle) and the status line/menu label flip correctly;
+Switch Profile actually round-trips against the real Daemon (Default ↔ Testing, confirmed via
+`GetState` and the menu's enabled/disabled reflecting the active Profile).
+
+**Not live-verified — split off to
+[Live-verify the tray icon's remaining interactions on hardware](./50-task-verify-tray-icon-on-hardware.md)**:
+Show Window, the `running_disconnected` (orange) state via a real device unplug/replug, Quit, and
+opening the Switch Profile submenu itself. This session hit two full-system hard freezes/reboots
+while live-testing this ticket — see ticket 50 for the timeline and the safety reasoning behind
+stopping short of finishing the checklist directly.
 

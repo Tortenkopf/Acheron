@@ -20,9 +20,10 @@ The Profile sidebar (ticket 19) is real: switching a Profile calls
 `SwitchProfile`, "+ New Profile" calls `CreateProfile`, and each row's "✎"/
 "×" call `RenameProfile`/`DeleteProfile` — "×" is disabled on the active
 Profile, mirroring the Daemon's own "can't delete the Profile out from under
-itself" rule rather than only surfacing it as a post-hoc error. The tray
-mock's "Quick switch" popover lists the same real Profiles and calls
-`SwitchProfile` too.
+itself" rule rather than only surfacing it as a post-hoc error. The real
+system tray icon (ticket 36, `tray.TrayIcon`) has its own equivalent Switch
+Profile submenu, listing the same real Profiles and calling `SwitchProfile`
+too — it lives outside this module entirely, not as a widget built here.
 
 The Base/Held tab row (ticket 18) is real: clicking a tab sets
 `ui_state["selected_layer"]`, the Layer whose Bindings Device Overview
@@ -281,77 +282,6 @@ def build_profile_sidebar(client, config: dict, profile: str, on_change: Callabl
     return sidebar
 
 
-def build_tray_mock(
-    client,
-    profile: str,
-    layer: str,
-    profiles: list[str],
-    on_change: Callable[[], None],
-    status: str | None = None,
-) -> Gtk.Box:
-    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-    box.add_css_class("tray-mock")
-    box.set_size_request(190, -1)
-    box.set_margin_top(12)
-    box.set_margin_end(12)
-    heading = Gtk.Label(label="Tray icon (simulated)", xalign=0)
-    heading.add_css_class("heading")
-    box.append(heading)
-
-    # `status` is `None` for callers with nothing to say about it (ticket
-    # 09's original prototype reuse, this module's own tests building
-    # `build_main_view` directly) — ticket 12/20's status line only appears
-    # when a real 3-way status is actually known.
-    if status is not None:
-        label, colour, glyph = STATUS_STATES[status]
-        status_lbl = Gtk.Label()
-        status_lbl.set_markup(f"{glyph}  <span foreground='{colour}'>{label}</span>")
-        box.append(status_lbl)
-
-    icon_row = Gtk.Box(spacing=6)
-    icon_row.append(Gtk.Label(label="\U0001f3ae"))
-    icon_row.append(Gtk.Label(label=f"{profile} · {layer}", xalign=0))
-    box.append(icon_row)
-
-    menu_btn = Gtk.MenuButton(label="Quick switch ▾")
-    popover = Gtk.Popover()
-    menu_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-    error_label = Gtk.Label(xalign=0, wrap=True)
-    error_label.add_css_class("error")
-    error_label.set_visible(False)
-    for name in profiles:
-        b = Gtk.Button(label=name)
-        if name == profile:
-            b.add_css_class("suggested-action")
-
-        def on_pick(_b, name=name):
-            if name != profile:
-                try:
-                    client.switch_profile(name)
-                except DaemonError as exc:
-                    # Same reasoning as the sidebar's own show_error: leave
-                    # the popover open with the failure visible rather than
-                    # popping down as if the switch had happened.
-                    error_label.set_label(str(exc))
-                    error_label.set_visible(True)
-                    return
-            popover.popdown()
-            on_change()
-
-        b.connect("clicked", on_pick)
-        menu_box.append(b)
-    menu_box.append(error_label)
-    popover.set_child(menu_box)
-    menu_btn.set_popover(popover)
-    box.append(menu_btn)
-
-    note = Gtk.Label(label="real tray uses AppIndicator3")
-    note.add_css_class("dim")
-    note.set_wrap(True)
-    box.append(note)
-    return box
-
-
 def make_input_button(
     client,
     config: dict,
@@ -513,7 +443,6 @@ def build_main_view(
     layer: str,
     on_change: Callable[[], None],
     ui_state: dict,
-    status: str | None = None,
     capture_mode: str = "digital",
 ) -> Gtk.Widget:
     selected_layer = ui_state.setdefault("selected_layer", "base")
@@ -633,7 +562,6 @@ def build_main_view(
         right.append(main)
 
     root.append(right)
-    root.append(build_tray_mock(client, profile, layer, list(config["profiles"]), on_change, status))
     return root
 
 
@@ -661,27 +589,23 @@ def build_status_wrapped_view(
     capture_mode: str = "digital",
 ) -> Gtk.Widget:
     """Wraps `build_main_view`'s whole Device Overview (profile sidebar,
-    Grid/Library destination, tray mock — all one widget tree, per tickets
-    09/48) with
-    ticket 12/20's status chip above it and, whenever `status` isn't
-    `"running_connected"`, a dimmed `Gtk.Overlay` disabling the whole thing —
-    matching prototype/12-daemon-device-status-indicators/prototype.py's
-    variant C, per this ticket's "build from the prototype directly, not
-    from the prose" instruction rather than redesigning it. That includes
-    disabling the tray mock's own Quick-switch control along with
-    everything else: `root.set_sensitive(False)` covers the whole subtree
-    the prototype already validated this against live.
+    Grid/Library destination — per tickets 09/48) with ticket 12/20's status
+    chip above it and, whenever `status` isn't `"running_connected"`, a
+    dimmed `Gtk.Overlay` disabling the whole thing — matching
+    prototype/12-daemon-device-status-indicators/prototype.py's variant C,
+    per this ticket's "build from the prototype directly, not from the
+    prose" instruction rather than redesigning it. `root.set_sensitive(False)`
+    covers the whole subtree the prototype already validated this against
+    live.
 
-    Unlike the prototype (which spliced its tray status line into a
-    `build_main_view` it didn't own, via `get_last_child()`/
-    `get_first_child()` — the only option available there), this ticket owns
-    the real `build_main_view`/`build_tray_mock` outright, so `status` is
-    passed straight through as a parameter instead: a future reordering of
-    `build_main_view`'s own `root.append(...)` calls can't silently break
-    the tray status line's placement the way reaching into the built tree
-    from outside could.
+    Ticket 36 removed the old in-window `build_tray_mock` placeholder
+    outright — the real tray icon (`tray.TrayIcon`) is a standalone D-Bus
+    service outside this widget tree entirely, kept in sync by `app.py`'s
+    own `rebuild()` calling `TrayIcon.update(config, profile, status)`
+    alongside this function, not by anything reaching into what's built
+    here.
     """
-    root = build_main_view(client, config, profile, layer, on_change, ui_state, status, capture_mode)
+    root = build_main_view(client, config, profile, layer, on_change, ui_state, capture_mode)
 
     outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
     outer.append(build_status_badge(status))

@@ -10,8 +10,8 @@ flips `ui_state["selected_layer"]` and rebuilds — the "GUI's tab indicator
 flips to Held" half of the live demo.
 
 Ticket 19: also subscribes to `ActiveProfileChanged` and rebuilds on it —
-covers a switch made from the tray's own real (non-GUI-process) icon, or any
-other D-Bus client, not just this window's own sidebar/tray-mock controls.
+covers a switch made from the tray icon's own Switch Profile submenu (ticket
+36), or any other D-Bus client, not just this window's own sidebar.
 `rebuild()` re-fetches `GetState()` on every call, so the newly active
 Profile is picked up with no separate `ui_state` key needed (unlike
 `selected_layer`, which is view state with no Daemon-side equivalent to
@@ -75,6 +75,7 @@ from .daemon_client import DaemonClient, DaemonError, DBusDaemonClient
 from .device_overview import PLACEHOLDER_CONFIG, build_status_wrapped_view, compute_status
 from .gtk_utils import clear_children
 from .systemd_client import DBusSystemdClient, SystemdClient
+from .tray import TrayIcon
 
 CSS = """
 .heading { font-weight: bold; }
@@ -85,7 +86,6 @@ CSS = """
 .bound { border: 2px solid #4caf50; }
 .empty { opacity: 0.75; }
 .mode-key { border-radius: 999px; }
-.tray-mock { border: 1px dashed alpha(currentColor, 0.35); border-radius: 8px; padding: 8px; }
 .error { color: #e53935; font-size: smaller; }
 .status-badge { font-size: 1.05em; }
 .dim-overlay { background-color: alpha(black, 0.45); border-radius: 6px; }
@@ -249,6 +249,33 @@ def _wire_status_tracking(client: DaemonClient, on_change: Callable[[], None]) -
     return status
 
 
+def _wire_window_close_to_hide(window) -> None:
+    """Ticket 36's minimize-to-tray: the titlebar close button hides the
+    main window instead of destroying it. Returning `True` from
+    `"close-request"` stops GTK's default handler, which would otherwise
+    destroy the window and drop it from the `Gtk.Application`'s own window
+    list — and since that list is what `GApplication`'s inherited hold
+    count is keyed to, destroying the last window would quit the whole
+    process. A hidden-but-still-added window keeps that hold count
+    non-zero, so no separate "suppress quit-on-last-window-closed" step is
+    needed beyond this — only the tray menu's own Quit item (`self.quit()`)
+    actually exits the GUI process now; the Daemon is unaffected either
+    way, per ticket 11's original design (it's already an independent
+    `systemd --user` service, not something this process owns).
+
+    `window` is duck-typed (`connect()` + `set_visible()`) rather than
+    annotated `Gtk.Window`, matching `_wire_focus_tracking`'s own reasoning:
+    tests drive it with a plain fake rather than a real windowing system,
+    which has no headless way to simulate a titlebar close.
+    """
+
+    def on_close_request(_window) -> bool:
+        window.set_visible(False)
+        return True
+
+    window.connect("close-request", on_close_request)
+
+
 def _ensure_daemon_started_on_launch(systemd_client: SystemdClient) -> None:
     """Ticket 21's GUI-side safety net: on its own launch, ask systemd to
     clear any latched `failed` state and (re)start the Daemon unit —
@@ -292,6 +319,15 @@ class AcheronApplication(Gtk.Application):
 
         win = Gtk.ApplicationWindow(application=self, title="Acheron")
         win.set_default_size(920, 680)
+        _wire_window_close_to_hide(win)
+
+        # Ticket 36: the real system tray icon — a standalone D-Bus service
+        # (`org.kde.StatusNotifierItem` + `com.canonical.dbusmenu`), not a
+        # widget in `content_box`'s own tree. Held on `self` so it outlives
+        # `do_activate` (nothing else keeps it referenced otherwise); kept
+        # in sync by `rebuild()`'s own `update()` call below rather than any
+        # D-Bus subscriptions of its own, per ticket 36's design.
+        self._tray_icon = TrayIcon(self._client, self._systemd_client, win.present, self.quit)
 
         content_box = Gtk.Box()
         # GUI-only view state (not Daemon state) that must survive a
@@ -342,6 +378,7 @@ class AcheronApplication(Gtk.Application):
                     status["device_connected"] = device_connected
                     status["capture_mode"] = capture_mode
             current_status = compute_status(status["daemon_running"], status["device_connected"])
+            self._tray_icon.update(last_known["config"], last_known["profile"], current_status)
             content_box.append(
                 build_status_wrapped_view(
                     self._client,

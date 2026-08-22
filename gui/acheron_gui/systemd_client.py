@@ -23,6 +23,14 @@ unit_name)`.
 Structural `SystemdClient` Protocol mirrors `daemon_client.DaemonClient`'s
 shape — `DBusSystemdClient` (real) vs a plain fake for tests — so `app.py`'s
 launch-time wiring never branches on which one it's holding.
+
+Ticket 36: `stop_daemon`/`start_daemon` back the tray menu's Pause/Resume
+Daemon item — session-only (`systemctl --user stop`/`start`, not `disable`/
+`enable`), so the unit stays login-enabled either way and a paused Daemon
+still comes back automatically at the next login (ticket 11's resolution).
+Plain `StopUnit`/`StartUnit`, unlike `ensure_daemon_started`'s `ResetFailedUnit`
+dance: there's no latched `failed` state to clear here, since Pause always
+starts from a cleanly-running unit.
 """
 
 from __future__ import annotations
@@ -43,6 +51,10 @@ DAEMON_UNIT = "acheron-daemon.service"
 
 class SystemdClient(Protocol):
     def ensure_daemon_started(self) -> None: ...
+
+    def stop_daemon(self) -> None: ...
+
+    def start_daemon(self) -> None: ...
 
 
 class DBusSystemdClient:
@@ -73,6 +85,28 @@ class DBusSystemdClient:
             -1,
             None,
         )
+        proxy.call_sync(
+            "StartUnit",
+            GLib.Variant("(ss)", (DAEMON_UNIT, "replace")),
+            Gio.DBusCallFlags.NONE,
+            -1,
+            None,
+        )
+
+    def stop_daemon(self) -> None:
+        proxy = self._proxy or self._connect()
+        self._proxy = proxy
+        proxy.call_sync(
+            "StopUnit",
+            GLib.Variant("(ss)", (DAEMON_UNIT, "replace")),
+            Gio.DBusCallFlags.NONE,
+            -1,
+            None,
+        )
+
+    def start_daemon(self) -> None:
+        proxy = self._proxy or self._connect()
+        self._proxy = proxy
         proxy.call_sync(
             "StartUnit",
             GLib.Variant("(ss)", (DAEMON_UNIT, "replace")),
