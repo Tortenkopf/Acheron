@@ -505,6 +505,34 @@ impl Daemon {
         rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
     }
 
+    /// Overwrites a Macro's step sequence in place — the real persistence
+    /// path ticket 52's library editor needs for add/remove/reorder edits
+    /// against an already-created entry (`CreateMacro`'s `steps` argument
+    /// only covers what the Macro is born with). Errors `NotFound` if
+    /// `macro_id` doesn't exist.
+    async fn set_macro_steps(
+        &self,
+        macro_id: String,
+        steps: Vec<HashMap<String, OwnedValue>>,
+    ) -> Result<(), DaemonError> {
+        let steps = steps
+            .iter()
+            .map(wire::macro_step_from_dict)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DaemonError::InvalidBinding)?;
+
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::SetMacroSteps {
+                macro_id: MacroId::from(macro_id),
+                steps,
+                reply,
+            })
+            .await
+            .map_err(dispatch_gone)?;
+        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+    }
+
     /// Switches the active Profile, force-stopping every currently running
     /// Toggle as part of the switch before the new Profile's state becomes
     /// active (ticket 19). Errors `NotFound` if `name` doesn't name a real
@@ -797,6 +825,11 @@ mod tests {
         ) -> zbus::Result<String>;
         fn rename_macro(&self, macro_id: &str, new_name: &str) -> zbus::Result<()>;
         fn delete_macro(&self, macro_id: &str) -> zbus::Result<()>;
+        fn set_macro_steps(
+            &self,
+            macro_id: &str,
+            steps: Vec<HashMap<String, OwnedValue>>,
+        ) -> zbus::Result<()>;
         fn switch_profile(&self, name: &str) -> zbus::Result<()>;
         fn stop_all_toggles(&self) -> zbus::Result<()>;
         fn set_actuation_point(&self, input: &str, actuation: u8, release: u8) -> zbus::Result<()>;
@@ -1519,6 +1552,53 @@ mod tests {
         let def: wire::Dict = macros.get(&macro_id).unwrap().clone().try_into().unwrap();
         let name: String = def.get("name").unwrap().clone().try_into().unwrap();
         assert_eq!(name, "New Name");
+    }
+
+    #[tokio::test]
+    async fn set_macro_steps_over_real_dbus_overwrites_steps_and_persists() {
+        let server = TestServer::start().await;
+        let macro_id = server
+            .create_macro(
+                "Test macro",
+                vec![crate::config::MacroStepDto::KeyDown(evdev::KeyCode::KEY_A)],
+            )
+            .await;
+
+        let new_steps: Vec<wire::Dict> = vec![
+            wire::macro_step_to_dict(&crate::config::MacroStepDto::KeyDown(evdev::KeyCode::KEY_B)),
+            wire::macro_step_to_dict(&crate::config::MacroStepDto::Delay(25)),
+        ];
+        server
+            .proxy
+            .set_macro_steps(&macro_id, new_steps)
+            .await
+            .expect("SetMacroSteps must succeed");
+
+        let config = server.proxy.get_config().await.unwrap();
+        let on_disk = std::fs::read_to_string(&server.config_path).unwrap();
+        server.shut_down().await;
+
+        let macros: wire::Dict = config.get("macros").unwrap().clone().try_into().unwrap();
+        let def: wire::Dict = macros.get(&macro_id).unwrap().clone().try_into().unwrap();
+        let name: String = def.get("name").unwrap().clone().try_into().unwrap();
+        assert_eq!(name, "Test macro");
+        assert!(on_disk.contains("[macros.test-macro]"));
+    }
+
+    #[tokio::test]
+    async fn set_macro_steps_over_real_dbus_on_an_unknown_macro_id_returns_not_found() {
+        let server = TestServer::start().await;
+
+        let err = server
+            .proxy
+            .set_macro_steps("nonexistent", vec![])
+            .await
+            .expect_err("setting steps on an unknown Macro must fail");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.NotFound")
+        );
+
+        server.shut_down().await;
     }
 
     #[tokio::test]

@@ -11,8 +11,10 @@ a Grid/Library destination switcher (`build_destination_switch`): the
 Profile sidebar stays exactly as it was (ticket 47's round-2 fix pins it
 at a stable width via `set_hexpand(False)`), the Action Table is cut
 outright (superseded by ticket 42's inline key/mouse-button picker), and
-selecting "Library" fully replaces the content area with a placeholder for
-ticket 41's real Library screen. The Grid destination keeps the real
+selecting "Library" fully replaces the content area with the real Library
+screen (`library_view.build_library_view`, ticket 52 — a Steppers/Macros
+tab-switched panel pair; the Macros panel is real, the Steppers panel
+stays a stub pending ticket 55). The Grid destination keeps the real
 `build_layer_bar` above the grid, plus an always-visible reserved slot
 beside it (`build_chords_placeholder`) for ticket 40's real Chords list.
 
@@ -46,7 +48,9 @@ from gi.repository import Gtk, Pango
 
 from .binding_editor import action_summary, build_binding_editor
 from .daemon_client import DaemonError
+from .gtk_utils import build_name_prompt_popover
 from .inputs import GRID_COLS, GRID_ROWS, grid_input, input_label
+from .library_view import build_library_view
 
 # Ticket 12/20 — Daemon/device status surface. Mirrors
 # prototype/12-daemon-device-status-indicators/prototype.py's STATUS_STATES
@@ -134,53 +138,6 @@ def build_layer_bar(
     role_handler_id = role_btn.connect("toggled", on_role_toggled)
     box.append(role_btn)
     return box
-
-
-def build_name_prompt_popover(
-    client_error_context: str, initial_text: str, submit_label: str, on_submit: Callable[[str], None]
-) -> Gtk.Popover:
-    """A small Entry-plus-submit-button popover shared by "+ New Profile"
-    and each row's rename ("✎") control — the closest existing pattern is
-    `build_binding_editor`'s own Save/error handling, reused here at a much
-    smaller scale rather than inventing a separate dialog mechanism."""
-    popover = Gtk.Popover()
-    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-    box.set_margin_top(8)
-    box.set_margin_bottom(8)
-    box.set_margin_start(8)
-    box.set_margin_end(8)
-
-    entry = Gtk.Entry(text=initial_text)
-    entry.set_width_chars(16)
-    box.append(entry)
-
-    error_label = Gtk.Label(xalign=0, wrap=True)
-    error_label.add_css_class("error")
-    error_label.set_visible(False)
-    box.append(error_label)
-
-    def on_submit_clicked(_widget):
-        name = entry.get_text().strip()
-        if not name:
-            error_label.set_label("Name can't be empty")
-            error_label.set_visible(True)
-            return
-        try:
-            on_submit(name)
-        except DaemonError as exc:
-            error_label.set_label(f"{client_error_context}: {exc}")
-            error_label.set_visible(True)
-            return
-        popover.popdown()
-
-    submit_btn = Gtk.Button(label=submit_label)
-    submit_btn.add_css_class("suggested-action")
-    submit_btn.connect("clicked", on_submit_clicked)
-    entry.connect("activate", on_submit_clicked)
-    box.append(submit_btn)
-
-    popover.set_child(box)
-    return popover
 
 
 def build_profile_sidebar(client, config: dict, profile: str, on_change: Callable[[], None]) -> Gtk.Box:
@@ -296,7 +253,10 @@ def make_input_button(
     capture_mode: str = "digital",
 ) -> Gtk.Button:
     binding = config["profiles"][profile][layer].get(inp)
-    inner = Gtk.Label(label=f"{input_label(inp)}\n{action_summary(binding, inp)}", justify=Gtk.Justification.CENTER)
+    inner = Gtk.Label(
+        label=f"{input_label(inp)}\n{action_summary(binding, inp, config.get('macros', {}))}",
+        justify=Gtk.Justification.CENTER,
+    )
     inner.set_wrap(True)
     # Plain `wrap=True` alone only breaks at whitespace (`Pango.WrapMode.WORD`,
     # the Gtk.Label default). Every summary string does have at least one
@@ -418,24 +378,6 @@ def build_chords_placeholder() -> Gtk.Widget:
     return box
 
 
-def build_library_placeholder() -> Gtk.Widget:
-    """Fully replaces the content area while the Library destination is
-    selected. Ticket 41 wires the real Stepper/Macro library screen in
-    here (it needs Daemon/D-Bus support this ticket doesn't build)."""
-    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-    heading = Gtk.Label(label="Library", xalign=0)
-    heading.add_css_class("heading")
-    box.append(heading)
-    placeholder = Gtk.Label(
-        label="Ticket 41 wires the real Stepper/Macro library screen into this destination.",
-        xalign=0,
-        wrap=True,
-    )
-    placeholder.add_css_class("dim")
-    box.append(placeholder)
-    return box
-
-
 def build_main_view(
     client,
     config: dict,
@@ -487,7 +429,7 @@ def build_main_view(
     right.append(Gtk.Separator())
 
     if dest == "library":
-        right.append(build_library_placeholder())
+        right.append(build_library_view(client, config, ui_state, on_change))
     else:
         main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         main.set_hexpand(True)

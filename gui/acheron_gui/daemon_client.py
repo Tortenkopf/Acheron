@@ -96,6 +96,8 @@ class DaemonClient(Protocol):
 
     def delete_macro(self, macro_id: str) -> None: ...
 
+    def set_macro_steps(self, macro_id: str, steps: list[dict]) -> None: ...
+
     def switch_profile(self, name: str) -> None: ...
 
     def set_output_suppressed(self, suppressed: bool) -> None: ...
@@ -194,6 +196,11 @@ class DBusDaemonClient:
 
     def delete_macro(self, macro_id: str) -> None:
         self._call("DeleteMacro", GLib.Variant("(s)", (macro_id,)))
+
+    def set_macro_steps(self, macro_id: str, steps: list[dict]) -> None:
+        variant_steps = [wire.macro_step_to_variant(step) for step in steps]
+        parameters = GLib.Variant("(saa{sv})", (macro_id, variant_steps))
+        self._call("SetMacroSteps", parameters)
 
     def switch_profile(self, name: str) -> None:
         self._call("SwitchProfile", GLib.Variant("(s)", (name,)))

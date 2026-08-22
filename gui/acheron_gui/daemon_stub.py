@@ -201,6 +201,12 @@ class DaemonStub:
         del self._macros[macro_id]
         self.calls.append(("delete_macro", macro_id))
 
+    def set_macro_steps(self, macro_id: str, steps: list[dict]) -> None:
+        if macro_id not in self._macros:
+            raise NotFoundError(f"no Macro with id {macro_id!r}")
+        self._macros[macro_id]["steps"] = copy.deepcopy(steps)
+        self.calls.append(("set_macro_steps", macro_id, copy.deepcopy(steps)))
+
     def switch_profile(self, name: str) -> None:
         if name not in self._profiles:
             raise NotFoundError(f"no Profile named {name!r}")

@@ -20,14 +20,14 @@ from typing import Callable
 from gi.repository import Gtk, GLib
 
 from .daemon_client import DaemonError
-from .gtk_utils import clear_children
+from .gtk_utils import build_name_prompt_popover, clear_children
 from .inputs import ACTION_TYPES, INPUT_DEFAULT_LABEL, TRIGGER_OPTIONS, TRIGGER_SHORT, input_label, is_grid_input
 from .controller_picker import LABEL_BY_CODE as CONTROLLER_LABEL_BY_CODE
 from .controller_picker import build_inline_controller_picker
 from .key_picker import LABEL_BY_CODE, build_inline_key_picker
 
 
-def action_summary(binding: dict | None, inp: str) -> str:
+def action_summary(binding: dict | None, inp: str, macros: dict) -> str:
     if not binding:
         # No "passthrough" qualifier: it's jargon the user doesn't need, it's
         # too long to fit the smaller (52px) buttons, and — once a running
@@ -57,10 +57,15 @@ def action_summary(binding: dict | None, inp: str) -> str:
         raw_button = binding["button"]
         button = CONTROLLER_LABEL_BY_CODE.get(raw_button, raw_button)
         return f"Btn: {button}  [{TRIGGER_SHORT[binding['trigger']]}]"
-    # Shows the raw macro_id, not the Macro's display name — resolving that
-    # needs `config["macros"]` threaded in here, which is ticket 52's job
-    # (the real library picker), not this narrow gate-the-editor ticket.
-    return f"Macro: {binding.get('macro_id', '?')}  [{TRIGGER_SHORT[binding['trigger']]}]"
+    # Ticket 52: resolves the library entry's display name rather than the
+    # raw macro_id (ticket 51 deferred this — it needed `macros` threaded
+    # in, which now happens here). Falls back to the raw id if the entry is
+    # somehow missing (e.g. `PLACEHOLDER_CONFIG`'s empty `macros`), rather
+    # than crashing on a dict lookup that should be structurally impossible
+    # once `SetBinding`'s own unknown-macro_id validation is in play.
+    macro_id = binding.get("macro_id", "?")
+    name = macros.get(macro_id, {}).get("name", macro_id)
+    return f"Macro: {name}  [{TRIGGER_SHORT[binding['trigger']]}]"
 
 
 def describe_step(step: dict) -> str:
@@ -555,23 +560,57 @@ def build_binding_editor(
             )
             editor_slot.append(labeled_row("Button", controller_picker))
         else:
-            # Ticket 51: the Macro Action cutover (steps moved off the
-            # Binding, into the named library) invalidated this editor's old
-            # inline step-editing UI outright. Reduced to the narrowest thing
-            # that doesn't crash on a Macro Binding — a read-only display of
-            # the current macro_id, Save disabled when there isn't one to
-            # preserve (no picker yet to assign a fresh one). Ticket 52
-            # builds the real library picker.
-            macro_id = draft["macro"].get("macro_id")
-            editor_slot.append(Gtk.Label(label=f"Macro: {macro_id or '(none)'}", xalign=0))
-            note = Gtk.Label(
-                label="Macro library picker not built yet — see ticket 52.",
-                xalign=0,
-                wrap=True,
+            # Ticket 52: the real assignment flow — a dropdown of existing
+            # library entries (by display name, ticket 51's macro_id stays
+            # internal) plus "+ New Macro" to create one inline and assign it
+            # right away, replacing ticket 51's temporary read-only stub.
+            # Full step authoring lives in the Library screen
+            # (`library_view.build_macro_editor`), not here — this popover
+            # only ever assigns a `macro_id` to the Binding, exactly like the
+            # Controller-button/Profile-switch branches only ever assign
+            # their own single field.
+            macros = config.get("macros", {})
+            macro_ids = sorted(macros, key=lambda mid: macros[mid]["name"].lower())
+            current_macro_id = draft["macro"].get("macro_id")
+
+            if macro_ids:
+                macro_dd = Gtk.DropDown(model=Gtk.StringList.new([macros[mid]["name"] for mid in macro_ids]))
+                if current_macro_id in macro_ids:
+                    macro_dd.set_selected(macro_ids.index(current_macro_id))
+                else:
+                    macro_dd.set_selected(0)
+                    draft["macro"]["macro_id"] = macro_ids[0]
+
+                def on_macro_changed(dd, *_):
+                    draft["macro"]["macro_id"] = macro_ids[dd.get_selected()]
+
+                macro_dd.connect("notify::selected", on_macro_changed)
+                editor_slot.append(labeled_row("Macro", macro_dd))
+            else:
+                editor_slot.append(
+                    Gtk.Label(label="No Macros in the library yet — create one below.", xalign=0, wrap=True)
+                )
+
+            new_macro_btn = Gtk.MenuButton(label="+ New Macro")
+
+            def on_new_macro_submitted(name: str):
+                macro_id = client.create_macro(name, [])
+                # `config` is a snapshot fetched before this popover opened
+                # (per the module docstring) — mutated in place here so the
+                # rebuild below sees the entry it just created, rather than
+                # `render_action_editor` immediately overwriting `macro_id`
+                # with `macro_ids[0]` because the fresh id isn't in its
+                # (stale) `macro_ids` list yet.
+                config.setdefault("macros", {})[macro_id] = {"name": name, "steps": []}
+                draft["macro"]["macro_id"] = macro_id
+                render_action_editor()
+
+            new_macro_btn.set_popover(
+                build_name_prompt_popover("Creating a Macro", "", "Create", on_new_macro_submitted)
             )
-            note.add_css_class("dim")
-            editor_slot.append(note)
-            save_btn.set_sensitive(macro_id is not None)
+            editor_slot.append(new_macro_btn)
+
+            save_btn.set_sensitive(draft["macro"].get("macro_id") is not None)
 
     action_dd.connect("notify::selected", lambda *_: render_action_editor())
     render_action_editor()

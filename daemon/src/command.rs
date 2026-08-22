@@ -173,6 +173,18 @@ pub enum Command {
         macro_id: MacroId,
         reply: oneshot::Sender<Result<(), CommandError>>,
     },
+    /// Overwrites a Macro's step sequence — a pure `MacroDef.steps` field
+    /// write, the `MacroId` and `name` untouched. Ticket 52's library
+    /// editor needs this to persist add/remove/reorder edits made against
+    /// an *existing* library entry; `CreateMacro` alone only covers the
+    /// steps a Macro is born with. Fails `NotFound` if `macro_id` doesn't
+    /// exist. No `InvalidRequest` case — an empty step sequence is exactly
+    /// as valid here as it is for a freshly `CreateMacro`'d entry.
+    SetMacroSteps {
+        macro_id: MacroId,
+        steps: Vec<MacroStepDto>,
+        reply: oneshot::Sender<Result<(), CommandError>>,
+    },
 }
 
 /// Errors a `Command` can fail with. Deliberately narrower than the D-Bus

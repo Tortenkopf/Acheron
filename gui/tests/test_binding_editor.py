@@ -125,7 +125,7 @@ def test_action_summary_shows_a_friendly_label_for_a_mouse_button_key():
     # Ticket 42's picker makes BTN_LEFT one click away — action_summary must
     # not show the raw wire code once it's this reachable.
     assert action_summary(
-        {"trigger": "fire_once", "type": "keypress", "key": "BTN_LEFT", "modifiers": []}, "grid_r1c1"
+        {"trigger": "fire_once", "type": "keypress", "key": "BTN_LEFT", "modifiers": []}, "grid_r1c1", {}
     ) == "Mouse Left  [1x]"
 
 
@@ -203,7 +203,7 @@ def test_selecting_profile_switch_disables_and_forces_the_trigger_dropdown_to_fi
 
 def test_profile_switch_action_summary_shows_the_target_with_no_trigger_suffix():
     assert action_summary(
-        {"trigger": "fire_once", "type": "profile_switch", "target": "Gaming"}, "grid_r1c1"
+        {"trigger": "fire_once", "type": "profile_switch", "target": "Gaming"}, "grid_r1c1", {}
     ) == "→ Gaming"
 
 
@@ -268,6 +268,7 @@ def test_controller_button_action_summary_shows_the_button_and_trigger():
         action_summary(
             {"trigger": "hold_to_repeat", "type": "controller_button", "button": "BTN_SOUTH"},
             "grid_r1c1",
+            {},
         )
         == "Btn: A / South  [hold]"
     )
@@ -534,29 +535,53 @@ def test_trigger_mode_warning_wiring_survives_repeated_action_kind_switching():
     assert not _has_warning(editor)
 
 
-def test_selecting_macro_on_an_unbound_key_shows_the_placeholder_and_disables_save():
-    # Ticket 51: the Macro Action cutover invalidated the old inline
-    # step-editing UI outright — reduced to a read-only macro_id display.
-    # With no existing Macro Binding (and no picker yet to assign a fresh
-    # macro_id), Save must be disabled rather than send an invalid payload.
+def test_selecting_macro_with_an_empty_library_shows_no_macros_yet_and_disables_save():
+    # Ticket 52's real assignment flow: with no library entries to pick
+    # from (and no "+ New Macro" submitted yet), Save must stay disabled
+    # rather than send a Macro Binding with no macro_id.
     stub = DaemonStub()
     editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
 
     action_dd = _dropdown_labeled(editor, "Action")
     action_dd.set_selected([k for k, _ in ACTION_TYPES].index("macro"))
 
-    assert find_one(editor, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "Macro: (none)") is not None
+    assert find_one(
+        editor, lambda w: isinstance(w, Gtk.Label) and "No Macros in the library yet" in w.get_label()
+    )
     assert not button_labeled(editor, "Save").get_sensitive()
 
 
-def test_opening_an_existing_macro_binding_shows_its_macro_id_read_only_and_save_resends_it():
+def test_selecting_macro_with_existing_entries_defaults_to_the_first_and_save_resends_it():
     stub = DaemonStub()
+    macro_id = stub.create_macro("Screenshot Combo", [{"type": "key_down", "key": "KEY_A"}])
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    action_dd = _dropdown_labeled(editor, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("macro"))
+
+    macro_dd = _dropdown_labeled(editor, "Macro")
+    assert macro_dd.get_model().get_string(macro_dd.get_selected()) == "Screenshot Combo"
+
+    button_labeled(editor, "Save").emit("clicked")
+
+    assert stub.calls[-1] == (
+        "set_binding",
+        "grid_r1c1",
+        "base",
+        {"trigger": "fire_once", "type": "macro", "macro_id": macro_id},
+    )
+
+
+def test_opening_an_existing_macro_binding_preselects_it_in_the_dropdown():
+    stub = DaemonStub()
+    stub.create_macro("Other Macro", [])
     macro_id = stub.create_macro("Test macro", [{"type": "key_down", "key": "KEY_A"}])
     stub.set_binding("grid_r1c1", "base", {"trigger": "fire_once", "type": "macro", "macro_id": macro_id})
 
     editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
 
-    assert find_one(editor, lambda w: isinstance(w, Gtk.Label) and w.get_label() == f"Macro: {macro_id}") is not None
+    macro_dd = _dropdown_labeled(editor, "Macro")
+    assert macro_dd.get_model().get_string(macro_dd.get_selected()) == "Test macro"
     save_btn = button_labeled(editor, "Save")
     assert save_btn.get_sensitive()
 
@@ -567,4 +592,45 @@ def test_opening_an_existing_macro_binding_shows_its_macro_id_read_only_and_save
         "grid_r1c1",
         "base",
         {"trigger": "fire_once", "type": "macro", "macro_id": macro_id},
+    )
+
+
+def test_creating_a_macro_inline_via_new_macro_assigns_it_and_enables_save():
+    stub = DaemonStub()
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    action_dd = _dropdown_labeled(editor, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("macro"))
+
+    new_btn = find_one(editor, lambda w: isinstance(w, Gtk.MenuButton) and w.get_label() == "+ New Macro")
+    popover = new_btn.get_popover()
+    find_one(popover, lambda w: isinstance(w, Gtk.Entry)).set_text("Fresh Macro")
+    find_one(popover, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Create").emit("clicked")
+
+    assert ("create_macro", "Fresh Macro", []) in stub.calls
+    (macro_id,) = [mid for mid, m in stub.get_config()["macros"].items() if m["name"] == "Fresh Macro"]
+
+    macro_dd = _dropdown_labeled(editor, "Macro")
+    assert macro_dd.get_model().get_string(macro_dd.get_selected()) == "Fresh Macro"
+
+    save_btn = button_labeled(editor, "Save")
+    assert save_btn.get_sensitive()
+    save_btn.emit("clicked")
+
+    assert stub.calls[-1] == (
+        "set_binding",
+        "grid_r1c1",
+        "base",
+        {"trigger": "fire_once", "type": "macro", "macro_id": macro_id},
+    )
+
+
+def test_action_summary_resolves_the_macros_display_name_not_the_raw_macro_id():
+    assert (
+        action_summary(
+            {"trigger": "fire_once", "type": "macro", "macro_id": "screenshot-combo"},
+            "grid_r1c1",
+            {"screenshot-combo": {"name": "Screenshot Combo", "steps": []}},
+        )
+        == "Macro: Screenshot Combo  [1x]"
     )

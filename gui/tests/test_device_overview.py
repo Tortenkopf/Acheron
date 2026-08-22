@@ -83,12 +83,11 @@ def test_library_destination_fully_replaces_the_content_area():
     # No grid buttons, no layer bar, no Chords slot while Library is shown.
     assert find_all(rebuilt, lambda w: isinstance(w, Gtk.Button) and "bound" in w.get_css_classes()) == []
     assert find_all(rebuilt, lambda w: isinstance(w, Gtk.Button) and "empty" in w.get_css_classes()) == []
-    # A Gtk.Button's own label is itself an internal Gtk.Label, so scope to
-    # the "heading" css class to land on the placeholder's heading alone,
-    # not the "Library" switch button's label too.
-    assert find_one(
-        rebuilt, lambda w: isinstance(w, Gtk.Label) and "heading" in w.get_css_classes() and w.get_label() == "Library"
-    )
+    # The real Steppers/Macros tab-switched panel pair (ticket 52) replaces
+    # the old placeholder — the Macros tab is selected by default.
+    assert find_one(rebuilt, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Steppers")
+    macros_tab = find_one(rebuilt, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Macros")
+    assert "suggested-action" in macros_tab.get_css_classes()
 
 
 def test_grid_destination_selection_survives_a_rebuild():
@@ -121,16 +120,30 @@ def test_grid_destination_has_a_reserved_chords_slot_naming_ticket_40():
     assert placeholder.get_label()
 
 
-def test_library_placeholder_names_ticket_41():
+def test_steppers_tab_names_ticket_55_as_a_stub():
     stub = DaemonStub()
-    ui_state = {"dest": "library"}
+    ui_state = {"dest": "library", "library_tab": "steppers"}
 
     root = _build(stub, ui_state)
 
     placeholder = find_one(
-        root, lambda w: isinstance(w, Gtk.Label) and "ticket 41" in w.get_label().lower()
+        root, lambda w: isinstance(w, Gtk.Label) and "ticket 55" in w.get_label().lower()
     )
     assert placeholder.get_label()
+
+
+def test_switching_to_the_steppers_tab_hides_the_macros_panel():
+    stub = DaemonStub()
+    stub.create_macro("Test macro", [])
+    ui_state = {"dest": "library"}
+
+    root = _build(stub, ui_state)
+    steppers_tab = find_one(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Steppers")
+    steppers_tab.emit("clicked")
+    assert ui_state["library_tab"] == "steppers"
+
+    rebuilt = _build(stub, ui_state)
+    assert find_all(rebuilt, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "Test macro") == []
 
 
 def test_profile_sidebar_does_not_widen_between_destinations():

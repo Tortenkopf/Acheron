@@ -253,6 +253,26 @@ def test_delete_macro_on_an_unknown_macro_id_raises_not_found():
         stub.delete_macro("nonexistent")
 
 
+def test_set_macro_steps_overwrites_steps_and_leaves_the_name_alone():
+    stub = DaemonStub()
+    macro_id = stub.create_macro("Test macro", [{"type": "key_down", "key": "KEY_A"}])
+
+    stub.set_macro_steps(macro_id, [{"type": "delay_ms", "ms": 25}])
+
+    assert stub.get_config()["macros"][macro_id] == {
+        "name": "Test macro",
+        "steps": [{"type": "delay_ms", "ms": 25}],
+    }
+    assert ("set_macro_steps", macro_id, [{"type": "delay_ms", "ms": 25}]) in stub.calls
+
+
+def test_set_macro_steps_on_an_unknown_macro_id_raises_not_found():
+    stub = DaemonStub()
+
+    with pytest.raises(NotFoundError):
+        stub.set_macro_steps("nonexistent", [])
+
+
 def test_set_binding_with_an_unknown_macro_id_raises_invalid_binding():
     stub = DaemonStub()
 

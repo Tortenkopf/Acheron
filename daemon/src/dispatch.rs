@@ -859,6 +859,26 @@ async fn handle_command(
             }
             let _ = reply.send(result);
         }
+        Command::SetMacroSteps {
+            macro_id,
+            steps,
+            reply,
+        } => {
+            let Some(def) = config.macros.get_mut(&macro_id) else {
+                let _ = reply.send(Err(CommandError::NotFound));
+                return;
+            };
+            let previous = std::mem::replace(&mut def.steps, steps);
+            let result = persist(config, config_path).await;
+            if result.is_err() {
+                config
+                    .macros
+                    .get_mut(&macro_id)
+                    .expect("just written above")
+                    .steps = previous;
+            }
+            let _ = reply.send(result);
+        }
     }
 }
 
@@ -1668,6 +1688,23 @@ mod tests {
             let (reply, rx) = oneshot::channel();
             self.cmd_tx
                 .send(Command::DeleteMacro { macro_id, reply })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
+        async fn set_macro_steps(
+            &self,
+            macro_id: MacroId,
+            steps: Vec<MacroStepDto>,
+        ) -> Result<(), CommandError> {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::SetMacroSteps {
+                    macro_id,
+                    steps,
+                    reply,
+                })
                 .await
                 .unwrap();
             rx.await.unwrap()
@@ -2807,6 +2844,59 @@ mod tests {
             .delete_macro(MacroId::from("nonexistent"))
             .await
             .expect_err("deleting an unknown Macro must fail");
+        assert!(matches!(err, CommandError::NotFound));
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn set_macro_steps_command_overwrites_steps_and_persists_but_leaves_name_alone() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        let macro_id = harness
+            .create_macro(
+                "Screenshot Combo",
+                vec![MacroStepDto::KeyDown(evdev::KeyCode::KEY_A)],
+            )
+            .await
+            .unwrap();
+
+        harness
+            .set_macro_steps(
+                macro_id.clone(),
+                vec![
+                    MacroStepDto::KeyDown(evdev::KeyCode::KEY_B),
+                    MacroStepDto::Delay(25),
+                    MacroStepDto::KeyUp(evdev::KeyCode::KEY_B),
+                ],
+            )
+            .await
+            .expect("SetMacroSteps must succeed");
+
+        let on_disk = std::fs::read_to_string(&harness.config_path).unwrap();
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+
+        let def = &config.macros[&macro_id];
+        assert_eq!(def.name, "Screenshot Combo");
+        assert_eq!(
+            def.steps,
+            vec![
+                MacroStepDto::KeyDown(evdev::KeyCode::KEY_B),
+                MacroStepDto::Delay(25),
+                MacroStepDto::KeyUp(evdev::KeyCode::KEY_B),
+            ]
+        );
+        assert!(on_disk.contains("screenshot-combo"));
+    }
+
+    #[tokio::test]
+    async fn set_macro_steps_command_on_an_unknown_macro_id_returns_not_found() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .set_macro_steps(MacroId::from("nonexistent"), vec![])
+            .await
+            .expect_err("setting steps on an unknown Macro must fail");
         assert!(matches!(err, CommandError::NotFound));
 
         harness.shut_down().await;
