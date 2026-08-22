@@ -1,6 +1,7 @@
-"""The shared Binding editor — one component used identically from Device
-Overview's popovers and the Action Table sidebar's expandable rows (ticket
-09's resolved IA). Trigger-mode/Macro-step UI is preserved in full from the
+"""The shared Binding editor — one component used from Device Overview's
+per-key editor windows (ticket 09's resolved IA; the Action Table sidebar
+that once also hosted it was cut outright in ticket 48). Trigger-mode/
+Macro-step UI is preserved in full from the
 prototype (the wire encoding already round-trips every `TriggerMode`/
 `Action::Macro` shape, per ticket 15) even though only Keypress/Fire-once
 actually fires in the Daemon yet (ticket 17) — matching ticket 16's

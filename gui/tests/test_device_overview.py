@@ -19,9 +19,7 @@ def _build_status(stub, status: str, ui_state=None):
     config = stub.get_config()
     state = stub.get_state()
     profile, layer = state["profile"], state["layer"]
-    return build_status_wrapped_view(
-        stub, config, profile, layer, status, lambda: None, ui_state or {"table_open": False}
-    )
+    return build_status_wrapped_view(stub, config, profile, layer, status, lambda: None, ui_state or {})
 
 
 def _device_overview_root(outer: Gtk.Widget) -> Gtk.Widget:
@@ -35,16 +33,14 @@ def _device_overview_root(outer: Gtk.Widget) -> Gtk.Widget:
     return last
 
 
-def _action_table_toggle(root):
-    return find_one(
-        root, lambda w: isinstance(w, Gtk.ToggleButton) and w.get_label() in ("Action Table ▸", "Action Table ◂")
-    )
+def _dest_switch_button(root, label):
+    return find_one(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == label)
 
 
 def test_device_overview_renders_one_button_per_input():
     stub = DaemonStub()
 
-    root = _build(stub, {"table_open": False})
+    root = _build(stub, {})
 
     # Filtered to "bound"/"empty"-classed buttons — only make_input_button's
     # grid buttons ever carry either class.
@@ -55,30 +51,103 @@ def test_device_overview_renders_one_button_per_input():
     assert len(input_buttons) == len(ALL_INPUTS)
 
 
-def test_action_table_sidebar_closed_by_default():
+def test_grid_destination_is_selected_by_default():
     stub = DaemonStub()
 
-    root = _build(stub, {"table_open": False})
+    root = _build(stub, {})
 
-    revealer = find_all(root, lambda w: isinstance(w, Gtk.Revealer))[0]
-    assert revealer.get_reveal_child() is False
+    assert "suggested-action" in _dest_switch_button(root, "Grid").get_css_classes()
+    assert "suggested-action" not in _dest_switch_button(root, "Library").get_css_classes()
+    # Action Table is cut outright (ticket 48), not relocated.
+    assert find_all(root, lambda w: isinstance(w, Gtk.Revealer)) == []
 
 
-def test_action_table_open_state_survives_a_rebuild():
+def test_library_destination_fully_replaces_the_content_area():
     stub = DaemonStub()
-    ui_state = {"table_open": False}
+
+    root = _build(stub, {})
+    library_btn = _dest_switch_button(root, "Library")
+    library_btn.emit("clicked")
+
+    # A real rebuild, mirroring how app.py's on_change triggers one — the
+    # switch button itself only records the pick into ui_state and calls
+    # on_change(), same pattern as build_layer_bar's own Base/Held tabs.
+    ui_state = {}
     root = _build(stub, ui_state)
-    toggle = _action_table_toggle(root)
+    library_btn = _dest_switch_button(root, "Library")
+    library_btn.emit("clicked")
+    assert ui_state["dest"] == "library"
 
-    toggle.set_active(True)
-    assert ui_state["table_open"] is True
+    rebuilt = _build(stub, ui_state)
+    assert "suggested-action" in _dest_switch_button(rebuilt, "Library").get_css_classes()
+    # No grid buttons, no layer bar, no Chords slot while Library is shown.
+    assert find_all(rebuilt, lambda w: isinstance(w, Gtk.Button) and "bound" in w.get_css_classes()) == []
+    assert find_all(rebuilt, lambda w: isinstance(w, Gtk.Button) and "empty" in w.get_css_classes()) == []
+    # A Gtk.Button's own label is itself an internal Gtk.Label, so scope to
+    # the "heading" css class to land on the placeholder's heading alone,
+    # not the "Library" switch button's label too.
+    assert find_one(
+        rebuilt, lambda w: isinstance(w, Gtk.Label) and "heading" in w.get_css_classes() and w.get_label() == "Library"
+    )
 
-    # Simulate a rebuild (a fresh widget tree from a fresh Gtk.Revealer,
-    # which defaults closed) — the *state dict* carrying table_open across
-    # it is what should keep the sidebar open, per ticket 09.
-    rebuilt_root = _build(stub, ui_state)
-    rebuilt_revealer = find_all(rebuilt_root, lambda w: isinstance(w, Gtk.Revealer))[0]
-    assert rebuilt_revealer.get_reveal_child() is True
+
+def test_grid_destination_selection_survives_a_rebuild():
+    stub = DaemonStub()
+    ui_state = {"dest": "library"}
+
+    rebuilt = _build(stub, ui_state)
+    grid_btn = _dest_switch_button(rebuilt, "Grid")
+    grid_btn.emit("clicked")
+    assert ui_state["dest"] == "grid"
+
+    rebuilt_again = _build(stub, ui_state)
+    assert "suggested-action" in _dest_switch_button(rebuilt_again, "Grid").get_css_classes()
+    input_buttons = find_all(
+        rebuilt_again,
+        lambda w: isinstance(w, Gtk.Button) and ("bound" in w.get_css_classes() or "empty" in w.get_css_classes()),
+    )
+    assert len(input_buttons) == len(ALL_INPUTS)
+
+
+def test_grid_destination_has_a_reserved_chords_slot_naming_ticket_40():
+    stub = DaemonStub()
+
+    root = _build(stub, {})
+
+    find_one(root, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "Chords")
+    placeholder = find_one(
+        root, lambda w: isinstance(w, Gtk.Label) and "ticket 40" in w.get_label().lower()
+    )
+    assert placeholder.get_label()
+
+
+def test_library_placeholder_names_ticket_41():
+    stub = DaemonStub()
+    ui_state = {"dest": "library"}
+
+    root = _build(stub, ui_state)
+
+    placeholder = find_one(
+        root, lambda w: isinstance(w, Gtk.Label) and "ticket 41" in w.get_label().lower()
+    )
+    assert placeholder.get_label()
+
+
+def test_profile_sidebar_does_not_widen_between_destinations():
+    # Ticket 47's round-2 GTK4 bug, caught and fixed live: a plain
+    # Gtk.Box's expand-propagation let the sidebar compete for whatever
+    # horizontal slack the *other* destination's content left unclaimed.
+    # `build_profile_sidebar`'s explicit `set_hexpand(False)` should pin it
+    # to the same width regardless of which destination is showing.
+    stub = DaemonStub()
+
+    grid_root = _build(stub, {"dest": "grid"})
+    library_root = _build(stub, {"dest": "library"})
+
+    grid_sidebar = _profile_sidebar(grid_root)
+    library_sidebar = _profile_sidebar(library_root)
+    assert grid_sidebar.get_hexpand() is False
+    assert library_sidebar.get_hexpand() is False
 
 
 def _profile_sidebar(root: Gtk.Widget) -> Gtk.Widget:
@@ -105,7 +174,7 @@ def test_clicking_a_sidebar_profile_button_switches_to_it():
     stub = DaemonStub()
     stub.create_profile("Gaming")
 
-    root = _build(stub, {"table_open": False})
+    root = _build(stub, {})
     switch_btn = find_one(_profile_sidebar(root), lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Gaming")
 
     switch_btn.emit("clicked")
@@ -117,7 +186,7 @@ def test_clicking_a_sidebar_profile_button_switches_to_it():
 def test_clicking_the_already_active_profiles_sidebar_button_is_a_no_op():
     stub = DaemonStub()
 
-    root = _build(stub, {"table_open": False})
+    root = _build(stub, {})
     switch_btn = find_one(_profile_sidebar(root), lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Default")
 
     switch_btn.emit("clicked")
@@ -132,7 +201,7 @@ def test_delete_is_disabled_for_the_active_profile_and_enabled_for_others():
     stub = DaemonStub()
     stub.create_profile("Gaming")
 
-    root = _build(stub, {"table_open": False})
+    root = _build(stub, {})
     delete_btns = find_all(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "×")
 
     sensitivities = {b.get_sensitive() for b in delete_btns}
@@ -143,7 +212,7 @@ def test_clicking_delete_on_a_non_active_profile_removes_it():
     stub = DaemonStub()
     stub.create_profile("Gaming")
 
-    root = _build(stub, {"table_open": False})
+    root = _build(stub, {})
     delete_btn = find_one(
         root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "×" and w.get_sensitive()
     )
@@ -156,7 +225,7 @@ def test_clicking_delete_on_a_non_active_profile_removes_it():
 def test_creating_a_profile_via_the_new_profile_popover_calls_create_profile():
     stub = DaemonStub()
 
-    root = _build(stub, {"table_open": False})
+    root = _build(stub, {})
     new_btn = find_one(root, lambda w: isinstance(w, Gtk.MenuButton) and w.get_label() == "+ New Profile")
 
     _fill_and_submit_name_prompt(new_btn, "Gaming", "Create")
@@ -168,7 +237,7 @@ def test_creating_a_profile_via_the_new_profile_popover_calls_create_profile():
 def test_renaming_the_active_profile_via_its_popover_calls_rename_profile():
     stub = DaemonStub()
 
-    root = _build(stub, {"table_open": False})
+    root = _build(stub, {})
     rename_btn = find_one(root, lambda w: isinstance(w, Gtk.MenuButton) and w.get_label() == "✎")
 
     _fill_and_submit_name_prompt(rename_btn, "Renamed", "Rename")
@@ -181,7 +250,7 @@ def test_tray_quick_switch_calls_switch_profile():
     stub = DaemonStub()
     stub.create_profile("Gaming")
 
-    root = _build(stub, {"table_open": False})
+    root = _build(stub, {})
     quick_switch = find_one(root, lambda w: isinstance(w, Gtk.MenuButton) and w.get_label() == "Quick switch ▾")
     popover = _popover_of(quick_switch)
     gaming_btn = find_one(popover, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Gaming")
@@ -195,7 +264,7 @@ def test_a_failed_tray_quick_switch_shows_an_error_and_keeps_the_popover_open():
     stub = _SwitchProfileFailsDaemonStub()
     stub.create_profile("Gaming")
 
-    root = _build(stub, {"table_open": False})
+    root = _build(stub, {})
     quick_switch = find_one(root, lambda w: isinstance(w, Gtk.MenuButton) and w.get_label() == "Quick switch ▾")
     popover = _popover_of(quick_switch)
     gaming_btn = find_one(popover, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Gaming")
@@ -218,7 +287,7 @@ def test_switching_profile_via_the_sidebar_clears_active_toggles():
     stub.simulate_toggle_started("grid_r1c1")
     assert stub.get_state()["active_toggles"] == ["grid_r1c1"]
 
-    root = _build(stub, {"table_open": False})
+    root = _build(stub, {})
     switch_btn = find_one(_profile_sidebar(root), lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Gaming")
     switch_btn.emit("clicked")
 
@@ -234,7 +303,7 @@ def test_a_failed_switch_shows_an_error_in_the_sidebar_instead_of_swallowing_it(
     stub = _SwitchProfileFailsDaemonStub()
     stub.create_profile("Gaming")
 
-    root = _build(stub, {"table_open": False})
+    root = _build(stub, {})
     sidebar = _profile_sidebar(root)
     switch_btn = find_one(sidebar, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Gaming")
 
@@ -256,7 +325,7 @@ def test_a_failed_delete_shows_an_error_in_the_sidebar_instead_of_swallowing_it(
     stub = _DeleteProfileFailsDaemonStub()
     stub.create_profile("Gaming")
 
-    root = _build(stub, {"table_open": False})
+    root = _build(stub, {})
     sidebar = _profile_sidebar(root)
     delete_btn = find_one(
         sidebar, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "×" and w.get_sensitive()
@@ -278,7 +347,7 @@ class _CreateProfileFailsDaemonStub(DaemonStub):
 def test_a_failed_create_profile_shows_an_error_instead_of_closing_the_popover():
     stub = _CreateProfileFailsDaemonStub()
 
-    root = _build(stub, {"table_open": False})
+    root = _build(stub, {})
     new_btn = find_one(root, lambda w: isinstance(w, Gtk.MenuButton) and w.get_label() == "+ New Profile")
 
     _fill_and_submit_name_prompt(new_btn, "Gaming", "Create")
@@ -291,7 +360,7 @@ def test_a_failed_create_profile_shows_an_error_instead_of_closing_the_popover()
 def test_clicking_the_held_tab_switches_which_layer_is_shown_and_edited():
     stub = DaemonStub()
     stub.set_binding("grid_r1c1", "held", {"trigger": "fire_once", "type": "keypress", "key": "KEY_F1", "modifiers": []})
-    ui_state = {"table_open": False, "expanded_rows": set()}
+    ui_state = {}
 
     root = _build(stub, ui_state)
     held_btn = find_one(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Held")
@@ -309,7 +378,7 @@ def test_clicking_the_held_tab_switches_which_layer_is_shown_and_edited():
 def test_mode_key_button_is_disabled_under_the_default_layer_switch_role():
     stub = DaemonStub()
 
-    root = _build(stub, {"table_open": False})
+    root = _build(stub, {})
 
     mode_btn = find_one(root, lambda w: isinstance(w, Gtk.Button) and "mode-key" in w.get_css_classes())
     assert not mode_btn.get_sensitive()
@@ -317,7 +386,7 @@ def test_mode_key_button_is_disabled_under_the_default_layer_switch_role():
 
 def test_toggling_mode_key_role_to_bound_enables_its_binding_editor():
     stub = DaemonStub()
-    ui_state = {"table_open": False}
+    ui_state = {}
 
     root = _build(stub, ui_state)
     role_btn = find_one(root, lambda w: isinstance(w, Gtk.ToggleButton) and w.get_label() == "Mode key: Layer-shift")
@@ -338,7 +407,7 @@ class _RoleFailsDaemonStub(DaemonStub):
 def test_a_failed_mode_key_role_change_reverts_the_toggle_button():
     stub = _RoleFailsDaemonStub()
 
-    root = _build(stub, {"table_open": False})
+    root = _build(stub, {})
     role_btn = find_one(root, lambda w: isinstance(w, Gtk.ToggleButton) and w.get_label() == "Mode key: Layer-shift")
 
     role_btn.set_active(True)

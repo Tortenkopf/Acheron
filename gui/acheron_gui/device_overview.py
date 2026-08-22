@@ -6,6 +6,16 @@ diamond rotated 90° clockwise, a circular Mode key above it, and key 20 as
 a separate paddle below it. Clicking any control opens the shared Binding
 editor (`binding_editor.build_binding_editor`) in a popover.
 
+Ticket 48 replaced the old permanent grid+Action-Table-sidebar layout with
+a Grid/Library destination switcher (`build_destination_switch`): the
+Profile sidebar stays exactly as it was (ticket 47's round-2 fix pins it
+at a stable width via `set_hexpand(False)`), the Action Table is cut
+outright (superseded by ticket 42's inline key/mouse-button picker), and
+selecting "Library" fully replaces the content area with a placeholder for
+ticket 41's real Library screen. The Grid destination keeps the real
+`build_layer_bar` above the grid, plus an always-visible reserved slot
+beside it (`build_chords_placeholder`) for ticket 40's real Chords list.
+
 The Profile sidebar (ticket 19) is real: switching a Profile calls
 `SwitchProfile`, "+ New Profile" calls `CreateProfile`, and each row's "✎"/
 "×" call `RenameProfile`/`DeleteProfile` — "×" is disabled on the active
@@ -15,9 +25,9 @@ mock's "Quick switch" popover lists the same real Profiles and calls
 `SwitchProfile` too.
 
 The Base/Held tab row (ticket 18) is real: clicking a tab sets
-`ui_state["selected_layer"]`, the Layer whose Bindings Device Overview and
-the Action Table sidebar currently show/edit — independent of which Layer
-is *live* on the physical device. `app.py` also calls
+`ui_state["selected_layer"]`, the Layer whose Bindings Device Overview
+currently shows/edits — independent of which Layer is *live* on the
+physical device. `app.py` also calls
 `client.subscribe_layer_changed` and updates the same `ui_state` key on
 every push, so the tab auto-follows a real Mode-key hold/release too — "wired
 to real `ActiveLayerChanged` state and to editing each Layer's Bindings
@@ -33,7 +43,6 @@ from typing import Callable
 
 from gi.repository import Gtk, Pango
 
-from .action_table import build_action_table
 from .binding_editor import action_summary, build_binding_editor
 from .daemon_client import DaemonError
 from .inputs import GRID_COLS, GRID_ROWS, grid_input, input_label
@@ -258,6 +267,17 @@ def build_profile_sidebar(client, config: dict, profile: str, on_change: Callabl
 
     new_btn.set_popover(build_name_prompt_popover("Creating a Profile", "", "Create", on_create_submitted))
     sidebar.append(new_btn)
+
+    # Ticket 47's round-2 fix, caught live: a plain Gtk.Box with no explicit
+    # hexpand still computes one via GTK4's expand-propagation — it infers
+    # from a row's `switch_btn` (`hexpand=True`, three container levels
+    # down) that the sidebar itself wants to expand, so it competes for
+    # whatever horizontal slack the *other* destination's content leaves
+    # unclaimed in `build_main_view` (Library claims less than the grid,
+    # so the sidebar visibly widened only there). Pin it explicitly so it
+    # stays exactly its own `set_size_request(150, -1)` width regardless of
+    # which destination is showing — measured at a stable 197px in both.
+    sidebar.set_hexpand(False)
     return sidebar
 
 
@@ -425,6 +445,67 @@ def make_input_button(
     return btn
 
 
+def build_destination_switch(selected_dest: str, on_select: Callable[[str], None]) -> Gtk.Box:
+    """Ticket 47's round-2 (variant D) winner: a plain-text, icon-free
+    "Grid"/"Library" switcher sitting where the old Action-Table toggle
+    used to, fully replacing `build_main_view`'s content area on
+    selection. `on_select` is expected to write the pick into `ui_state`
+    and call `on_change()` — this widget carries no state of its own,
+    matching `build_layer_bar`'s own selected-tab pattern."""
+    row = Gtk.Box(spacing=6)
+    for dest_key, label in (("grid", "Grid"), ("library", "Library")):
+        btn = Gtk.Button(label=label)
+        if dest_key == selected_dest:
+            btn.add_css_class("suggested-action")
+
+        def on_clicked(_b, dest_key=dest_key):
+            on_select(dest_key)
+
+        btn.connect("clicked", on_clicked)
+        row.append(btn)
+    return row
+
+
+def build_chords_placeholder() -> Gtk.Widget:
+    """Reserved layout space beside the grid for the Chords list — always
+    visible while the Grid destination is selected (no toggle, per ticket
+    47's round-2: nothing should rescale on open/close). Ticket 40 wires
+    the real Chord-recording content in here; this ticket only needs the
+    slot itself to be real and testable."""
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+    box.add_css_class("sidebar")
+    box.set_size_request(220, -1)
+    heading = Gtk.Label(label="Chords", xalign=0)
+    heading.add_css_class("heading")
+    box.append(heading)
+    placeholder = Gtk.Label(
+        label="Ticket 40 wires the real Chord-recording UX into this slot.",
+        xalign=0,
+        wrap=True,
+    )
+    placeholder.add_css_class("dim")
+    box.append(placeholder)
+    return box
+
+
+def build_library_placeholder() -> Gtk.Widget:
+    """Fully replaces the content area while the Library destination is
+    selected. Ticket 41 wires the real Stepper/Macro library screen in
+    here (it needs Daemon/D-Bus support this ticket doesn't build)."""
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+    heading = Gtk.Label(label="Library", xalign=0)
+    heading.add_css_class("heading")
+    box.append(heading)
+    placeholder = Gtk.Label(
+        label="Ticket 41 wires the real Stepper/Macro library screen into this destination.",
+        xalign=0,
+        wrap=True,
+    )
+    placeholder.add_css_class("dim")
+    box.append(placeholder)
+    return box
+
+
 def build_main_view(
     client,
     config: dict,
@@ -436,6 +517,7 @@ def build_main_view(
     capture_mode: str = "digital",
 ) -> Gtk.Widget:
     selected_layer = ui_state.setdefault("selected_layer", "base")
+    dest = ui_state.setdefault("dest", "grid")
     mode_key_role = config["profiles"][profile]["mode_key_role"]
     mode_key_bindable = mode_key_role == "bound"
 
@@ -462,90 +544,95 @@ def build_main_view(
 
     root.append(build_profile_sidebar(client, config, profile, on_change))
 
-    main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-    main.set_hexpand(True)
+    right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+    right.set_hexpand(True)
 
-    top_row = Gtk.Box(spacing=12)
-    top_row.append(build_layer_bar(client, selected_layer, mode_key_role, on_change, ui_state))
-    spacer = Gtk.Box(hexpand=True)
-    top_row.append(spacer)
-    table_toggle = Gtk.ToggleButton(label="Action Table ◂" if ui_state["table_open"] else "Action Table ▸")
-    table_toggle.set_active(ui_state["table_open"])
-    top_row.append(table_toggle)
-    main.append(top_row)
+    def on_dest_select(dest_key: str) -> None:
+        ui_state["dest"] = dest_key
+        on_change()
 
-    device = Gtk.Box(spacing=28)
+    right.append(build_destination_switch(dest, on_dest_select))
+    # Round 2's own fix: a light separator between the switcher and
+    # whatever it's switching, so the destination-level chrome reads as
+    # visually distinct from the per-destination content below it.
+    right.append(Gtk.Separator())
 
-    # Grid: rows 1-3 are a full 5 columns; row 4 is only 4 wide (16-19). The
-    # wheel occupies the same column-5 slot row 4's missing key would sit
-    # in (next to 19), continuing straight down for two more rows (scroll
-    # up, click, scroll down) — same Gtk.Grid, same button size, so it
-    # lines up exactly like a real 5th column rather than a detached panel.
-    grid = Gtk.Grid(row_spacing=4, column_spacing=4)
-    for r in range(1, GRID_ROWS + 1):
-        cols = GRID_COLS if r < GRID_ROWS else GRID_COLS - 1
-        for c in range(1, cols + 1):
-            grid.attach(input_btn(grid_input(r, c)), c - 1, r - 1, 1, 1)
-    wheel_col_index = GRID_COLS - 1
-    grid.attach(input_btn("wheel_scroll_up"), wheel_col_index, GRID_ROWS - 1, 1, 1)
-    grid.attach(input_btn("wheel_middle"), wheel_col_index, GRID_ROWS, 1, 1)
-    grid.attach(input_btn("wheel_scroll_down"), wheel_col_index, GRID_ROWS + 1, 1, 1)
-    device.append(grid)
+    if dest == "library":
+        right.append(build_library_placeholder())
+    else:
+        main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        main.set_hexpand(True)
 
-    # Thumbstick, further right — the Mode key sits directly above the
-    # diamond's top lobe (Left, per the rotation below), and "20" below it,
-    # each its own block with breathing room between; the diamond itself
-    # stays tight so it still reads as one control.
-    stick_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18, halign=Gtk.Align.CENTER, valign=Gtk.Align.START)
-    # The Mode key's own Binding only matters — and is only editable — while
-    # `mode_key_role` is `Bound`; under the default `LayerSwitch` it's
-    # intercepted before any Binding lookup ever runs (ticket 18).
-    mode_btn = input_btn(
-        "mode_key",
-        52,
-        40,
-        sensitive=mode_key_bindable,
-        insensitive_reason="Layer-shift Mode key: switch it to Bound above to give it its own Binding",
-    )
-    mode_btn.add_css_class("mode-key")
-    stick_col.append(mode_btn)
+        main.append(build_layer_bar(client, selected_layer, mode_key_role, on_change, ui_state))
 
-    # Diamond rotated 90° clockwise from a plain N/S/E/W layout: the lobe
-    # nearest the user's viewing angle when the device sits beside them on
-    # the desk (per layout.md) fires Left at top, Down at left, Up at
-    # right, Right at bottom — not the naive Up-at-top mapping.
-    diamond = Gtk.Grid(row_spacing=2, column_spacing=2)
-    diamond.attach(input_btn("thumbstick_left", 52, 40), 1, 0, 1, 1)
-    diamond.attach(input_btn("thumbstick_down", 52, 40), 0, 1, 1, 1)
-    diamond.attach(input_btn("thumbstick_up", 52, 40), 2, 1, 1, 1)
-    diamond.attach(input_btn("thumbstick_right", 52, 40), 1, 2, 1, 1)
-    stick_col.append(diamond)
+        device_row = Gtk.Box(spacing=16)
+        # Round 2's own fix for round 1's grid crowding the Base/Held/Mode-key
+        # row directly above it — a top margin here, distinct from `main`'s
+        # own inter-row spacing, gives the grid itself room to breathe.
+        device_row.set_margin_top(8)
 
-    stick_col.append(input_btn(grid_input(4, 5), 52, 40))
-    device.append(stick_col)
+        device = Gtk.Box(spacing=28)
 
-    main.append(device)
-    root.append(main)
+        # Grid: rows 1-3 are a full 5 columns; row 4 is only 4 wide (16-19).
+        # The wheel occupies the same column-5 slot row 4's missing key would
+        # sit in (next to 19), continuing straight down for two more rows
+        # (scroll up, click, scroll down) — same Gtk.Grid, same button size,
+        # so it lines up exactly like a real 5th column rather than a
+        # detached panel.
+        grid = Gtk.Grid(row_spacing=4, column_spacing=4)
+        for r in range(1, GRID_ROWS + 1):
+            cols = GRID_COLS if r < GRID_ROWS else GRID_COLS - 1
+            for c in range(1, cols + 1):
+                grid.attach(input_btn(grid_input(r, c)), c - 1, r - 1, 1, 1)
+        wheel_col_index = GRID_COLS - 1
+        grid.attach(input_btn("wheel_scroll_up"), wheel_col_index, GRID_ROWS - 1, 1, 1)
+        grid.attach(input_btn("wheel_middle"), wheel_col_index, GRID_ROWS, 1, 1)
+        grid.attach(input_btn("wheel_scroll_down"), wheel_col_index, GRID_ROWS + 1, 1, 1)
+        device.append(grid)
 
-    table_revealer = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_LEFT)
-    table_revealer.set_reveal_child(ui_state["table_open"])
-    table_sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-    table_sidebar.add_css_class("sidebar")
-    table_sidebar.set_size_request(280, -1)
-    table_heading = Gtk.Label(label="Action Table", xalign=0)
-    table_heading.add_css_class("heading")
-    table_sidebar.append(table_heading)
-    table_sidebar.append(build_action_table(client, config, profile, selected_layer, on_change, ui_state))
-    table_revealer.set_child(table_sidebar)
-    root.append(table_revealer)
+        # Thumbstick, further right — the Mode key sits directly above the
+        # diamond's top lobe (Left, per the rotation below), and "20" below
+        # it, each its own block with breathing room between; the diamond
+        # itself stays tight so it still reads as one control.
+        stick_col = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=18, halign=Gtk.Align.CENTER, valign=Gtk.Align.START
+        )
+        # The Mode key's own Binding only matters — and is only editable —
+        # while `mode_key_role` is `Bound`; under the default `LayerSwitch`
+        # it's intercepted before any Binding lookup ever runs (ticket 18).
+        mode_btn = input_btn(
+            "mode_key",
+            52,
+            40,
+            sensitive=mode_key_bindable,
+            insensitive_reason="Layer-shift Mode key: switch it to Bound above to give it its own Binding",
+        )
+        mode_btn.add_css_class("mode-key")
+        stick_col.append(mode_btn)
 
-    def on_toggle(btn):
-        ui_state["table_open"] = btn.get_active()
-        table_revealer.set_reveal_child(btn.get_active())
-        btn.set_label("Action Table ◂" if btn.get_active() else "Action Table ▸")
+        # Diamond rotated 90° clockwise from a plain N/S/E/W layout: the
+        # lobe nearest the user's viewing angle when the device sits beside
+        # them on the desk (per layout.md) fires Left at top, Down at left,
+        # Up at right, Right at bottom — not the naive Up-at-top mapping.
+        diamond = Gtk.Grid(row_spacing=2, column_spacing=2)
+        diamond.attach(input_btn("thumbstick_left", 52, 40), 1, 0, 1, 1)
+        diamond.attach(input_btn("thumbstick_down", 52, 40), 0, 1, 1, 1)
+        diamond.attach(input_btn("thumbstick_up", 52, 40), 2, 1, 1, 1)
+        diamond.attach(input_btn("thumbstick_right", 52, 40), 1, 2, 1, 1)
+        stick_col.append(diamond)
 
-    table_toggle.connect("toggled", on_toggle)
+        stick_col.append(input_btn(grid_input(4, 5), 52, 40))
+        device.append(stick_col)
 
+        device_row.append(device)
+        # Always visible while Grid is selected, no toggle (ticket 47's
+        # round 2: nothing should rescale on open/close) — reserved layout
+        # space for ticket 40's real Chord-recording UX.
+        device_row.append(build_chords_placeholder())
+        main.append(device_row)
+        right.append(main)
+
+    root.append(right)
     root.append(build_tray_mock(client, profile, layer, list(config["profiles"]), on_change, status))
     return root
 
@@ -574,7 +661,8 @@ def build_status_wrapped_view(
     capture_mode: str = "digital",
 ) -> Gtk.Widget:
     """Wraps `build_main_view`'s whole Device Overview (profile sidebar,
-    grid, Action Table, tray mock — all one widget tree, per ticket 09) with
+    Grid/Library destination, tray mock — all one widget tree, per tickets
+    09/48) with
     ticket 12/20's status chip above it and, whenever `status` isn't
     `"running_connected"`, a dimmed `Gtk.Overlay` disabling the whole thing —
     matching prototype/12-daemon-device-status-indicators/prototype.py's

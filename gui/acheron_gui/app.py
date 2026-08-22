@@ -295,15 +295,14 @@ class AcheronApplication(Gtk.Application):
 
         content_box = Gtk.Box()
         # GUI-only view state (not Daemon state) that must survive a
-        # rebuild — otherwise reopening the Action Table sidebar, or
-        # re-expanding one of its rows, and then editing a Binding would
-        # snap them shut again, since rebuild() reconstructs the whole
-        # widget tree (including a fresh Gtk.Revealer/Gtk.Expander, which
-        # default closed) from scratch (ticket 09). `selected_layer` is the
-        # same kind of view state (ticket 18) — which Layer Device
-        # Overview/Action Table show/edit — except it's also kept in sync
-        # with the Daemon's live Layer via the signal subscription below.
-        ui_state = {"table_open": False, "expanded_rows": set(), "selected_layer": "base"}
+        # rebuild — otherwise switching to the Library destination, or
+        # switching back to Grid, would snap back to Grid every time, since
+        # rebuild() reconstructs the whole widget tree from scratch (ticket
+        # 09; the Grid/Library switcher itself is ticket 48). `selected_layer`
+        # is the same kind of view state (ticket 18) — which Layer Device
+        # Overview shows/edits — except it's also kept in sync with the
+        # Daemon's live Layer via the signal subscription below.
+        ui_state = {"dest": "grid", "selected_layer": "base"}
         # Last successfully fetched Config/profile/layer (ticket 20) — kept
         # so the dimmed grid still has *something* to render while the
         # Daemon isn't reachable, rather than Device Overview vanishing
