@@ -57,8 +57,10 @@ def action_summary(binding: dict | None, inp: str) -> str:
         raw_button = binding["button"]
         button = CONTROLLER_LABEL_BY_CODE.get(raw_button, raw_button)
         return f"Btn: {button}  [{TRIGGER_SHORT[binding['trigger']]}]"
-    steps = binding.get("steps", [])
-    return f"Macro ({len(steps)} steps)  [{TRIGGER_SHORT[binding['trigger']]}]"
+    # Shows the raw macro_id, not the Macro's display name — resolving that
+    # needs `config["macros"]` threaded in here, which is ticket 52's job
+    # (the real library picker), not this narrow gate-the-editor ticket.
+    return f"Macro: {binding.get('macro_id', '?')}  [{TRIGGER_SHORT[binding['trigger']]}]"
 
 
 def describe_step(step: dict) -> str:
@@ -457,11 +459,17 @@ def build_binding_editor(
     editor_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
     box.append(editor_slot)
 
+    # Created here (ahead of render_action_editor's definition/first call)
+    # so the Macro branch below can gate it directly, mirroring how
+    # trigger_dd's sensitivity is already gated for profile_switch.
+    save_btn = Gtk.Button(label="Save")
+    save_btn.add_css_class("suggested-action")
+
     draft = {
         "keypress": {"key": starting.get("key", "KEY_A"), "modifiers": list(starting.get("modifiers", []))}
         if starting["type"] == "keypress"
         else {"key": "KEY_A", "modifiers": []},
-        "steps": list(starting.get("steps", [])) if starting["type"] == "macro" else [],
+        "macro": {"macro_id": starting.get("macro_id")} if starting["type"] == "macro" else {"macro_id": None},
         "profile_switch": {"target": starting.get("target", profile)}
         if starting["type"] == "profile_switch"
         else {"target": profile},
@@ -484,6 +492,10 @@ def build_binding_editor(
             _trigger_handler["id"] = None
 
         kind = ACTION_TYPES[action_dd.get_selected()][0]
+        # Reset here, unconditionally — only the Macro branch below ever
+        # disables it (no picker yet to assign a fresh macro_id), and every
+        # other kind must not stay disabled from a previous render.
+        save_btn.set_sensitive(True)
         # Profile Switch has no coherent held/toggled meaning (ticket 05) —
         # locked to Fire-once here and again, defensively, in on_save.
         trigger_dd.set_sensitive(kind != "profile_switch")
@@ -543,80 +555,23 @@ def build_binding_editor(
             )
             editor_slot.append(labeled_row("Button", controller_picker))
         else:
-            steps_list = Gtk.ListBox()
-            steps_list.add_css_class("boxed-list")
-
-            def render_steps():
-                clear_children(steps_list)
-                for i, step in enumerate(draft["steps"]):
-                    row_box = Gtk.Box(spacing=6)
-                    row_box.set_margin_top(2)
-                    row_box.set_margin_bottom(2)
-                    row_box.set_margin_start(4)
-                    row_box.set_margin_end(4)
-                    row_box.append(Gtk.Label(label=describe_step(step), hexpand=True, xalign=0))
-                    rm = Gtk.Button(label="×")
-
-                    def on_remove(b, i=i):
-                        draft["steps"].pop(i)
-                        render_steps()
-
-                    rm.connect("clicked", on_remove)
-                    row_box.append(rm)
-                    steps_list.append(row_box)
-
-            render_steps()
-            editor_slot.append(steps_list)
-
-            add_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-            step_kind_dd = Gtk.DropDown(model=Gtk.StringList.new(["KeyDown", "KeyUp", "Delay (ms)"]))
-            add_box.append(labeled_row("New step", step_kind_dd))
-
-            value_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-            add_box.append(value_slot)
-
-            new_step_value = {"key": "KEY_A", "ms_text": "0"}
-
-            def render_value_slot():
-                clear_children(value_slot)
-                if step_kind_dd.get_selected() == 2:
-                    ms_entry = Gtk.Entry(text=new_step_value["ms_text"], width_chars=10)
-                    ms_entry.connect("changed", lambda e: new_step_value.__setitem__("ms_text", e.get_text()))
-                    value_slot.append(labeled_row("Value", ms_entry))
-                else:
-                    def on_value_key_changed(code: str) -> None:
-                        new_step_value["key"] = code
-
-                    # Ticket 02's bare-modifier warning doesn't apply here —
-                    # a KeyDown-only step *is* that warning's own recommended
-                    # workaround (a Toggle-driven single KeyDown-only Macro
-                    # step), so it's suppressed for this mount point rather
-                    # than reused unconditionally.
-                    value_picker, _refresh = build_inline_key_picker(
-                        new_step_value["key"], on_value_key_changed, warn_predicate=lambda: False
-                    )
-                    value_slot.append(labeled_row("Value", value_picker))
-
-            step_kind_dd.connect("notify::selected", lambda *_: render_value_slot())
-            render_value_slot()
-
-            add_btn = Gtk.Button(label="+ Add step")
-
-            def on_add(b):
-                kind_i = step_kind_dd.get_selected()
-                if kind_i == 0:
-                    step = {"type": "key_down", "key": new_step_value["key"]}
-                elif kind_i == 1:
-                    step = {"type": "key_up", "key": new_step_value["key"]}
-                else:
-                    val = new_step_value["ms_text"]
-                    step = {"type": "delay_ms", "ms": int(val) if val.isdigit() else 0}
-                draft["steps"].append(step)
-                render_steps()
-
-            add_btn.connect("clicked", on_add)
-            add_box.append(add_btn)
-            editor_slot.append(add_box)
+            # Ticket 51: the Macro Action cutover (steps moved off the
+            # Binding, into the named library) invalidated this editor's old
+            # inline step-editing UI outright. Reduced to the narrowest thing
+            # that doesn't crash on a Macro Binding — a read-only display of
+            # the current macro_id, Save disabled when there isn't one to
+            # preserve (no picker yet to assign a fresh one). Ticket 52
+            # builds the real library picker.
+            macro_id = draft["macro"].get("macro_id")
+            editor_slot.append(Gtk.Label(label=f"Macro: {macro_id or '(none)'}", xalign=0))
+            note = Gtk.Label(
+                label="Macro library picker not built yet — see ticket 52.",
+                xalign=0,
+                wrap=True,
+            )
+            note.add_css_class("dim")
+            editor_slot.append(note)
+            save_btn.set_sensitive(macro_id is not None)
 
     action_dd.connect("notify::selected", lambda *_: render_action_editor())
     render_action_editor()
@@ -626,8 +581,6 @@ def build_binding_editor(
         error_label.set_visible(True)
 
     btn_row = Gtk.Box(spacing=8)
-    save_btn = Gtk.Button(label="Save")
-    save_btn.add_css_class("suggested-action")
 
     def on_save(b):
         kind = ACTION_TYPES[action_dd.get_selected()][0]
@@ -656,7 +609,7 @@ def build_binding_editor(
             binding = {
                 "trigger": TRIGGER_OPTIONS[trigger_dd.get_selected()][0],
                 "type": "macro",
-                "steps": draft["steps"],
+                "macro_id": draft["macro"]["macro_id"],
             }
         try:
             client.set_binding(inp, layer, binding)

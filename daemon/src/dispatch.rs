@@ -30,7 +30,8 @@ use zbus::object_server::SignalEmitter;
 use crate::capture::{CaptureMode, EventState, PhysicalEvent};
 use crate::command::{Command, CommandError, State};
 use crate::config::{
-    self, Action, ActuationPoint, Binding, Config, Layer, ModeKeyRole, Profile, TriggerMode,
+    self, Action, ActuationPoint, Binding, Config, Layer, MacroDef, MacroId, ModeKeyRole, Profile,
+    TriggerMode,
 };
 use crate::dbus::Daemon;
 use crate::executor::{self, ActiveToggle, FiringHandle};
@@ -207,6 +208,7 @@ async fn handle_event(
                 event.input,
                 &binding,
                 event.state,
+                &config.macros,
             )
             .await
         }
@@ -297,6 +299,7 @@ async fn fire(
     input: Input,
     binding: &Binding,
     state: EventState,
+    macros: &HashMap<MacroId, MacroDef>,
 ) -> io::Result<()> {
     match (binding.trigger, state) {
         (TriggerMode::FireOnce, EventState::Down)
@@ -314,13 +317,13 @@ async fn fire(
             {
                 return Ok(());
             }
-            let steps = executor::compile(&binding.action);
+            let steps = executor::compile(&binding.action, macros);
             let handle = executor::spawn_fire_once(injector.clone(), steps);
             in_flight.insert(input, handle);
             Ok(())
         }
         (TriggerMode::Toggle, EventState::Down) => {
-            let steps = executor::compile(&binding.action);
+            let steps = executor::compile(&binding.action, macros);
             toggles.insert(input, ActiveToggle::spawn(injector.clone(), steps));
             Ok(())
         }
@@ -458,6 +461,20 @@ fn profile_switch_references(config: &Config, name: &str) -> bool {
     })
 }
 
+/// Whether any Profile's Base/Held Binding map contains an
+/// `Action::Macro { macro_id }` naming `macro_id` — `DeleteMacro` refuses
+/// while this is true, so a dangling reference can never exist (ticket 15/
+/// 51), mirroring `profile_switch_references`'s identical shape.
+fn macro_references(config: &Config, macro_id: &MacroId) -> bool {
+    config.profiles.values().any(|profile| {
+        [&profile.base, &profile.held].into_iter().any(|bindings| {
+            bindings.values().any(|binding| {
+                matches!(&binding.action, Action::Macro { macro_id: id } if id == macro_id)
+            })
+        })
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_command(
     config: &mut Config,
@@ -503,6 +520,14 @@ async fn handle_command(
             {
                 let _ = reply.send(Err(CommandError::InvalidRequest(format!(
                     "{button:?} is not a valid gamepad button"
+                ))));
+                return;
+            }
+            if let Action::Macro { macro_id } = &binding.action
+                && !config.macros.contains_key(macro_id)
+            {
+                let _ = reply.send(Err(CommandError::InvalidRequest(format!(
+                    "{macro_id:?} does not name a Macro in the library"
                 ))));
                 return;
             }
@@ -774,6 +799,66 @@ async fn handle_command(
             }
             let _ = reply.send(result);
         }
+        Command::CreateMacro { name, steps, reply } => {
+            if name.trim().is_empty() {
+                let _ = reply.send(Err(CommandError::InvalidRequest(
+                    "Macro name can't be empty".to_string(),
+                )));
+                return;
+            }
+            let macro_id = config::unique_macro_id(config, &name);
+            config
+                .macros
+                .insert(macro_id.clone(), config::MacroDef { name, steps });
+            let result = persist(config, config_path).await;
+            if result.is_err() {
+                config.macros.remove(&macro_id);
+            }
+            let _ = reply.send(result.map(|()| macro_id));
+        }
+        Command::RenameMacro {
+            macro_id,
+            new_name,
+            reply,
+        } => {
+            if new_name.trim().is_empty() {
+                let _ = reply.send(Err(CommandError::InvalidRequest(
+                    "Macro name can't be empty".to_string(),
+                )));
+                return;
+            }
+            let Some(def) = config.macros.get_mut(&macro_id) else {
+                let _ = reply.send(Err(CommandError::NotFound));
+                return;
+            };
+            let previous = std::mem::replace(&mut def.name, new_name);
+            let result = persist(config, config_path).await;
+            if result.is_err() {
+                config
+                    .macros
+                    .get_mut(&macro_id)
+                    .expect("just written above")
+                    .name = previous;
+            }
+            let _ = reply.send(result);
+        }
+        Command::DeleteMacro { macro_id, reply } => {
+            if macro_references(config, &macro_id) {
+                let _ = reply.send(Err(CommandError::InvalidRequest(format!(
+                    "{macro_id:?} is still referenced by a Macro Binding"
+                ))));
+                return;
+            }
+            let Some(previous) = config.macros.remove(&macro_id) else {
+                let _ = reply.send(Err(CommandError::NotFound));
+                return;
+            };
+            let result = persist(config, config_path).await;
+            if result.is_err() {
+                config.macros.insert(macro_id, previous);
+            }
+            let _ = reply.send(result);
+        }
     }
 }
 
@@ -822,6 +907,13 @@ mod tests {
     }
 
     fn config_with_profile(profile: Profile) -> Config {
+        config_with_profile_and_macros(profile, HashMap::new())
+    }
+
+    fn config_with_profile_and_macros(
+        profile: Profile,
+        macros: HashMap<MacroId, MacroDef>,
+    ) -> Config {
         let mut profiles = HashMap::new();
         profiles.insert(DEFAULT_PROFILE_NAME.to_string(), profile);
         Config {
@@ -829,7 +921,46 @@ mod tests {
             active_profile: DEFAULT_PROFILE_NAME.to_string(),
             profiles,
             force_digital: false,
+            macros,
         }
+    }
+
+    fn config_with_bindings_and_macros(
+        bindings: HashMap<Input, Binding>,
+        macros: HashMap<MacroId, MacroDef>,
+    ) -> Config {
+        config_with_profile_and_macros(
+            Profile {
+                base: bindings,
+                ..Default::default()
+            },
+            macros,
+        )
+    }
+
+    /// Registers one `MacroDef` under `macro_id` and returns the map
+    /// alongside the `Action::Macro` referencing it — this test module's
+    /// shorthand for what used to be an inline `Action::Macro { steps }`
+    /// before ticket 51 moved step content off the Binding and into the
+    /// library. None of these tests exercise Macro-library behavior itself
+    /// (that's covered separately, in the `Command::CreateMacro`/
+    /// `RenameMacro`/`DeleteMacro` tests below) — they're reusing a
+    /// multi-step Macro Action as a convenient way to exercise Trigger-mode/
+    /// timing behavior.
+    fn macro_action(
+        macro_id: &str,
+        steps: Vec<MacroStepDto>,
+    ) -> (Action, HashMap<MacroId, MacroDef>) {
+        let id = MacroId::from(macro_id);
+        let mut macros = HashMap::new();
+        macros.insert(
+            id.clone(),
+            MacroDef {
+                name: macro_id.to_string(),
+                steps,
+            },
+        );
+        (Action::Macro { macro_id: id }, macros)
     }
 
     /// A `config_path` no test in this module ever writes to (persistence
@@ -1109,14 +1240,16 @@ mod tests {
         // (`KeyDown` with no matching `KeyUp`) under Hold-to-repeat, used to
         // fake a sustained "hold" — pre-fix, this left KEY_LEFTCTRL held at
         // the OS level forever, surviving even a rebind, requiring a reboot.
+        let (action, macros) = macro_action(
+            "test-macro",
+            vec![MacroStepDto::KeyDown(evdev::KeyCode::KEY_LEFTCTRL)],
+        );
         let mut bindings = HashMap::new();
         bindings.insert(
             Input::Grid(1, 1),
             Binding {
                 trigger: TriggerMode::HoldToRepeat,
-                action: Action::Macro {
-                    steps: vec![MacroStepDto::KeyDown(evdev::KeyCode::KEY_LEFTCTRL)],
-                },
+                action,
             },
         );
 
@@ -1130,7 +1263,7 @@ mod tests {
             conn_rx,
             cmd_rx,
             inj.clone(),
-            config_with_bindings(bindings),
+            config_with_bindings_and_macros(bindings, macros),
             unused_config_path(),
             None,
             actuation_channel(),
@@ -1181,18 +1314,20 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn overlapping_same_input_firings_are_dropped_not_queued() {
+        let (action, macros) = macro_action(
+            "test-macro",
+            vec![
+                MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
+                MacroStepDto::Delay(20),
+                MacroStepDto::KeyUp(evdev::KeyCode::KEY_A),
+            ],
+        );
         let mut bindings = HashMap::new();
         bindings.insert(
             Input::Grid(1, 1),
             Binding {
                 trigger: TriggerMode::HoldToRepeat,
-                action: Action::Macro {
-                    steps: vec![
-                        MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
-                        MacroStepDto::Delay(20),
-                        MacroStepDto::KeyUp(evdev::KeyCode::KEY_A),
-                    ],
-                },
+                action,
             },
         );
 
@@ -1206,7 +1341,7 @@ mod tests {
             conn_rx,
             cmd_rx,
             inj.clone(),
-            config_with_bindings(bindings),
+            config_with_bindings_and_macros(bindings, macros),
             unused_config_path(),
             None,
             actuation_channel(),
@@ -1276,21 +1411,23 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn fire_once_macro_action_runs_its_delayed_steps_in_order() {
+        let (action, macros) = macro_action(
+            "test-macro",
+            vec![
+                MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
+                MacroStepDto::Delay(20),
+                MacroStepDto::KeyUp(evdev::KeyCode::KEY_A),
+            ],
+        );
         let mut bindings = HashMap::new();
         bindings.insert(
             Input::Grid(1, 1),
             Binding {
                 trigger: TriggerMode::FireOnce,
-                action: Action::Macro {
-                    steps: vec![
-                        MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
-                        MacroStepDto::Delay(20),
-                        MacroStepDto::KeyUp(evdev::KeyCode::KEY_A),
-                    ],
-                },
+                action,
             },
         );
-        let harness = CommandHarness::spawn(config_with_bindings(bindings));
+        let harness = CommandHarness::spawn(config_with_bindings_and_macros(bindings, macros));
 
         harness.press(Input::Grid(1, 1)).await;
         tokio::time::advance(Duration::from_millis(25)).await;
@@ -1311,23 +1448,25 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn toggle_starts_on_down_and_the_same_key_stops_it_on_the_next_down() {
+        // Deliberately unbalanced within the window we stop in: KeyDown
+        // fires, then a long Delay, so KEY_A is still held when the second
+        // press stops the Toggle.
+        let (action, macros) = macro_action(
+            "test-macro",
+            vec![
+                MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
+                MacroStepDto::Delay(50),
+            ],
+        );
         let mut bindings = HashMap::new();
         bindings.insert(
             Input::Grid(1, 1),
             Binding {
                 trigger: TriggerMode::Toggle,
-                action: Action::Macro {
-                    // Deliberately unbalanced within the window we stop in:
-                    // KeyDown fires, then a long Delay, so KEY_A is still
-                    // held when the second press stops the Toggle.
-                    steps: vec![
-                        MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
-                        MacroStepDto::Delay(50),
-                    ],
-                },
+                action,
             },
         );
-        let harness = CommandHarness::spawn(config_with_bindings(bindings));
+        let harness = CommandHarness::spawn(config_with_bindings_and_macros(bindings, macros));
 
         harness.press(Input::Grid(1, 1)).await;
         tokio::time::advance(Duration::from_millis(10)).await;
@@ -1486,6 +1625,49 @@ mod tests {
                     new_name: new_name.to_string(),
                     reply,
                 })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
+        async fn create_macro(
+            &self,
+            name: &str,
+            steps: Vec<MacroStepDto>,
+        ) -> Result<MacroId, CommandError> {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::CreateMacro {
+                    name: name.to_string(),
+                    steps,
+                    reply,
+                })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
+        async fn rename_macro(
+            &self,
+            macro_id: MacroId,
+            new_name: &str,
+        ) -> Result<(), CommandError> {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::RenameMacro {
+                    macro_id,
+                    new_name: new_name.to_string(),
+                    reply,
+                })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
+        async fn delete_macro(&self, macro_id: MacroId) -> Result<(), CommandError> {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::DeleteMacro { macro_id, reply })
                 .await
                 .unwrap();
             rx.await.unwrap()
@@ -2141,17 +2323,19 @@ mod tests {
         // switching before it ever reaches the stop-toggle check — so
         // without an explicit stop here, this Toggle would run forever with
         // no physical key able to stop it.
+        let (action, macros) = macro_action(
+            "test-macro",
+            vec![
+                MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
+                MacroStepDto::Delay(50),
+            ],
+        );
         let mut base = HashMap::new();
         base.insert(
             Input::ModeKey,
             Binding {
                 trigger: TriggerMode::Toggle,
-                action: Action::Macro {
-                    steps: vec![
-                        MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
-                        MacroStepDto::Delay(50),
-                    ],
-                },
+                action,
             },
         );
         let profile = Profile {
@@ -2159,7 +2343,7 @@ mod tests {
             mode_key_role: ModeKeyRole::Bound,
             ..Default::default()
         };
-        let harness = CommandHarness::spawn(config_with_profile(profile));
+        let harness = CommandHarness::spawn(config_with_profile_and_macros(profile, macros));
 
         harness
             .event_tx
@@ -2485,6 +2669,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_macro_command_derives_a_slug_and_persists_it() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let macro_id = harness
+            .create_macro(
+                "Screenshot Combo",
+                vec![MacroStepDto::KeyDown(evdev::KeyCode::KEY_A)],
+            )
+            .await
+            .expect("CreateMacro must succeed");
+        assert_eq!(macro_id, MacroId::from("screenshot-combo"));
+
+        let on_disk = std::fs::read_to_string(&harness.config_path).unwrap();
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+
+        let def = &config.macros[&macro_id];
+        assert_eq!(def.name, "Screenshot Combo");
+        assert_eq!(
+            def.steps,
+            vec![MacroStepDto::KeyDown(evdev::KeyCode::KEY_A)]
+        );
+        assert!(on_disk.contains("screenshot-combo"));
+    }
+
+    #[tokio::test]
+    async fn create_macro_command_appends_a_numeric_suffix_on_slug_collision() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let first = harness
+            .create_macro("Screenshot Combo", vec![])
+            .await
+            .unwrap();
+        let second = harness
+            .create_macro("Screenshot Combo", vec![])
+            .await
+            .unwrap();
+
+        harness.shut_down().await;
+
+        assert_eq!(first, MacroId::from("screenshot-combo"));
+        assert_eq!(second, MacroId::from("screenshot-combo-2"));
+    }
+
+    #[tokio::test]
+    async fn create_macro_command_rejects_an_empty_or_whitespace_name() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        for name in ["", "   "] {
+            let err = harness
+                .create_macro(name, vec![])
+                .await
+                .expect_err("an empty/whitespace Macro name must fail");
+            assert!(matches!(err, CommandError::InvalidRequest(_)));
+        }
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn rename_macro_command_changes_the_name_not_the_macro_id() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        let macro_id = harness.create_macro("Old Name", vec![]).await.unwrap();
+
+        harness
+            .rename_macro(macro_id.clone(), "New Name")
+            .await
+            .expect("RenameMacro must succeed");
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+
+        assert_eq!(config.macros[&macro_id].name, "New Name");
+    }
+
+    #[tokio::test]
+    async fn rename_macro_command_on_an_unknown_macro_id_returns_not_found() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .rename_macro(MacroId::from("nonexistent"), "New Name")
+            .await
+            .expect_err("renaming an unknown Macro must fail");
+        assert!(matches!(err, CommandError::NotFound));
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn delete_macro_command_rejects_deleting_a_macro_still_referenced_by_a_binding() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        let macro_id = harness
+            .create_macro(
+                "Test macro",
+                vec![MacroStepDto::KeyDown(evdev::KeyCode::KEY_A)],
+            )
+            .await
+            .unwrap();
+        harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::FireOnce,
+                    action: Action::Macro {
+                        macro_id: macro_id.clone(),
+                    },
+                },
+            )
+            .await
+            .expect("SetBinding referencing a real macro_id must succeed");
+
+        let err = harness
+            .delete_macro(macro_id.clone())
+            .await
+            .expect_err("deleting a still-referenced Macro must fail");
+        assert!(matches!(err, CommandError::InvalidRequest(_)));
+
+        harness
+            .clear_binding(Input::Grid(1, 1), Layer::Base)
+            .await
+            .unwrap();
+        harness
+            .delete_macro(macro_id)
+            .await
+            .expect("deleting an unreferenced Macro must now succeed");
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn delete_macro_command_on_an_unknown_macro_id_returns_not_found() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .delete_macro(MacroId::from("nonexistent"))
+            .await
+            .expect_err("deleting an unknown Macro must fail");
+        assert!(matches!(err, CommandError::NotFound));
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn set_binding_rejects_a_macro_action_naming_an_unknown_macro_id() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::FireOnce,
+                    action: Action::Macro {
+                        macro_id: MacroId::from("nonexistent"),
+                    },
+                },
+            )
+            .await
+            .expect_err("SetBinding with an unknown macro_id must fail");
+        assert!(matches!(err, CommandError::InvalidRequest(_)));
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
     async fn switch_profile_command_switches_active_profile_and_persists() {
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
         harness.create_profile("Gaming").await.unwrap();
@@ -2534,6 +2884,7 @@ mod tests {
             active_profile: DEFAULT_PROFILE_NAME.to_string(),
             profiles,
             force_digital: false,
+            macros: HashMap::new(),
         };
         let harness = CommandHarness::spawn(config);
 
@@ -2574,20 +2925,22 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn switch_profile_force_stops_every_active_toggle_with_exact_key_release() {
+        // Deliberately unbalanced within the window we switch in: KeyDown
+        // fires, then a long Delay, so KEY_A is still held when the Profile
+        // switch stops it.
+        let (action, macros) = macro_action(
+            "test-macro",
+            vec![
+                MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
+                MacroStepDto::Delay(50),
+            ],
+        );
         let mut base = HashMap::new();
         base.insert(
             Input::Grid(1, 1),
             Binding {
                 trigger: TriggerMode::Toggle,
-                action: Action::Macro {
-                    // Deliberately unbalanced within the window we switch
-                    // in: KeyDown fires, then a long Delay, so KEY_A is
-                    // still held when the Profile switch stops it.
-                    steps: vec![
-                        MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
-                        MacroStepDto::Delay(50),
-                    ],
-                },
+                action,
             },
         );
         let mut profiles = HashMap::new();
@@ -2604,6 +2957,7 @@ mod tests {
             active_profile: DEFAULT_PROFILE_NAME.to_string(),
             profiles,
             force_digital: false,
+            macros,
         };
         let harness = CommandHarness::spawn(config);
 
@@ -2650,17 +3004,19 @@ mod tests {
         // Command::SwitchProfile D-Bus path — `handle_event`'s interception
         // must produce the exact same effects the shared `switch_profile`
         // gives `Command::SwitchProfile`.
+        let (action, macros) = macro_action(
+            "test-macro",
+            vec![
+                MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
+                MacroStepDto::Delay(50),
+            ],
+        );
         let mut base = HashMap::new();
         base.insert(
             Input::Grid(1, 1),
             Binding {
                 trigger: TriggerMode::Toggle,
-                action: Action::Macro {
-                    steps: vec![
-                        MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
-                        MacroStepDto::Delay(50),
-                    ],
-                },
+                action,
             },
         );
         base.insert(
@@ -2686,6 +3042,7 @@ mod tests {
             active_profile: DEFAULT_PROFILE_NAME.to_string(),
             profiles,
             force_digital: false,
+            macros,
         };
         let harness = CommandHarness::spawn(config);
 
@@ -2719,17 +3076,19 @@ mod tests {
         // kill a Toggle left running once its own window gains focus,
         // without that also being a Profile switch — same force-stop
         // mechanism as SwitchProfile, minus the Profile change.
+        let (action, macros) = macro_action(
+            "test-macro",
+            vec![
+                MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
+                MacroStepDto::Delay(50),
+            ],
+        );
         let mut base = HashMap::new();
         base.insert(
             Input::Grid(1, 1),
             Binding {
                 trigger: TriggerMode::Toggle,
-                action: Action::Macro {
-                    steps: vec![
-                        MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
-                        MacroStepDto::Delay(50),
-                    ],
-                },
+                action,
             },
         );
         let mut profiles = HashMap::new();
@@ -2745,6 +3104,7 @@ mod tests {
             active_profile: DEFAULT_PROFILE_NAME.to_string(),
             profiles,
             force_digital: false,
+            macros,
         };
         let harness = CommandHarness::spawn(config);
 
@@ -3071,6 +3431,7 @@ mod tests {
             active_profile: DEFAULT_PROFILE_NAME.to_string(),
             profiles,
             force_digital: false,
+            macros: HashMap::new(),
         };
         let harness = CommandHarness::spawn(config);
 

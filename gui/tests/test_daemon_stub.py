@@ -22,6 +22,7 @@ def test_fresh_stub_matches_the_seed_configs_shape():
             }
         },
         "force_digital": False,
+        "macros": {},
     }
     assert stub.get_state() == {
         "profile": "Default",
@@ -161,6 +162,104 @@ def test_rename_profile_on_an_unknown_old_name_raises_not_found():
 
     with pytest.raises(NotFoundError):
         stub.rename_profile("Nonexistent", "Whatever")
+
+
+def test_create_macro_derives_a_slug_and_persists_it():
+    stub = DaemonStub()
+
+    macro_id = stub.create_macro(
+        "Screenshot Combo", [{"type": "key_down", "key": "KEY_A"}]
+    )
+
+    assert macro_id == "screenshot-combo"
+    assert stub.get_config()["macros"]["screenshot-combo"] == {
+        "name": "Screenshot Combo",
+        "steps": [{"type": "key_down", "key": "KEY_A"}],
+    }
+    assert stub.calls == [
+        ("create_macro", "Screenshot Combo", [{"type": "key_down", "key": "KEY_A"}])
+    ]
+
+
+def test_create_macro_rejects_an_empty_or_whitespace_name():
+    stub = DaemonStub()
+
+    for name in ["", "   "]:
+        with pytest.raises(InvalidBindingError):
+            stub.create_macro(name, [])
+
+
+def test_rename_macro_rejects_an_empty_or_whitespace_new_name():
+    stub = DaemonStub()
+    macro_id = stub.create_macro("Test macro", [])
+
+    for new_name in ["", "   "]:
+        with pytest.raises(InvalidBindingError):
+            stub.rename_macro(macro_id, new_name)
+
+
+def test_create_macro_appends_a_numeric_suffix_on_slug_collision():
+    stub = DaemonStub()
+
+    first = stub.create_macro("Screenshot Combo", [])
+    second = stub.create_macro("Screenshot Combo", [])
+
+    assert first == "screenshot-combo"
+    assert second == "screenshot-combo-2"
+
+
+def test_rename_macro_changes_the_name_not_the_macro_id():
+    stub = DaemonStub()
+    macro_id = stub.create_macro("Old Name", [])
+
+    stub.rename_macro(macro_id, "New Name")
+
+    assert stub.get_config()["macros"][macro_id]["name"] == "New Name"
+
+
+def test_rename_macro_on_an_unknown_macro_id_raises_not_found():
+    stub = DaemonStub()
+
+    with pytest.raises(NotFoundError):
+        stub.rename_macro("nonexistent", "New Name")
+
+
+def test_delete_macro_removes_an_unreferenced_macro():
+    stub = DaemonStub()
+    macro_id = stub.create_macro("Test macro", [])
+
+    stub.delete_macro(macro_id)
+
+    assert macro_id not in stub.get_config()["macros"]
+
+
+def test_delete_macro_still_referenced_by_a_binding_raises_invalid_binding():
+    stub = DaemonStub()
+    macro_id = stub.create_macro("Test macro", [{"type": "key_down", "key": "KEY_A"}])
+    stub.set_binding("grid_r1c1", "base", {"trigger": "fire_once", "type": "macro", "macro_id": macro_id})
+
+    with pytest.raises(InvalidBindingError):
+        stub.delete_macro(macro_id)
+
+    stub.clear_binding("grid_r1c1", "base")
+    stub.delete_macro(macro_id)
+    assert macro_id not in stub.get_config()["macros"]
+
+
+def test_delete_macro_on_an_unknown_macro_id_raises_not_found():
+    stub = DaemonStub()
+
+    with pytest.raises(NotFoundError):
+        stub.delete_macro("nonexistent")
+
+
+def test_set_binding_with_an_unknown_macro_id_raises_invalid_binding():
+    stub = DaemonStub()
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_binding(
+            "grid_r1c1", "base", {"trigger": "fire_once", "type": "macro", "macro_id": "nonexistent"}
+        )
 
 
 def test_switch_profile_changes_active_profile_and_notifies_subscribers():

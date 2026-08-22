@@ -20,8 +20,8 @@ use zbus::zvariant::{OwnedValue, Value};
 
 use crate::command::State;
 use crate::config::{
-    Action, ActuationPoint, Binding, Config, Layer, MacroStepDto, ModeKeyRole, Modifiers, Profile,
-    TriggerMode,
+    Action, ActuationPoint, Binding, Config, Layer, MacroDef, MacroId, MacroStepDto, ModeKeyRole,
+    Modifiers, Profile, TriggerMode,
 };
 
 /// The `a{sv}` shape every `Action`/`MacroStep`/`Binding`/`Config` entity
@@ -51,17 +51,6 @@ fn get_str<'a>(dict: &'a Dict, key: &str) -> Result<&'a str, String> {
 
 fn get_u64(dict: &Dict, key: &str) -> Result<u64, String> {
     u64::try_from(get(dict, key)?).map_err(|_| format!("field {key:?} is not an integer"))
-}
-
-fn get_dict_vec(dict: &Dict, key: &str) -> Result<Vec<Dict>, String> {
-    let items: Vec<OwnedValue> = Vec::try_from(get(dict, key)?.clone())
-        .map_err(|_| format!("field {key:?} is not an array"))?;
-    items
-        .into_iter()
-        .map(|item| {
-            Dict::try_from(item).map_err(|_| format!("field {key:?} contains a non-dict element"))
-        })
-        .collect()
 }
 
 fn key_to_string(key: KeyCode) -> String {
@@ -152,7 +141,7 @@ fn modifiers_from_slice(names: &[String]) -> Result<Modifiers, String> {
     Ok(modifiers)
 }
 
-fn macro_step_to_dict(step: &MacroStepDto) -> Dict {
+pub fn macro_step_to_dict(step: &MacroStepDto) -> Dict {
     let mut dict = Dict::new();
     match step {
         MacroStepDto::KeyDown(key) => {
@@ -171,7 +160,7 @@ fn macro_step_to_dict(step: &MacroStepDto) -> Dict {
     dict
 }
 
-fn macro_step_from_dict(dict: &Dict) -> Result<MacroStepDto, String> {
+pub fn macro_step_from_dict(dict: &Dict) -> Result<MacroStepDto, String> {
     match get_str(dict, "type")? {
         "key_down" => Ok(MacroStepDto::KeyDown(key_from_str(get_str(dict, "key")?)?)),
         "key_up" => Ok(MacroStepDto::KeyUp(key_from_str(get_str(dict, "key")?)?)),
@@ -191,10 +180,9 @@ pub fn action_to_dict(action: &Action) -> Dict {
                 dict.insert("modifiers".to_string(), scalar(modifiers));
             }
         }
-        Action::Macro { steps } => {
+        Action::Macro { macro_id } => {
             dict.insert("type".to_string(), scalar("macro".to_string()));
-            let steps: Vec<Dict> = steps.iter().map(macro_step_to_dict).collect();
-            dict.insert("steps".to_string(), scalar(steps));
+            dict.insert("macro_id".to_string(), scalar(macro_id.to_string()));
         }
         Action::ProfileSwitch { target } => {
             dict.insert("type".to_string(), scalar("profile_switch".to_string()));
@@ -223,13 +211,9 @@ pub fn action_from_dict(dict: &Dict) -> Result<Action, String> {
             };
             Ok(Action::Keypress { modifiers, key })
         }
-        "macro" => {
-            let steps = get_dict_vec(dict, "steps")?
-                .iter()
-                .map(macro_step_from_dict)
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(Action::Macro { steps })
-        }
+        "macro" => Ok(Action::Macro {
+            macro_id: MacroId::from(get_str(dict, "macro_id")?),
+        }),
         "profile_switch" => Ok(Action::ProfileSwitch {
             target: get_str(dict, "target")?.to_string(),
         }),
@@ -306,10 +290,30 @@ fn profile_to_dict(profile: &Profile) -> Dict {
     dict
 }
 
+/// A `MacroDef` marshals as a flat two-field `a{sv}` — its `name` plus its
+/// `steps` (reusing `macro_step_to_dict`'s array-of-dicts shape, the same
+/// one a Binding's own Macro Action used before ticket 51 moved step content
+/// off the Binding and into the library).
+fn macro_def_to_dict(def: &MacroDef) -> Dict {
+    let mut dict = Dict::new();
+    dict.insert("name".to_string(), scalar(def.name.clone()));
+    let steps: Vec<Dict> = def.steps.iter().map(macro_step_to_dict).collect();
+    dict.insert("steps".to_string(), scalar(steps));
+    dict
+}
+
+fn macros_to_dict(macros: &HashMap<MacroId, MacroDef>) -> Dict {
+    macros
+        .iter()
+        .map(|(macro_id, def)| (macro_id.to_string(), scalar(macro_def_to_dict(def))))
+        .collect()
+}
+
 /// `GetConfig()`'s full-document return: `schema_version`/`active_profile`
 /// as scalars, `profiles` recursively reusing `binding_to_dict`'s
 /// conventions (issue 08); each Profile now also carries `held` alongside
-/// `base` and its `mode_key_role` (ticket 18).
+/// `base` and its `mode_key_role` (ticket 18). `macros` (ticket 51) is the
+/// global Macro library, keyed by `macro_id` string.
 pub fn config_to_dict(config: &Config) -> Dict {
     let mut dict = Dict::new();
     dict.insert("schema_version".to_string(), scalar(config.schema_version));
@@ -324,6 +328,7 @@ pub fn config_to_dict(config: &Config) -> Dict {
         .collect();
     dict.insert("profiles".to_string(), scalar(profiles));
     dict.insert("force_digital".to_string(), scalar(config.force_digital));
+    dict.insert("macros".to_string(), scalar(macros_to_dict(&config.macros)));
     dict
 }
 
@@ -400,15 +405,12 @@ mod tests {
     #[test]
     fn macro_action_round_trips_through_a_dict() {
         let action = Action::Macro {
-            steps: vec![
-                MacroStepDto::KeyDown(KeyCode::KEY_A),
-                MacroStepDto::Delay(50),
-                MacroStepDto::KeyUp(KeyCode::KEY_A),
-            ],
+            macro_id: MacroId::from("screenshot-combo"),
         };
 
         let dict = action_to_dict(&action);
         assert_eq!(dict_get_string(&dict, "type"), "macro");
+        assert_eq!(dict_get_string(&dict, "macro_id"), "screenshot-combo");
 
         let round_tripped = action_from_dict(&dict).unwrap();
         assert_eq!(round_tripped, action);
@@ -514,6 +516,7 @@ mod tests {
             active_profile: "Default".to_string(),
             profiles,
             force_digital: false,
+            macros: StdHashMap::new(),
         };
 
         let dict = config_to_dict(&config);
@@ -569,9 +572,48 @@ mod tests {
             active_profile: "Default".to_string(),
             profiles: Default::default(),
             force_digital: true,
+            macros: HashMap::new(),
         };
         let dict = config_to_dict(&config);
         assert!(bool::try_from(get(&dict, "force_digital").unwrap()).unwrap());
+    }
+
+    /// Ticket 51: `config_to_dict` must serialize `Config.macros` — the
+    /// global Macro library, keyed by `macro_id` string.
+    #[test]
+    fn config_to_dict_serializes_macros() {
+        let mut macros = HashMap::new();
+        macros.insert(
+            MacroId::from("screenshot-combo"),
+            MacroDef {
+                name: "Screenshot combo".to_string(),
+                steps: vec![
+                    MacroStepDto::KeyDown(KeyCode::KEY_A),
+                    MacroStepDto::Delay(50),
+                    MacroStepDto::KeyUp(KeyCode::KEY_A),
+                ],
+            },
+        );
+        let config = Config {
+            schema_version: 1,
+            active_profile: "Default".to_string(),
+            profiles: Default::default(),
+            force_digital: false,
+            macros,
+        };
+
+        let dict = config_to_dict(&config);
+        let macros_dict: Dict = get(&dict, "macros").unwrap().clone().try_into().unwrap();
+        let macro_dict: Dict = macros_dict
+            .get("screenshot-combo")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(dict_get_string(&macro_dict, "name"), "Screenshot combo");
+        let steps: Vec<OwnedValue> =
+            Vec::try_from(get(&macro_dict, "steps").unwrap().clone()).unwrap();
+        assert_eq!(steps.len(), 3);
     }
 
     /// Ticket 26: `config_to_dict` must serialize a Profile's
@@ -608,6 +650,7 @@ mod tests {
             active_profile: "Default".to_string(),
             profiles,
             force_digital: false,
+            macros: StdHashMap::new(),
         };
 
         let dict = config_to_dict(&config);

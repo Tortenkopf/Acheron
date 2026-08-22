@@ -31,6 +31,7 @@ no real session bus in GUI tests either.
 from __future__ import annotations
 
 import copy
+import re
 from typing import Callable
 
 from .daemon_client import AlreadyExistsError, InvalidBindingError, NotFoundError
@@ -52,6 +53,8 @@ class DaemonStub:
         self._schema_version = 1
         self._active_profile = active_profile
         self._profiles: dict[str, dict] = {active_profile: copy.deepcopy(self._SEED_PROFILE)}
+        # Ticket 51: the global Macro library — macro_id -> {"name", "steps"}.
+        self._macros: dict[str, dict] = {}
         self._layer = "base"
         self._active_toggles: list[str] = []
         # Hardcoded, mirroring the real Daemon's ticket 21 stand-in — there
@@ -84,6 +87,7 @@ class DaemonStub:
             "active_profile": self._active_profile,
             "profiles": {name: copy.deepcopy(profile) for name, profile in self._profiles.items()},
             "force_digital": self._force_digital,
+            "macros": {macro_id: copy.deepcopy(m) for macro_id, m in self._macros.items()},
         }
 
     def get_state(self) -> dict:
@@ -96,6 +100,12 @@ class DaemonStub:
         }
 
     def set_binding(self, input_str: str, layer: str, binding: dict) -> None:
+        # Ticket 51: mirrors the real Daemon's SetBinding validation — a
+        # Macro Action naming an unknown macro_id is rejected outright.
+        if binding.get("type") == "macro" and binding.get("macro_id") not in self._macros:
+            raise InvalidBindingError(
+                f"{binding.get('macro_id')!r} does not name a Macro in the library"
+            )
         # Deep-copied for the same reason: SetBinding's real wire encoding
         # (wire.py) copies every field into a GLib.Variant, decoupled from
         # the caller's dict, so mutating `binding` afterward must not reach
@@ -140,6 +150,56 @@ class DaemonStub:
         self._profiles[new_name] = self._profiles.pop(old_name)
         if self._active_profile == old_name:
             self._active_profile = new_name
+
+    @staticmethod
+    def _slug_base(name: str) -> str:
+        # Mirrors daemon/src/config.rs's `slug_base`: lowercase, runs of
+        # non-alphanumeric characters collapsed to one hyphen, trimmed,
+        # falling back to a fixed placeholder if nothing alphanumeric
+        # survives.
+        slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+        return slug or "macro"
+
+    def _unique_macro_id(self, name: str) -> str:
+        base = self._slug_base(name)
+        if base not in self._macros:
+            return base
+        n = 2
+        while f"{base}-{n}" in self._macros:
+            n += 1
+        return f"{base}-{n}"
+
+    def _macro_referenced(self, macro_id: str) -> bool:
+        return any(
+            binding.get("type") == "macro" and binding.get("macro_id") == macro_id
+            for profile in self._profiles.values()
+            for layer in ("base", "held")
+            for binding in profile[layer].values()
+        )
+
+    def create_macro(self, name: str, steps: list[dict]) -> str:
+        if not name.strip():
+            raise InvalidBindingError("Macro name can't be empty")
+        macro_id = self._unique_macro_id(name)
+        self._macros[macro_id] = {"name": name, "steps": copy.deepcopy(steps)}
+        self.calls.append(("create_macro", name, copy.deepcopy(steps)))
+        return macro_id
+
+    def rename_macro(self, macro_id: str, new_name: str) -> None:
+        if macro_id not in self._macros:
+            raise NotFoundError(f"no Macro with id {macro_id!r}")
+        if not new_name.strip():
+            raise InvalidBindingError("Macro name can't be empty")
+        self._macros[macro_id]["name"] = new_name
+        self.calls.append(("rename_macro", macro_id, new_name))
+
+    def delete_macro(self, macro_id: str) -> None:
+        if macro_id not in self._macros:
+            raise NotFoundError(f"no Macro with id {macro_id!r}")
+        if self._macro_referenced(macro_id):
+            raise InvalidBindingError(f"Macro {macro_id!r} is still referenced by a Binding")
+        del self._macros[macro_id]
+        self.calls.append(("delete_macro", macro_id))
 
     def switch_profile(self, name: str) -> None:
         if name not in self._profiles:

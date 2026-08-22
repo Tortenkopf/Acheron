@@ -40,6 +40,15 @@ pub struct Config {
     /// `command::State::capture_mode`'s live-reported actual mode.
     #[serde(default)]
     pub force_digital: bool,
+    /// The global, named Macro library (ticket 15/51 — CONTEXT.md: Macro).
+    /// One shared map across every Profile; an `Action::Macro { macro_id }`
+    /// Binding references an entry here rather than carrying its own step
+    /// content, so any number of Bindings across any number of Profiles can
+    /// reuse the same `MacroDef` at once. Additive/`#[serde(default)]` even
+    /// though `Action::Macro`'s own shape change is a breaking one — a
+    /// config with no Macros at all still parses.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub macros: HashMap<MacroId, MacroDef>,
 }
 
 impl Config {
@@ -53,6 +62,7 @@ impl Config {
             active_profile: DEFAULT_PROFILE_NAME.to_string(),
             profiles,
             force_digital: false,
+            macros: HashMap::new(),
         }
     }
 
@@ -214,17 +224,16 @@ pub enum Action {
         modifiers: Modifiers,
         key: KeyCode,
     },
-    Macro {
-        steps: Vec<MacroStepDto>,
-    },
+    /// References a `MacroDef` in `Config.macros` rather than carrying step
+    /// content directly (ticket 15/51) — no inline/unnamed Macro survives as
+    /// a second representation.
+    Macro { macro_id: MacroId },
     /// Switches the active Profile when fired (ticket 05/34). Validated
     /// (`SetBinding` and `load_or_seed`, via `parse`'s
     /// `InvalidProfileSwitchTrigger` check) to only ever pair with
     /// `TriggerMode::FireOnce` — a held/toggled Profile switch has no
     /// coherent meaning.
-    ProfileSwitch {
-        target: String,
-    },
+    ProfileSwitch { target: String },
     /// Fires a virtual-gamepad button press (ticket 14/43) — an ordinary
     /// Action reusing Binding/Trigger-mode/dispatch/executor exactly like
     /// Keypress (only the target `uinput` device differs, an
@@ -233,9 +242,7 @@ pub enum Action {
     /// `load_or_seed`, via `parse`'s `InvalidControllerButton` check)
     /// against `input::gamepad_button_codes()`'s curated 57-entry allowlist
     /// — unlike Keypress's `key`, which accepts any `KeyCode` at all.
-    ControllerButton {
-        button: KeyCode,
-    },
+    ControllerButton { button: KeyCode },
 }
 
 /// A Keypress's modifier chord (e.g. Ctrl+Shift+T). Per issue 06: ctrl,
@@ -265,6 +272,101 @@ pub enum MacroStepDto {
     Delay(u64),
 }
 
+/// A Macro's identity (CONTEXT.md: Macro; ticket 15's Answer) — a slug
+/// derived from `MacroDef.name` at creation time, then frozen: it is the
+/// `Config.macros` key and never changes again, even when `name` is later
+/// edited via `RenameMacro`. Deliberately opaque/decoupled from `name`
+/// (unlike `Profile`, whose name *is* its map key) so a rename is a pure
+/// field write with no scan/cascade anywhere else in `config.toml`.
+/// `#[serde(transparent)]` round-trips as the plain inner string, matching
+/// `Input`'s hand-written TOML/D-Bus string convention — simpler here since
+/// there's no fixed grammar to validate against; a lookup miss just becomes
+/// `CommandError::NotFound`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MacroId(String);
+
+impl MacroId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for MacroId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<String> for MacroId {
+    fn from(id: String) -> Self {
+        MacroId(id)
+    }
+}
+
+impl From<&str> for MacroId {
+    fn from(id: &str) -> Self {
+        MacroId(id.to_string())
+    }
+}
+
+/// A library entry in `Config.macros` (ticket 15/51 — CONTEXT.md: Macro).
+/// `name` is the editable display name (`RenameMacro`); `steps` is exactly
+/// the step-sequence content that used to live inline on `Action::Macro`,
+/// moved here unchanged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MacroDef {
+    pub name: String,
+    pub steps: Vec<MacroStepDto>,
+}
+
+/// The lowercase/hyphenated base of a `MacroId` slug, derived from a
+/// user-supplied Macro name (ticket 15's Answer): every ASCII alphanumeric
+/// character is kept (lowercased), every run of anything else collapses to
+/// one `-`, and leading/trailing `-` are trimmed. Falls back to a fixed
+/// placeholder if that leaves nothing (e.g. a name with no alphanumeric
+/// characters at all) — `unique_macro_id` still guarantees the final result
+/// is collision-free.
+fn slug_base(name: &str) -> String {
+    let mut result = String::with_capacity(name.len());
+    let mut last_was_hyphen = true; // suppresses a leading hyphen
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            result.push(ch.to_ascii_lowercase());
+            last_was_hyphen = false;
+        } else if !last_was_hyphen {
+            result.push('-');
+            last_was_hyphen = true;
+        }
+    }
+    while result.ends_with('-') {
+        result.pop();
+    }
+    if result.is_empty() {
+        result.push_str("macro");
+    }
+    result
+}
+
+/// Appends `-2`, `-3`, ... to `slug_base(name)` until the result isn't
+/// already a key in `config.macros` — ticket 15's Answer's worked example:
+/// `screenshot-combo`, `screenshot-combo-2`. Used by `CreateMacro`'s
+/// dispatch handler to derive a new, frozen `MacroId`.
+pub(crate) fn unique_macro_id(config: &Config, name: &str) -> MacroId {
+    let base = slug_base(name);
+    if !config.macros.contains_key(&MacroId(base.clone())) {
+        return MacroId(base);
+    }
+    let mut n = 2u32;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if !config.macros.contains_key(&MacroId(candidate.clone())) {
+            return MacroId(candidate);
+        }
+        n += 1;
+    }
+}
+
 #[derive(Debug)]
 pub enum ConfigError {
     Io(io::Error),
@@ -275,6 +377,7 @@ pub enum ConfigError {
     InvalidActiveProfile(String),
     InvalidProfileSwitchTrigger,
     InvalidControllerButton(String),
+    UnknownMacro(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -307,6 +410,10 @@ impl fmt::Display for ConfigError {
             ConfigError::InvalidControllerButton(button) => write!(
                 f,
                 "config.toml contains an Action::ControllerButton Binding whose button {button:?} is not a valid gamepad button"
+            ),
+            ConfigError::UnknownMacro(macro_id) => write!(
+                f,
+                "config.toml contains an Action::Macro Binding whose macro_id {macro_id:?} does not name a Macro in [macros]"
             ),
         }
     }
@@ -375,6 +482,21 @@ fn parse(contents: &str) -> Result<Config, ConfigError> {
     });
     if let Some(button) = invalid_controller_button {
         return Err(ConfigError::InvalidControllerButton(format!("{button:?}")));
+    }
+    let dangling_macro_id = config.profiles.values().find_map(|profile| {
+        [&profile.base, &profile.held]
+            .into_iter()
+            .find_map(|bindings| {
+                bindings.values().find_map(|binding| match &binding.action {
+                    Action::Macro { macro_id } if !config.macros.contains_key(macro_id) => {
+                        Some(macro_id.clone())
+                    }
+                    _ => None,
+                })
+            })
+    });
+    if let Some(macro_id) = dangling_macro_id {
+        return Err(ConfigError::UnknownMacro(macro_id.to_string()));
     }
     Ok(config)
 }
@@ -535,14 +657,18 @@ action = { type = "keypress", key = "KEY_T", modifiers = { ctrl = true, shift = 
 schema_version = 1
 active_profile = "Default"
 
+[macros.test-macro]
+name = "Test macro"
+steps = [
+  { key_down = "KEY_A" }, { delay_ms = 50 }, { key_up = "KEY_A" },
+]
+
 [profiles.Default]
 mode_key_role = "bound"
 
 [profiles.Default.held.grid_r2c1]
 trigger = "toggle"
-action = { type = "macro", steps = [
-  { key_down = "KEY_A" }, { delay_ms = 50 }, { key_up = "KEY_A" },
-] }
+action = { type = "macro", macro_id = "test-macro" }
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         let profile = &config.profiles["Default"];
@@ -716,6 +842,17 @@ action = { type = "controller_button", button = "KEY_A" }
     fn held_layer_bindings_survive_a_full_write_and_reparse_round_trip() {
         let (_dir, path) = temp_config_path();
         let mut config = Config::seed();
+        config.macros.insert(
+            MacroId::from("screenshot-combo"),
+            MacroDef {
+                name: "Screenshot combo".to_string(),
+                steps: vec![
+                    MacroStepDto::KeyDown(KeyCode::KEY_A),
+                    MacroStepDto::Delay(50),
+                    MacroStepDto::KeyUp(KeyCode::KEY_A),
+                ],
+            },
+        );
         let profile = config.active_profile_mut().unwrap();
         profile.mode_key_role = ModeKeyRole::Bound;
         profile.held.insert(
@@ -723,11 +860,7 @@ action = { type = "controller_button", button = "KEY_A" }
             Binding {
                 trigger: TriggerMode::Toggle,
                 action: Action::Macro {
-                    steps: vec![
-                        MacroStepDto::KeyDown(KeyCode::KEY_A),
-                        MacroStepDto::Delay(50),
-                        MacroStepDto::KeyUp(KeyCode::KEY_A),
-                    ],
+                    macro_id: MacroId::from("screenshot-combo"),
                 },
             },
         );
@@ -736,5 +869,111 @@ action = { type = "controller_button", button = "KEY_A" }
         let reparsed = load_or_seed(&path).unwrap();
 
         assert_eq!(reparsed, config);
+    }
+
+    #[test]
+    fn a_pre_ticket_51_config_defaults_an_empty_macro_library() {
+        // A config.toml written before ticket 51 has no `[macros]` table at
+        // all — it must still parse, defaulting to an empty library, per
+        // `Config.macros`'s own `#[serde(default)]`.
+        let toml = r#"
+schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base.grid_r1c1]
+trigger = "fire_once"
+action = { type = "keypress", key = "KEY_F1" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.macros.is_empty());
+    }
+
+    #[test]
+    fn refuses_to_start_when_a_macro_binding_names_an_unknown_macro_id() {
+        let (_dir, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base.grid_r1c1]
+trigger = "fire_once"
+action = { type = "macro", macro_id = "does-not-exist" }
+"#;
+        fs::write(&path, original).unwrap();
+
+        let err = load_or_seed(&path).expect_err("a dangling macro_id must refuse to start");
+        assert!(matches!(err, ConfigError::UnknownMacro(id) if id == "does-not-exist"));
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn parses_a_macro_binding_shape() {
+        let toml = r#"
+schema_version = 1
+active_profile = "Default"
+
+[macros.screenshot-combo]
+name = "Screenshot combo"
+steps = [
+  { key_down = "KEY_A" }, { delay_ms = 50 }, { key_up = "KEY_A" },
+]
+
+[profiles.Default.base.grid_r1c1]
+trigger = "fire_once"
+action = { type = "macro", macro_id = "screenshot-combo" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let binding = &config.profiles["Default"].base[&Input::Grid(1, 1)];
+        assert_eq!(
+            binding.action,
+            Action::Macro {
+                macro_id: MacroId::from("screenshot-combo"),
+            }
+        );
+        let def = &config.macros[&MacroId::from("screenshot-combo")];
+        assert_eq!(def.name, "Screenshot combo");
+        assert_eq!(
+            def.steps,
+            vec![
+                MacroStepDto::KeyDown(KeyCode::KEY_A),
+                MacroStepDto::Delay(50),
+                MacroStepDto::KeyUp(KeyCode::KEY_A),
+            ]
+        );
+    }
+
+    #[test]
+    fn slug_base_lowercases_and_hyphenates() {
+        assert_eq!(slug_base("Screenshot Combo"), "screenshot-combo");
+        assert_eq!(slug_base("  weird!!__Name--"), "weird-name");
+        assert_eq!(slug_base("こんにちは"), "macro");
+    }
+
+    #[test]
+    fn unique_macro_id_appends_a_numeric_suffix_on_collision() {
+        let mut config = Config::seed();
+        let first = unique_macro_id(&config, "Screenshot Combo");
+        assert_eq!(first, MacroId::from("screenshot-combo"));
+        config.macros.insert(
+            first.clone(),
+            MacroDef {
+                name: "Screenshot Combo".to_string(),
+                steps: vec![],
+            },
+        );
+
+        let second = unique_macro_id(&config, "Screenshot Combo");
+        assert_eq!(second, MacroId::from("screenshot-combo-2"));
+        config.macros.insert(
+            second.clone(),
+            MacroDef {
+                name: "Screenshot Combo".to_string(),
+                steps: vec![],
+            },
+        );
+
+        let third = unique_macro_id(&config, "Screenshot Combo");
+        assert_eq!(third, MacroId::from("screenshot-combo-3"));
     }
 }

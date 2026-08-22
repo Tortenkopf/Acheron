@@ -11,7 +11,7 @@
 //! up/down goes through the one shared `Injector` channel so concurrently
 //! running Toggles never interleave raw `uinput` writes.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ use evdev::KeyCode;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{Action, MacroStepDto, Modifiers};
+use crate::config::{Action, MacroDef, MacroId, MacroStepDto, Modifiers};
 use crate::injector::{Injector, InjectorClosed};
 
 /// The runtime step sequence a compiled `Action` runs as, per spec.md's
@@ -65,18 +65,30 @@ fn keypress_steps(modifiers: Modifiers, key: KeyCode) -> Vec<MacroStep> {
 
 /// Compiles a Binding's `Action` into the flat step sequence the shared
 /// executor runs (spec.md: "both Action kinds compile ... into one steps:
-/// Vec<MacroStep> ... run by one shared executor").
-pub fn compile(action: &Action) -> Vec<MacroStep> {
+/// Vec<MacroStep> ... run by one shared executor"). `macros` resolves a
+/// Macro Action's `macro_id` into its `MacroDef` (ticket 51 — a Binding no
+/// longer carries step content directly, only a reference into the shared
+/// library).
+pub fn compile(action: &Action, macros: &HashMap<MacroId, MacroDef>) -> Vec<MacroStep> {
     match action {
         Action::Keypress { modifiers, key } => keypress_steps(*modifiers, *key),
-        Action::Macro { steps } => steps
-            .iter()
-            .map(|step| match step {
-                MacroStepDto::KeyDown(key) => MacroStep::KeyDown(*key),
-                MacroStepDto::KeyUp(key) => MacroStep::KeyUp(*key),
-                MacroStepDto::Delay(ms) => MacroStep::Delay(Duration::from_millis(*ms)),
-            })
-            .collect(),
+        Action::Macro { macro_id } => {
+            // Every `macro_id` reaching here is structurally guaranteed to
+            // resolve: `SetBinding` rejects an unknown one at write time, and
+            // `config::parse` refuses to even start the Daemon on a
+            // `config.toml` with a dangling reference (ticket 51).
+            let def = macros.get(macro_id).expect(
+                "SetBinding/config::parse validate every macro_id references an existing MacroDef",
+            );
+            def.steps
+                .iter()
+                .map(|step| match step {
+                    MacroStepDto::KeyDown(key) => MacroStep::KeyDown(*key),
+                    MacroStepDto::KeyUp(key) => MacroStep::KeyUp(*key),
+                    MacroStepDto::Delay(ms) => MacroStep::Delay(Duration::from_millis(*ms)),
+                })
+                .collect()
+        }
         Action::ProfileSwitch { .. } => {
             unreachable!(
                 "Action::ProfileSwitch is intercepted in dispatch::handle_event before compile is ever called"
@@ -318,6 +330,13 @@ mod tests {
     use crate::config::{Action, MacroStepDto, Modifiers};
     use crate::injector::{self, testing::RecordingSink};
 
+    /// An empty macro library for tests exercising a non-Macro `Action` —
+    /// `compile` requires the map unconditionally, but Keypress/
+    /// ControllerButton/ProfileSwitch never consult it.
+    fn empty_macros() -> HashMap<MacroId, MacroDef> {
+        HashMap::new()
+    }
+
     fn key_and_value(event: evdev::InputEvent) -> (KeyCode, i32) {
         match event.destructure() {
             evdev::EventSummary::Key(_, code, value) => (code, value),
@@ -337,7 +356,7 @@ mod tests {
             key: KeyCode::KEY_T,
         };
 
-        let steps = compile(&action);
+        let steps = compile(&action, &empty_macros());
 
         assert_eq!(
             steps,
@@ -354,15 +373,23 @@ mod tests {
 
     #[test]
     fn compile_macro_maps_steps_straight_across() {
+        let mut macros = empty_macros();
+        macros.insert(
+            MacroId::from("test-macro"),
+            MacroDef {
+                name: "Test macro".to_string(),
+                steps: vec![
+                    MacroStepDto::KeyDown(KeyCode::KEY_A),
+                    MacroStepDto::Delay(50),
+                    MacroStepDto::KeyUp(KeyCode::KEY_A),
+                ],
+            },
+        );
         let action = Action::Macro {
-            steps: vec![
-                MacroStepDto::KeyDown(KeyCode::KEY_A),
-                MacroStepDto::Delay(50),
-                MacroStepDto::KeyUp(KeyCode::KEY_A),
-            ],
+            macro_id: MacroId::from("test-macro"),
         };
 
-        let steps = compile(&action);
+        let steps = compile(&action, &macros);
 
         assert_eq!(
             steps,
@@ -380,7 +407,7 @@ mod tests {
             button: KeyCode::BTN_SOUTH,
         };
 
-        let steps = compile(&action);
+        let steps = compile(&action, &empty_macros());
 
         assert_eq!(
             steps,
@@ -396,10 +423,13 @@ mod tests {
         let sink = RecordingSink::new();
         let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
 
-        let steps = compile(&Action::Keypress {
-            modifiers: Modifiers::default(),
-            key: KeyCode::KEY_F1,
-        });
+        let steps = compile(
+            &Action::Keypress {
+                modifiers: Modifiers::default(),
+                key: KeyCode::KEY_F1,
+            },
+            &empty_macros(),
+        );
         spawn_fire_once(inj.clone(), steps).join().await;
 
         drop(inj);
@@ -515,7 +545,11 @@ mod tests {
         // KEY_A's KeyDown is sent for real while unsuppressed.
         tokio::time::advance(Duration::from_millis(10)).await;
         tokio::task::yield_now().await;
-        assert_eq!(sink.batches().len(), 1, "the initial KeyDown must have reached the sink");
+        assert_eq!(
+            sink.batches().len(),
+            1,
+            "the initial KeyDown must have reached the sink"
+        );
 
         inj.set_suppressed(true).await.unwrap();
         toggle.stop().await;
@@ -527,7 +561,11 @@ mod tests {
         else {
             panic!("expected a key event");
         };
-        assert_eq!(code, KeyCode::KEY_A, "the held key must still be force-released");
+        assert_eq!(
+            code,
+            KeyCode::KEY_A,
+            "the held key must still be force-released"
+        );
         assert_eq!(
             value, 0,
             "force-release must bypass suppression, not be silently dropped"
@@ -557,7 +595,11 @@ mod tests {
         // KEY_A's KeyDown is sent for real while unsuppressed.
         tokio::time::advance(Duration::from_millis(10)).await;
         tokio::task::yield_now().await;
-        assert_eq!(sink.batches().len(), 1, "the initial KeyDown must have reached the sink");
+        assert_eq!(
+            sink.batches().len(),
+            1,
+            "the initial KeyDown must have reached the sink"
+        );
 
         // Suppression turns on (the GUI gains focus) before the loop's own
         // KeyUp step runs. That KeyUp's write is withheld — no new batch —
@@ -619,7 +661,7 @@ mod tests {
             modifiers: Modifiers::default(),
             key: KeyCode::KEY_C,
         };
-        let steps = compile(&action);
+        let steps = compile(&action, &empty_macros());
         assert!(
             !steps.iter().any(|s| matches!(s, MacroStep::Delay(_))),
             "a plain Keypress must compile to zero Delay steps"

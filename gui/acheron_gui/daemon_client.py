@@ -90,6 +90,12 @@ class DaemonClient(Protocol):
 
     def rename_profile(self, old_name: str, new_name: str) -> None: ...
 
+    def create_macro(self, name: str, steps: list[dict]) -> str: ...
+
+    def rename_macro(self, macro_id: str, new_name: str) -> None: ...
+
+    def delete_macro(self, macro_id: str) -> None: ...
+
     def switch_profile(self, name: str) -> None: ...
 
     def set_output_suppressed(self, suppressed: bool) -> None: ...
@@ -176,6 +182,18 @@ class DBusDaemonClient:
 
     def rename_profile(self, old_name: str, new_name: str) -> None:
         self._call("RenameProfile", GLib.Variant("(ss)", (old_name, new_name)))
+
+    def create_macro(self, name: str, steps: list[dict]) -> str:
+        variant_steps = [wire.macro_step_to_variant(step) for step in steps]
+        parameters = GLib.Variant("(saa{sv})", (name, variant_steps))
+        (macro_id,) = self._call("CreateMacro", parameters)
+        return macro_id
+
+    def rename_macro(self, macro_id: str, new_name: str) -> None:
+        self._call("RenameMacro", GLib.Variant("(ss)", (macro_id, new_name)))
+
+    def delete_macro(self, macro_id: str) -> None:
+        self._call("DeleteMacro", GLib.Variant("(s)", (macro_id,)))
 
     def switch_profile(self, name: str) -> None:
         self._call("SwitchProfile", GLib.Variant("(s)", (name,)))

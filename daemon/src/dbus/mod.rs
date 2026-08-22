@@ -21,6 +21,7 @@ use zbus::object_server::SignalEmitter;
 use zbus::zvariant::OwnedValue;
 
 use crate::command::{Command, CommandError};
+use crate::config::MacroId;
 use crate::injector::Injector;
 use crate::input::Input;
 
@@ -445,6 +446,65 @@ impl Daemon {
         rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
     }
 
+    /// Creates a new Macro library entry (ticket 15/51) — atomic/
+    /// immediately-applied/immediately-persisted, same conventions as
+    /// `CreateProfile`. Unlike a Profile (whose identity *is* the
+    /// caller-chosen name), a Macro's identity is a `MacroId` slug derived
+    /// from `name` and frozen at creation; the return value is that
+    /// assigned id, which the caller needs in order to reference it from a
+    /// Binding.
+    async fn create_macro(
+        &self,
+        name: String,
+        steps: Vec<HashMap<String, OwnedValue>>,
+    ) -> Result<String, DaemonError> {
+        let steps = steps
+            .iter()
+            .map(wire::macro_step_from_dict)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DaemonError::InvalidBinding)?;
+
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::CreateMacro { name, steps, reply })
+            .await
+            .map_err(dispatch_gone)?;
+        let macro_id = rx
+            .await
+            .map_err(dispatch_gone)?
+            .map_err(DaemonError::from)?;
+        Ok(macro_id.to_string())
+    }
+
+    /// Renames a Macro — a pure display-name field write; the `MacroId`
+    /// itself never changes. Errors `NotFound` if `macro_id` doesn't exist.
+    async fn rename_macro(&self, macro_id: String, new_name: String) -> Result<(), DaemonError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::RenameMacro {
+                macro_id: MacroId::from(macro_id),
+                new_name,
+                reply,
+            })
+            .await
+            .map_err(dispatch_gone)?;
+        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+    }
+
+    /// Deletes a Macro. Errors `NotFound` if it doesn't exist, or
+    /// `InvalidBinding` if any Binding anywhere still references it.
+    async fn delete_macro(&self, macro_id: String) -> Result<(), DaemonError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::DeleteMacro {
+                macro_id: MacroId::from(macro_id),
+                reply,
+            })
+            .await
+            .map_err(dispatch_gone)?;
+        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+    }
+
     /// Switches the active Profile, force-stopping every currently running
     /// Toggle as part of the switch before the new Profile's state becomes
     /// active (ticket 19). Errors `NotFound` if `name` doesn't name a real
@@ -730,6 +790,13 @@ mod tests {
         fn create_profile(&self, name: &str) -> zbus::Result<()>;
         fn delete_profile(&self, name: &str) -> zbus::Result<()>;
         fn rename_profile(&self, old_name: &str, new_name: &str) -> zbus::Result<()>;
+        fn create_macro(
+            &self,
+            name: &str,
+            steps: Vec<HashMap<String, OwnedValue>>,
+        ) -> zbus::Result<String>;
+        fn rename_macro(&self, macro_id: &str, new_name: &str) -> zbus::Result<()>;
+        fn delete_macro(&self, macro_id: &str) -> zbus::Result<()>;
         fn switch_profile(&self, name: &str) -> zbus::Result<()>;
         fn stop_all_toggles(&self) -> zbus::Result<()>;
         fn set_actuation_point(&self, input: &str, actuation: u8, release: u8) -> zbus::Result<()>;
@@ -787,6 +854,7 @@ mod tests {
                 active_profile: DEFAULT_PROFILE_NAME.to_string(),
                 profiles,
                 force_digital: false,
+                macros: HashMap::new(),
             };
             crate::config::write(&config_path, &config).unwrap();
 
@@ -875,6 +943,24 @@ mod tests {
                 .unwrap();
         }
 
+        /// Creates a Macro via a real `CreateMacro` D-Bus round-trip and
+        /// returns its assigned `macro_id` — this test module's shorthand
+        /// for seeding a Macro Binding's referenced library entry (ticket
+        /// 51: `SetBinding` now rejects a Macro Action naming an unknown
+        /// `macro_id`, so these tests must create the entry for real first).
+        async fn create_macro(
+            &self,
+            name: &str,
+            steps: Vec<crate::config::MacroStepDto>,
+        ) -> String {
+            let steps: Vec<HashMap<String, OwnedValue>> =
+                steps.iter().map(wire::macro_step_to_dict).collect();
+            self.proxy
+                .create_macro(name, steps)
+                .await
+                .expect("CreateMacro must succeed")
+        }
+
         /// Stands in for the `CaptureSource`'s poll loop reporting a
         /// device-connection transition (ticket 20).
         async fn set_device_connected(&self, connected: bool) {
@@ -958,13 +1044,19 @@ mod tests {
     async fn set_binding_over_real_dbus_with_a_macro_toggle_payload_starts_and_stops_it() {
         let server = TestServer::start().await;
 
-        let binding = wire::binding_to_dict(&crate::config::Binding {
-            trigger: crate::config::TriggerMode::Toggle,
-            action: crate::config::Action::Macro {
-                steps: vec![
+        let macro_id = server
+            .create_macro(
+                "Test macro",
+                vec![
                     crate::config::MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
                     crate::config::MacroStepDto::Delay(50),
                 ],
+            )
+            .await;
+        let binding = wire::binding_to_dict(&crate::config::Binding {
+            trigger: crate::config::TriggerMode::Toggle,
+            action: crate::config::Action::Macro {
+                macro_id: crate::config::MacroId::from(macro_id),
             },
         });
 
@@ -1381,6 +1473,114 @@ mod tests {
         assert!(on_disk.contains("active_profile = \"Renamed\""));
     }
 
+    #[tokio::test]
+    async fn create_macro_over_real_dbus_derives_a_slug_and_persists_it() {
+        let server = TestServer::start().await;
+
+        let macro_id = server
+            .create_macro(
+                "Screenshot Combo",
+                vec![crate::config::MacroStepDto::KeyDown(evdev::KeyCode::KEY_A)],
+            )
+            .await;
+        assert_eq!(macro_id, "screenshot-combo");
+
+        let config = server.proxy.get_config().await.unwrap();
+        let on_disk = std::fs::read_to_string(&server.config_path).unwrap();
+        server.shut_down().await;
+
+        let macros: wire::Dict = config.get("macros").unwrap().clone().try_into().unwrap();
+        let def: wire::Dict = macros
+            .get("screenshot-combo")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let name: String = def.get("name").unwrap().clone().try_into().unwrap();
+        assert_eq!(name, "Screenshot Combo");
+        assert!(on_disk.contains("[macros.screenshot-combo]"));
+    }
+
+    #[tokio::test]
+    async fn rename_macro_over_real_dbus_changes_the_name_not_the_macro_id() {
+        let server = TestServer::start().await;
+        let macro_id = server.create_macro("Old Name", vec![]).await;
+
+        server
+            .proxy
+            .rename_macro(&macro_id, "New Name")
+            .await
+            .expect("RenameMacro must succeed");
+
+        let config = server.proxy.get_config().await.unwrap();
+        server.shut_down().await;
+
+        let macros: wire::Dict = config.get("macros").unwrap().clone().try_into().unwrap();
+        let def: wire::Dict = macros.get(&macro_id).unwrap().clone().try_into().unwrap();
+        let name: String = def.get("name").unwrap().clone().try_into().unwrap();
+        assert_eq!(name, "New Name");
+    }
+
+    #[tokio::test]
+    async fn delete_macro_over_real_dbus_rejects_deleting_a_referenced_macro() {
+        let server = TestServer::start().await;
+        let macro_id = server
+            .create_macro(
+                "Test macro",
+                vec![crate::config::MacroStepDto::KeyDown(evdev::KeyCode::KEY_A)],
+            )
+            .await;
+        let binding = wire::binding_to_dict(&crate::config::Binding {
+            trigger: crate::config::TriggerMode::FireOnce,
+            action: crate::config::Action::Macro {
+                macro_id: crate::config::MacroId::from(macro_id.clone()),
+            },
+        });
+        server
+            .proxy
+            .set_binding("grid_r1c1", "base", binding)
+            .await
+            .expect("SetBinding referencing a real macro_id must succeed");
+
+        let err = server
+            .proxy
+            .delete_macro(&macro_id)
+            .await
+            .expect_err("deleting a still-referenced Macro must fail");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.InvalidBinding")
+        );
+
+        server
+            .proxy
+            .clear_binding("grid_r1c1", "base")
+            .await
+            .unwrap();
+        server
+            .proxy
+            .delete_macro(&macro_id)
+            .await
+            .expect("deleting an unreferenced Macro must now succeed");
+
+        server.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn delete_macro_over_real_dbus_on_an_unknown_macro_id_returns_not_found() {
+        let server = TestServer::start().await;
+
+        let err = server
+            .proxy
+            .delete_macro("nonexistent")
+            .await
+            .expect_err("deleting an unknown Macro must fail");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.NotFound")
+        );
+
+        server.shut_down().await;
+    }
+
     /// Ticket 19's live demo, exercised without real hardware: creating a
     /// second Profile, switching to it over real D-Bus, and getting the
     /// `ActiveProfileChanged` push a subscribed client (the GUI/tray) relies
@@ -1433,13 +1633,19 @@ mod tests {
         let server = TestServer::start().await;
         server.proxy.create_profile("Gaming").await.unwrap();
 
-        let binding = wire::binding_to_dict(&crate::config::Binding {
-            trigger: crate::config::TriggerMode::Toggle,
-            action: crate::config::Action::Macro {
-                steps: vec![
+        let macro_id = server
+            .create_macro(
+                "Test macro",
+                vec![
                     crate::config::MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
                     crate::config::MacroStepDto::Delay(50),
                 ],
+            )
+            .await;
+        let binding = wire::binding_to_dict(&crate::config::Binding {
+            trigger: crate::config::TriggerMode::Toggle,
+            action: crate::config::Action::Macro {
+                macro_id: crate::config::MacroId::from(macro_id),
             },
         });
         server
@@ -1505,13 +1711,19 @@ mod tests {
     async fn stop_all_toggles_over_real_dbus_releases_a_key_even_while_suppressed() {
         let server = TestServer::start().await;
 
-        let binding = wire::binding_to_dict(&crate::config::Binding {
-            trigger: crate::config::TriggerMode::Toggle,
-            action: crate::config::Action::Macro {
-                steps: vec![
+        let macro_id = server
+            .create_macro(
+                "Test macro",
+                vec![
                     crate::config::MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
                     crate::config::MacroStepDto::Delay(50),
                 ],
+            )
+            .await;
+        let binding = wire::binding_to_dict(&crate::config::Binding {
+            trigger: crate::config::TriggerMode::Toggle,
+            action: crate::config::Action::Macro {
+                macro_id: crate::config::MacroId::from(macro_id),
             },
         });
         server
@@ -1627,15 +1839,21 @@ mod tests {
     async fn output_suppression_withholds_a_running_toggles_output_without_stopping_it() {
         let server = TestServer::start().await;
 
-        let binding = wire::binding_to_dict(&crate::config::Binding {
-            trigger: crate::config::TriggerMode::Toggle,
-            action: crate::config::Action::Macro {
-                steps: vec![
+        let macro_id = server
+            .create_macro(
+                "Test macro",
+                vec![
                     crate::config::MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
                     crate::config::MacroStepDto::Delay(15),
                     crate::config::MacroStepDto::KeyUp(evdev::KeyCode::KEY_A),
                     crate::config::MacroStepDto::Delay(15),
                 ],
+            )
+            .await;
+        let binding = wire::binding_to_dict(&crate::config::Binding {
+            trigger: crate::config::TriggerMode::Toggle,
+            action: crate::config::Action::Macro {
+                macro_id: crate::config::MacroId::from(macro_id),
             },
         });
         server
@@ -1733,6 +1951,7 @@ mod tests {
             active_profile: DEFAULT_PROFILE_NAME.to_string(),
             profiles,
             force_digital: false,
+            macros: HashMap::new(),
         };
         crate::config::write(&config_path, &config).unwrap();
 

@@ -37,8 +37,10 @@ def macro_step_to_variant(step: dict) -> dict[str, GLib.Variant]:
 
 def action_to_variant(action: dict) -> dict[str, GLib.Variant]:
     """`action` carries `"type"` plus either Keypress's `"key"`/`"modifiers"`
-    or Macro's `"steps"`. Mirrors `action_to_dict` in wire.rs: an empty
-    `modifiers` list is omitted entirely rather than sent as `[]`."""
+    or Macro's `"macro_id"` (ticket 51 — a Binding references a library
+    entry rather than carrying step content directly). Mirrors
+    `action_to_dict` in wire.rs: an empty `modifiers` list is omitted
+    entirely rather than sent as `[]`."""
     kind = action["type"]
     if kind == "keypress":
         result = {"type": GLib.Variant("s", "keypress"), "key": GLib.Variant("s", action["key"])}
@@ -47,8 +49,7 @@ def action_to_variant(action: dict) -> dict[str, GLib.Variant]:
             result["modifiers"] = GLib.Variant("as", modifiers)
         return result
     if kind == "macro":
-        steps = [macro_step_to_variant(step) for step in action["steps"]]
-        return {"type": GLib.Variant("s", "macro"), "steps": GLib.Variant("aa{sv}", steps)}
+        return {"type": GLib.Variant("s", "macro"), "macro_id": GLib.Variant("s", action["macro_id"])}
     if kind == "profile_switch":
         return {"type": GLib.Variant("s", "profile_switch"), "target": GLib.Variant("s", action["target"])}
     if kind == "controller_button":

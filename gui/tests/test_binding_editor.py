@@ -534,43 +534,37 @@ def test_trigger_mode_warning_wiring_survives_repeated_action_kind_switching():
     assert not _has_warning(editor)
 
 
-def test_macro_step_keydown_value_uses_the_picker_and_records_the_key_code():
+def test_selecting_macro_on_an_unbound_key_shows_the_placeholder_and_disables_save():
+    # Ticket 51: the Macro Action cutover invalidated the old inline
+    # step-editing UI outright — reduced to a read-only macro_id display.
+    # With no existing Macro Binding (and no picker yet to assign a fresh
+    # macro_id), Save must be disabled rather than send an invalid payload.
     stub = DaemonStub()
     editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
 
     action_dd = _dropdown_labeled(editor, "Action")
     action_dd.set_selected([k for k, _ in ACTION_TYPES].index("macro"))
 
-    _pick_key(editor, "Value", "F2")
-    button_labeled(editor, "+ Add step").emit("clicked")
-
-    assert find_one(editor, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "KeyDown KEY_F2") is not None
+    assert find_one(editor, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "Macro: (none)") is not None
+    assert not button_labeled(editor, "Save").get_sensitive()
 
 
-def test_macro_step_keydown_value_never_shows_the_modifier_warning():
-    # A KeyDown-only step *is* ticket 02's own recommended workaround for
-    # holding a modifier via Toggle — warning about it here would be wrong.
+def test_opening_an_existing_macro_binding_shows_its_macro_id_read_only_and_save_resends_it():
     stub = DaemonStub()
+    macro_id = stub.create_macro("Test macro", [{"type": "key_down", "key": "KEY_A"}])
+    stub.set_binding("grid_r1c1", "base", {"trigger": "fire_once", "type": "macro", "macro_id": macro_id})
+
     editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
 
-    action_dd = _dropdown_labeled(editor, "Action")
-    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("macro"))
+    assert find_one(editor, lambda w: isinstance(w, Gtk.Label) and w.get_label() == f"Macro: {macro_id}") is not None
+    save_btn = button_labeled(editor, "Save")
+    assert save_btn.get_sensitive()
 
-    _pick_first_modifier(editor, "Value")
+    save_btn.emit("clicked")
 
-    assert not _has_warning(editor)
-
-
-def test_macro_step_kind_switch_to_delay_swaps_the_picker_for_a_plain_entry():
-    stub = DaemonStub()
-    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
-
-    action_dd = _dropdown_labeled(editor, "Action")
-    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("macro"))
-
-    step_kind_dd = _dropdown_labeled(editor, "New step")
-    step_kind_dd.set_selected(2)  # Delay (ms)
-
-    value_row = _key_picker_row(editor, "Value")
-    assert find_all(value_row, lambda w: isinstance(w, Gtk.Entry)) != []
-    assert find_all(value_row, lambda w: "key-picker-toggle" in w.get_css_classes()) == []
+    assert stub.calls[-1] == (
+        "set_binding",
+        "grid_r1c1",
+        "base",
+        {"trigger": "fire_once", "type": "macro", "macro_id": macro_id},
+    )

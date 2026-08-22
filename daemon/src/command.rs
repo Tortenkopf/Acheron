@@ -6,7 +6,7 @@
 
 use tokio::sync::oneshot;
 
-use crate::config::{Binding, Config, Layer, ModeKeyRole};
+use crate::config::{Binding, Config, Layer, MacroId, MacroStepDto, ModeKeyRole};
 use crate::input::Input;
 
 /// The live runtime snapshot `GetState()` returns. `layer` reflects the
@@ -141,6 +141,36 @@ pub enum Command {
     /// triggers the supervisor's live capture-source swap.
     SetForceDigital {
         force: bool,
+        reply: oneshot::Sender<Result<(), CommandError>>,
+    },
+    /// Creates a new Macro library entry (ticket 15/51) — a `MacroId` is
+    /// derived from `name` via the slug algorithm (`config::unique_macro_id`)
+    /// and frozen; the reply carries that assigned id back to the caller,
+    /// unlike `CreateProfile` (whose identity *is* the caller-chosen name).
+    /// Fails `InvalidRequest` if `name` is empty/whitespace. No
+    /// `AlreadyExists` case — a slug collision is resolved automatically
+    /// (numeric suffix), never rejected.
+    CreateMacro {
+        name: String,
+        steps: Vec<MacroStepDto>,
+        reply: oneshot::Sender<Result<MacroId, CommandError>>,
+    },
+    /// Renames a Macro — a pure `MacroDef.name` field write, the `MacroId`
+    /// itself never changes (ticket 15's Answer: identity is deliberately
+    /// decoupled from the editable display name). Fails `NotFound` if
+    /// `macro_id` doesn't exist, or `InvalidRequest` if `new_name` is
+    /// empty/whitespace. No `AlreadyExists` — display names aren't unique.
+    RenameMacro {
+        macro_id: MacroId,
+        new_name: String,
+        reply: oneshot::Sender<Result<(), CommandError>>,
+    },
+    /// Deletes a Macro. Fails `NotFound` if it doesn't exist, or
+    /// `InvalidRequest` if any Binding anywhere (`base`/`held`, any Profile)
+    /// still references its `MacroId` — mirrors `DeleteProfile`'s identical
+    /// reasoning, making a dangling `macro_id` structurally impossible.
+    DeleteMacro {
+        macro_id: MacroId,
         reply: oneshot::Sender<Result<(), CommandError>>,
     },
 }

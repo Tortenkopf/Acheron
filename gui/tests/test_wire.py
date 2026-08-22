@@ -37,17 +37,22 @@ def test_controller_button_binding_round_trips_through_a_variant():
 
 
 def test_macro_binding_round_trips_through_a_variant():
-    binding = {
-        "trigger": "toggle",
-        "type": "macro",
-        "steps": [
-            {"type": "key_down", "key": "KEY_A"},
-            {"type": "delay_ms", "ms": 50},
-            {"type": "key_up", "key": "KEY_A"},
-        ],
-    }
+    binding = {"trigger": "toggle", "type": "macro", "macro_id": "screenshot-combo"}
 
     variant_dict = wire.binding_to_variant(binding)
     unpacked = {k: v.unpack() for k, v in variant_dict.items()}
 
     assert unpacked == binding
+
+
+def test_macro_step_to_variant_round_trips_every_step_kind():
+    steps = [
+        {"type": "key_down", "key": "KEY_A"},
+        {"type": "delay_ms", "ms": 50},
+        {"type": "key_up", "key": "KEY_A"},
+    ]
+
+    for step in steps:
+        variant_dict = wire.macro_step_to_variant(step)
+        unpacked = {k: v.unpack() for k, v in variant_dict.items()}
+        assert unpacked == step
