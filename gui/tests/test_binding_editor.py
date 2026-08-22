@@ -221,6 +221,71 @@ def test_bound_profile_switch_shows_the_target_in_the_grid_button_label():
     assert "→ Gaming" in label.get_label()
 
 
+# --- Controller Button (ticket 43) ---
+
+
+def test_saving_a_controller_button_binding_calls_set_binding_with_the_chosen_button():
+    stub = DaemonStub()
+    changed = []
+
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
+    popover = editor_content(btn)
+
+    action_dd = _dropdown_labeled(popover, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("controller_button"))
+
+    button_row = find_one(popover, lambda w: isinstance(w, Gtk.Box) and _row_label_text(w) == "Button")
+    button_labeled(button_row, "B").emit("clicked")
+
+    button_labeled(popover, "Save").emit("clicked")
+
+    assert stub.calls == [
+        (
+            "set_binding",
+            "grid_r1c1",
+            "base",
+            {"trigger": "fire_once", "type": "controller_button", "button": "BTN_EAST"},
+        )
+    ]
+    assert changed == [1]
+
+
+def test_controller_button_keeps_the_trigger_dropdown_selectable():
+    stub = DaemonStub()
+
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+    popover = editor_content(btn)
+
+    action_dd = _dropdown_labeled(popover, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("controller_button"))
+
+    trigger_dd = _dropdown_labeled(popover, "Trigger mode")
+    assert trigger_dd.get_sensitive()
+
+
+def test_controller_button_action_summary_shows_the_button_and_trigger():
+    assert (
+        action_summary(
+            {"trigger": "hold_to_repeat", "type": "controller_button", "button": "BTN_SOUTH"},
+            "grid_r1c1",
+        )
+        == "Btn: A / South  [hold]"
+    )
+
+
+def test_bound_controller_button_shows_the_button_in_the_grid_button_label():
+    stub = DaemonStub()
+    stub.set_binding(
+        "grid_r1c1", "base", {"trigger": "fire_once", "type": "controller_button", "button": "BTN_START"}
+    )
+
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    assert "bound" in btn.get_css_classes()
+    label = btn.get_child()
+    assert "Btn: Start" in label.get_label()
+
+
 # --- Actuation & release (ticket 26) ---
 
 

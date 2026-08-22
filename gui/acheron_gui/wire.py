@@ -51,6 +51,8 @@ def action_to_variant(action: dict) -> dict[str, GLib.Variant]:
         return {"type": GLib.Variant("s", "macro"), "steps": GLib.Variant("aa{sv}", steps)}
     if kind == "profile_switch":
         return {"type": GLib.Variant("s", "profile_switch"), "target": GLib.Variant("s", action["target"])}
+    if kind == "controller_button":
+        return {"type": GLib.Variant("s", "controller_button"), "button": GLib.Variant("s", action["button"])}
     raise ValueError(f"{kind!r} is not a valid Action type")
 
 

@@ -54,7 +54,17 @@ async fn main() -> io::Result<()> {
         25,
     )
     .await?;
-    let (inj, inj_handle) = injector::spawn(device);
+    // Ticket 14/43's second uinput device, for Action::ControllerButton —
+    // opened right alongside the keyboard device so the same startup-race
+    // retry (ticket 28) covers it too.
+    let gamepad_device = injector::retry_on_permission_denied(
+        "/dev/uinput (gamepad)",
+        injector::build_gamepad_device,
+        Duration::from_millis(200),
+        25,
+    )
+    .await?;
+    let (inj, inj_handle) = injector::spawn(device, gamepad_device);
 
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
     let (connection_tx, connection_rx) = tokio::sync::mpsc::channel(8);

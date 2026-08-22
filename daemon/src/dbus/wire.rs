@@ -200,6 +200,10 @@ pub fn action_to_dict(action: &Action) -> Dict {
             dict.insert("type".to_string(), scalar("profile_switch".to_string()));
             dict.insert("target".to_string(), scalar(target.clone()));
         }
+        Action::ControllerButton { button } => {
+            dict.insert("type".to_string(), scalar("controller_button".to_string()));
+            dict.insert("button".to_string(), scalar(key_to_string(*button)));
+        }
     }
     dict
 }
@@ -228,6 +232,9 @@ pub fn action_from_dict(dict: &Dict) -> Result<Action, String> {
         }
         "profile_switch" => Ok(Action::ProfileSwitch {
             target: get_str(dict, "target")?.to_string(),
+        }),
+        "controller_button" => Ok(Action::ControllerButton {
+            button: key_from_str(get_str(dict, "button")?)?,
         }),
         other => Err(format!("{other:?} is not a valid Action type")),
     }
@@ -416,6 +423,20 @@ mod tests {
         let dict = action_to_dict(&action);
         assert_eq!(dict_get_string(&dict, "type"), "profile_switch");
         assert_eq!(dict_get_string(&dict, "target"), "Gaming");
+
+        let round_tripped = action_from_dict(&dict).unwrap();
+        assert_eq!(round_tripped, action);
+    }
+
+    #[test]
+    fn controller_button_action_round_trips_through_a_dict() {
+        let action = Action::ControllerButton {
+            button: KeyCode::BTN_SOUTH,
+        };
+
+        let dict = action_to_dict(&action);
+        assert_eq!(dict_get_string(&dict, "type"), "controller_button");
+        assert_eq!(dict_get_string(&dict, "button"), "BTN_SOUTH");
 
         let round_tripped = action_from_dict(&dict).unwrap();
         assert_eq!(round_tripped, action);

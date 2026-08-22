@@ -113,6 +113,14 @@ CSS = """
 .keycap-mod { background-color: alpha(#4a90e2, 0.22); }
 .keycap-mouse { background-color: alpha(#8e44ad, 0.22); }
 .keycap-mm { background-color: alpha(#27ae60, 0.22); }
+/* Ticket 43: the real controller-button picker (controller_picker.py),
+   ported from ticket 38's winning variant A prototype. */
+.pad-body { background-color: alpha(currentColor, 0.06); border-radius: 18px; }
+.padbtn { min-width: 0; min-height: 0; font-size: 11px; padding: 2px 4px; }
+.padbtn-face { background-color: alpha(#4a90e2, 0.22); }
+.padbtn-shoulder { background-color: alpha(#e67e22, 0.22); }
+.padbtn-stick { background-color: alpha(#8e44ad, 0.22); }
+.padbtn-dpad { background-color: alpha(#27ae60, 0.22); }
 """
 
 

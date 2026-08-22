@@ -791,7 +791,7 @@ mod tests {
             crate::config::write(&config_path, &config).unwrap();
 
             let sink = RecordingSink::new();
-            let (inj, inj_handle) = injector::spawn(sink.clone());
+            let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
             let (event_tx, event_rx) = mpsc::channel(8);
             let (conn_tx, conn_rx) = mpsc::channel(8);
             let (cmd_tx, cmd_rx) = mpsc::channel(8);
@@ -1737,7 +1737,7 @@ mod tests {
         crate::config::write(&config_path, &config).unwrap();
 
         let sink = RecordingSink::new();
-        let (inj, inj_handle) = injector::spawn(sink.clone());
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
         let (event_tx, event_rx) = mpsc::channel(8);
         let (_conn_tx, conn_rx) = mpsc::channel(8);
         let (cmd_tx, cmd_rx) = mpsc::channel(8);

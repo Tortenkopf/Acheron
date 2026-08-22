@@ -82,6 +82,13 @@ pub fn compile(action: &Action) -> Vec<MacroStep> {
                 "Action::ProfileSwitch is intercepted in dispatch::handle_event before compile is ever called"
             )
         }
+        // Same shape as a plain, unmodified Keypress (ticket 14's Answer: "a
+        // controller-button press is the same shape as a Keypress: compile a
+        // down/up pair, inject it") — only the target uinput device differs,
+        // which the injector alone decides (`input::is_gamepad_button`).
+        Action::ControllerButton { button } => {
+            vec![MacroStep::KeyDown(*button), MacroStep::KeyUp(*button)]
+        }
     }
 }
 
@@ -367,10 +374,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compile_controller_button_is_a_bare_down_up_pair() {
+        let action = Action::ControllerButton {
+            button: KeyCode::BTN_SOUTH,
+        };
+
+        let steps = compile(&action);
+
+        assert_eq!(
+            steps,
+            vec![
+                MacroStep::KeyDown(KeyCode::BTN_SOUTH),
+                MacroStep::KeyUp(KeyCode::BTN_SOUTH),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn spawn_fire_once_runs_the_steps_exactly_once() {
         let sink = RecordingSink::new();
-        let (inj, inj_handle) = injector::spawn(sink.clone());
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
 
         let steps = compile(&Action::Keypress {
             modifiers: Modifiers::default(),
@@ -390,7 +414,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn toggle_loops_the_steps_until_stopped() {
         let sink = RecordingSink::new();
-        let (inj, inj_handle) = injector::spawn(sink.clone());
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
 
         let steps = vec![
             MacroStep::KeyDown(KeyCode::KEY_A),
@@ -428,7 +452,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn toggle_stop_force_releases_a_key_left_held_by_an_unbalanced_macro() {
         let sink = RecordingSink::new();
-        let (inj, inj_handle) = injector::spawn(sink.clone());
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
 
         // An unbalanced Macro: KeyDown with no matching KeyUp before the
         // loop's Delay — the Toggle should still force-release it on stop.
@@ -480,7 +504,7 @@ mod tests {
         // the key is left stuck down at the OS level with `active_toggles`
         // wrongly implying it was released.
         let sink = RecordingSink::new();
-        let (inj, inj_handle) = injector::spawn(sink.clone());
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
 
         let steps = vec![
             MacroStep::KeyDown(KeyCode::KEY_A),
@@ -520,7 +544,7 @@ mod tests {
         // shortly after, `force_release` no longer knew that key was still
         // genuinely down, and it was never actually released.
         let sink = RecordingSink::new();
-        let (inj, inj_handle) = injector::spawn(sink.clone());
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
 
         let steps = vec![
             MacroStep::KeyDown(KeyCode::KEY_A),
@@ -570,7 +594,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn toggle_with_an_empty_macro_stops_cleanly_with_no_output() {
         let sink = RecordingSink::new();
-        let (inj, inj_handle) = injector::spawn(sink.clone());
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
 
         let toggle = ActiveToggle::spawn(inj.clone(), Vec::new());
         tokio::task::yield_now().await;
@@ -589,7 +613,7 @@ mod tests {
         // with no Delay step at all, so without a floor the loop would
         // busy-spin as fast as the injector channel allowed.
         let sink = RecordingSink::new();
-        let (inj, inj_handle) = injector::spawn(sink.clone());
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
 
         let action = Action::Keypress {
             modifiers: Modifiers::default(),
@@ -641,7 +665,7 @@ mod tests {
         // hand-built Toggle Macro of a single delay-free KeyDown is just as
         // dangerous and must hit the same floor.
         let sink = RecordingSink::new();
-        let (inj, inj_handle) = injector::spawn(sink.clone());
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
 
         let steps = vec![MacroStep::KeyDown(KeyCode::KEY_A)];
 

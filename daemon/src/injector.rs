@@ -48,6 +48,27 @@ pub fn build_device() -> io::Result<VirtualDevice> {
         .build()
 }
 
+/// Builds the second `uinput` device `Action::ControllerButton` fires
+/// against (ticket 14/43) — distinct from `build_device`'s keyboard/mouse
+/// device, advertising only `input::gamepad_button_codes()`'s curated
+/// 57-entry set (not the full `EV_KEY` range `build_device` declares: unlike
+/// Keypress, a ControllerButton's `button` is already validated against this
+/// exact set at `SetBinding`/`load_or_seed` time, so there's no "any code at
+/// all" case to leave room for). Kernel `joydev` auto-attaches a `/dev/input/
+/// jsX` node to any `uinput` device that advertises this `BTN_GAMEPAD`-class
+/// bit set — confirmed by ticket 37's research, zero extra work needed here.
+pub fn build_gamepad_device() -> io::Result<VirtualDevice> {
+    let mut keys = AttributeSet::<KeyCode>::new();
+    for code in input::gamepad_button_codes() {
+        keys.insert(code);
+    }
+
+    VirtualDevice::builder()?
+        .name("Acheron Virtual Controller")
+        .with_keys(&keys)?
+        .build()
+}
+
 /// Retries a fallible open on `PermissionDenied` alone, bounded by
 /// `attempts` with `delay` between each (ticket 28).
 ///
@@ -186,15 +207,38 @@ impl Injector {
     }
 }
 
-/// Spawns the injector task, which owns `sink` for the life of the task.
-pub fn spawn<S: InjectSink>(sink: S) -> (Injector, JoinHandle<io::Result<()>>) {
+/// Spawns the injector task, which owns both `sink` (keyboard/mouse) and
+/// `gamepad_sink` (ticket 14/43's second `uinput` device) for the life of
+/// the task. A single generic `S` (rather than two distinct sink types) —
+/// every real call site builds both from the same `VirtualDevice`/
+/// `InjectSink` impl, and tests that don't care about gamepad routing can
+/// pass the same `RecordingSink` clone for both, landing every batch in one
+/// shared recording.
+pub fn spawn<S: InjectSink>(sink: S, gamepad_sink: S) -> (Injector, JoinHandle<io::Result<()>>) {
     let (tx, rx) = mpsc::channel(256);
-    let handle = tokio::spawn(injector_loop(sink, rx));
+    let handle = tokio::spawn(injector_loop(sink, gamepad_sink, rx));
     (Injector { tx }, handle)
+}
+
+/// Routes a `KeyState`/`ForceRelease` write to the gamepad sink instead of
+/// the keyboard/mouse one when `key` is one of ticket 43's curated gamepad
+/// codes — the injector-level device distinction ticket 14 asked for,
+/// invisible to `executor.rs`'s generic `KeyDown`/`KeyUp` steps.
+fn sink_for<'a, S: InjectSink>(
+    sink: &'a mut S,
+    gamepad_sink: &'a mut S,
+    key: KeyCode,
+) -> &'a mut S {
+    if input::is_gamepad_button(key) {
+        gamepad_sink
+    } else {
+        sink
+    }
 }
 
 async fn injector_loop<S: InjectSink>(
     mut sink: S,
+    mut gamepad_sink: S,
     mut rx: mpsc::Receiver<InjectorMessage>,
 ) -> io::Result<()> {
     let mut suppressed = false;
@@ -203,18 +247,22 @@ async fn injector_loop<S: InjectSink>(
             InjectorMessage::Physical(event) => {
                 let batch = translate(event);
                 if !batch.is_empty() && !suppressed {
+                    // A physical Input's passthrough code is always a
+                    // keyboard/mouse code (input.rs's Input variants never
+                    // map onto a gamepad button) — always the primary sink.
                     sink.emit(&batch)?;
                 }
             }
             InjectorMessage::KeyState { key, down, applied } => {
                 if !suppressed {
                     let value = if down { 1 } else { 0 };
-                    sink.emit(&[*KeyEvent::new(key, value)])?;
+                    sink_for(&mut sink, &mut gamepad_sink, key)
+                        .emit(&[*KeyEvent::new(key, value)])?;
                 }
                 let _ = applied.send(!suppressed);
             }
             InjectorMessage::ForceRelease(key) => {
-                sink.emit(&[*KeyEvent::new(key, 0)])?;
+                sink_for(&mut sink, &mut gamepad_sink, key).emit(&[*KeyEvent::new(key, 0)])?;
             }
             InjectorMessage::SetSuppressed(value) => suppressed = value,
         }
@@ -356,7 +404,7 @@ mod tests {
     #[tokio::test]
     async fn set_key_state_emits_one_frame_per_transition() {
         let sink = testing::RecordingSink::new();
-        let (injector, handle) = spawn(sink.clone());
+        let (injector, handle) = spawn(sink.clone(), sink.clone());
 
         injector.set_key_state(KeyCode::KEY_F1, true).await.unwrap();
         injector
@@ -383,6 +431,66 @@ mod tests {
                 .map(key_and_value)
                 .collect::<Vec<_>>(),
             vec![(KeyCode::KEY_F1, 0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn set_key_state_routes_gamepad_codes_to_the_gamepad_sink() {
+        let sink = testing::RecordingSink::new();
+        let gamepad_sink = testing::RecordingSink::new();
+        let (injector, handle) = spawn(sink.clone(), gamepad_sink.clone());
+
+        injector
+            .set_key_state(KeyCode::BTN_SOUTH, true)
+            .await
+            .unwrap();
+        injector.set_key_state(KeyCode::KEY_F1, true).await.unwrap();
+        drop(injector);
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(
+            sink.batches()
+                .into_iter()
+                .flatten()
+                .map(key_and_value)
+                .collect::<Vec<_>>(),
+            vec![(KeyCode::KEY_F1, 1)],
+            "a keyboard code must never reach the gamepad device"
+        );
+        assert_eq!(
+            gamepad_sink
+                .batches()
+                .into_iter()
+                .flatten()
+                .map(key_and_value)
+                .collect::<Vec<_>>(),
+            vec![(KeyCode::BTN_SOUTH, 1)],
+            "a gamepad code must never reach the keyboard/mouse device"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_release_routes_gamepad_codes_to_the_gamepad_sink() {
+        let sink = testing::RecordingSink::new();
+        let gamepad_sink = testing::RecordingSink::new();
+        let (injector, handle) = spawn(sink.clone(), gamepad_sink.clone());
+
+        injector
+            .force_release_key(KeyCode::BTN_TRIGGER_HAPPY1)
+            .await
+            .unwrap();
+        drop(injector);
+        handle.await.unwrap().unwrap();
+
+        assert!(sink.batches().is_empty());
+        assert_eq!(
+            gamepad_sink
+                .batches()
+                .into_iter()
+                .flatten()
+                .map(key_and_value)
+                .collect::<Vec<_>>(),
+            vec![(KeyCode::BTN_TRIGGER_HAPPY1, 0)]
         );
     }
 

@@ -498,6 +498,14 @@ async fn handle_command(
                 )));
                 return;
             }
+            if let Action::ControllerButton { button } = binding.action
+                && !crate::input::is_gamepad_button(button)
+            {
+                let _ = reply.send(Err(CommandError::InvalidRequest(format!(
+                    "{button:?} is not a valid gamepad button"
+                ))));
+                return;
+            }
             let previous = active_profile_mut(config)
                 .layer_mut(layer)
                 .insert(input, binding);
@@ -860,7 +868,7 @@ mod tests {
         bindings: HashMap<Input, Binding>,
     ) -> Vec<Vec<evdev::InputEvent>> {
         let sink = RecordingSink::new();
-        let (inj, inj_handle) = injector::spawn(sink.clone());
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
 
         let (tx, rx) = mpsc::channel(8);
         let (conn_tx, conn_rx) = mpsc::channel(8);
@@ -1030,7 +1038,7 @@ mod tests {
         );
 
         let sink = RecordingSink::new();
-        let (inj, inj_handle) = injector::spawn(sink.clone());
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
         let (tx, rx) = mpsc::channel(8);
         let (_conn_tx, conn_rx) = mpsc::channel(8);
         let (_cmd_tx, cmd_rx) = mpsc::channel(8);
@@ -1113,7 +1121,7 @@ mod tests {
         );
 
         let sink = RecordingSink::new();
-        let (inj, inj_handle) = injector::spawn(sink.clone());
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
         let (tx, rx) = mpsc::channel(8);
         let (_conn_tx, conn_rx) = mpsc::channel(8);
         let (_cmd_tx, cmd_rx) = mpsc::channel(8);
@@ -1189,7 +1197,7 @@ mod tests {
         );
 
         let sink = RecordingSink::new();
-        let (inj, inj_handle) = injector::spawn(sink.clone());
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
         let (tx, rx) = mpsc::channel(8);
         let (_conn_tx, conn_rx) = mpsc::channel(8);
         let (_cmd_tx, cmd_rx) = mpsc::channel(8);
@@ -1374,7 +1382,7 @@ mod tests {
             config::write(&config_path, &config).unwrap();
 
             let sink = RecordingSink::new();
-            let (inj, inj_handle) = injector::spawn(sink.clone());
+            let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
             let (event_tx, event_rx) = mpsc::channel(8);
             let (conn_tx, conn_rx) = mpsc::channel(8);
             let (cmd_tx, cmd_rx) = mpsc::channel(8);
@@ -2066,6 +2074,63 @@ mod tests {
                 "the rejected Binding must not have been applied"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn set_binding_rejects_a_controller_button_outside_the_gamepad_allowlist() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::FireOnce,
+                    action: Action::ControllerButton {
+                        button: evdev::KeyCode::KEY_A,
+                    },
+                },
+            )
+            .await
+            .expect_err("a non-gamepad ControllerButton Binding must be rejected");
+        assert!(matches!(err, CommandError::InvalidRequest(_)));
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+        assert!(
+            !config.profiles[DEFAULT_PROFILE_NAME]
+                .base
+                .contains_key(&Input::Grid(1, 1)),
+            "the rejected Binding must not have been applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_binding_accepts_a_controller_button_in_the_gamepad_allowlist() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::FireOnce,
+                    action: Action::ControllerButton {
+                        button: evdev::KeyCode::BTN_SOUTH,
+                    },
+                },
+            )
+            .await
+            .expect("a gamepad ControllerButton Binding must be accepted");
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+        assert_eq!(
+            config.profiles[DEFAULT_PROFILE_NAME].base[&Input::Grid(1, 1)].action,
+            Action::ControllerButton {
+                button: evdev::KeyCode::BTN_SOUTH,
+            }
+        );
     }
 
     #[tokio::test]

@@ -21,6 +21,8 @@ from gi.repository import Gtk, GLib
 from .daemon_client import DaemonError
 from .gtk_utils import clear_children
 from .inputs import ACTION_TYPES, INPUT_DEFAULT_LABEL, TRIGGER_OPTIONS, TRIGGER_SHORT, input_label, is_grid_input
+from .controller_picker import LABEL_BY_CODE as CONTROLLER_LABEL_BY_CODE
+from .controller_picker import build_inline_controller_picker
 from .key_picker import LABEL_BY_CODE, build_inline_key_picker
 
 
@@ -50,6 +52,10 @@ def action_summary(binding: dict | None, inp: str) -> str:
         # Fire-once (ticket 34), so it would always read the same "[1x]"
         # every other binding kind's suffix actually varies by.
         return f"→ {binding['target']}"
+    if binding["type"] == "controller_button":
+        raw_button = binding["button"]
+        button = CONTROLLER_LABEL_BY_CODE.get(raw_button, raw_button)
+        return f"Btn: {button}  [{TRIGGER_SHORT[binding['trigger']]}]"
     steps = binding.get("steps", [])
     return f"Macro ({len(steps)} steps)  [{TRIGGER_SHORT[binding['trigger']]}]"
 
@@ -458,6 +464,9 @@ def build_binding_editor(
         "profile_switch": {"target": starting.get("target", profile)}
         if starting["type"] == "profile_switch"
         else {"target": profile},
+        "controller_button": {"button": starting.get("button", "BTN_SOUTH")}
+        if starting["type"] == "controller_button"
+        else {"button": "BTN_SOUTH"},
     }
 
     # Ticket 42: the keypress Key field's modifier warning also depends on
@@ -524,6 +533,14 @@ def build_binding_editor(
 
             target_dd.connect("notify::selected", on_target_changed)
             editor_slot.append(labeled_row("Target Profile", target_dd))
+        elif kind == "controller_button":
+            def on_button_changed(code: str) -> None:
+                draft["controller_button"]["button"] = code
+
+            controller_picker = build_inline_controller_picker(
+                draft["controller_button"].get("button", "BTN_SOUTH"), on_button_changed
+            )
+            editor_slot.append(labeled_row("Button", controller_picker))
         else:
             steps_list = Gtk.ListBox()
             steps_list.add_css_class("boxed-list")
@@ -627,6 +644,12 @@ def build_binding_editor(
                 "trigger": "fire_once",
                 "type": "profile_switch",
                 "target": draft["profile_switch"].get("target", profile),
+            }
+        elif kind == "controller_button":
+            binding = {
+                "trigger": TRIGGER_OPTIONS[trigger_dd.get_selected()][0],
+                "type": "controller_button",
+                "button": draft["controller_button"].get("button", "BTN_SOUTH"),
             }
         else:
             binding = {

@@ -228,6 +228,51 @@ pub fn all_injectable_key_codes() -> Vec<KeyCode> {
     (0..=KEY_CODE_MAX).map(KeyCode::new).collect()
 }
 
+/// Whether `code` is one of the curated 57-entry gamepad-button allowlist
+/// `Action::ControllerButton` validates against (ticket 43, per ticket 14's
+/// settled device-advertising scope): the standard Linux Gamepad Spec's
+/// named `BTN_GAMEPAD` range, the four `BTN_DPAD_*` directions, and the full
+/// `BTN_TRIGGER_HAPPY1`-`40` extra range. Also the injector's
+/// keyboard-vs-gamepad routing decision: a `KeyCode` never carries which
+/// `uinput` device it targets, so the injector infers it from the code
+/// itself rather than threading a device tag through `executor.rs` (which
+/// stays unchanged, exactly as ticket 14 intended — "only the target uinput
+/// device differs, an executor/injector-level distinction").
+pub fn is_gamepad_button(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::BTN_SOUTH
+            | KeyCode::BTN_EAST
+            | KeyCode::BTN_NORTH
+            | KeyCode::BTN_WEST
+            | KeyCode::BTN_TL
+            | KeyCode::BTN_TR
+            | KeyCode::BTN_TL2
+            | KeyCode::BTN_TR2
+            | KeyCode::BTN_SELECT
+            | KeyCode::BTN_START
+            | KeyCode::BTN_MODE
+            | KeyCode::BTN_THUMBL
+            | KeyCode::BTN_THUMBR
+            | KeyCode::BTN_DPAD_UP
+            | KeyCode::BTN_DPAD_DOWN
+            | KeyCode::BTN_DPAD_LEFT
+            | KeyCode::BTN_DPAD_RIGHT
+    ) || (KeyCode::BTN_TRIGGER_HAPPY1.code()..=KeyCode::BTN_TRIGGER_HAPPY40.code())
+        .contains(&code.code())
+}
+
+/// The curated gamepad-button allowlist as a list — the second `uinput`
+/// device's own advertised capability set (`injector::build_gamepad_device`),
+/// so the device's declared codes and `is_gamepad_button`'s validation/
+/// routing decision can never drift apart.
+pub fn gamepad_button_codes() -> Vec<KeyCode> {
+    (0..=KEY_CODE_MAX)
+        .map(KeyCode::new)
+        .filter(|&code| is_gamepad_button(code))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +378,49 @@ mod tests {
         assert!("grid_r5c1".parse::<Input>().is_err());
         assert!("grid_r1c6".parse::<Input>().is_err());
         assert!("grid_r0c1".parse::<Input>().is_err());
+    }
+
+    #[test]
+    fn gamepad_button_codes_has_exactly_57_entries() {
+        assert_eq!(gamepad_button_codes().len(), 57);
+    }
+
+    #[test]
+    fn is_gamepad_button_accepts_every_named_button_and_the_full_trigger_happy_range() {
+        for code in [
+            KeyCode::BTN_SOUTH,
+            KeyCode::BTN_EAST,
+            KeyCode::BTN_NORTH,
+            KeyCode::BTN_WEST,
+            KeyCode::BTN_TL,
+            KeyCode::BTN_TR,
+            KeyCode::BTN_TL2,
+            KeyCode::BTN_TR2,
+            KeyCode::BTN_SELECT,
+            KeyCode::BTN_START,
+            KeyCode::BTN_MODE,
+            KeyCode::BTN_THUMBL,
+            KeyCode::BTN_THUMBR,
+            KeyCode::BTN_DPAD_UP,
+            KeyCode::BTN_DPAD_DOWN,
+            KeyCode::BTN_DPAD_LEFT,
+            KeyCode::BTN_DPAD_RIGHT,
+        ] {
+            assert!(is_gamepad_button(code), "{code:?} must be a gamepad button");
+        }
+        for i in KeyCode::BTN_TRIGGER_HAPPY1.code()..=KeyCode::BTN_TRIGGER_HAPPY40.code() {
+            assert!(is_gamepad_button(KeyCode::new(i)));
+        }
+    }
+
+    #[test]
+    fn is_gamepad_button_rejects_keyboard_and_mouse_codes() {
+        assert!(!is_gamepad_button(KeyCode::KEY_A));
+        assert!(!is_gamepad_button(KeyCode::BTN_LEFT));
+        assert!(!is_gamepad_button(KeyCode::BTN_MIDDLE));
+        assert!(!is_gamepad_button(KeyCode::new(
+            KeyCode::BTN_TRIGGER_HAPPY40.code() + 1
+        )));
     }
 
     #[test]

@@ -225,6 +225,17 @@ pub enum Action {
     ProfileSwitch {
         target: String,
     },
+    /// Fires a virtual-gamepad button press (ticket 14/43) — an ordinary
+    /// Action reusing Binding/Trigger-mode/dispatch/executor exactly like
+    /// Keypress (only the target `uinput` device differs, an
+    /// executor/injector-level distinction, per `executor::compile` and
+    /// `input::is_gamepad_button`). `button` is validated (`SetBinding` and
+    /// `load_or_seed`, via `parse`'s `InvalidControllerButton` check)
+    /// against `input::gamepad_button_codes()`'s curated 57-entry allowlist
+    /// — unlike Keypress's `key`, which accepts any `KeyCode` at all.
+    ControllerButton {
+        button: KeyCode,
+    },
 }
 
 /// A Keypress's modifier chord (e.g. Ctrl+Shift+T). Per issue 06: ctrl,
@@ -263,6 +274,7 @@ pub enum ConfigError {
     UnsupportedSchemaVersion(i64),
     InvalidActiveProfile(String),
     InvalidProfileSwitchTrigger,
+    InvalidControllerButton(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -291,6 +303,10 @@ impl fmt::Display for ConfigError {
             ConfigError::InvalidProfileSwitchTrigger => write!(
                 f,
                 "config.toml contains an Action::ProfileSwitch Binding whose trigger is not fire_once"
+            ),
+            ConfigError::InvalidControllerButton(button) => write!(
+                f,
+                "config.toml contains an Action::ControllerButton Binding whose button {button:?} is not a valid gamepad button"
             ),
         }
     }
@@ -342,6 +358,23 @@ fn parse(contents: &str) -> Result<Config, ConfigError> {
     });
     if has_invalid_profile_switch_trigger {
         return Err(ConfigError::InvalidProfileSwitchTrigger);
+    }
+    let invalid_controller_button = config.profiles.values().find_map(|profile| {
+        [&profile.base, &profile.held]
+            .into_iter()
+            .find_map(|bindings| {
+                bindings.values().find_map(|binding| match binding.action {
+                    Action::ControllerButton { button }
+                        if !crate::input::is_gamepad_button(button) =>
+                    {
+                        Some(button)
+                    }
+                    _ => None,
+                })
+            })
+    });
+    if let Some(button) = invalid_controller_button {
+        return Err(ConfigError::InvalidControllerButton(format!("{button:?}")));
     }
     Ok(config)
 }
@@ -637,6 +670,44 @@ action = { type = "profile_switch", target = "Gaming" }
 
         let err = load_or_seed(&path).expect_err("a Toggle Profile Switch must refuse to start");
         assert!(matches!(err, ConfigError::InvalidProfileSwitchTrigger));
+    }
+
+    #[test]
+    fn parses_a_controller_button_binding() {
+        let toml = r#"
+schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base.grid_r1c1]
+trigger = "fire_once"
+action = { type = "controller_button", button = "BTN_SOUTH" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let binding = &config.profiles["Default"].base[&Input::Grid(1, 1)];
+        assert_eq!(
+            binding.action,
+            Action::ControllerButton {
+                button: KeyCode::BTN_SOUTH,
+            }
+        );
+    }
+
+    #[test]
+    fn refuses_to_start_when_a_controller_button_is_not_in_the_gamepad_allowlist() {
+        let (_dir, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base.grid_r1c1]
+trigger = "fire_once"
+action = { type = "controller_button", button = "KEY_A" }
+"#;
+        fs::write(&path, original).unwrap();
+
+        let err =
+            load_or_seed(&path).expect_err("a non-gamepad ControllerButton must refuse to start");
+        assert!(matches!(err, ConfigError::InvalidControllerButton(_)));
 
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }

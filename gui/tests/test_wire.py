@@ -27,6 +27,15 @@ def test_profile_switch_binding_round_trips_through_a_variant():
     assert unpacked == binding
 
 
+def test_controller_button_binding_round_trips_through_a_variant():
+    binding = {"trigger": "fire_once", "type": "controller_button", "button": "BTN_SOUTH"}
+
+    variant_dict = wire.binding_to_variant(binding)
+    unpacked = {k: v.unpack() for k, v in variant_dict.items()}
+
+    assert unpacked == binding
+
+
 def test_macro_binding_round_trips_through_a_variant():
     binding = {
         "trigger": "toggle",
