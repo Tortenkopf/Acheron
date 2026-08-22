@@ -344,7 +344,7 @@ def make_input_button(
     sensitive: bool = True,
     insensitive_reason: str | None = None,
     capture_mode: str = "digital",
-) -> Gtk.MenuButton:
+) -> Gtk.Button:
     binding = config["profiles"][profile][layer].get(inp)
     inner = Gtk.Label(label=f"{input_label(inp)}\n{action_summary(binding, inp)}", justify=Gtk.Justification.CENTER)
     inner.set_wrap(True)
@@ -366,7 +366,7 @@ def make_input_button(
     # split inside a button that's already `w`-wide — the same "floor, not
     # ceiling" tradeoff already accepted for `h` below, not a new one.
     inner.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
-    btn = Gtk.MenuButton()
+    btn = Gtk.Button()
     btn.set_child(inner)
     btn.set_size_request(w, h)
     # A MenuButton's default halign is FILL: inside a plain Gtk.Box (the Mode
@@ -375,21 +375,53 @@ def make_input_button(
     # diamond's ~160px, not this button's own 52px — live-verified via a
     # real screenshot as the actual cause of the oversized Mode-key oval,
     # not missing wrapping. A Gtk.Grid cell (every other caller) already
-    # sizes to its own column, so this is a no-op there.
+    # sizes to its own column, so this is a no-op there. (Still relevant
+    # now that `btn` is a plain Gtk.Button, not a Gtk.MenuButton — both
+    # default to halign FILL.)
     btn.set_halign(Gtk.Align.CENTER)
     btn.add_css_class("bound" if binding else "empty")
     btn.set_sensitive(sensitive)
     if not sensitive and insensitive_reason:
         btn.set_tooltip_text(insensitive_reason)
-    popover = Gtk.Popover()
+
+    # Ticket 44 (live-verified on real hardware): a real top-level Gtk.Window
+    # instead of a Gtk.Popover anchored to `btn`. The Binding editor's
+    # content — now including ticket 44's always-inline key/mouse-button
+    # picker — is tall enough that GTK4/Wayland's Popover positioning has no
+    # valid place to put it for nearly every Device Overview grid button,
+    # even with the main window maximized: a Popover is constrained to its
+    # own toplevel's local bounds, not the full screen, and this content
+    # routinely needs more room than a grid button's surrounding space
+    # provides within that toplevel. A real Window is placed by the window
+    # manager across the whole screen instead, sidestepping the constraint
+    # entirely. Built once (like the old popover) and shown/hidden via
+    # present()/close() rather than recreated per click — which needs
+    # `set_hide_on_close`: unlike Gtk.Popover.popdown(), Gtk.Window.close()
+    # *destroys* the window by default. Live-verified as a real bug: without
+    # this, the second open of the same key re-presented an already-
+    # destroyed window ("A window is shown after it has been destroyed" per
+    # GTK's own warning), corrupting its content and eventually hanging the
+    # whole app after a few open/close cycles.
+    window = Gtk.Window(modal=True, title=f"{profile} / {layer} / {input_label(inp)}")
+    window.set_hide_on_close(True)
 
     def on_saved():
-        popover.popdown()
+        window.close()
         on_change()
 
     editor = build_binding_editor(client, config, profile, layer, inp, on_saved, capture_mode)
-    popover.set_child(editor)
-    btn.set_popover(popover)
+    window.set_child(editor)
+
+    def on_click(_b):
+        window.set_transient_for(btn.get_root())
+        window.present()
+
+    btn.connect("clicked", on_click)
+    # Exposed for tests, which need to reach the editor's content without
+    # actually presenting a real top-level window in a headless run (unlike
+    # the old Gtk.Popover, there's no `btn.get_popover()`-style GTK API for
+    # "the window this button opens").
+    btn.binding_editor_window = window
     return btn
 
 
@@ -407,7 +439,7 @@ def build_main_view(
     mode_key_role = config["profiles"][profile]["mode_key_role"]
     mode_key_bindable = mode_key_role == "bound"
 
-    def input_btn(inp: str, w=76, h=99, sensitive=True, insensitive_reason=None) -> Gtk.MenuButton:
+    def input_btn(inp: str, w=76, h=99, sensitive=True, insensitive_reason=None) -> Gtk.Button:
         return make_input_button(
             client,
             config,

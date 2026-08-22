@@ -130,17 +130,17 @@ _NUM_ROW = (
 )
 _QWERTY_ROW = (
     [("KEY_TAB", "Tab", 1.5)]
-    + [(f"KEY_{c}", c.upper(), 1.0) for c in "qwertyuiop"]
+    + [(f"KEY_{c.upper()}", c.upper(), 1.0) for c in "qwertyuiop"]
     + [("KEY_LEFTBRACE", "[", 1.0), ("KEY_RIGHTBRACE", "]", 1.0), ("KEY_BACKSLASH", "\\", 1.5)]
 )
 _HOME_ROW = (
     [("KEY_CAPSLOCK", "Caps", 1.8)]
-    + [(f"KEY_{c}", c.upper(), 1.0) for c in "asdfghjkl"]
+    + [(f"KEY_{c.upper()}", c.upper(), 1.0) for c in "asdfghjkl"]
     + [("KEY_SEMICOLON", ";", 1.0), ("KEY_APOSTROPHE", "'", 1.0), ("KEY_ENTER", "Enter", 2.2)]
 )
 _BOTTOM_ROW = (
     [("KEY_LEFTSHIFT", "Shift", 2.3)]
-    + [(f"KEY_{c}", c.upper(), 1.0) for c in "zxcvbnm"]
+    + [(f"KEY_{c.upper()}", c.upper(), 1.0) for c in "zxcvbnm"]
     + [("KEY_COMMA", ",", 1.0), ("KEY_DOT", ".", 1.0), ("KEY_SLASH", "/", 1.0), ("KEY_RIGHTSHIFT", "Shift", 2.3)]
 )
 _SPACE_ROW = [
@@ -258,11 +258,26 @@ def build_inline_key_picker(
     on_change: Callable[[str], None],
     warn_predicate: Callable[[], bool] = lambda: True,
 ) -> tuple[Gtk.Widget, Callable[[], None]]:
-    """Returns `(widget, refresh_warning)`. `widget` is a collapsed summary
-    button that expands into the full keyboard grid in place; wrap it in the
-    caller's own `labeled_row(label, widget)` for the field label, since this
-    component is mounted twice (Binding "Key", Macro step "Value") under two
-    different labels.
+    """Returns `(widget, refresh_warning)`. `widget` is the current-selection
+    label plus the full keyboard grid, always shown inline (no collapse/
+    expand toggle); wrap it in the caller's own `labeled_row(label, widget)`
+    for the field label, since this component is mounted twice (Binding
+    "Key", Macro step "Value") under two different labels.
+
+    Ticket 44 (live-verified on real hardware): ticket 42's original shape
+    was a collapsed "<label> ▸ Change" summary button that expanded the grid
+    in place inside the *outer* per-key Binding-editor Popover. That grow-
+    in-place resize silently failed for nearly every Device Overview grid
+    position on GTK4/Wayland (the compositor's xdg_popup positioner is
+    computed once at first show and can't be resatisfied for a much bigger
+    size afterward — confirmed independent of Gtk.Popover autohide, which
+    made no difference). A follow-up attempt nesting a second Gtk.Popover
+    off a Gtk.MenuButton also live-verified broken: it rendered the grid's
+    full content correctly, but positioned it at the window's origin instead
+    of anchored to the toggle, a nested-popover-positioning bug on the same
+    Wayland stack. Always showing the grid inline sidesteps both failure
+    modes: the outer popover's size is fixed from its own very first render,
+    never resized afterward.
 
     `warn_predicate` gates ticket 02's bare-modifier warning on ticket 42's
     added "Trigger mode isn't Toggle" condition — external state this
@@ -271,17 +286,17 @@ def build_inline_key_picker(
     Trigger-mode dropdown), since picking a key is the only event this
     component reacts to by itself.
     """
-    state = {"code": current_code, "expanded": False}
+    state = {"code": current_code}
     root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
 
-    toggle_btn = Gtk.Button(hexpand=True, css_classes=["key-picker-toggle"])
-    root.append(toggle_btn)
+    summary_label = Gtk.Label(xalign=0, css_classes=["key-picker-summary"])
+    root.append(summary_label)
 
     warn_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
     root.append(warn_slot)
 
-    panel_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["picker-panel"])
-    root.append(panel_slot)
+    grid_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["picker-panel"])
+    root.append(grid_slot)
 
     def render_warning():
         clear_children(warn_slot)
@@ -289,30 +304,20 @@ def build_inline_key_picker(
             warn_slot.append(build_modifier_warning())
 
     def render_summary():
-        chevron = "▾" if state["expanded"] else "▸"
-        toggle_btn.set_label(f"{LABEL_BY_CODE.get(state['code'], state['code'])}  {chevron} Change")
+        summary_label.set_label(f"Selected: {LABEL_BY_CODE.get(state['code'], state['code'])}")
 
-    def render_panel():
-        clear_children(panel_slot)
-        panel_slot.set_visible(state["expanded"])
-        if state["expanded"]:
-            panel_slot.append(_keyboard_grid(on_pick, state["code"]))
+    def render_grid():
+        clear_children(grid_slot)
+        grid_slot.append(_keyboard_grid(on_pick, state["code"]))
 
     def on_pick(code: str):
         state["code"] = code
-        state["expanded"] = False
         render_summary()
         render_warning()
-        render_panel()
+        render_grid()
         on_change(code)
 
-    def on_toggle(b):
-        state["expanded"] = not state["expanded"]
-        render_summary()
-        render_panel()
-
-    toggle_btn.connect("clicked", on_toggle)
     render_summary()
     render_warning()
-    render_panel()
+    render_grid()
     return root, render_warning

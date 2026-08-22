@@ -22,15 +22,11 @@ def _key_picker_row(root, label_text):
     return find_one(root, lambda w: isinstance(w, Gtk.Box) and _row_label_text(w) == label_text)
 
 
-def _key_picker_toggle(root, label_text):
-    row = _key_picker_row(root, label_text)
-    return find_one(row, lambda w: isinstance(w, Gtk.Button) and "key-picker-toggle" in w.get_css_classes())
-
-
 def _pick_key(root, label_text, key_label):
-    """Expands the picker labeled `label_text` (e.g. "Key"/"Value") and
-    clicks the keycap button labeled `key_label` (e.g. "F1", "Left")."""
-    _key_picker_toggle(root, label_text).emit("clicked")
+    """Clicks the keycap button labeled `key_label` (e.g. "F1", "Left") in
+    the picker labeled `label_text` (e.g. "Key"/"Value"). Ticket 44: the
+    keyboard grid is always shown inline (no collapse/expand toggle), so
+    it's reachable directly."""
     row = _key_picker_row(root, label_text)
     button_labeled(row, key_label).emit("clicked")
 
@@ -39,7 +35,6 @@ def _pick_first_modifier(root, label_text):
     """Every modifier keycap label ("Ctrl"/"Shift"/"Alt"/"Super") appears
     twice (Left/Right) — this clicks whichever comes first, which is enough
     to exercise the modifier-selected path."""
-    _key_picker_toggle(root, label_text).emit("clicked")
     row = _key_picker_row(root, label_text)
     find_all(row, lambda w: isinstance(w, Gtk.Button) and "keycap-mod" in w.get_css_classes())[0].emit("clicked")
 
@@ -55,7 +50,7 @@ def test_clicking_an_unbound_key_opens_editor_defaulted_to_fire_once_keypress():
     btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
 
     assert "empty" in btn.get_css_classes()
-    popover = btn.get_popover()
+    popover = btn.binding_editor_window.get_child()
     heading = find_one(popover, lambda w: "heading" in w.get_css_classes())
     assert heading.get_label() == "Default / base / 1"
 
@@ -65,7 +60,7 @@ def test_saving_a_keypress_binding_calls_set_binding_and_closes_popover():
     changed = []
 
     btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
-    popover = btn.get_popover()
+    popover = btn.binding_editor_window.get_child()
 
     _pick_key(popover, "Key", "F1")
 
@@ -90,7 +85,7 @@ def test_clearing_an_existing_binding_calls_clear_binding():
     changed = []
 
     btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
-    popover = btn.get_popover()
+    popover = btn.binding_editor_window.get_child()
 
     button_labeled(popover, "Clear (passthrough)").emit("clicked")
 
@@ -103,7 +98,7 @@ def test_clearing_an_already_passthrough_input_is_a_noop_but_still_closes():
     changed = []
 
     btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
-    popover = btn.get_popover()
+    popover = btn.binding_editor_window.get_child()
 
     button_labeled(popover, "Clear (passthrough)").emit("clicked")
 
@@ -139,7 +134,7 @@ def test_editing_targets_the_held_layer_independently_of_base():
     changed = []
 
     btn = make_input_button(stub, stub.get_config(), "Default", "held", "grid_r1c1", lambda: changed.append(1))
-    popover = btn.get_popover()
+    popover = btn.binding_editor_window.get_child()
     heading = find_one(popover, lambda w: "heading" in w.get_css_classes())
     assert heading.get_label() == "Default / held / 1"
 
@@ -167,7 +162,7 @@ def test_saving_a_profile_switch_binding_calls_set_binding_with_fire_once_and_th
     changed = []
 
     btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
-    popover = btn.get_popover()
+    popover = btn.binding_editor_window.get_child()
 
     action_dd = _dropdown_labeled(popover, "Action")
     action_dd.set_selected([k for k, _ in ACTION_TYPES].index("profile_switch"))
@@ -194,7 +189,7 @@ def test_selecting_profile_switch_disables_and_forces_the_trigger_dropdown_to_fi
     stub.create_profile("Gaming")
 
     btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
-    popover = btn.get_popover()
+    popover = btn.binding_editor_window.get_child()
 
     trigger_dd = _dropdown_labeled(popover, "Trigger mode")
     trigger_dd.set_selected([k for k, _ in TRIGGER_OPTIONS].index("toggle"))
@@ -288,7 +283,7 @@ def test_set_as_profile_default_closes_the_popover_and_refreshes_the_cached_conf
     changed = []
 
     btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
-    popover = btn.get_popover()
+    popover = btn.binding_editor_window.get_child()
 
     button_labeled(popover, "Set as Profile default").emit("clicked")
 
@@ -300,7 +295,7 @@ def test_reset_all_keys_to_profile_default_closes_the_popover_and_refreshes_the_
     changed = []
 
     btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
-    popover = btn.get_popover()
+    popover = btn.binding_editor_window.get_child()
 
     button_labeled(popover, "Reset all keys to Profile default").emit("clicked")
 
@@ -319,7 +314,7 @@ def test_reset_to_profile_default_does_not_close_the_popover():
     changed = []
 
     btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
-    popover = btn.get_popover()
+    popover = btn.binding_editor_window.get_child()
 
     button_labeled(popover, "Reset to Profile default").emit("clicked")
 

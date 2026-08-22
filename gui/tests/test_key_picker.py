@@ -10,53 +10,67 @@ from acheron_gui.key_picker import (
 from .widget_tree import button_labeled, find_all, find_one
 
 
-def _toggle(widget) -> Gtk.Button:
-    return find_one(widget, lambda w: isinstance(w, Gtk.Button) and "key-picker-toggle" in w.get_css_classes())
+def _summary(widget) -> Gtk.Label:
+    return find_one(widget, lambda w: "key-picker-summary" in w.get_css_classes())
 
 
-def test_starts_collapsed_showing_the_current_key_s_nice_label():
+def test_shows_the_current_key_s_nice_label():
     widget, _refresh = build_inline_key_picker("KEY_F1", lambda code: None)
 
-    toggle = _toggle(widget)
-    assert toggle.get_label() == "F1  ▸ Change"
-    assert find_all(widget, lambda w: "keycap" in w.get_css_classes()) == []
+    assert _summary(widget).get_label() == "Selected: F1"
 
 
-def test_clicking_toggle_expands_the_full_keyboard_grid():
+def test_the_full_keyboard_grid_is_always_shown_inline():
+    # Ticket 44: no collapse/expand toggle — the grid is always inline.
+    # Live-verified on real hardware that both a grow-in-place resize of the
+    # outer Binding-editor Popover, and a nested Gtk.Popover positioned off
+    # a Gtk.MenuButton, are broken on this GTK4/Wayland stack; always
+    # rendering inline avoids both failure modes since the outer popover's
+    # size is fixed at its own first render.
     widget, _refresh = build_inline_key_picker("KEY_A", lambda code: None)
-
-    _toggle(widget).emit("clicked")
 
     assert button_labeled(widget, "F1") is not None
     assert button_labeled(widget, "Space") is not None
     assert button_labeled(widget, "Left") is not None  # mouse strip
 
 
-def test_picking_a_key_collapses_the_panel_and_calls_on_change():
+def test_picking_a_key_updates_the_summary_and_calls_on_change():
     picked = []
     widget, _refresh = build_inline_key_picker("KEY_A", lambda code: picked.append(code))
 
-    _toggle(widget).emit("clicked")
     button_labeled(widget, "F1").emit("clicked")
 
     assert picked == ["KEY_F1"]
-    assert _toggle(widget).get_label() == "F1  ▸ Change"
-    assert find_all(widget, lambda w: "keycap" in w.get_css_classes()) == []
+    assert _summary(widget).get_label() == "Selected: F1"
 
 
 def test_picking_a_mouse_button_reports_its_btn_code():
     picked = []
     widget, _refresh = build_inline_key_picker("KEY_A", lambda code: picked.append(code))
 
-    _toggle(widget).emit("clicked")
     button_labeled(widget, "Left").emit("clicked")
 
     assert picked == ["BTN_LEFT"]
 
 
+def test_every_qwerty_home_and_bottom_row_letter_reports_an_uppercase_code():
+    # Regression test: the physical-keyboard-layout rows (_QWERTY_ROW,
+    # _HOME_ROW, _BOTTOM_ROW) build their code from the row's own lowercase
+    # loop variable directly (`f"KEY_{c}"`) while only the *label* uppercases
+    # it — live-verified on real hardware (ticket 44) that this produced
+    # invalid codes like "KEY_h" the real Daemon correctly rejected
+    # (evdev::KeyCode only recognizes uppercase KEY_* names), while the
+    # *catalog*-driven letters (`_LETTERS`, used elsewhere) were unaffected.
+    for row_letters in ("qwertyuiop", "asdfghjkl", "zxcvbnm"):
+        for letter in row_letters:
+            picked = []
+            widget, _refresh = build_inline_key_picker("KEY_A", lambda code: picked.append(code))
+            button_labeled(widget, letter.upper()).emit("clicked")
+            assert picked == [f"KEY_{letter.upper()}"]
+
+
 def test_f13_through_f24_are_hidden_behind_a_show_toggle():
     widget, _refresh = build_inline_key_picker("KEY_A", lambda code: None)
-    _toggle(widget).emit("clicked")
 
     assert find_all(widget, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "F13") == []
 
@@ -74,7 +88,6 @@ def _click_a_modifier(widget) -> None:
 
 def test_selecting_a_modifier_shows_the_warning_by_default():
     widget, _refresh = build_inline_key_picker("KEY_A", lambda code: None)
-    _toggle(widget).emit("clicked")
 
     _click_a_modifier(widget)
 
@@ -83,7 +96,6 @@ def test_selecting_a_modifier_shows_the_warning_by_default():
 
 def test_warn_predicate_suppresses_the_modifier_warning():
     widget, _refresh = build_inline_key_picker("KEY_A", lambda code: None, warn_predicate=lambda: False)
-    _toggle(widget).emit("clicked")
 
     _click_a_modifier(widget)
 
@@ -102,6 +114,15 @@ def test_refresh_warning_reevaluates_the_predicate_without_a_new_pick():
     refresh()
 
     assert find_all(widget, lambda w: "warning" in w.get_css_classes()) != []
+
+
+def test_picking_a_key_refreshes_the_highlighted_current_keycap():
+    widget, _refresh = build_inline_key_picker("KEY_A", lambda code: None)
+
+    button_labeled(widget, "F1").emit("clicked")
+
+    f1_button = button_labeled(widget, "F1")
+    assert "suggested-action" in f1_button.get_css_classes()
 
 
 def test_key_css_class_classifies_modifiers_mouse_and_multimedia_distinctly():

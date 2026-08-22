@@ -1,4 +1,5 @@
 Type: task
+Status: resolved
 
 ## Question
 
@@ -12,3 +13,21 @@ Checklist:
 - Select a bare modifier (e.g. Left Ctrl) as the Key with Trigger mode at Fire-once — confirm the warning renders; switch Trigger mode to Toggle live and confirm it disappears without reselecting the key.
 - Switch the Action to Macro, add a KeyDown step via the picker — confirm the step is added correctly and that no modifier warning appears even when the step's key is a bare modifier.
 - Confirm the Device Overview grid button and Action Table row both show a readable label ("Mouse Left", not "BTN_LEFT") for a saved mouse-button Binding.
+
+## Answer
+
+Every checklist item is now live-verified working against the real Daemon/Tartarus Pro/GUI, but getting there required three real, unanticipated fixes — this ticket's first item (the picker even opening) failed outright, live, in exactly the way ticket 42's own session couldn't have caught without physical access.
+
+**Finding 1 — grow-in-place is broken on this GTK4/Wayland stack.** Ticket 42's collapsed-summary-expands-in-place shape (`panel_slot.set_visible(True)` + append, inside the *outer* per-key Binding-editor Popover) silently failed for nearly every Device Overview grid button: the popover's own `visible` flipped back to `False` within ~16ms of the click, before the expanded content ever painted, and this was independent of `Gtk.Popover.set_autohide()` (tried both states, no difference). A follow-up attempt — a second, nested `Gtk.Popover` off a `Gtk.MenuButton` for just the expanded grid — rendered its content correctly but positioned it at the window's origin instead of anchored to the toggle (a nested-popover-positioning bug on the same stack). Root cause, confirmed by process of elimination: `Gtk.Popover` positioning is constrained to its own toplevel's local bounds, not the full screen, and this content (~470–600px) routinely has nowhere to go within a grid button's own small window.
+
+**Fix 1 — always-inline, no collapse/expand toggle.** `build_inline_key_picker` (`key_picker.py`) now always shows the full keyboard grid; there is no "▸ Change" toggle. This means the *outer* popover's size is fixed at its own very first render and never resized afterward — but the outer popover itself was still too tall to position for most grid buttons even maximized, so:
+
+**Fix 2 — the per-key Binding editor is now a real top-level `Gtk.Window`, not a `Gtk.Popover`.** `make_input_button` (`device_overview.py`) changed from a `Gtk.MenuButton`+`Gtk.Popover` to a plain `Gtk.Button` that opens a modal `Gtk.Window` (`window.set_transient_for(btn.get_root())`, `window.present()`), sidestepping the toplevel-bounds constraint entirely — a real Window is placed by the window manager across the whole screen. Only this one Popover (the Binding editor) was converted; the two other, small Popover usages in `device_overview.py` (the rename/create-Profile name prompt, the tray mock's Quick-switch menu) were untouched — live-verified unaffected by this constraint.
+
+**Bug found by Fix 2 itself, live**: `Gtk.Window.close()` *destroys* the window by default (unlike `Gtk.Popover.popdown()`, which just hides it), and the window is reused (built once, shown/hidden per click) the same way the old popover was. Without `window.set_hide_on_close(True)`, the second open of the same key re-presented an already-destroyed window (GTK's own warning: "A window is shown after it has been destroyed"), corrupting its content and eventually hanging the whole app after a few open/close cycles. Fixed with one line.
+
+**Finding 2 — a genuine pre-existing ticket-42 bug, caught by the first real Save**: `_QWERTY_ROW`/`_HOME_ROW`/`_BOTTOM_ROW` built their code from the row's own lowercase loop variable directly (`f"KEY_{c}"`) while only the *label* uppercased it — every letter picked via the visual keyboard-layout rows (not the flat `_LETTERS` catalog) produced an invalid code like `"KEY_h"`, which the real Daemon correctly rejected (`InvalidBindingError`) since `evdev::KeyCode` only recognizes uppercase names. This was unreachable without live D-Bus round-tripping — ticket 42 shipped without ever saving a real Binding. Fixed (`f"KEY_{c.upper()}"` in all three rows) with a new regression test (`test_every_qwerty_home_and_bottom_row_letter_reports_an_uppercase_code`) that clicks every letter in all three rows and asserts the reported code.
+
+**Test suite**: 108 Python tests green (was 106; +1 new picker test, +1 regression test above), including updates to `test_key_picker.py`/`test_binding_editor.py`/`test_device_overview.py` for the architecture change (`Gtk.Button` instead of `Gtk.MenuButton`, `btn.binding_editor_window.get_child()` instead of `btn.get_popover()`). No Rust changes — the Daemon was untouched throughout.
+
+**Full checklist, live-verified**: picker opens correctly for grid buttons across the whole layout (not just edge/thumbstick positions); letters, a function key, a multimedia key, a lock key, an F13–F24 key, and all five mouse buttons all round-trip through `config.toml`/D-Bus and produce correct real output; the bare-modifier warning shows for Fire-once and disappears live when switched to Toggle without reselecting the key; a Macro KeyDown step adds correctly via the picker with no warning even for a bare modifier; both the Device Overview grid button and Action Table row show "Mouse Left" (not "BTN_LEFT") for a saved mouse-button Binding.

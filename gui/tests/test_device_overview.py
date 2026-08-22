@@ -46,11 +46,11 @@ def test_device_overview_renders_one_button_per_input():
 
     root = _build(stub, {"table_open": False})
 
-    # Filtered to "bound"/"empty"-classed buttons — the tray mock's own
-    # "Quick switch" control is also a Gtk.MenuButton but isn't an Input.
+    # Filtered to "bound"/"empty"-classed buttons — only make_input_button's
+    # grid buttons ever carry either class.
     input_buttons = find_all(
         root,
-        lambda w: isinstance(w, Gtk.MenuButton) and ("bound" in w.get_css_classes() or "empty" in w.get_css_classes()),
+        lambda w: isinstance(w, Gtk.Button) and ("bound" in w.get_css_classes() or "empty" in w.get_css_classes()),
     )
     assert len(input_buttons) == len(ALL_INPUTS)
 
@@ -301,8 +301,8 @@ def test_clicking_the_held_tab_switches_which_layer_is_shown_and_edited():
     assert ui_state["selected_layer"] == "held"
 
     rebuilt = _build(stub, ui_state)
-    grid_r1c1_btn = find_one(rebuilt, lambda w: "bound" in w.get_css_classes() if isinstance(w, Gtk.MenuButton) else False)
-    heading = find_one(grid_r1c1_btn.get_popover(), lambda w: "heading" in w.get_css_classes())
+    grid_r1c1_btn = find_one(rebuilt, lambda w: "bound" in w.get_css_classes() if isinstance(w, Gtk.Button) else False)
+    heading = find_one(grid_r1c1_btn.binding_editor_window.get_child(), lambda w: "heading" in w.get_css_classes())
     assert heading.get_label() == "Default / held / 1"
 
 
@@ -311,7 +311,7 @@ def test_mode_key_button_is_disabled_under_the_default_layer_switch_role():
 
     root = _build(stub, {"table_open": False})
 
-    mode_btn = find_one(root, lambda w: isinstance(w, Gtk.MenuButton) and "mode-key" in w.get_css_classes())
+    mode_btn = find_one(root, lambda w: isinstance(w, Gtk.Button) and "mode-key" in w.get_css_classes())
     assert not mode_btn.get_sensitive()
 
 
@@ -326,7 +326,7 @@ def test_toggling_mode_key_role_to_bound_enables_its_binding_editor():
     assert stub.get_config()["profiles"]["Default"]["mode_key_role"] == "bound"
 
     rebuilt = _build(stub, ui_state)
-    mode_btn = find_one(rebuilt, lambda w: isinstance(w, Gtk.MenuButton) and "mode-key" in w.get_css_classes())
+    mode_btn = find_one(rebuilt, lambda w: isinstance(w, Gtk.Button) and "mode-key" in w.get_css_classes())
     assert mode_btn.get_sensitive()
 
 

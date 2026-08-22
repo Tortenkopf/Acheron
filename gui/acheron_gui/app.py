@@ -84,7 +84,7 @@ CSS = """
    be bare class selectors, not element-qualified, or they silently never match. */
 .bound { border: 2px solid #4caf50; }
 .empty { opacity: 0.75; }
-.mode-key, .mode-key > button { border-radius: 999px; }
+.mode-key { border-radius: 999px; }
 .tray-mock { border: 1px dashed alpha(currentColor, 0.35); border-radius: 8px; padding: 8px; }
 .error { color: #e53935; font-size: smaller; }
 .status-badge { font-size: 1.05em; }
