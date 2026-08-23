@@ -1,5 +1,6 @@
 Type: task
 Blocked by: 48
+Status: resolved
 
 ## Question
 
@@ -17,3 +18,7 @@ If the combined scope is too large for one session (precedent: [ticket 18](./18-
 ## Comments
 
 Split ahead of resolution (via `/to-tickets`, not during a build session) into six tickets covering this ticket's full scope: [51](./51-task-land-macro-library-daemon.md)/[52](./52-task-build-macro-library-gui.md)/[53](./53-task-verify-macro-library-on-hardware.md) for the Macro library (Daemon → GUI → hardware verify) and [54](./54-task-land-stepper-library-daemon.md)/[55](./55-task-build-stepper-library-gui.md)/[56](./56-task-verify-stepper-library-on-hardware.md) for the Stepper library, same shape. Split by construct (Macro vs. Stepper) rather than purely by layer, since a Daemon-only slice isn't independently verifiable without the picker GUI to create/assign a reference — each construct's Daemon ticket still only touches cross-module plumbing, not GUI widgets, per the ticket-21 precedent. Macro goes first since its Action cutover is breaking and its GUI ticket builds the shared tab-switch shell; Stepper's Daemon ticket carries no blocking edge on Macro's (independent schema, purely additive) but its GUI ticket depends on the shell ticket 52 builds. This ticket (41) is left unresolved/unmodified as the parent; work continues on 51 and 54.
+
+## Answer
+
+All six split children — [51](./51-task-land-macro-library-daemon.md), [52](./52-task-build-macro-library-gui.md), [53](./53-task-verify-macro-library-on-hardware.md), [54](./54-task-land-stepper-library-daemon.md), [55](./55-task-build-stepper-library-gui.md), [56](./56-task-verify-stepper-library-on-hardware.md) — are now resolved and live-hardware-verified: the Macro and Stepper libraries both exist for real in the Daemon/GUI, exactly to this ticket's original scope (Config/Daemon shapes, the tab-switched panel pair, the real key-entry picker, mounted in `build_library_placeholder()`'s slot). This parent ticket is closed as fully delivered by its split — no independent work remains under it. Found while scanning the frontier for the next takeable ticket in this session; a pure bookkeeping closure, not a new decision.
