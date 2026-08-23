@@ -451,22 +451,26 @@ async fn fire_chord(
     }
 }
 
-/// Fully releases one active Chord — a running Toggle is stopped, an
-/// in-flight Fire-once/Hold-to-repeat firing is force-released — regardless
-/// of its own Trigger mode (ticket 01's Answer: "releasing any one member
-/// ends the Chord's held/toggle state as a whole"). A Chord that never
+/// Force-releases a Chord's in-flight Fire-once/Hold-to-repeat firing, if
+/// any, on a member's `Up` — those Trigger modes are tied to the physical
+/// keys staying down, same as `fire`'s own Up handling. A Chord that never
 /// actually fired (still pending, or a FireOnce whose firing already
-/// finished on its own) has nothing to release here; both checks are
-/// no-ops in that case, same as `fire`'s own Up handling.
-async fn release_chord(
+/// finished on its own) has nothing to release here; the check is a no-op
+/// in that case.
+///
+/// **Toggle-mode Chords are deliberately not touched here** (correction,
+/// hardware-verified live in ticket 67): ticket 01's original Answer had
+/// any member's `Up` also stop an active Toggle, but that felt wrong on the
+/// real device — a Toggle should behave like a toggle, staying on past a
+/// release. A Toggle Chord now stops only when its full member set
+/// completes again, mirroring how a single Input's own Toggle stops on a
+/// second `Down`, never on `Up` — see the `Down` arm of
+/// `handle_chord_event`.
+async fn release_chord_firing(
     injector: &Injector,
-    chord_toggles: &mut HashMap<ChordKey, ActiveToggle>,
     chord_in_flight: &HashMap<ChordKey, FiringHandle>,
     key: &ChordKey,
 ) {
-    if let Some(toggle) = chord_toggles.remove(key) {
-        toggle.stop().await;
-    }
     if let Some(firing) = chord_in_flight.get(key) {
         firing.force_release_stuck(injector).await;
     }
@@ -576,18 +580,19 @@ async fn handle_chord_event(
                 .expect("just inserted above")
                 .down
                 .clone();
-            let completed: Vec<(ChordKey, Binding)> = chords
+            let starting: Vec<(ChordKey, Binding)> = chords
                 .iter()
                 .filter(|(key, _)| {
                     // A stale-but-*finished* `chord_in_flight` entry must
                     // not permanently exclude a FireOnce/HoldToRepeat Chord
-                    // from ever completing again — `release_chord` only
-                    // force-releases it, it never removes the map entry
-                    // (mirroring `fire`'s own single-Input `in_flight`,
-                    // which is never cleaned up either), so this must check
-                    // `is_finished()` itself rather than bare presence
-                    // (code-review finding: an earlier version of this
-                    // filter treated any entry as still-active forever).
+                    // from ever completing again — `release_chord_firing`
+                    // only force-releases it, it never removes the map
+                    // entry (mirroring `fire`'s own single-Input
+                    // `in_flight`, which is never cleaned up either), so
+                    // this must check `is_finished()` itself rather than
+                    // bare presence (code-review finding: an earlier
+                    // version of this filter treated any entry as
+                    // still-active forever).
                     !chord_state.toggles.contains_key(*key)
                         && !chord_state
                             .in_flight
@@ -598,7 +603,20 @@ async fn handle_chord_event(
                 .map(|(key, binding)| (key.clone(), binding.clone()))
                 .collect();
 
-            for (key, binding) in completed {
+            // A Toggle Chord that's already active and whose full member set
+            // just completed *again* is the Toggle's own "second Down" —
+            // stops it, mirroring a single Input's own Toggle (ticket 67
+            // correction; see `release_chord_firing`'s doc comment).
+            let stopping: Vec<ChordKey> = chords
+                .keys()
+                .filter(|key| {
+                    chord_state.toggles.contains_key(*key)
+                        && key.members().is_subset(&down_snapshot)
+                })
+                .cloned()
+                .collect();
+
+            for (key, binding) in starting {
                 fire_chord(
                     injector,
                     &mut chord_state.toggles,
@@ -611,6 +629,16 @@ async fn handle_chord_event(
                     stepper_cursors,
                 )
                 .await?;
+                if let Some(window) = chord_state.window.as_mut() {
+                    for member in key.members() {
+                        window.down.remove(member);
+                    }
+                }
+            }
+            for key in stopping {
+                if let Some(toggle) = chord_state.toggles.remove(&key) {
+                    toggle.stop().await;
+                }
                 if let Some(window) = chord_state.window.as_mut() {
                     for member in key.members() {
                         window.down.remove(member);
@@ -631,12 +659,24 @@ async fn handle_chord_event(
             // fired" — Repeat is a no-op for it, mirroring `fire`'s own
             // FireOnce/Toggle handling of Repeat. Only a member of an
             // already-ACTIVE Hold-to-repeat Chord re-fires.
+            //
+            // While a Chord is active every member is still physically down
+            // (any member's Up would already have ended it via the release
+            // path below), so the kernel independently autorepeats *each*
+            // member at the same cadence — an N-member Chord otherwise sees
+            // up to N interleaved Repeat streams landing on one
+            // `chord_in_flight` slot, re-firing N times as fast as a single
+            // Input ever would (hardware-verified regression, ticket 67).
+            // Only the member sorted first by `ChordKey`'s `BTreeSet`
+            // ordering drives the re-fire, so exactly one kernel repeat
+            // stream reaches it, matching a single Input's own cadence.
             let profile = config
                 .active_profile()
                 .expect("load_or_seed validates active_profile names a real profile");
             let chords = profile.chords(active_layer);
             let due: Vec<(ChordKey, Binding)> = chord_keys_containing(chords, event.input)
                 .into_iter()
+                .filter(|key| key.members().iter().next() == Some(&event.input))
                 .filter(|key| chord_state.in_flight.contains_key(key))
                 .filter_map(|key| chords.get(&key).cloned().map(|b| (key, b)))
                 .filter(|(_, binding)| binding.trigger == TriggerMode::HoldToRepeat)
@@ -703,13 +743,7 @@ async fn handle_chord_event(
                 .expect("load_or_seed validates active_profile names a real profile");
             let keys = chord_keys_containing(profile.chords(active_layer), event.input);
             for key in keys {
-                release_chord(
-                    injector,
-                    &mut chord_state.toggles,
-                    &chord_state.in_flight,
-                    &key,
-                )
-                .await;
+                release_chord_firing(injector, &chord_state.in_flight, &key).await;
             }
             Ok(())
         }
@@ -3154,7 +3188,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hold_to_repeat_chord_refires_on_repeat_for_any_member() {
+    async fn hold_to_repeat_chord_refires_only_on_the_leader_members_repeat() {
+        // Hardware-verified regression (ticket 67): while a Chord is active
+        // every member stays physically down, so the kernel independently
+        // autorepeats *each* member at the same cadence. Re-firing on any
+        // member's Repeat (the original ticket-40 design) made an N-member
+        // Chord repeat up to N times as fast as a single Input ever would.
+        // Only the member sorted first by `ChordKey`'s `BTreeSet` ordering —
+        // `Input::Grid(1, 1)` here — now drives the re-fire.
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
         harness
             .set_chord_binding(
@@ -3176,8 +3217,12 @@ mod tests {
         for _ in 0..5 {
             tokio::task::yield_now().await;
         }
-        // A Repeat on *either* member re-fires the Chord — not just the one
-        // that happened to complete it.
+        // A Repeat on the non-leader member is a no-op — no re-fire.
+        harness.repeat(Input::Grid(1, 2)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        // A Repeat on the leader member does re-fire.
         harness.repeat(Input::Grid(1, 1)).await;
         for _ in 0..5 {
             tokio::task::yield_now().await;
@@ -3185,8 +3230,8 @@ mod tests {
 
         let batches = harness.shut_down().await;
 
-        // The initial completion, plus one Repeat re-fire — each a
-        // KeyDown/KeyUp pair.
+        // The initial completion, plus exactly one Repeat re-fire (from the
+        // leader member only) — each a KeyDown/KeyUp pair.
         assert_eq!(batches.len(), 4);
         for pair in batches.chunks(2) {
             let evdev::EventSummary::Key(_, down_code, down_value) = pair[0][0].destructure()
@@ -3202,10 +3247,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn toggle_chord_is_stopped_by_releasing_any_member_not_a_fresh_press() {
-        // Deliberately unbalanced (no matching KeyUp step) so the Toggle's
-        // stop is what force-releases it, mirroring ticket 33's
-        // reproduction and this map's single-Input Toggle tests.
+    async fn toggle_chord_survives_releasing_one_member_and_stops_on_a_fresh_completion() {
+        // Hardware-verified correction (ticket 67): ticket 01's original
+        // Answer had releasing any one member end a Chord's Toggle — live on
+        // the real device that felt wrong (a Toggle should stay on past a
+        // release, like a real toggle). It now stops only when the full
+        // member set completes again, mirroring a single Input's own Toggle
+        // (a second Down stops it, never an Up).
         let (action, macros) = macro_action(
             "stuck",
             vec![MacroStepDto::KeyDown(evdev::KeyCode::KEY_LEFTCTRL)],
@@ -3230,13 +3278,27 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        // Releasing just ONE member ends the Chord's Toggle entirely — not
-        // a fresh Down of the exact same set (ticket 01's Answer).
+        // Releasing just ONE member must NOT stop the Chord's Toggle.
         harness.release(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        // A fresh completion of the full member set — both members down
+        // again — is what stops it.
+        harness.press(Input::Grid(1, 1)).await;
+        harness.press(Input::Grid(1, 2)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
 
         let batches = harness.shut_down().await;
 
-        assert_eq!(batches.len(), 2, "one KeyDown lap, then the force-release");
+        assert_eq!(
+            batches.len(),
+            2,
+            "one KeyDown lap surviving the mid-run release, then the stop's force-release"
+        );
         let evdev::EventSummary::Key(_, code, value) = batches[0][0].destructure() else {
             panic!("expected a key event");
         };

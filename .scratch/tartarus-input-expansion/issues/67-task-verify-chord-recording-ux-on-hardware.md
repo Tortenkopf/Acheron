@@ -1,4 +1,5 @@
 Type: task
+Status: resolved
 
 ## Question
 
@@ -18,3 +19,14 @@ Checklist:
 - Delete a Chord via its "×" and confirm the D-Bus round-trip and disk persistence.
 
 ## Answer
+
+Live-verified against the real, connected Tartarus Pro and GUI, straight off a fresh build of ticket 40's landed code — 9 of the 10 checklist items confirmed clean on the first pass. **The click-to-toggle recording gesture is confirmed good enough as final behavior** — asked the user directly given the checklist's own clean run, and real physical-press capture (the materially bigger Daemon-side signal-stream addition ticket 40's own fog note flagged) is not needed.
+
+Two real bugs found live, both fixed and re-verified in this same session:
+
+- **Hold-to-repeat Chord re-fired up to N times too fast** (N = member count) — while a Chord is active every member stays physically down, so the kernel independently autorepeats *each* member at the same cadence; the `EventState::Repeat` handler re-fired on *any* member's Repeat event landing on the shared `chord_in_flight` slot, so a 2-member Chord repeated roughly 2x too fast instead of matching a single Input's own cadence. Fixed in `dispatch.rs`'s Chord `Repeat` handling: only the member sorted first by `ChordKey`'s `BTreeSet` ordering now drives the re-fire (safe since every other member is guaranteed still down while the Chord is active — its release would already have ended things via the release path). Regression test rewritten (`hold_to_repeat_chord_refires_only_on_the_leader_members_repeat`) to lock in the corrected behavior; the old test's own name/comment had literally asserted the buggy "any member" behavior as intended.
+- **Toggle Chord stopped on any single member's release** rather than acting like a real toggle — this was ticket 01's original, deliberate Answer ("releasing any one member ends the Chord's held/toggle state as a whole"), itemized as expected behavior in this very ticket's own checklist, but felt wrong once actually lived with: a Toggle should stay on past a release, the same as a single Input's own Toggle (which ignores `Up` entirely and only stops on a second `Down`). **Correction, live user call**: a Toggle Chord now stops only when its full member set completes again — the Chord's own equivalent of "a second Down." Implemented by splitting the Down-completion pass in `handle_chord_event` into `starting` (fires a Chord not yet active) and `stopping` (an already-toggled-on Chord whose members just went down again — stops it) branches, and narrowing the old `release_chord` (renamed `release_chord_firing`) to only force-release Fire-once/Hold-to-repeat's in-flight firing on a member's `Up`, never a Toggle. Fire-once/Hold-to-repeat's existing any-member-releases-it-all behavior is untouched — those really are tied to the physical keys staying down. New/rewritten regression test: `toggle_chord_survives_releasing_one_member_and_stops_on_a_fresh_completion`.
+
+285 Rust tests green (both new/rewritten tests included), clippy/fmt clean. Both fixes rebuilt, reinstalled, and re-verified live against the real Daemon/GUI/device before this ticket closed.
+
+**A third finding, deliberately not fixed here** — Toggle's re-fire pace (unrelated to the two bugs above, and not Chord-specific: same `run_toggle_loop`/`MIN_TOGGLE_LAP` mechanism as every individual Toggle Binding) also read as noticeably faster than the now-corrected Hold-to-repeat, once the two were freshly comparable. `MIN_TOGGLE_LAP`'s hardcoded 20ms floor (from ticket 26) was only ever a flood-safety floor, never tuned to match the kernel's real autorepeat rate the way Hold-to-repeat's cadence now is. Out of this ticket's scope (a pre-existing, project-wide mechanism, not a chord-recording regression) — spawned [Match Toggle-mode pacing to the kernel autorepeat rate](./68-task-match-toggle-pacing-to-kernel-autorepeat.md).
