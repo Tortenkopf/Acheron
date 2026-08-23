@@ -120,16 +120,21 @@ def test_grid_destination_has_a_reserved_chords_slot_naming_ticket_40():
     assert placeholder.get_label()
 
 
-def test_steppers_tab_names_ticket_55_as_a_stub():
+def test_steppers_tab_shows_the_real_panel_through_device_overview():
+    # Ticket 55: the Steppers panel is real now, mounted with the same
+    # currently-selected Profile/Layer `make_input_button`'s own editor
+    # popovers use (build_main_view's `profile`/`selected_layer`) — this
+    # exercises that threading end-to-end rather than only unit-testing
+    # library_view.build_library_view directly (test_library_view.py's job).
     stub = DaemonStub()
     ui_state = {"dest": "library", "library_tab": "steppers"}
 
     root = _build(stub, ui_state)
 
-    placeholder = find_one(
-        root, lambda w: isinstance(w, Gtk.Label) and "ticket 55" in w.get_label().lower()
+    assert find_one(
+        root, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "Steppers" and "heading" in w.get_css_classes()
     )
-    assert placeholder.get_label()
+    assert find_one(root, lambda w: isinstance(w, Gtk.Label) and "No Steppers yet" in w.get_label())
 
 
 def test_switching_to_the_steppers_tab_hides_the_macros_panel():

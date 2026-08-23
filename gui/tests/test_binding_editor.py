@@ -636,10 +636,10 @@ def test_action_summary_resolves_the_macros_display_name_not_the_raw_macro_id():
     )
 
 
-def test_action_summary_shows_the_stepper_id_and_direction():
-    # Ticket 54 landed the Daemon/wire side only — no library-name
-    # resolution here yet (unlike Macro's, ticket 51/52), so this shows the
-    # raw stepper_id.
+def test_action_summary_shows_the_raw_stepper_id_when_no_steppers_dict_is_given():
+    # `steppers` is optional (defaults to None) — a caller that hasn't been
+    # updated to thread it in (or a Stepper missing from a stale snapshot)
+    # falls back to the raw id, same as Macro's identical fallback stance.
     assert (
         action_summary(
             {"trigger": "fire_once", "type": "step", "stepper_id": "weapon-wheel", "direction": "forward"},
@@ -658,19 +658,28 @@ def test_action_summary_shows_the_stepper_id_and_direction():
     )
 
 
-def test_opening_an_existing_step_binding_does_not_crash_and_disables_save():
-    # Regression test: `Action::Step` isn't in ACTION_TYPES (ticket 55
-    # builds its real editor), so before this fix, opening the popover for
-    # a grid key already bound to a Step Action raised ValueError from
-    # `ACTION_TYPES`'s `.index()` lookup — a real crash exposed by ticket 54
-    # making `Action::Step` a Binding the Daemon can actually hand back.
-    stub = DaemonStub()
-    stepper_id = stub.create_stepper("Weapon Wheel", [{"type": "key", "key": "KEY_1"}])
-    stub.set_binding(
-        "grid_r1c1",
-        "base",
-        {"trigger": "fire_once", "type": "step", "stepper_id": stepper_id, "direction": "forward"},
+def test_action_summary_resolves_the_steppers_display_name_not_the_raw_stepper_id():
+    assert (
+        action_summary(
+            {"trigger": "fire_once", "type": "step", "stepper_id": "weapon-wheel", "direction": "forward"},
+            "grid_r1c1",
+            {},
+            {"weapon-wheel": {"name": "Weapon Wheel", "items": []}},
+        )
+        == "Step ↑ Weapon Wheel  [1x]"
     )
+
+
+def test_opening_an_existing_binding_with_an_unknown_action_kind_does_not_crash_and_disables_save():
+    # Regression test for the general crash-guard mechanism ticket 54 added
+    # (originally exercised via `Action::Step`, which ticket 55 now gives a
+    # real editor to — see the Stepper-support tests below). Kept here with
+    # a synthetic, never-real kind so the guard itself — opening a popover
+    # for a Binding type this editor doesn't (yet) know how to render must
+    # never raise `ValueError` from `ACTION_TYPES`'s `.index()` lookup —
+    # stays covered against whatever the *next* net-new Action variant is.
+    stub = DaemonStub()
+    stub.set_binding("grid_r1c1", "base", {"trigger": "fire_once", "type": "future_action_kind"})
 
     editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
 
@@ -682,14 +691,9 @@ def test_opening_an_existing_step_binding_does_not_crash_and_disables_save():
     assert stub.calls[-1] == ("clear_binding", "grid_r1c1", "base")
 
 
-def test_picking_a_real_action_over_an_unsupported_step_binding_reenables_save():
+def test_picking_a_real_action_over_an_unsupported_binding_reenables_save():
     stub = DaemonStub()
-    stepper_id = stub.create_stepper("Weapon Wheel", [{"type": "key", "key": "KEY_1"}])
-    stub.set_binding(
-        "grid_r1c1",
-        "base",
-        {"trigger": "fire_once", "type": "step", "stepper_id": stepper_id, "direction": "forward"},
-    )
+    stub.set_binding("grid_r1c1", "base", {"trigger": "fire_once", "type": "future_action_kind"})
 
     editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
     action_dd = _dropdown_labeled(editor, "Action")
@@ -697,3 +701,140 @@ def test_picking_a_real_action_over_an_unsupported_step_binding_reenables_save()
 
     save_btn = button_labeled(editor, "Save")
     assert save_btn.get_sensitive()
+
+
+# --- Stepper (ticket 55) ---
+
+
+def test_selecting_stepper_with_an_empty_library_shows_no_steppers_yet_and_disables_save():
+    stub = DaemonStub()
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    action_dd = _dropdown_labeled(editor, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("step"))
+
+    assert find_one(
+        editor, lambda w: isinstance(w, Gtk.Label) and "No Steppers in the library yet" in w.get_label()
+    )
+    assert not button_labeled(editor, "Save").get_sensitive()
+
+
+def test_selecting_stepper_with_existing_entries_defaults_to_the_first_and_forward_and_save_sends_it():
+    stub = DaemonStub()
+    stepper_id = stub.create_stepper("Weapon Wheel", [{"type": "key", "key": "KEY_1"}])
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    action_dd = _dropdown_labeled(editor, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("step"))
+
+    stepper_dd = _dropdown_labeled(editor, "Stepper")
+    assert stepper_dd.get_model().get_string(stepper_dd.get_selected()) == "Weapon Wheel"
+    direction_dd = _dropdown_labeled(editor, "Direction")
+    assert direction_dd.get_model().get_string(direction_dd.get_selected()) == "Forward"
+
+    button_labeled(editor, "Save").emit("clicked")
+
+    assert stub.calls[-1] == (
+        "set_binding",
+        "grid_r1c1",
+        "base",
+        {"trigger": "fire_once", "type": "step", "stepper_id": stepper_id, "direction": "forward"},
+    )
+
+
+def test_changing_direction_for_a_step_binding_updates_the_saved_binding():
+    stub = DaemonStub()
+    stepper_id = stub.create_stepper("Weapon Wheel", [])
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    action_dd = _dropdown_labeled(editor, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("step"))
+
+    direction_dd = _dropdown_labeled(editor, "Direction")
+    direction_dd.set_selected(1)  # Backward
+
+    button_labeled(editor, "Save").emit("clicked")
+
+    assert stub.calls[-1] == (
+        "set_binding",
+        "grid_r1c1",
+        "base",
+        {"trigger": "fire_once", "type": "step", "stepper_id": stepper_id, "direction": "backward"},
+    )
+
+
+def test_opening_an_existing_step_binding_preselects_the_stepper_and_direction():
+    stub = DaemonStub()
+    stub.create_stepper("Other Wheel", [])
+    stepper_id = stub.create_stepper("Weapon Wheel", [{"type": "key", "key": "KEY_1"}])
+    stub.set_binding(
+        "grid_r1c1", "base", {"trigger": "hold_to_repeat", "type": "step", "stepper_id": stepper_id, "direction": "backward"}
+    )
+
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    stepper_dd = _dropdown_labeled(editor, "Stepper")
+    assert stepper_dd.get_model().get_string(stepper_dd.get_selected()) == "Weapon Wheel"
+    direction_dd = _dropdown_labeled(editor, "Direction")
+    assert direction_dd.get_model().get_string(direction_dd.get_selected()) == "Backward"
+    save_btn = button_labeled(editor, "Save")
+    assert save_btn.get_sensitive()
+
+    save_btn.emit("clicked")
+
+    assert stub.calls[-1] == (
+        "set_binding",
+        "grid_r1c1",
+        "base",
+        {"trigger": "hold_to_repeat", "type": "step", "stepper_id": stepper_id, "direction": "backward"},
+    )
+
+
+def test_creating_a_stepper_inline_via_new_stepper_assigns_it_and_enables_save():
+    stub = DaemonStub()
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    action_dd = _dropdown_labeled(editor, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("step"))
+
+    new_btn = find_one(editor, lambda w: isinstance(w, Gtk.MenuButton) and w.get_label() == "+ New Stepper")
+    popover = new_btn.get_popover()
+    find_one(popover, lambda w: isinstance(w, Gtk.Entry)).set_text("Fresh Wheel")
+    find_one(popover, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Create").emit("clicked")
+
+    assert ("create_stepper", "Fresh Wheel", []) in stub.calls
+    (stepper_id,) = [sid for sid, s in stub.get_config()["steppers"].items() if s["name"] == "Fresh Wheel"]
+
+    stepper_dd = _dropdown_labeled(editor, "Stepper")
+    assert stepper_dd.get_model().get_string(stepper_dd.get_selected()) == "Fresh Wheel"
+
+    save_btn = button_labeled(editor, "Save")
+    assert save_btn.get_sensitive()
+    save_btn.emit("clicked")
+
+    assert stub.calls[-1] == (
+        "set_binding",
+        "grid_r1c1",
+        "base",
+        {"trigger": "fire_once", "type": "step", "stepper_id": stepper_id, "direction": "forward"},
+    )
+
+
+def test_saving_a_step_binding_with_toggle_trigger_surfaces_the_daemons_rejection():
+    # Toggle is disallowed for a Stepper Binding (ticket 03/54's Answer) —
+    # this editor doesn't pre-emptively lock the Trigger-mode dropdown down
+    # the way it does for Profile Switch (Step allows two of the three
+    # options, not exactly one), so the Daemon's own rejection is relied on
+    # and must surface through the ordinary error path.
+    stub = DaemonStub()
+    stub.create_stepper("Weapon Wheel", [])
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    action_dd = _dropdown_labeled(editor, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("step"))
+    trigger_dd = _dropdown_labeled(editor, "Trigger mode")
+    trigger_dd.set_selected([k for k, _ in TRIGGER_OPTIONS].index("toggle"))
+
+    button_labeled(editor, "Save").emit("clicked")
+
+    assert find_one(editor, lambda w: "error" in w.get_css_classes() and "Toggle" in w.get_label())

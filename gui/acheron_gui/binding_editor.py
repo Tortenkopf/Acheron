@@ -27,7 +27,7 @@ from .controller_picker import build_inline_controller_picker
 from .key_picker import LABEL_BY_CODE, build_inline_key_picker
 
 
-def action_summary(binding: dict | None, inp: str, macros: dict) -> str:
+def action_summary(binding: dict | None, inp: str, macros: dict, steppers: dict | None = None) -> str:
     if not binding:
         # No "passthrough" qualifier: it's jargon the user doesn't need, it's
         # too long to fit the smaller (52px) buttons, and — once a running
@@ -58,13 +58,16 @@ def action_summary(binding: dict | None, inp: str, macros: dict) -> str:
         button = CONTROLLER_LABEL_BY_CODE.get(raw_button, raw_button)
         return f"Btn: {button}  [{TRIGGER_SHORT[binding['trigger']]}]"
     if binding["type"] == "step":
-        # Ticket 54 landed the Daemon/wire side only — no library dict is
-        # threaded in here yet (unlike `macros`), so this shows the raw
-        # `stepper_id` rather than a resolved display name, mirroring
-        # ticket 51's identical "raw id until the real picker lands" stance
-        # for Macro. Ticket 55 builds the real Stepper library UI.
+        # Ticket 55: resolves the library entry's display name rather than
+        # the raw stepper_id, mirroring ticket 52's identical closing of
+        # ticket 51's own "raw id until the real picker lands" gap for
+        # Macro. Falls back to the raw id if the entry is somehow missing
+        # (e.g. `steppers` not threaded in by an older caller), same as the
+        # Macro branch below.
         arrow = "↑" if binding["direction"] == "forward" else "↓"
-        return f"Step {arrow} {binding['stepper_id']}  [{TRIGGER_SHORT[binding['trigger']]}]"
+        stepper_id = binding["stepper_id"]
+        name = (steppers or {}).get(stepper_id, {}).get("name", stepper_id)
+        return f"Step {arrow} {name}  [{TRIGGER_SHORT[binding['trigger']]}]"
     # Ticket 52: resolves the library entry's display name rather than the
     # raw macro_id (ticket 51 deferred this — it needed `macros` threaded
     # in, which now happens here). Falls back to the raw id if the entry is
@@ -496,6 +499,12 @@ def build_binding_editor(
         if starting["type"] == "keypress"
         else {"key": "KEY_A", "modifiers": []},
         "macro": {"macro_id": starting.get("macro_id")} if starting["type"] == "macro" else {"macro_id": None},
+        "step": {
+            "stepper_id": starting.get("stepper_id"),
+            "direction": starting.get("direction", "forward"),
+        }
+        if starting["type"] == "step"
+        else {"stepper_id": None, "direction": "forward"},
         "profile_switch": {"target": starting.get("target", profile)}
         if starting["type"] == "profile_switch"
         else {"target": profile},
@@ -580,6 +589,68 @@ def build_binding_editor(
                 draft["controller_button"].get("button", "BTN_SOUTH"), on_button_changed
             )
             editor_slot.append(labeled_row("Button", controller_picker))
+        elif kind == "step":
+            # Ticket 55: the real assignment flow, mirroring the Macro
+            # branch below almost exactly — a dropdown of existing library
+            # entries (by display name) plus "+ New Stepper" to create one
+            # inline and assign it right away. Unlike Macro, Action::Step
+            # carries a second field (`direction`), so a Forward/Backward
+            # dropdown sits alongside the Stepper dropdown; full item
+            # authoring and the Forward/Backward *Input*-pair assignment
+            # both live in the Library screen
+            # (`library_view.build_stepper_editor`), not here — this
+            # popover only ever assigns `stepper_id`/`direction` to the
+            # Binding on this one Input, exactly like every other branch
+            # here only assigns its own field(s).
+            steppers = config.get("steppers", {})
+            stepper_ids = sorted(steppers, key=lambda sid: steppers[sid]["name"].lower())
+            current_stepper_id = draft["step"].get("stepper_id")
+
+            if stepper_ids:
+                stepper_dd = Gtk.DropDown(model=Gtk.StringList.new([steppers[sid]["name"] for sid in stepper_ids]))
+                if current_stepper_id in stepper_ids:
+                    stepper_dd.set_selected(stepper_ids.index(current_stepper_id))
+                else:
+                    stepper_dd.set_selected(0)
+                    draft["step"]["stepper_id"] = stepper_ids[0]
+
+                def on_stepper_changed(dd, *_):
+                    draft["step"]["stepper_id"] = stepper_ids[dd.get_selected()]
+
+                stepper_dd.connect("notify::selected", on_stepper_changed)
+                editor_slot.append(labeled_row("Stepper", stepper_dd))
+            else:
+                editor_slot.append(
+                    Gtk.Label(label="No Steppers in the library yet — create one below.", xalign=0, wrap=True)
+                )
+
+            direction_options = [("forward", "Forward"), ("backward", "Backward")]
+            direction_dd = Gtk.DropDown(model=Gtk.StringList.new([lbl for _, lbl in direction_options]))
+            current_direction = draft["step"].get("direction", "forward")
+            direction_dd.set_selected([k for k, _ in direction_options].index(current_direction))
+
+            def on_direction_changed(dd, *_):
+                draft["step"]["direction"] = direction_options[dd.get_selected()][0]
+
+            direction_dd.connect("notify::selected", on_direction_changed)
+            editor_slot.append(labeled_row("Direction", direction_dd))
+
+            new_stepper_btn = Gtk.MenuButton(label="+ New Stepper")
+
+            def on_new_stepper_submitted(name: str):
+                stepper_id = client.create_stepper(name, [])
+                # Same reasoning as "+ New Macro" below: mutate the snapshot
+                # in place so the rebuild sees the entry it just created.
+                config.setdefault("steppers", {})[stepper_id] = {"name": name, "items": []}
+                draft["step"]["stepper_id"] = stepper_id
+                render_action_editor()
+
+            new_stepper_btn.set_popover(
+                build_name_prompt_popover("Creating a Stepper", "", "Create", on_new_stepper_submitted)
+            )
+            editor_slot.append(new_stepper_btn)
+
+            save_btn.set_sensitive(draft["step"].get("stepper_id") is not None)
         else:
             # Ticket 52: the real assignment flow — a dropdown of existing
             # library entries (by display name, ticket 51's macro_id stays
@@ -681,6 +752,13 @@ def build_binding_editor(
                 "trigger": TRIGGER_OPTIONS[trigger_dd.get_selected()][0],
                 "type": "controller_button",
                 "button": draft["controller_button"].get("button", "BTN_SOUTH"),
+            }
+        elif kind == "step":
+            binding = {
+                "trigger": TRIGGER_OPTIONS[trigger_dd.get_selected()][0],
+                "type": "step",
+                "stepper_id": draft["step"]["stepper_id"],
+                "direction": draft["step"].get("direction", "forward"),
             }
         else:
             binding = {

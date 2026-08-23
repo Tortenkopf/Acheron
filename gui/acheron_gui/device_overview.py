@@ -13,8 +13,8 @@ at a stable width via `set_hexpand(False)`), the Action Table is cut
 outright (superseded by ticket 42's inline key/mouse-button picker), and
 selecting "Library" fully replaces the content area with the real Library
 screen (`library_view.build_library_view`, ticket 52 — a Steppers/Macros
-tab-switched panel pair; the Macros panel is real, the Steppers panel
-stays a stub pending ticket 55). The Grid destination keeps the real
+tab-switched panel pair; both panels are real as of ticket 55). The Grid
+destination keeps the real
 `build_layer_bar` above the grid, plus an always-visible reserved slot
 beside it (`build_chords_placeholder`) for ticket 40's real Chords list.
 
@@ -254,7 +254,7 @@ def make_input_button(
 ) -> Gtk.Button:
     binding = config["profiles"][profile][layer].get(inp)
     inner = Gtk.Label(
-        label=f"{input_label(inp)}\n{action_summary(binding, inp, config.get('macros', {}))}",
+        label=f"{input_label(inp)}\n{action_summary(binding, inp, config.get('macros', {}), config.get('steppers', {}))}",
         justify=Gtk.Justification.CENTER,
     )
     inner.set_wrap(True)
@@ -429,7 +429,7 @@ def build_main_view(
     right.append(Gtk.Separator())
 
     if dest == "library":
-        right.append(build_library_view(client, config, ui_state, on_change))
+        right.append(build_library_view(client, config, profile, selected_layer, ui_state, on_change))
     else:
         main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         main.set_hexpand(True)

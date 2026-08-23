@@ -99,6 +99,7 @@ TRIGGER_SHORT = {"fire_once": "1x", "hold_to_repeat": "hold", "toggle": "toggle"
 ACTION_TYPES = [
     ("keypress", "Keypress"),
     ("macro", "Macro"),
+    ("step", "Stepper"),
     ("profile_switch", "Profile Switch"),
     ("controller_button", "Controller Button"),
 ]

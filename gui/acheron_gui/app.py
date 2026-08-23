@@ -107,6 +107,10 @@ CSS = """
 /* Ticket 42: the real key/mouse-button picker (key_picker.py), ported from
    ticket 32's winning variant A prototype. */
 .warning { background-color: alpha(#e6991a, 0.18); border-radius: 6px; padding: 6px 8px; font-size: smaller; }
+/* Ticket 55: the Stepper library's one-shot "Moved off '<name>'" steal
+   notice (library_view.py), styled distinctly from .warning/.error since
+   it's neither a problem nor a mistake, just an FYI. */
+.toast { background-color: alpha(#4a90e2, 0.18); border-radius: 6px; padding: 6px 8px; font-size: smaller; }
 .picker-panel { padding: 8px; background-color: alpha(currentColor, 0.05); border-radius: 6px; }
 .section-label { font-size: smaller; opacity: 0.65; font-weight: bold; }
 .keycap { min-height: 25px; padding: 2px 4px; font-size: 12px; }
