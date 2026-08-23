@@ -65,7 +65,16 @@ def _translate_error(err: GLib.Error) -> Exception:
     prefix = f"{INTERFACE}.Error."
     if name.startswith(prefix):
         exc_type = _ERROR_SUFFIXES.get(name[len(prefix) :], DaemonError)
-        return exc_type(Gio.DBusError.strip_remote_error(err))
+        # `Gio.DBusError.strip_remote_error` returns a bool (whether it
+        # stripped anything), not the stripped string — and in practice its
+        # in-place mutation of `err.message` doesn't survive PyGObject's
+        # GLib.Error wrapper either, so it's useless here either way. Strip
+        # the known "GDBus.Error:<name>: " prefix ourselves instead.
+        message = err.message
+        remote_prefix = f"GDBus.Error:{name}: "
+        if message.startswith(remote_prefix):
+            message = message[len(remote_prefix) :]
+        return exc_type(message)
     return err
 
 
