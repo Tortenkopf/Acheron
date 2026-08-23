@@ -18,20 +18,22 @@ Save button, mirroring the Profile sidebar's own autosave convention
 (ticket 31's Answer) — which is why the editor pane says so upfront.
 
 The Steppers panel (`build_steppers_panel`) mirrors the Macros panel's list-
-plus-editor shape closely, with three settled differences (ticket 31 round
-2's Answer): (1) delete carries no used-by gate in this GUI — clicking "×"
-always attempts `delete_stepper`, surfacing the Daemon's own referenced-list
-refusal (mirroring `dispatch.rs`'s `DeleteStepper` handler, which — per
-ticket 54's Answer — refuses exactly like `DeleteMacro` does) as an ordinary
-error rather than pre-emptively greying the button, since ticket 03 never
-specified an "in use" concept for a Stepper the way Macro's `used_by` count
-does; (2) the item editor has no step-kind selector, since `StepperItem`
-has exactly one wire variant (`Key`, covering both keyboard keys and mouse
-buttons through `key_picker`'s one unified picker) unlike Macro's three
-(KeyDown/KeyUp/Delay); (3) an assignment row (Forward/Backward Input
-dropdowns) sits below the item list — a Stepper Binding has no other GUI
-surface that lets a *list* pick its own Input pair (only the reverse:
-`binding_editor.py`'s Stepper Action branch lets one Input pick a list).
+plus-editor shape closely, with two settled differences (ticket 31 round
+2's Answer) plus one deliberate parity choice: delete is gated exactly like
+Macro's — disabled with a "Used by N Binding(s) — can't delete" tooltip
+while `stepper_used_by_count` is nonzero (`dispatch.rs`'s `DeleteStepper`
+handler, landed by ticket 54, refuses exactly like `DeleteMacro` does; this
+ticket's own text originally read that as "no gate," since ticket 03 never
+specified an "in use" *concept*, but the user directed the GUI treatment to
+match Macro's regardless — consistent delete UX across both library panels
+outweighs that textual distinction). The two real differences: (1) the item
+editor has no step-kind selector, since `StepperItem` has exactly one wire
+variant (`Key`, covering both keyboard keys and mouse buttons through
+`key_picker`'s one unified picker) unlike Macro's three (KeyDown/KeyUp/
+Delay); (2) an assignment row (Forward/Backward Input dropdowns) sits below
+the item list — a Stepper Binding has no other GUI surface that lets a
+*list* pick its own Input pair (only the reverse: `binding_editor.py`'s
+Stepper Action branch lets one Input pick a list).
 Reassigning the *same* list's forward/backward off its old pair is the
 Daemon's own job (`SetBinding`'s `take_stepper_direction_elsewhere`, ticket
 54) — this module only needs to detect what the Daemon doesn't announce
@@ -364,6 +366,21 @@ def _stepper_pair_inputs(bindings: dict, stepper_id: str) -> dict[str, str | Non
     return result
 
 
+def stepper_used_by_count(config: dict, stepper_id: str) -> int:
+    """How many Bindings, across every Profile's Base/Held Layer, reference
+    `stepper_id` (either direction counts) — mirrors `macro_used_by_count`
+    exactly, just for `dispatch.rs::stepper_references`'s Stepper
+    counterpart, so the delete tooltip can name N the same way Macro's
+    does."""
+    return sum(
+        1
+        for profile in config["profiles"].values()
+        for layer_key in ("base", "held")
+        for binding in profile[layer_key].values()
+        if binding.get("type") == "step" and binding.get("stepper_id") == stepper_id
+    )
+
+
 def build_stepper_row(
     client,
     config: dict,
@@ -399,11 +416,12 @@ def build_stepper_row(
     )
     row.append(rename_btn)
 
-    # No used-by gate (module docstring point 1) — unlike Macro's delete,
-    # this is never pre-emptively disabled; the Daemon's own refusal (if
-    # still referenced) surfaces through the ordinary error path instead.
+    used_by = stepper_used_by_count(config, stepper_id)
     delete_btn = Gtk.Button(label="×")
-    delete_btn.set_tooltip_text(f"Delete {name!r}")
+    delete_btn.set_sensitive(used_by == 0)
+    delete_btn.set_tooltip_text(
+        f"Used by {used_by} Binding(s) — can't delete" if used_by else f"Delete {name!r}"
+    )
 
     def on_delete_clicked(_b, stepper_id=stepper_id):
         try:

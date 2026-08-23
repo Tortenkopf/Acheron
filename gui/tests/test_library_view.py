@@ -3,7 +3,7 @@ from gi.repository import Gtk
 from acheron_gui.daemon_client import DaemonError
 from acheron_gui.daemon_stub import DaemonStub
 from acheron_gui.inputs import ALL_INPUTS
-from acheron_gui.library_view import build_library_view, macro_used_by_count
+from acheron_gui.library_view import build_library_view, macro_used_by_count, stepper_used_by_count
 
 from .widget_tree import button_labeled, find_all, find_one
 
@@ -350,41 +350,42 @@ def test_renaming_a_stepper_via_its_popover_calls_rename_stepper():
     assert ("rename_stepper", stepper_id, "New Name") in stub.calls
 
 
-def test_stepper_delete_button_is_never_disabled_even_when_referenced():
-    # Ticket 55: no used-by gate in this GUI, unlike Macro's — the button
-    # stays clickable regardless of whether the Daemon would refuse.
+def test_stepper_delete_is_disabled_with_a_used_by_tooltip_while_referenced():
+    # Parity with Macro's delete gate, by direct instruction: Stepper delete
+    # behaves exactly like Macro's — pre-emptively disabled with a "Used by
+    # N Binding(s)" tooltip while referenced, not just relying on the
+    # Daemon's own refusal to surface as a post-click error.
     stub = DaemonStub()
     stepper_id = stub.create_stepper("Weapon Wheel", [])
     stub.set_binding("grid_r1c1", "base", {"trigger": "fire_once", "type": "step", "stepper_id": stepper_id, "direction": "forward"})
 
     root = _build_steppers(stub)
 
-    delete_btn = find_one(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "×" and w.get_tooltip_text() == "Delete 'Weapon Wheel'")
-    assert delete_btn.get_sensitive()
+    delete_btn = find_one(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "×")
+    assert not delete_btn.get_sensitive()
+    assert "Used by 1 Binding(s)" in delete_btn.get_tooltip_text()
 
 
-def test_deleting_a_referenced_stepper_shows_the_daemons_refusal():
+def test_stepper_used_by_count_scans_base_and_held_across_profiles():
     stub = DaemonStub()
+    stub.create_profile("Gaming")
     stepper_id = stub.create_stepper("Weapon Wheel", [])
     stub.set_binding("grid_r1c1", "base", {"trigger": "fire_once", "type": "step", "stepper_id": stepper_id, "direction": "forward"})
-    ui_state = {"library_tab": "steppers"}
+    stub.switch_profile("Gaming")
+    stub.set_binding("grid_r1c2", "held", {"trigger": "fire_once", "type": "step", "stepper_id": stepper_id, "direction": "backward"})
 
-    root = _build(stub, ui_state)
-    delete_btn = find_one(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "×" and "Weapon Wheel" in (w.get_tooltip_text() or ""))
-    delete_btn.emit("clicked")
-
-    assert stepper_id in stub.get_config()["steppers"]
-    assert ui_state["library_selected_stepper"] == stepper_id
-    assert find_one(root, lambda w: isinstance(w, Gtk.Label) and "still referenced" in w.get_label())
+    assert stepper_used_by_count(stub.get_config(), stepper_id) == 2
+    assert stepper_used_by_count(stub.get_config(), "nonexistent") == 0
 
 
-def test_deleting_an_unreferenced_stepper_works():
+def test_stepper_delete_is_enabled_and_works_once_unreferenced():
     stub = DaemonStub()
     stepper_id = stub.create_stepper("Weapon Wheel", [])
     ui_state = {"library_tab": "steppers"}
 
     root = _build(stub, ui_state)
     delete_btn = find_one(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "×")
+    assert delete_btn.get_sensitive()
     delete_btn.emit("clicked")
 
     assert stepper_id not in stub.get_config()["steppers"]
