@@ -1,5 +1,5 @@
 Type: task
-Status: open
+Status: resolved
 
 ## Question
 
@@ -19,5 +19,40 @@ Settled during charting (see [the map](../map.md)'s Decisions so far), so no ope
 - Confirm nothing regresses: reorder (↑/↓), remove (×), rename, delete-gating, the "+ New"/"+ Add step"/"+ Add item" controls, and autosave all still work with the list wrapped.
 
 Live-hardware verification is not required for this ticket — nothing here touches the Daemon or physical device; the GUI test suite is the bar, consistent with this map's other GUI-only tickets (e.g. ticket 52/55's own scope notes).
+
+## Answer
+
+All four `Gtk.Box` lists in `gui/acheron_gui/library_view.py` now sit inside a
+`Gtk.ScrolledWindow` (`hscrollbar_policy=NEVER`, `propagate_natural_height=True`,
+`max_content_height=240`): `build_macro_editor`'s `steps_list`,
+`build_stepper_editor`'s `items_list`, and — in both `build_macros_panel` and
+`build_steppers_panel` — a new inner `rows_list` Box holding just the browse
+rows, wrapped and inserted between the existing heading/error label and the
+"+ New" button so those stay fixed outside the scroll region rather than
+scrolling away with the rows. `propagate_natural_height` means a short list
+still sizes to its content instead of reserving the full 240px, so this
+doesn't change the look of today's small lists — it only caps growth once a
+list gets long. 240px was picked by reasoning about the window's default
+680px height and the space the editor's other controls need above/below the
+list, not by live-eyeballing on the real device screen: this session had a
+live X/Wayland display (`DISPLAY=:0`) but no screenshot tool installed
+(`grim`/`gnome-screenshot`/`scrot`/`mss` all absent), and a from-scratch
+GTK4 offscreen-render script hung on `AcheronApplication`'s D-Bus-facing
+init even with `DaemonStub`/a fake `SystemdClient` swapped in — not worth
+debugging further given the ticket's own text that no specific pixel value
+was settled and the GUI test suite is the bar.
+
+Nothing else in the two editors' layout changed — two-column layout, all
+five reorder/remove/rename/delete-gating/add-controls, and autosave are
+untouched code paths, only the container around each list changed. Full GUI
+suite: 235/235 pass (`gui/tests/`, `.venv/bin/python -m pytest tests/`),
+including all 37 in `test_library_view.py` unmodified — the tests' recursive
+`widget_tree.walk()` finds widgets through `Gtk.ScrolledWindow.set_child()`
+the same as any other container, so wrapping needed no test changes.
+
+If the fixed 240px reads wrong against the real hardware/screen, it's a
+one-line follow-up (`set_max_content_height` on the four scrollers) — no
+ticket opened for that since it's exactly the kind of live-eyeball tuning
+this ticket's own text anticipated might need a second pass.
 
 ## Comments

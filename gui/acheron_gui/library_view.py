@@ -225,7 +225,12 @@ def build_macro_editor(
         row_box.append(rm_btn)
 
         steps_list.append(row_box)
-    box.append(steps_list)
+
+    steps_scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+    steps_scroller.set_propagate_natural_height(True)
+    steps_scroller.set_max_content_height(240)
+    steps_scroller.set_child(steps_list)
+    box.append(steps_scroller)
 
     add_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
     step_kind_dd = Gtk.DropDown(model=Gtk.StringList.new(["KeyDown", "KeyUp", "Delay (ms)"]))
@@ -306,10 +311,16 @@ def build_macros_panel(
         error_label.set_label(str(exc))
         error_label.set_visible(True)
 
+    rows_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
     for macro_id in macro_ids:
-        list_box.append(
+        rows_list.append(
             build_macro_row(client, config, macro_id, selected_macro_id, ui_state, on_change, show_error)
         )
+    rows_scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+    rows_scroller.set_propagate_natural_height(True)
+    rows_scroller.set_max_content_height(240)
+    rows_scroller.set_child(rows_list)
+    list_box.append(rows_scroller)
 
     new_btn = Gtk.MenuButton(label="+ New")
 
@@ -614,7 +625,12 @@ def build_stepper_editor(
         row_box.append(rm_btn)
 
         items_list.append(row_box)
-    box.append(items_list)
+
+    items_scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+    items_scroller.set_propagate_natural_height(True)
+    items_scroller.set_max_content_height(240)
+    items_scroller.set_child(items_list)
+    box.append(items_scroller)
 
     # No kind selector here (unlike Macro's step editor) — `StepperItem` has
     # exactly one wire variant (`Key`), and `key_picker`'s inline picker
@@ -685,10 +701,16 @@ def build_steppers_panel(
         error_label.set_label(str(exc))
         error_label.set_visible(True)
 
+    rows_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
     for stepper_id in stepper_ids:
-        list_box.append(
+        rows_list.append(
             build_stepper_row(client, config, stepper_id, selected_stepper_id, ui_state, on_change, show_error)
         )
+    rows_scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+    rows_scroller.set_propagate_natural_height(True)
+    rows_scroller.set_max_content_height(240)
+    rows_scroller.set_child(rows_list)
+    list_box.append(rows_scroller)
 
     new_btn = Gtk.MenuButton(label="+ New")
 
