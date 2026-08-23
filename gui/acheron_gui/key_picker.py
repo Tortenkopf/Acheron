@@ -79,9 +79,23 @@ _MULTIMEDIA_NICE = [
 ]
 _MULTIMEDIA_CODES = {code for code, _ in _MULTIMEDIA_NICE}
 
+# Ticket 65: the core 17 numpad keys — distinct evdev KeyCodes from their
+# main-block twins (KEY_KP1 vs KEY_1), so labels disambiguate the same way
+# _MODIFIERS_NICE already disambiguates Left/Right Ctrl. Obscure JIS/Mac/
+# calculator-style extras (KEY_KPEQUAL, KEY_KPCOMMA, …) excluded per ticket
+# 64's Answer — no physical numpad exposes them.
+_NUMPAD_NICE = [(f"KEY_KP{d}", f"Num {d}") for d in "0123456789"] + [
+    ("KEY_KPDOT", "Num ."),
+    ("KEY_KPENTER", "Num Enter"),
+    ("KEY_KPPLUS", "Num +"),
+    ("KEY_KPMINUS", "Num -"),
+    ("KEY_KPASTERISK", "Num *"),
+    ("KEY_KPSLASH", "Num /"),
+]
+
 _ALL_ENTRIES: list[tuple[str, str]] = (
     _LETTERS + _DIGITS + _MODIFIERS_NICE + _FUNCTION_NICE + _NAVIGATION_NICE
-    + _LOCK_NICE + _MISC_NICE + _MULTIMEDIA_NICE + MOUSE_BUTTONS
+    + _LOCK_NICE + _MISC_NICE + _MULTIMEDIA_NICE + _NUMPAD_NICE + MOUSE_BUTTONS
 )
 LABEL_BY_CODE = {code: label for code, label in _ALL_ENTRIES}
 
@@ -174,6 +188,21 @@ _MM_STRIP = [
     ("KEY_PLAYPAUSE", "Play/Pause", 2.0), ("KEY_PREVIOUSSONG", "Prev", 1.6), ("KEY_NEXTSONG", "Next", 1.6),
     ("KEY_MICMUTE", "Mic Mute", 2.0),
 ]
+# Ticket 65: physical numpad shape. The top row (/, *, -) is a plain
+# _keycap_row strip; the 4x4 block below needs real row/col spans (+ spans
+# two rows, Enter spans two rows, 0 spans two columns) that _keycap_row's
+# single-row Gtk.Box can't express, so it's laid out on a Gtk.Grid instead
+# — see _numpad_block(). Cells: (code, label, col, row, col_span, row_span).
+_NUMPAD_TOP_ROW = [("KEY_KPSLASH", "Num /", 1.0), ("KEY_KPASTERISK", "Num *", 1.0), ("KEY_KPMINUS", "Num -", 1.0)]
+_NUMPAD_GRID_CELLS = [
+    ("KEY_KP7", "Num 7", 0, 0, 1, 1), ("KEY_KP8", "Num 8", 1, 0, 1, 1), ("KEY_KP9", "Num 9", 2, 0, 1, 1),
+    ("KEY_KPPLUS", "Num +", 3, 0, 1, 2),
+    ("KEY_KP4", "Num 4", 0, 1, 1, 1), ("KEY_KP5", "Num 5", 1, 1, 1, 1), ("KEY_KP6", "Num 6", 2, 1, 1, 1),
+    ("KEY_KP1", "Num 1", 0, 2, 1, 1), ("KEY_KP2", "Num 2", 1, 2, 1, 1), ("KEY_KP3", "Num 3", 2, 2, 1, 1),
+    ("KEY_KPENTER", "Num Enter", 3, 2, 1, 2),
+    ("KEY_KP0", "Num 0", 0, 3, 2, 1), ("KEY_KPDOT", "Num .", 2, 3, 1, 1),
+]
+
 # ticket 32 round 2: physical mouse layout (Left/Middle/Right) with the two
 # thumb buttons (Back/Forward) visually separated by a gap, not catalog order.
 _MOUSE_STRIP = [
@@ -206,6 +235,24 @@ def _keycap_row(entries, on_pick, current: str) -> Gtk.Box:
     return row
 
 
+def _numpad_block(on_pick, current: str) -> Gtk.Widget:
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+    box.append(_keycap_row(_NUMPAD_TOP_ROW, on_pick, current))
+
+    grid = Gtk.Grid(row_spacing=3, column_spacing=3)
+    for code, label, col, row, col_span, row_span in _NUMPAD_GRID_CELLS:
+        btn = Gtk.Button(label=label, css_classes=["keycap"])
+        if code == current:
+            btn.add_css_class("suggested-action")
+        width = _UNIT_PX * col_span + 3 * (col_span - 1)
+        height = _UNIT_PX * row_span + 3 * (row_span - 1)
+        btn.set_size_request(int(width), int(height))
+        btn.connect("clicked", lambda b, code=code: on_pick(code))
+        grid.attach(btn, col, row, col_span, row_span)
+    box.append(grid)
+    return box
+
+
 def _keyboard_grid(on_pick, current: str) -> Gtk.Widget:
     grid = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
     grid.append(_keycap_row(_FN_ROW, on_pick, current))
@@ -233,6 +280,23 @@ def _keyboard_grid(on_pick, current: str) -> Gtk.Widget:
     grid.append(_keycap_row(_HOME_ROW, on_pick, current))
     grid.append(_keycap_row(_BOTTOM_ROW, on_pick, current))
     grid.append(_keycap_row(_SPACE_ROW, on_pick, current))
+
+    numpad_state = {"shown": False}
+    numpad_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    show_numpad_btn = Gtk.Button(label="Show Numpad ▸", halign=Gtk.Align.START)
+
+    def toggle_numpad(b):
+        numpad_state["shown"] = not numpad_state["shown"]
+        clear_children(numpad_slot)
+        if numpad_state["shown"]:
+            numpad_slot.append(_numpad_block(on_pick, current))
+            show_numpad_btn.set_label("Hide Numpad ▾")
+        else:
+            show_numpad_btn.set_label("Show Numpad ▸")
+
+    show_numpad_btn.connect("clicked", toggle_numpad)
+    grid.append(show_numpad_btn)
+    grid.append(numpad_slot)
 
     clusters = Gtk.Box(spacing=16)
     nav_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)

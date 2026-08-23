@@ -80,6 +80,43 @@ def test_f13_through_f24_are_hidden_behind_a_show_toggle():
     assert button_labeled(widget, "F24") is not None
 
 
+def test_numpad_keys_are_hidden_behind_a_show_toggle():
+    widget, _refresh = build_inline_key_picker("KEY_A", lambda code: None)
+
+    assert find_all(widget, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Num 7") == []
+
+    button_labeled(widget, "Show Numpad ▸").emit("clicked")
+
+    assert button_labeled(widget, "Num 7") is not None
+    assert button_labeled(widget, "Num Enter") is not None
+    assert button_labeled(widget, "Num +") is not None
+
+    button_labeled(widget, "Hide Numpad ▾").emit("clicked")
+
+    assert find_all(widget, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Num 7") == []
+
+
+def test_numpad_toggle_is_independent_of_the_f13_f24_toggle():
+    widget, _refresh = build_inline_key_picker("KEY_A", lambda code: None)
+
+    button_labeled(widget, "Show F13-F24 ▸").emit("clicked")
+
+    assert button_labeled(widget, "F13") is not None
+    assert find_all(widget, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Num 7") == []
+    assert button_labeled(widget, "Show Numpad ▸") is not None
+
+
+def test_picking_a_numpad_key_reports_its_kp_code():
+    picked = []
+    widget, _refresh = build_inline_key_picker("KEY_A", lambda code: picked.append(code))
+
+    button_labeled(widget, "Show Numpad ▸").emit("clicked")
+    button_labeled(widget, "Num Enter").emit("clicked")
+
+    assert picked == ["KEY_KPENTER"]
+    assert _summary(widget).get_label() == "Selected: Num Enter"
+
+
 def _click_a_modifier(widget) -> None:
     # "Ctrl"/"Shift"/"Alt"/"Super" each appear twice (Left/Right) — any
     # modifier keycap exercises the same warning path.
@@ -135,6 +172,14 @@ def test_key_css_class_classifies_modifiers_mouse_and_multimedia_distinctly():
 def test_label_by_code_covers_modifiers_and_mouse_buttons():
     assert LABEL_BY_CODE["KEY_LEFTCTRL"] == "Left Ctrl"
     assert LABEL_BY_CODE["BTN_LEFT"] == "Mouse Left"
+
+
+def test_label_by_code_covers_the_core_numpad_keys():
+    assert LABEL_BY_CODE["KEY_KP7"] == "Num 7"
+    assert LABEL_BY_CODE["KEY_KPENTER"] == "Num Enter"
+    assert LABEL_BY_CODE["KEY_KPPLUS"] == "Num +"
+    assert LABEL_BY_CODE["KEY_KPDOT"] == "Num ."
+    assert "KEY_KPEQUAL" not in LABEL_BY_CODE
 
 
 def test_modifier_codes_cover_all_eight_evdev_modifier_keys():
