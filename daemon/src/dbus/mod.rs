@@ -9,7 +9,7 @@
 
 pub mod wire;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -620,6 +620,66 @@ impl Daemon {
         rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
     }
 
+    /// Creates or edits a Chord Binding on the active Profile (ticket 01/40
+    /// — CONTEXT.md: Chord): atomic/immediately-applied/immediately-
+    /// persisted, mirroring `set_binding` exactly but keyed by `inputs`
+    /// (≥2 members, per-element the same `Input` string form `set_binding`
+    /// takes) instead of one. Errors `InvalidBinding` if any member string
+    /// doesn't parse, if `inputs` has fewer than two members, if the
+    /// Action/Trigger combination fails the same validation `set_binding`
+    /// already runs, or if `inputs`' member set is a subset or superset of
+    /// an existing Chord's on the same Layer.
+    async fn set_chord_binding(
+        &self,
+        inputs: Vec<String>,
+        layer: String,
+        binding: HashMap<String, OwnedValue>,
+    ) -> Result<(), DaemonError> {
+        let mut parsed_inputs = BTreeSet::new();
+        for input in &inputs {
+            parsed_inputs.insert(Self::parse_input(input)?);
+        }
+        let layer = wire::layer_from_str(&layer).map_err(DaemonError::InvalidBinding)?;
+        let binding = wire::binding_from_dict(&binding).map_err(DaemonError::InvalidBinding)?;
+
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::SetChordBinding {
+                inputs: parsed_inputs,
+                layer,
+                binding,
+                reply,
+            })
+            .await
+            .map_err(dispatch_gone)?;
+        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+    }
+
+    /// Removes a Chord Binding by its exact member set. Errors `NotFound` if
+    /// no Chord with exactly that member set exists on `layer`.
+    async fn clear_chord_binding(
+        &self,
+        inputs: Vec<String>,
+        layer: String,
+    ) -> Result<(), DaemonError> {
+        let mut parsed_inputs = BTreeSet::new();
+        for input in &inputs {
+            parsed_inputs.insert(Self::parse_input(input)?);
+        }
+        let layer = wire::layer_from_str(&layer).map_err(DaemonError::InvalidBinding)?;
+
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::ClearChordBinding {
+                inputs: parsed_inputs,
+                layer,
+                reply,
+            })
+            .await
+            .map_err(dispatch_gone)?;
+        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+    }
+
     /// Switches the active Profile, force-stopping every currently running
     /// Toggle as part of the switch before the new Profile's state becomes
     /// active (ticket 19). Errors `NotFound` if `name` doesn't name a real
@@ -900,6 +960,13 @@ mod tests {
             binding: HashMap<String, OwnedValue>,
         ) -> zbus::Result<()>;
         fn clear_binding(&self, input: &str, layer: &str) -> zbus::Result<()>;
+        fn set_chord_binding(
+            &self,
+            inputs: Vec<String>,
+            layer: &str,
+            binding: HashMap<String, OwnedValue>,
+        ) -> zbus::Result<()>;
+        fn clear_chord_binding(&self, inputs: Vec<String>, layer: &str) -> zbus::Result<()>;
         fn set_output_suppressed(&self, suppressed: bool) -> zbus::Result<()>;
         fn set_mode_key_role(&self, role: &str) -> zbus::Result<()>;
         fn create_profile(&self, name: &str) -> zbus::Result<()>;
@@ -1070,6 +1137,17 @@ mod tests {
                 .send(PhysicalEvent {
                     input,
                     state: EventState::Down,
+                    depth: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn release(&self, input: Input) {
+            self.event_tx
+                .send(PhysicalEvent {
+                    input,
+                    state: EventState::Up,
                     depth: None,
                 })
                 .await
@@ -2851,5 +2929,225 @@ mod tests {
         );
 
         server.shut_down().await;
+    }
+
+    /// Ticket 40's end-to-end live demo, exercised without real hardware: a
+    /// real `SetChordBinding` D-Bus call persists a Chord, and pressing both
+    /// members' Down within the window fires the Chord's own Action instead
+    /// of either member's (nonexistent) individual one.
+    #[tokio::test]
+    async fn set_chord_binding_over_real_dbus_persists_and_fires_on_both_members_down() {
+        let server = TestServer::start().await;
+
+        let mut binding = wire::action_to_dict(&crate::config::Action::Keypress {
+            modifiers: crate::config::Modifiers::default(),
+            key: evdev::KeyCode::KEY_C,
+        });
+        binding.insert(
+            "trigger".to_string(),
+            OwnedValue::try_from(zbus::zvariant::Value::new("fire_once".to_string())).unwrap(),
+        );
+
+        server
+            .proxy
+            .set_chord_binding(
+                vec!["grid_r1c1".to_string(), "grid_r1c2".to_string()],
+                "base",
+                binding,
+            )
+            .await
+            .expect("SetChordBinding over D-Bus must succeed");
+
+        let config = server.proxy.get_config().await.unwrap();
+        let profiles: wire::Dict = config.get("profiles").unwrap().clone().try_into().unwrap();
+        let default_profile: wire::Dict = profiles
+            .get(DEFAULT_PROFILE_NAME)
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let chords_base: wire::Dict = default_profile
+            .get("chords_base")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert!(chords_base.contains_key("grid_r1c1+grid_r1c2"));
+
+        server.press(Input::Grid(1, 1)).await;
+        server.press(Input::Grid(1, 2)).await;
+
+        let on_disk = std::fs::read_to_string(&server.config_path).unwrap();
+        let batches = server.shut_down().await;
+
+        // The Chord's own KEY_C fires — not KEY_1/KEY_2 passthrough, and not
+        // twice (once per member) — one press batch + one release batch.
+        assert_eq!(batches.len(), 2, "one press batch + one release batch");
+        let evdev::EventSummary::Key(_, code, _) = batches[0][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!(code, evdev::KeyCode::KEY_C);
+        assert!(on_disk.contains("grid_r1c1+grid_r1c2"));
+    }
+
+    #[tokio::test]
+    async fn set_chord_binding_over_real_dbus_rejects_fewer_than_two_inputs() {
+        let server = TestServer::start().await;
+
+        let mut binding = wire::action_to_dict(&crate::config::Action::Keypress {
+            modifiers: crate::config::Modifiers::default(),
+            key: evdev::KeyCode::KEY_C,
+        });
+        binding.insert(
+            "trigger".to_string(),
+            OwnedValue::try_from(zbus::zvariant::Value::new("fire_once".to_string())).unwrap(),
+        );
+
+        let err = server
+            .proxy
+            .set_chord_binding(vec!["grid_r1c1".to_string()], "base", binding)
+            .await
+            .expect_err("a single-Input Chord must be rejected");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.InvalidBinding")
+        );
+
+        server.shut_down().await;
+    }
+
+    /// Ticket 01's amended Answer: a subset/superset relationship between
+    /// two Chords' member sets is rejected, but a plain intersection (the
+    /// diagonal shape — two members share one Input but each has a member
+    /// the other lacks) is not.
+    #[tokio::test]
+    async fn set_chord_binding_over_real_dbus_rejects_a_subset_superset_conflict_but_allows_intersection()
+     {
+        let server = TestServer::start().await;
+
+        let mut binding = wire::action_to_dict(&crate::config::Action::Keypress {
+            modifiers: crate::config::Modifiers::default(),
+            key: evdev::KeyCode::KEY_C,
+        });
+        binding.insert(
+            "trigger".to_string(),
+            OwnedValue::try_from(zbus::zvariant::Value::new("fire_once".to_string())).unwrap(),
+        );
+        server
+            .proxy
+            .set_chord_binding(
+                vec!["grid_r1c1".to_string(), "grid_r1c2".to_string()],
+                "base",
+                binding.clone(),
+            )
+            .await
+            .expect("the first Chord must succeed");
+
+        // Superset of the existing Chord: rejected.
+        let err = server
+            .proxy
+            .set_chord_binding(
+                vec![
+                    "grid_r1c1".to_string(),
+                    "grid_r1c2".to_string(),
+                    "mode_key".to_string(),
+                ],
+                "base",
+                binding.clone(),
+            )
+            .await
+            .expect_err("a superset of an existing Chord must be rejected");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.InvalidBinding")
+        );
+
+        // Intersects (shares grid_r1c1, each has a member the other lacks):
+        // allowed — the thumbstick-diagonal worked example's own shape.
+        server
+            .proxy
+            .set_chord_binding(
+                vec!["grid_r1c1".to_string(), "mode_key".to_string()],
+                "base",
+                binding,
+            )
+            .await
+            .expect("an intersecting-but-not-subset/superset Chord must be allowed");
+
+        server.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn clear_chord_binding_over_real_dbus_on_an_unknown_chord_returns_not_found() {
+        let server = TestServer::start().await;
+
+        let err = server
+            .proxy
+            .clear_chord_binding(
+                vec!["grid_r1c1".to_string(), "grid_r1c2".to_string()],
+                "base",
+            )
+            .await
+            .expect_err("clearing an unknown Chord must fail");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.NotFound")
+        );
+
+        server.shut_down().await;
+    }
+
+    /// Ticket 01's Answer: if the window elapses before the rest of a
+    /// Chord's members join, the pending member's own individual Binding
+    /// fires retroactively.
+    #[tokio::test]
+    async fn a_lone_chord_member_pressed_alone_fires_its_own_individual_binding_after_the_window() {
+        let server = TestServer::start().await;
+
+        let mut chord_binding = wire::action_to_dict(&crate::config::Action::Keypress {
+            modifiers: crate::config::Modifiers::default(),
+            key: evdev::KeyCode::KEY_C,
+        });
+        chord_binding.insert(
+            "trigger".to_string(),
+            OwnedValue::try_from(zbus::zvariant::Value::new("fire_once".to_string())).unwrap(),
+        );
+        server
+            .proxy
+            .set_chord_binding(
+                vec!["grid_r1c1".to_string(), "grid_r1c2".to_string()],
+                "base",
+                chord_binding,
+            )
+            .await
+            .unwrap();
+
+        let mut individual_binding = wire::action_to_dict(&crate::config::Action::Keypress {
+            modifiers: crate::config::Modifiers::default(),
+            key: evdev::KeyCode::KEY_F1,
+        });
+        individual_binding.insert(
+            "trigger".to_string(),
+            OwnedValue::try_from(zbus::zvariant::Value::new("fire_once".to_string())).unwrap(),
+        );
+        server
+            .proxy
+            .set_binding("grid_r1c1", "base", individual_binding)
+            .await
+            .unwrap();
+
+        server.press(Input::Grid(1, 1)).await;
+        // Comfortably past the 50ms window, without ever pressing grid_r1c2.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        server.release(Input::Grid(1, 1)).await;
+
+        let batches = server.shut_down().await;
+
+        assert_eq!(batches.len(), 2, "one press batch + one release batch");
+        let evdev::EventSummary::Key(_, code, _) = batches[0][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!(
+            code,
+            evdev::KeyCode::KEY_F1,
+            "the individual Binding fired, not the Chord's"
+        );
     }
 }

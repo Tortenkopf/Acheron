@@ -4,7 +4,7 @@
 //! copy). The D-Bus-facing `dbus` module builds these and decodes the
 //! replies; it never touches `Config` directly.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use tokio::sync::oneshot;
 
@@ -232,6 +232,31 @@ pub enum Command {
     SetStepperItems {
         stepper_id: StepperId,
         items: Vec<StepperItem>,
+        reply: oneshot::Sender<Result<(), CommandError>>,
+    },
+    /// Creates or edits a Chord Binding on the active Profile (ticket 01/40
+    /// — CONTEXT.md: Chord): atomic/immediately-applied/immediately-
+    /// persisted, mirroring `SetBinding` exactly but keyed by `inputs`
+    /// (≥2 members) instead of a single `Input`. Fails `InvalidRequest` if
+    /// `inputs` has fewer than two members, if the Action/Trigger
+    /// combination fails the same validation `SetBinding` already runs
+    /// (Macro/Stepper naming a real library entry, ControllerButton naming a
+    /// real gamepad button, ProfileSwitch pairing only with Fire-once), or
+    /// if `inputs`' member set is a subset or superset of an existing
+    /// Chord's on the same Layer (ticket 01's amended Answer) — editing the
+    /// exact same member set back (same `inputs`) is not a conflict with
+    /// itself.
+    SetChordBinding {
+        inputs: BTreeSet<Input>,
+        layer: Layer,
+        binding: Binding,
+        reply: oneshot::Sender<Result<(), CommandError>>,
+    },
+    /// Removes a Chord Binding by its exact member set. Fails `NotFound` if
+    /// no Chord with exactly that member set exists on `layer`.
+    ClearChordBinding {
+        inputs: BTreeSet<Input>,
+        layer: Layer,
         reply: oneshot::Sender<Result<(), CommandError>>,
     },
 }

@@ -125,6 +125,13 @@ CSS = """
 .padbtn-shoulder { background-color: alpha(#e67e22, 0.22); }
 .padbtn-stick { background-color: alpha(#8e44ad, 0.22); }
 .padbtn-dpad { background-color: alpha(#27ae60, 0.22); }
+/* Ticket 40: the real Chord recording flow (device_overview.py) — a
+   distinct border colour per state, matching the ticket 30 prototype's own
+   green-selected/amber-previewed scheme (.bound already claims a plain
+   green border for an ordinary Binding, so selected uses a heavier one to
+   stay visually distinct from it). */
+.chord-selected { border: 3px solid #2ecc71; }
+.chord-preview { border: 3px solid #e6991a; }
 """
 
 

@@ -1,6 +1,6 @@
 from gi.repository import Gtk
 
-from acheron_gui.binding_editor import DepthTrack, action_summary, build_binding_editor
+from acheron_gui.binding_editor import DepthTrack, action_summary, build_binding_editor, build_chord_binding_dialog
 from acheron_gui.daemon_stub import DaemonStub
 from acheron_gui.device_overview import make_input_button
 from acheron_gui.inputs import ACTION_TYPES, TRIGGER_OPTIONS
@@ -838,3 +838,73 @@ def test_saving_a_step_binding_with_toggle_trigger_surfaces_the_daemons_rejectio
     button_labeled(editor, "Save").emit("clicked")
 
     assert find_one(editor, lambda w: "error" in w.get_css_classes() and "Toggle" in w.get_label())
+
+
+def test_chord_binding_dialog_does_not_offer_profile_switch_as_an_action():
+    # A Chord's own Action can never be Profile Switch (`SetChordBinding`
+    # always rejects it — see `ConfigError::InvalidChordProfileSwitch`), so
+    # offering it here would be a guaranteed-failing round-trip rather than
+    # a structurally-prevented one (code-review finding).
+    stub = DaemonStub()
+    dialog = build_chord_binding_dialog(
+        stub, stub.get_config(), "Default", "base", ["grid_r1c1", "grid_r1c2"], None, lambda: None, None
+    )
+
+    action_dd = _dropdown_labeled(dialog, "Action")
+    labels = [action_dd.get_model().get_string(i) for i in range(action_dd.get_model().get_n_items())]
+    assert "Profile Switch" not in labels
+
+
+def test_saving_an_edited_chords_grown_membership_clears_the_old_key_first():
+    # Regression test: setting the new membership before clearing the old
+    # one would make the still-present old key spuriously conflict with
+    # itself whenever the edit grows/shrinks membership by containment
+    # (e.g. {grid_r1c1, grid_r1c2} edited into {grid_r1c1, grid_r1c2,
+    # mode_key} — a superset the Daemon's own subset/superset rule would
+    # otherwise reject against the not-yet-cleared old Chord).
+    stub = DaemonStub()
+    stub.set_chord_binding(
+        ["grid_r1c1", "grid_r1c2"], "base", {"trigger": "fire_once", "type": "keypress", "key": "KEY_C"}
+    )
+    existing = stub.get_config()["profiles"]["Default"]["chords_base"]["grid_r1c1+grid_r1c2"]
+
+    dialog = build_chord_binding_dialog(
+        stub,
+        stub.get_config(),
+        "Default",
+        "base",
+        ["grid_r1c1", "grid_r1c2", "mode_key"],
+        existing,
+        lambda: None,
+        None,
+        "grid_r1c1+grid_r1c2",
+    )
+    button_labeled(dialog, "Save Chord").emit("clicked")
+
+    chords = stub.get_config()["profiles"]["Default"]["chords_base"]
+    assert "grid_r1c1+grid_r1c2" not in chords
+    assert any(set(key.split("+")) == {"grid_r1c1", "grid_r1c2", "mode_key"} for key in chords)
+
+
+def test_saving_an_edited_chord_with_unchanged_membership_does_not_clear_it():
+    stub = DaemonStub()
+    stub.set_chord_binding(
+        ["grid_r1c1", "grid_r1c2"], "base", {"trigger": "fire_once", "type": "keypress", "key": "KEY_C"}
+    )
+    existing = stub.get_config()["profiles"]["Default"]["chords_base"]["grid_r1c1+grid_r1c2"]
+
+    dialog = build_chord_binding_dialog(
+        stub,
+        stub.get_config(),
+        "Default",
+        "base",
+        ["grid_r1c2", "grid_r1c1"],  # same members, different order
+        existing,
+        lambda: None,
+        None,
+        "grid_r1c1+grid_r1c2",
+    )
+    button_labeled(dialog, "Save Chord").emit("clicked")
+
+    assert "clear_chord_binding" not in [call[0] for call in stub.calls]
+    assert "grid_r1c1+grid_r1c2" in stub.get_config()["profiles"]["Default"]["chords_base"]

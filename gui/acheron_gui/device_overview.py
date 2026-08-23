@@ -15,8 +15,25 @@ selecting "Library" fully replaces the content area with the real Library
 screen (`library_view.build_library_view`, ticket 52 — a Steppers/Macros
 tab-switched panel pair; both panels are real as of ticket 55). The Grid
 destination keeps the real
-`build_layer_bar` above the grid, plus an always-visible reserved slot
-beside it (`build_chords_placeholder`) for ticket 40's real Chords list.
+`build_layer_bar` above the grid, plus an always-visible slot beside it
+(`build_chords_section`, ticket 40) holding the real Chord-recording flow.
+
+Ticket 40's Chord recording (settled in the prototype's variant A, round 3
+— `.scratch/tartarus-input-expansion/issues/30-prototype-chord-recording-ux.md`):
+a "Select Chord members" toggle in the Chords section is what changes what a
+device click does — off (the default) it opens the ordinary per-Input
+Binding editor exactly as always; on, clicking any Input (grid, thumbstick,
+Mode key, or wheel — a Chord's members are open-ended, not Grid-only) toggles
+it into the in-progress selection instead, per `ui_state["chord"]`. A
+"Binding →" button enables once ≥2 Inputs are selected and no subset/
+superset conflict exists with an existing Chord on the current Layer
+(ticket 01's amended Answer — an Input may belong to any number of Chords;
+only a subset/superset relationship between two Chords' member sets is
+rejected), opening `binding_editor.build_chord_binding_dialog` for just the
+Trigger/Action step. The Chords list below shows every Chord on the current
+Layer; each row's "Edit" re-enters selection mode pre-loaded with its
+members, a click on the row previews its members on the grid (a distinct
+highlight), and "×" calls `ClearChordBinding` directly.
 
 The Profile sidebar (ticket 19) is real: switching a Profile calls
 `SwitchProfile`, "+ New Profile" calls `CreateProfile`, and each row's "✎"/
@@ -46,7 +63,7 @@ from typing import Callable
 
 from gi.repository import Gtk, Pango
 
-from .binding_editor import action_summary, build_binding_editor
+from .binding_editor import action_summary, build_binding_editor, build_chord_binding_dialog
 from .daemon_client import DaemonError
 from .gtk_utils import build_name_prompt_popover
 from .inputs import GRID_COLS, GRID_ROWS, grid_input, input_label
@@ -239,6 +256,73 @@ def build_profile_sidebar(client, config: dict, profile: str, on_change: Callabl
     return sidebar
 
 
+# --- Chord recording (ticket 01/40) — a Chord's `ChordKey` wire form (see
+# `daemon/src/config.rs::ChordKey`'s Display) is a "+"-joined, sorted string
+# of member Input strings; these helpers all operate on that same string
+# form, matching what `GetConfig()`'s `chords_base`/`chords_held` dicts
+# actually key by. ---
+
+
+def _chord_members(key: str) -> list[str]:
+    return key.split("+")
+
+
+def _chord_members_text(members: list[str]) -> str:
+    return " + ".join(input_label(m) for m in members)
+
+
+def _chords_containing(chords: dict, inp: str) -> list[str]:
+    """Every Chord key on `chords` (one Layer's worth) that has `inp` among
+    its members — an Input may belong to any number of Chords (ticket 01's
+    amended Answer), so this can return more than one."""
+    return [key for key in chords if inp in _chord_members(key)]
+
+
+def _chord_conflict(chords: dict, members: list[str], exclude_key: str | None = None) -> str | None:
+    """The only conflict that survives ticket 01's correction: a subset/
+    superset relationship between `members` and an existing Chord's own set
+    — a plain intersection (the thumbstick-diagonal shape) is not a
+    conflict. `exclude_key` is the Chord currently being edited, if any —
+    editing it back to the exact same members is not a conflict with
+    itself."""
+    candidate = set(members)
+    for key in chords:
+        if key == exclude_key:
+            continue
+        other = set(_chord_members(key))
+        if candidate <= other or other <= candidate:
+            return key
+    return None
+
+
+def _chord_button_style(
+    chords: dict, config: dict, chord_ui: dict, inp: str
+) -> tuple[list[str], str | None]:
+    """Per-device-button CSS classes/tooltip for the current Chord-UI state
+    — recomputed on every rebuild for every device button (grid, thumbstick,
+    Mode key, wheel alike, since a Chord's members are open-ended), mirroring
+    the prototype's `sync_surface`/`styler` pattern."""
+    classes = []
+    if chord_ui["selecting"] and inp in chord_ui["recorded"]:
+        classes.append("chord-selected")
+    preview = chord_ui.get("preview")
+    if preview is not None and inp in _chord_members(preview):
+        classes.append("chord-preview")
+    owners = [
+        key for key in _chords_containing(chords, inp) if key != chord_ui.get("edit_key")
+    ]
+    tooltip = None
+    if owners:
+        lines = [
+            f"{_chord_members_text(_chord_members(key))} → "
+            f"{action_summary(chords[key], '', config.get('macros', {}), config.get('steppers', {}))}"
+            for key in owners
+        ]
+        heading = "Part of Chord:" if len(lines) == 1 else "Part of Chords:"
+        tooltip = heading + "\n" + "\n".join(lines)
+    return classes, tooltip
+
+
 def make_input_button(
     client,
     config: dict,
@@ -251,6 +335,9 @@ def make_input_button(
     sensitive: bool = True,
     insensitive_reason: str | None = None,
     capture_mode: str = "digital",
+    chord_classes: list[str] | None = None,
+    chord_tooltip: str | None = None,
+    on_click_override: Callable[[str], None] | None = None,
 ) -> Gtk.Button:
     binding = config["profiles"][profile][layer].get(inp)
     inner = Gtk.Label(
@@ -290,9 +377,13 @@ def make_input_button(
     # default to halign FILL.)
     btn.set_halign(Gtk.Align.CENTER)
     btn.add_css_class("bound" if binding else "empty")
+    for cls in chord_classes or []:
+        btn.add_css_class(cls)
     btn.set_sensitive(sensitive)
     if not sensitive and insensitive_reason:
         btn.set_tooltip_text(insensitive_reason)
+    elif chord_tooltip:
+        btn.set_tooltip_text(chord_tooltip)
 
     # Ticket 44 (live-verified on real hardware): a real top-level Gtk.Window
     # instead of a Gtk.Popover anchored to `btn`. The Binding editor's
@@ -323,6 +414,9 @@ def make_input_button(
     window.set_child(editor)
 
     def on_click(_b):
+        if on_click_override is not None:
+            on_click_override(inp)
+            return
         window.set_transient_for(btn.get_root())
         window.present()
 
@@ -356,25 +450,196 @@ def build_destination_switch(selected_dest: str, on_select: Callable[[str], None
     return row
 
 
-def build_chords_placeholder() -> Gtk.Widget:
-    """Reserved layout space beside the grid for the Chords list — always
-    visible while the Grid destination is selected (no toggle, per ticket
-    47's round-2: nothing should rescale on open/close). Ticket 40 wires
-    the real Chord-recording content in here; this ticket only needs the
-    slot itself to be real and testable."""
+def build_chords_section(
+    client,
+    config: dict,
+    profile: str,
+    layer: str,
+    chord_ui: dict,
+    on_change: Callable[[], None],
+) -> Gtk.Widget:
+    """The real Chord-recording flow (ticket 01/40, prototype variant A
+    round 3) — always visible beside the grid while the Grid destination is
+    selected (no toggle, per ticket 47's round-2: nothing should rescale on
+    open/close).
+
+    `chord_ui` (`ui_state["chord"]`, so it survives a rebuild) is
+    `{"selecting": bool, "recorded": list[str], "edit_key": str | None,
+    "preview": str | None}`. `selecting` is what actually changes device
+    click behaviour — see `make_input_button`'s `on_click_override` and this
+    module's docstring — everything else here is just this state's own
+    rendering.
+    """
+    chords = config["profiles"][profile][f"chords_{layer}"]
+
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
     box.add_css_class("sidebar")
     box.set_size_request(220, -1)
-    heading = Gtk.Label(label="Chords", xalign=0)
-    heading.add_css_class("heading")
-    box.append(heading)
-    placeholder = Gtk.Label(
-        label="Ticket 40 wires the real Chord-recording UX into this slot.",
-        xalign=0,
-        wrap=True,
+    box.append(Gtk.Label(label="Chords", xalign=0, css_classes=["heading"]))
+
+    selecting_btn = Gtk.ToggleButton(label="Select Chord members")
+    selecting_btn.set_active(chord_ui["selecting"])
+    selecting_btn.set_tooltip_text(
+        "On: clicking any Input on the device above toggles it into the Chord "
+        "selection below, instead of opening its own Binding editor."
     )
-    placeholder.add_css_class("dim")
-    box.append(placeholder)
+
+    def on_selecting_toggled(b):
+        chord_ui["selecting"] = b.get_active()
+        if not chord_ui["selecting"]:
+            chord_ui["recorded"] = []
+            chord_ui["edit_key"] = None
+        on_change()
+
+    selecting_btn.connect("toggled", on_selecting_toggled)
+    box.append(selecting_btn)
+
+    if chord_ui["selecting"]:
+        conflict_key = (
+            _chord_conflict(chords, chord_ui["recorded"], exclude_key=chord_ui["edit_key"])
+            if len(chord_ui["recorded"]) >= 2
+            else None
+        )
+
+        status = Gtk.Label(xalign=0, wrap=True, css_classes=["dim"])
+        if conflict_key is not None:
+            status.set_label(
+                f"{_chord_members_text(chord_ui['recorded'])} conflicts with the existing Chord "
+                f"{_chord_members_text(_chord_members(conflict_key))}: one member set fully "
+                "contains the other. Adjust the selection, or edit that Chord instead."
+            )
+        elif chord_ui["recorded"]:
+            verb = "Editing" if chord_ui["edit_key"] is not None else "Selected"
+            status.set_label(f"{verb}: {_chord_members_text(chord_ui['recorded'])}")
+        else:
+            status.set_label(
+                "Click two or more Inputs on the device above to start a Chord — an Input "
+                "may belong to more than one."
+            )
+        box.append(status)
+
+        action_row = Gtk.Box(spacing=8)
+        binding_btn = Gtk.Button(label="Binding →", css_classes=["suggested-action"])
+        binding_btn.set_sensitive(len(chord_ui["recorded"]) >= 2 and conflict_key is None)
+
+        def on_binding(b):
+            members = list(chord_ui["recorded"])
+            existing = chords.get(chord_ui["edit_key"]) if chord_ui["edit_key"] is not None else None
+
+            def on_saved():
+                chord_ui["recorded"] = []
+                chord_ui["edit_key"] = None
+                on_change()
+
+            dialog = build_chord_binding_dialog(
+                client,
+                config,
+                profile,
+                layer,
+                members,
+                existing,
+                on_saved,
+                binding_btn.get_root(),
+                chord_ui["edit_key"],
+            )
+            # Exposed for tests, which need to reach a fresh dialog's
+            # content without a real windowing system — mirrors
+            # `make_input_button`'s own `btn.binding_editor_window`, except
+            # this one is rebuilt per click rather than built once, since
+            # `members`/`existing` differ every time.
+            binding_btn.last_chord_dialog = dialog
+            dialog.present()
+
+        binding_btn.connect("clicked", on_binding)
+        action_row.append(binding_btn)
+
+        clear_btn = Gtk.Button(label="Clear selection")
+        clear_btn.set_sensitive(bool(chord_ui["recorded"]))
+
+        def on_clear(b):
+            chord_ui["recorded"] = []
+            chord_ui["edit_key"] = None
+            on_change()
+
+        clear_btn.connect("clicked", on_clear)
+        action_row.append(clear_btn)
+        box.append(action_row)
+
+        if conflict_key is not None:
+            conflict_btn = Gtk.Button(label="Edit conflicting Chord")
+
+            def on_edit_conflict(b, key=conflict_key):
+                chord_ui["edit_key"] = key
+                chord_ui["recorded"] = _chord_members(key)
+                on_change()
+
+            conflict_btn.connect("clicked", on_edit_conflict)
+            box.append(conflict_btn)
+
+        box.append(
+            Gtk.Label(
+                label="Tip: click two adjacent thumbstick directions together to define a diagonal.",
+                xalign=0,
+                wrap=True,
+                css_classes=["dim"],
+            )
+        )
+
+    box.append(Gtk.Separator())
+    if not chords:
+        box.append(Gtk.Label(label="No Chords defined on this Layer yet.", xalign=0, wrap=True, css_classes=["dim"]))
+    for key in sorted(chords):
+        binding = chords[key]
+        row = Gtk.Box(spacing=6)
+        summary = action_summary(binding, "", config.get("macros", {}), config.get("steppers", {}))
+        preview_btn = Gtk.Button(
+            label=f"{_chord_members_text(_chord_members(key))} → {summary}", hexpand=True
+        )
+        preview_btn.set_tooltip_text("Click to preview this Chord's members on the grid above.")
+        if chord_ui.get("preview") == key:
+            preview_btn.add_css_class("suggested-action")
+
+        def on_preview(b, key=key):
+            chord_ui["preview"] = None if chord_ui.get("preview") == key else key
+            on_change()
+
+        preview_btn.connect("clicked", on_preview)
+        row.append(preview_btn)
+
+        edit_btn = Gtk.Button(label="Edit")
+
+        def on_edit(b, key=key):
+            chord_ui["selecting"] = True
+            chord_ui["edit_key"] = key
+            chord_ui["recorded"] = _chord_members(key)
+            chord_ui["preview"] = None
+            on_change()
+
+        edit_btn.connect("clicked", on_edit)
+        row.append(edit_btn)
+
+        remove_btn = Gtk.Button(label="×")
+        remove_btn.set_tooltip_text(f"Delete the {_chord_members_text(_chord_members(key))} Chord")
+
+        def on_remove(b, key=key):
+            try:
+                client.clear_chord_binding(_chord_members(key), layer)
+            except DaemonError:
+                # Racing another client's own delete — nothing left to
+                # remove; the rebuild below simply won't show it any more.
+                pass
+            if chord_ui.get("edit_key") == key:
+                chord_ui["edit_key"] = None
+                chord_ui["recorded"] = []
+            if chord_ui.get("preview") == key:
+                chord_ui["preview"] = None
+            on_change()
+
+        remove_btn.connect("clicked", on_remove)
+        row.append(remove_btn)
+
+        box.append(row)
+
     return box
 
 
@@ -391,8 +656,23 @@ def build_main_view(
     dest = ui_state.setdefault("dest", "grid")
     mode_key_role = config["profiles"][profile]["mode_key_role"]
     mode_key_bindable = mode_key_role == "bound"
+    # Ticket 40: `selecting`/`recorded`/`edit_key`/`preview` survive a
+    # rebuild the same way `dest`/`selected_layer` do — mutated in place by
+    # `build_chords_section` and `input_btn`'s own click-override below.
+    chord_ui = ui_state.setdefault(
+        "chord", {"selecting": False, "recorded": [], "edit_key": None, "preview": None}
+    )
+    chords_on_layer = config["profiles"][profile][f"chords_{selected_layer}"]
+
+    def chord_click_override(inp: str) -> None:
+        if inp in chord_ui["recorded"]:
+            chord_ui["recorded"].remove(inp)
+        else:
+            chord_ui["recorded"].append(inp)
+        on_change()
 
     def input_btn(inp: str, w=76, h=99, sensitive=True, insensitive_reason=None) -> Gtk.Button:
+        chord_classes, chord_tooltip = _chord_button_style(chords_on_layer, config, chord_ui, inp)
         return make_input_button(
             client,
             config,
@@ -405,6 +685,9 @@ def build_main_view(
             sensitive,
             insensitive_reason,
             capture_mode,
+            chord_classes,
+            chord_tooltip,
+            chord_click_override if chord_ui["selecting"] else None,
         )
 
     root = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
@@ -497,9 +780,9 @@ def build_main_view(
 
         device_row.append(device)
         # Always visible while Grid is selected, no toggle (ticket 47's
-        # round 2: nothing should rescale on open/close) — reserved layout
-        # space for ticket 40's real Chord-recording UX.
-        device_row.append(build_chords_placeholder())
+        # round 2: nothing should rescale on open/close) — the real
+        # Chord-recording flow (ticket 40).
+        device_row.append(build_chords_section(client, config, profile, selected_layer, chord_ui, on_change))
         main.append(device_row)
         right.append(main)
 

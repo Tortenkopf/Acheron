@@ -7,11 +7,12 @@
 //! through. Ticket 18 added the `Layer` enum and each Profile's `held`
 //! Binding map alongside `base`, plus the per-Profile `mode_key_role`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use evdev::KeyCode;
 use serde::{Deserialize, Serialize};
@@ -145,6 +146,18 @@ pub struct Profile {
     /// type level, per ticket 17 §3).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub actuation_overrides: HashMap<Input, ActuationPoint>,
+    /// Chord Bindings active while this Profile's Base Layer is active
+    /// (ticket 01/40 — CONTEXT.md: Chord): a `Binding` reused unchanged,
+    /// keyed by the `Set<Input>` that must all be down together within the
+    /// dispatch task's ~50ms window to fire it instead of any member's own
+    /// individual Binding. Mirrors `base`/`held`'s own per-Layer split
+    /// exactly — a Chord is "just a Binding keyed by a Set<Input> instead of
+    /// one Input" (ticket 01's Answer), not a parallel concept.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub chords_base: HashMap<ChordKey, Binding>,
+    /// `chords_base`'s exact mirror for the Held Layer.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub chords_held: HashMap<ChordKey, Binding>,
 }
 
 impl Profile {
@@ -182,6 +195,104 @@ impl Profile {
             Layer::Base => &mut self.base,
             Layer::Held => &mut self.held,
         }
+    }
+
+    /// `layer`'s exact mirror for a Profile's Chord Bindings (ticket 40).
+    pub fn chords(&self, layer: Layer) -> &HashMap<ChordKey, Binding> {
+        match layer {
+            Layer::Base => &self.chords_base,
+            Layer::Held => &self.chords_held,
+        }
+    }
+
+    /// `layer_mut`'s exact mirror for a Profile's Chord Bindings.
+    pub fn chords_mut(&mut self, layer: Layer) -> &mut HashMap<ChordKey, Binding> {
+        match layer {
+            Layer::Base => &mut self.chords_base,
+            Layer::Held => &mut self.chords_held,
+        }
+    }
+}
+
+/// A Chord's membership key (ticket 01/40 — CONTEXT.md: Chord): the set of
+/// physical Inputs that must all be down together within the dispatch
+/// task's ~50ms window to fire this Chord's Binding instead of any member's
+/// own individual one. `BTreeSet<Input>` per ticket 01's Answer — TOML has
+/// no non-string map-key type, so (mirroring `Input`'s own hand-written
+/// TOML string-key convention) this marshals as a `+`-joined, sorted string
+/// of each member's own `Input` `Display` form (e.g.
+/// `"grid_r1c1+grid_r1c2"`). Always at least 2 members — enforced by
+/// `dispatch::handle_command`'s `SetChordBinding` handler, not the type
+/// itself, matching how `ActuationPoint`'s hysteresis invariant is enforced
+/// at the `Command` layer rather than baked into the struct.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ChordKey(BTreeSet<Input>);
+
+impl ChordKey {
+    pub fn new(members: BTreeSet<Input>) -> Self {
+        ChordKey(members)
+    }
+
+    pub fn members(&self) -> &BTreeSet<Input> {
+        &self.0
+    }
+}
+
+impl fmt::Display for ChordKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let joined = self
+            .0
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("+");
+        write!(f, "{joined}")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseChordKeyError(String);
+
+impl fmt::Display for ParseChordKeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?} is not a valid Chord key", self.0)
+    }
+}
+
+impl std::error::Error for ParseChordKeyError {}
+
+impl FromStr for ChordKey {
+    type Err = ParseChordKeyError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut members = BTreeSet::new();
+        for part in s.split('+') {
+            let input: Input = part
+                .parse()
+                .map_err(|_| ParseChordKeyError(s.to_string()))?;
+            members.insert(input);
+        }
+        // A single-member "Chord" is meaningless (ticket 01: "open-ended,
+        // N>=2") — rejected here too, not just at the Command layer, so a
+        // hand-edited config.toml with a bogus one-member chord key refuses
+        // to start rather than silently loading an unreachable entry.
+        if members.len() < 2 {
+            return Err(ParseChordKeyError(s.to_string()));
+        }
+        Ok(ChordKey(members))
+    }
+}
+
+impl Serialize for ChordKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for ChordKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -497,6 +608,14 @@ pub enum ConfigError {
     UnknownMacro(String),
     UnknownStepper(String),
     InvalidStepTrigger,
+    /// A Chord Binding (`chords_base`/`chords_held`) whose Action is
+    /// `ProfileSwitch` (ticket 40) — refused because `executor::compile`
+    /// panics on it: unlike an ordinary Binding, `dispatch::fire_chord` has
+    /// no `&mut Config`/`config_path` to actually run a Profile switch
+    /// through, so this Action never reaches a Chord at all, structurally
+    /// enforced both here (a hand-edited `config.toml`) and by
+    /// `SetChordBinding`'s own validation (a live D-Bus caller).
+    InvalidChordProfileSwitch,
 }
 
 impl fmt::Display for ConfigError {
@@ -542,6 +661,10 @@ impl fmt::Display for ConfigError {
                 f,
                 "config.toml contains an Action::Step Binding whose trigger is toggle"
             ),
+            ConfigError::InvalidChordProfileSwitch => write!(
+                f,
+                "config.toml contains a Chord Binding whose Action is profile_switch, which is not supported on a Chord"
+            ),
         }
     }
 }
@@ -583,75 +706,81 @@ fn parse(contents: &str) -> Result<Config, ConfigError> {
         return Err(ConfigError::InvalidActiveProfile(config.active_profile));
     }
     let has_invalid_profile_switch_trigger = config.profiles.values().any(|profile| {
-        [&profile.base, &profile.held].into_iter().any(|bindings| {
-            bindings.values().any(|binding| {
-                matches!(binding.action, Action::ProfileSwitch { .. })
-                    && binding.trigger != TriggerMode::FireOnce
-            })
+        profile_all_bindings(profile).any(|binding| {
+            matches!(binding.action, Action::ProfileSwitch { .. })
+                && binding.trigger != TriggerMode::FireOnce
         })
     });
     if has_invalid_profile_switch_trigger {
         return Err(ConfigError::InvalidProfileSwitchTrigger);
     }
     let invalid_controller_button = config.profiles.values().find_map(|profile| {
-        [&profile.base, &profile.held]
-            .into_iter()
-            .find_map(|bindings| {
-                bindings.values().find_map(|binding| match binding.action {
-                    Action::ControllerButton { button }
-                        if !crate::input::is_gamepad_button(button) =>
-                    {
-                        Some(button)
-                    }
-                    _ => None,
-                })
-            })
+        profile_all_bindings(profile).find_map(|binding| match binding.action {
+            Action::ControllerButton { button } if !crate::input::is_gamepad_button(button) => {
+                Some(button)
+            }
+            _ => None,
+        })
     });
     if let Some(button) = invalid_controller_button {
         return Err(ConfigError::InvalidControllerButton(format!("{button:?}")));
     }
     let dangling_macro_id = config.profiles.values().find_map(|profile| {
-        [&profile.base, &profile.held]
-            .into_iter()
-            .find_map(|bindings| {
-                bindings.values().find_map(|binding| match &binding.action {
-                    Action::Macro { macro_id } if !config.macros.contains_key(macro_id) => {
-                        Some(macro_id.clone())
-                    }
-                    _ => None,
-                })
-            })
+        profile_all_bindings(profile).find_map(|binding| match &binding.action {
+            Action::Macro { macro_id } if !config.macros.contains_key(macro_id) => {
+                Some(macro_id.clone())
+            }
+            _ => None,
+        })
     });
     if let Some(macro_id) = dangling_macro_id {
         return Err(ConfigError::UnknownMacro(macro_id.to_string()));
     }
     let dangling_stepper_id = config.profiles.values().find_map(|profile| {
-        [&profile.base, &profile.held]
-            .into_iter()
-            .find_map(|bindings| {
-                bindings.values().find_map(|binding| match &binding.action {
-                    Action::Step { stepper, .. } if !config.steppers.contains_key(stepper) => {
-                        Some(stepper.clone())
-                    }
-                    _ => None,
-                })
-            })
+        profile_all_bindings(profile).find_map(|binding| match &binding.action {
+            Action::Step { stepper, .. } if !config.steppers.contains_key(stepper) => {
+                Some(stepper.clone())
+            }
+            _ => None,
+        })
     });
     if let Some(stepper_id) = dangling_stepper_id {
         return Err(ConfigError::UnknownStepper(stepper_id.to_string()));
     }
     let has_invalid_step_trigger = config.profiles.values().any(|profile| {
-        [&profile.base, &profile.held].into_iter().any(|bindings| {
-            bindings.values().any(|binding| {
-                matches!(binding.action, Action::Step { .. })
-                    && binding.trigger == TriggerMode::Toggle
-            })
+        profile_all_bindings(profile).any(|binding| {
+            matches!(binding.action, Action::Step { .. }) && binding.trigger == TriggerMode::Toggle
         })
     });
     if has_invalid_step_trigger {
         return Err(ConfigError::InvalidStepTrigger);
     }
+    let has_chord_profile_switch = config.profiles.values().any(|profile| {
+        profile
+            .chords_base
+            .values()
+            .chain(profile.chords_held.values())
+            .any(|binding| matches!(binding.action, Action::ProfileSwitch { .. }))
+    });
+    if has_chord_profile_switch {
+        return Err(ConfigError::InvalidChordProfileSwitch);
+    }
     Ok(config)
+}
+
+/// Every Binding on `profile`, across both ordinary per-`Input` Layers and
+/// both per-`ChordKey` Chord Layers (ticket 40) — shared by every
+/// cross-cutting validation check `parse` runs, so a hand-edited
+/// `config.toml`'s Chord Bindings are held to the exact same
+/// ProfileSwitch/ControllerButton/Macro/Stepper invariants as ordinary ones
+/// rather than silently skipped.
+pub(crate) fn profile_all_bindings(profile: &Profile) -> impl Iterator<Item = &Binding> {
+    profile
+        .base
+        .values()
+        .chain(profile.held.values())
+        .chain(profile.chords_base.values())
+        .chain(profile.chords_held.values())
 }
 
 /// Rewrites `config.toml` in full — the only persistence path, used both for
@@ -1307,5 +1436,135 @@ action = { type = "step", stepper = "weapon-wheel", direction = "forward" }
         assert!(matches!(err, ConfigError::InvalidStepTrigger));
 
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn chord_key_displays_as_a_plus_joined_sorted_string() {
+        let key = ChordKey::new(BTreeSet::from([Input::Grid(1, 2), Input::Grid(1, 1)]));
+        assert_eq!(key.to_string(), "grid_r1c1+grid_r1c2");
+    }
+
+    #[test]
+    fn chord_key_round_trips_through_its_display_form() {
+        let key = ChordKey::new(BTreeSet::from([
+            Input::Thumbstick(crate::input::Direction::Up),
+            Input::Thumbstick(crate::input::Direction::Right),
+        ]));
+        let parsed: ChordKey = key.to_string().parse().unwrap();
+        assert_eq!(parsed, key);
+    }
+
+    #[test]
+    fn chord_key_from_str_rejects_fewer_than_two_members() {
+        assert!("grid_r1c1".parse::<ChordKey>().is_err());
+        assert!("".parse::<ChordKey>().is_err());
+    }
+
+    #[test]
+    fn chord_key_from_str_rejects_an_unknown_member() {
+        assert!("grid_r1c1+not_an_input".parse::<ChordKey>().is_err());
+    }
+
+    #[test]
+    fn parses_a_chord_binding_shape_on_both_layers() {
+        let toml = r#"
+schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.chords_base."grid_r1c1+grid_r1c2"]
+trigger = "fire_once"
+action = { type = "keypress", key = "KEY_C", modifiers = { ctrl = true } }
+
+[profiles.Default.chords_held."thumbstick_left+thumbstick_up"]
+trigger = "fire_once"
+action = { type = "keypress", key = "KEY_Q" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let profile = &config.profiles["Default"];
+        let base_key = ChordKey::new(BTreeSet::from([Input::Grid(1, 1), Input::Grid(1, 2)]));
+        assert_eq!(
+            profile.chords(Layer::Base)[&base_key].trigger,
+            TriggerMode::FireOnce
+        );
+        let held_key = ChordKey::new(BTreeSet::from([
+            Input::Thumbstick(crate::input::Direction::Left),
+            Input::Thumbstick(crate::input::Direction::Up),
+        ]));
+        assert!(profile.chords(Layer::Held).contains_key(&held_key));
+    }
+
+    #[test]
+    fn a_pre_ticket_40_config_defaults_empty_chord_maps() {
+        let toml = r#"
+schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base.grid_r1c1]
+trigger = "fire_once"
+action = { type = "keypress", key = "KEY_F1" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let profile = &config.profiles["Default"];
+        assert!(profile.chords_base.is_empty());
+        assert!(profile.chords_held.is_empty());
+    }
+
+    #[test]
+    fn chord_bindings_survive_a_full_write_and_reparse_round_trip() {
+        let (_dir, path) = temp_config_path();
+        let mut config = Config::seed();
+        let profile = config.active_profile_mut().unwrap();
+        let key = ChordKey::new(BTreeSet::from([Input::Grid(1, 1), Input::Grid(1, 2)]));
+        profile.chords_base.insert(
+            key.clone(),
+            Binding {
+                trigger: TriggerMode::FireOnce,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: KeyCode::KEY_C,
+                },
+            },
+        );
+
+        write(&path, &config).unwrap();
+        let reparsed = load_or_seed(&path).unwrap();
+
+        assert_eq!(reparsed, config);
+        assert!(reparsed.profiles["Default"].chords_base.contains_key(&key));
+    }
+
+    #[test]
+    fn refuses_to_start_when_a_chord_binding_names_an_unknown_macro_id() {
+        let (_dir, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.chords_base."grid_r1c1+grid_r1c2"]
+trigger = "fire_once"
+action = { type = "macro", macro_id = "does-not-exist" }
+"#;
+        fs::write(&path, original).unwrap();
+
+        let err = load_or_seed(&path).expect_err("a dangling Chord macro_id must refuse to start");
+        assert!(matches!(err, ConfigError::UnknownMacro(id) if id == "does-not-exist"));
+    }
+
+    #[test]
+    fn refuses_to_start_when_a_chord_binding_is_a_profile_switch() {
+        let (_dir, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.chords_base."grid_r1c1+grid_r1c2"]
+trigger = "fire_once"
+action = { type = "profile_switch", target = "Gaming" }
+"#;
+        fs::write(&path, original).unwrap();
+
+        let err =
+            load_or_seed(&path).expect_err("a ProfileSwitch Chord Binding must refuse to start");
+        assert!(matches!(err, ConfigError::InvalidChordProfileSwitch));
     }
 }

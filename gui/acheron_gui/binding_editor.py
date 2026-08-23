@@ -437,38 +437,47 @@ def build_actuation_section(
     return box
 
 
-def build_binding_editor(
+def build_action_and_trigger_fields(
     client,
     config: dict,
     profile: str,
-    layer: str,
-    inp: str,
-    on_saved: Callable[[], None],
-    capture_mode: str = "digital",
-) -> Gtk.Widget:
-    bindings = config["profiles"][profile][layer]
-    existing = bindings.get(inp)
-    starting = existing or {"trigger": "fire_once", "type": "keypress", "key": "KEY_A", "modifiers": []}
+    starting: dict,
+    save_btn: Gtk.Button,
+    available_action_types: list[tuple[str, str]] = ACTION_TYPES,
+) -> tuple[Gtk.Widget, Gtk.DropDown, Callable[[], dict]]:
+    """The Trigger-mode/Action editor core — everything below a Binding's
+    own heading, shared verbatim by `build_binding_editor`'s per-Input
+    popover and `build_chord_binding_dialog`'s small modal (ticket 01/40:
+    a Chord's Binding is edited with "the existing Trigger/Action editor
+    UI", not a second copy of it — `Binding` itself is unchanged, just keyed
+    by a Set<Input> instead of one `Input`).
 
-    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-    box.set_margin_top(10)
-    box.set_margin_bottom(10)
-    box.set_margin_start(10)
-    box.set_margin_end(10)
-    heading = Gtk.Label(label=f"{profile} / {layer} / {input_label(inp)}", xalign=0)
-    heading.add_css_class("heading")
-    box.append(heading)
+    `available_action_types` defaults to every kind `build_binding_editor`
+    offers; `build_chord_binding_dialog` passes a narrower list excluding
+    Profile Switch, which `SetChordBinding` always rejects (a Chord's own
+    Action can never be one — see `ConfigError::InvalidChordProfileSwitch`)
+    — offering it here would be a guaranteed-failing round-trip rather than
+    a structurally-prevented one, per the codebase's "impossible, not just
+    tolerated" standard (e.g. `SetChordBinding`'s subset/superset rule
+    itself).
 
-    error_label = Gtk.Label(xalign=0, wrap=True)
-    error_label.add_css_class("error")
-    error_label.set_visible(False)
-    box.append(error_label)
+    Returns `(fields, trigger_dd, get_binding)`: `fields` is the widget to
+    append into the caller's own box; `trigger_dd` is exposed so a caller
+    that also validates Trigger-mode-specific rules (none currently do, but
+    `build_binding_editor` did historically) can still reach it directly;
+    `get_binding()` reads the current widget state into the same flat
+    Binding dict every caller sends to the Daemon. `save_btn` is the
+    caller's own Save button — this function only ever toggles its
+    `set_sensitive`, never builds or places it, so each caller keeps full
+    control of its own button row.
+    """
+    fields = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
 
     trigger_dd = Gtk.DropDown(model=Gtk.StringList.new([lbl for _, lbl in TRIGGER_OPTIONS]))
     trigger_dd.set_selected([k for k, _ in TRIGGER_OPTIONS].index(starting["trigger"]))
-    box.append(labeled_row("Trigger mode", trigger_dd))
+    fields.append(labeled_row("Trigger mode", trigger_dd))
 
-    known_action_kinds = [k for k, _ in ACTION_TYPES]
+    known_action_kinds = [k for k, _ in available_action_types]
     # `Action::Step` (ticket 03/54) has no editor built here yet (ticket
     # 55's job) and isn't offered in `ACTION_TYPES` — but the Daemon can
     # already hand back a Step Binding (a hand-edited config.toml, or any
@@ -481,19 +490,17 @@ def build_binding_editor(
     # default.
     unsupported_kind = starting["type"] not in known_action_kinds
 
-    action_dd = Gtk.DropDown(model=Gtk.StringList.new([lbl for _, lbl in ACTION_TYPES]))
+    action_dd = Gtk.DropDown(model=Gtk.StringList.new([lbl for _, lbl in available_action_types]))
     action_dd.set_selected(0 if unsupported_kind else known_action_kinds.index(starting["type"]))
-    box.append(labeled_row("Action", action_dd))
+    fields.append(labeled_row("Action", action_dd))
 
     editor_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-    box.append(editor_slot)
+    fields.append(editor_slot)
 
-    # Created here (ahead of render_action_editor's definition/first call)
-    # so the Macro branch below can gate it directly, mirroring how
-    # trigger_dd's sensitivity is already gated for profile_switch.
-    save_btn = Gtk.Button(label="Save")
-    save_btn.add_css_class("suggested-action")
-
+    # `save_btn` is the caller's own button (see this function's docstring)
+    # — the Macro/Step branches below gate its sensitivity directly,
+    # mirroring how trigger_dd's sensitivity is already gated for
+    # profile_switch.
     draft = {
         "keypress": {"key": starting.get("key", "KEY_A"), "modifiers": list(starting.get("modifiers", []))}
         if starting["type"] == "keypress"
@@ -526,7 +533,7 @@ def build_binding_editor(
             trigger_dd.disconnect(_trigger_handler["id"])
             _trigger_handler["id"] = None
 
-        kind = ACTION_TYPES[action_dd.get_selected()][0]
+        kind = available_action_types[action_dd.get_selected()][0]
         # Reset here, unconditionally — only the Macro branch below ever
         # disables it (no picker yet to assign a fresh macro_id), and every
         # other kind must not stay disabled from a previous render.
@@ -724,6 +731,78 @@ def build_binding_editor(
             )
         )
 
+    def get_binding() -> dict:
+        kind = available_action_types[action_dd.get_selected()][0]
+        if kind == "keypress":
+            return {
+                "trigger": TRIGGER_OPTIONS[trigger_dd.get_selected()][0],
+                "type": "keypress",
+                "key": draft["keypress"].get("key", "KEY_A"),
+                "modifiers": draft["keypress"].get("modifiers", []),
+            }
+        if kind == "profile_switch":
+            return {
+                # Always Fire-once regardless of the (disabled) dropdown's
+                # own selection — the Daemon rejects anything else anyway.
+                "trigger": "fire_once",
+                "type": "profile_switch",
+                "target": draft["profile_switch"].get("target", profile),
+            }
+        if kind == "controller_button":
+            return {
+                "trigger": TRIGGER_OPTIONS[trigger_dd.get_selected()][0],
+                "type": "controller_button",
+                "button": draft["controller_button"].get("button", "BTN_SOUTH"),
+            }
+        if kind == "step":
+            return {
+                "trigger": TRIGGER_OPTIONS[trigger_dd.get_selected()][0],
+                "type": "step",
+                "stepper_id": draft["step"]["stepper_id"],
+                "direction": draft["step"].get("direction", "forward"),
+            }
+        return {
+            "trigger": TRIGGER_OPTIONS[trigger_dd.get_selected()][0],
+            "type": "macro",
+            "macro_id": draft["macro"]["macro_id"],
+        }
+
+    return fields, trigger_dd, get_binding
+
+
+def build_binding_editor(
+    client,
+    config: dict,
+    profile: str,
+    layer: str,
+    inp: str,
+    on_saved: Callable[[], None],
+    capture_mode: str = "digital",
+) -> Gtk.Widget:
+    bindings = config["profiles"][profile][layer]
+    existing = bindings.get(inp)
+    starting = existing or {"trigger": "fire_once", "type": "keypress", "key": "KEY_A", "modifiers": []}
+
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    box.set_margin_top(10)
+    box.set_margin_bottom(10)
+    box.set_margin_start(10)
+    box.set_margin_end(10)
+    heading = Gtk.Label(label=f"{profile} / {layer} / {input_label(inp)}", xalign=0)
+    heading.add_css_class("heading")
+    box.append(heading)
+
+    error_label = Gtk.Label(xalign=0, wrap=True)
+    error_label.add_css_class("error")
+    error_label.set_visible(False)
+    box.append(error_label)
+
+    save_btn = Gtk.Button(label="Save")
+    save_btn.add_css_class("suggested-action")
+
+    fields, _trigger_dd, get_binding = build_action_and_trigger_fields(client, config, profile, starting, save_btn)
+    box.append(fields)
+
     def show_error(exc: Exception):
         error_label.set_label(str(exc))
         error_label.set_visible(True)
@@ -731,41 +810,7 @@ def build_binding_editor(
     btn_row = Gtk.Box(spacing=8)
 
     def on_save(b):
-        kind = ACTION_TYPES[action_dd.get_selected()][0]
-        if kind == "keypress":
-            binding = {
-                "trigger": TRIGGER_OPTIONS[trigger_dd.get_selected()][0],
-                "type": "keypress",
-                "key": draft["keypress"].get("key", "KEY_A"),
-                "modifiers": draft["keypress"].get("modifiers", []),
-            }
-        elif kind == "profile_switch":
-            binding = {
-                # Always Fire-once regardless of the (disabled) dropdown's
-                # own selection — the Daemon rejects anything else anyway.
-                "trigger": "fire_once",
-                "type": "profile_switch",
-                "target": draft["profile_switch"].get("target", profile),
-            }
-        elif kind == "controller_button":
-            binding = {
-                "trigger": TRIGGER_OPTIONS[trigger_dd.get_selected()][0],
-                "type": "controller_button",
-                "button": draft["controller_button"].get("button", "BTN_SOUTH"),
-            }
-        elif kind == "step":
-            binding = {
-                "trigger": TRIGGER_OPTIONS[trigger_dd.get_selected()][0],
-                "type": "step",
-                "stepper_id": draft["step"]["stepper_id"],
-                "direction": draft["step"].get("direction", "forward"),
-            }
-        else:
-            binding = {
-                "trigger": TRIGGER_OPTIONS[trigger_dd.get_selected()][0],
-                "type": "macro",
-                "macro_id": draft["macro"]["macro_id"],
-            }
+        binding = get_binding()
         try:
             client.set_binding(inp, layer, binding)
         except DaemonError as exc:
@@ -798,3 +843,95 @@ def build_binding_editor(
         box.append(build_actuation_section(client, config, profile, inp, capture_mode, on_saved))
 
     return box
+
+
+def build_chord_binding_dialog(
+    client,
+    config: dict,
+    profile: str,
+    layer: str,
+    members: list[str],
+    existing: dict | None,
+    on_saved: Callable[[], None],
+    win: Gtk.Window,
+    editing_key: str | None = None,
+) -> Gtk.Window:
+    """The small modal ticket 40 asks for: just the Trigger/Action editor
+    (ticket 01/02's already-settled UI, reused via
+    `build_action_and_trigger_fields`) for a Chord's own Binding — its
+    membership (`members`) is fully decided before this dialog ever opens
+    (the caller's own grid selection in `device_overview.py`), so there is
+    no Input picker here, unlike `build_binding_editor`'s per-Input popover.
+    A fresh dialog is built and presented per call rather than built once
+    and reused (unlike ticket 44's per-key editor windows) — `members` and
+    `existing` differ on every "Binding →"/"Edit" click, so there is nothing
+    to usefully cache here.
+
+    `editing_key` is the Chord's *original* `+`-joined member-key string
+    when editing an existing Chord whose membership may have just changed
+    (`chord_ui["edit_key"]`, unrelated to `members`, the *new* selection) —
+    `None` for a brand new Chord. When it differs from `members`' own key,
+    `on_save` clears the old key *before* setting the new one (code-review
+    finding: setting first would make the still-present old key spuriously
+    conflict with itself whenever the edit grows/shrinks membership by
+    containment — e.g. `{A,B}` edited into `{A,B,C}` — since
+    `SetChordBinding`'s subset/superset check runs before any old entry is
+    removed).
+    """
+    starting = existing or {"trigger": "fire_once", "type": "keypress", "key": "KEY_A", "modifiers": []}
+    chord_action_types = [(k, lbl) for k, lbl in ACTION_TYPES if k != "profile_switch"]
+
+    dialog = Gtk.Window(transient_for=win, modal=True, title="Chord binding")
+    dialog.set_default_size(320, 280)
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    for setter in (outer.set_margin_top, outer.set_margin_bottom, outer.set_margin_start, outer.set_margin_end):
+        setter(10)
+    dialog.set_child(outer)
+
+    heading = Gtk.Label(label=" + ".join(input_label(m) for m in members), xalign=0)
+    heading.add_css_class("heading")
+    outer.append(heading)
+
+    error_label = Gtk.Label(xalign=0, wrap=True)
+    error_label.add_css_class("error")
+    error_label.set_visible(False)
+    outer.append(error_label)
+
+    save_btn = Gtk.Button(label="Save Chord")
+    save_btn.add_css_class("suggested-action")
+
+    fields, _trigger_dd, get_binding = build_action_and_trigger_fields(
+        client, config, profile, starting, save_btn, chord_action_types
+    )
+    outer.append(fields)
+
+    def on_save(b):
+        binding = get_binding()
+        try:
+            # Compared as sets, not by re-deriving what the wire key
+            # "should" look like — this stub/GUI must never assume its own
+            # guess at the Daemon's `ChordKey` string-ordering convention
+            # (code-review finding: an earlier version built a
+            # `"+".join(sorted(members))` string here to compare against
+            # `editing_key`, which is wrong whenever a Chord mixes Input
+            # variant kinds, since the real Daemon's `ChordKey` orders by
+            # `Input`'s own `Ord`, not alphabetically).
+            if editing_key is not None and set(editing_key.split("+")) != set(members):
+                client.clear_chord_binding(editing_key.split("+"), layer)
+            client.set_chord_binding(members, layer, binding)
+        except DaemonError as exc:
+            error_label.set_label(str(exc))
+            error_label.set_visible(True)
+            return
+        dialog.close()
+        on_saved()
+
+    save_btn.connect("clicked", on_save)
+    btn_row = Gtk.Box(spacing=8)
+    btn_row.append(save_btn)
+    cancel_btn = Gtk.Button(label="Cancel")
+    cancel_btn.connect("clicked", lambda b: dialog.close())
+    btn_row.append(cancel_btn)
+    outer.append(btn_row)
+
+    return dialog

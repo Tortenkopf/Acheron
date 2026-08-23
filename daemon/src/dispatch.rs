@@ -20,23 +20,65 @@
 //! instead flows through the exact same `(Layer, Input) -> Binding` lookup
 //! and Trigger-mode dispatch as any other Input.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
 use zbus::object_server::SignalEmitter;
 
 use crate::capture::{CaptureMode, EventState, PhysicalEvent};
 use crate::command::{Command, CommandError, State};
 use crate::config::{
-    self, Action, ActuationPoint, Binding, Config, Layer, MacroDef, MacroId, ModeKeyRole, Profile,
-    StepDirection, StepperDef, StepperId, StepperItem, TriggerMode,
+    self, Action, ActuationPoint, Binding, ChordKey, Config, Layer, MacroDef, MacroId, ModeKeyRole,
+    Profile, StepDirection, StepperDef, StepperId, StepperItem, TriggerMode,
 };
 use crate::dbus::Daemon;
 use crate::executor::{self, ActiveToggle, FiringHandle};
 use crate::injector::Injector;
 use crate::input::Input;
+
+/// The fixed simultaneity window between a Chord's first and last member
+/// going down (ticket 01's Answer, §"Simultaneity detection") — a Rust
+/// constant, deliberately not a persisted `Config` value or a v1.0 user
+/// setting.
+const CHORD_WINDOW: Duration = Duration::from_millis(50);
+
+/// The currently-developing press-combo a Chord may complete from (ticket
+/// 01/40): every chord-eligible Input pressed since the window opened, and
+/// the absolute instant it closes. At most one window is ever open at a
+/// time — a fresh chord-eligible Down either joins the existing window or,
+/// if none is open, starts a new one.
+struct ChordWindow {
+    // `BTreeSet`, not `HashSet`: compared directly against a `ChordKey`'s
+    // own `BTreeSet<Input>` membership via `is_subset` below, which requires
+    // the same set type on both sides.
+    down: BTreeSet<Input>,
+    deadline: Instant,
+}
+
+/// Every piece of Daemon-owned runtime state the Chord-detection state
+/// machine needs (ticket 01/40), mirroring `toggles`/`in_flight`'s existing
+/// per-Input shapes but keyed by `ChordKey` — a Chord's own Trigger-mode
+/// dispatch is otherwise identical to an ordinary Binding's, just evaluated
+/// against a member *set* rather than one Input (see `fire_chord`).
+#[derive(Default)]
+struct ChordState {
+    window: Option<ChordWindow>,
+    in_flight: HashMap<ChordKey, FiringHandle>,
+    toggles: HashMap<ChordKey, ActiveToggle>,
+    /// Every Input currently "owned" by the Chord machinery — either still
+    /// inside an open window, or physically held down as a member of a
+    /// Chord that has since fired. Routes that Input's later Repeat/Up
+    /// events back through the Chord path rather than the ordinary
+    /// per-Input one, even after `chords_containing_input` would otherwise
+    /// still call it chord-eligible (ticket 01: "the remaining member(s)
+    /// don't fall back to their individual Bindings until they're released
+    /// and re-pressed fresh").
+    claimed: HashSet<Input>,
+}
 
 /// Returns an error once the injector channel closes, or the capture
 /// channel closes (meaning the capture task has died) — per issue 07, a
@@ -109,6 +151,10 @@ pub async fn run(
     let mut commands_open = true;
     let mut connection_open = true;
     let mut capture_mode_open = true;
+    // Owns the ~50ms Chord simultaneity window plus every currently-active
+    // Chord's Trigger-mode state (ticket 01/40) — reset fresh on every
+    // dispatch task start, same as `toggles`/`active_layer`.
+    let mut chord_state = ChordState::default();
     loop {
         tokio::select! {
             event = rx_events.recv() => {
@@ -123,7 +169,23 @@ pub async fn run(
                     &mut active_layer,
                     &signal_emitter,
                     &actuation_tx,
+                    &mut chord_state,
                     event,
+                )
+                .await?;
+            }
+            () = chord_window_deadline(&chord_state.window) => {
+                handle_chord_timeout(
+                    &injector,
+                    &mut config,
+                    &config_path,
+                    active_layer,
+                    &mut toggles,
+                    &mut in_flight,
+                    &mut stepper_cursors,
+                    &actuation_tx,
+                    &signal_emitter,
+                    &mut chord_state,
                 )
                 .await?;
             }
@@ -161,6 +223,7 @@ async fn handle_event(
     active_layer: &mut Layer,
     signal_emitter: &Option<SignalEmitter<'static>>,
     actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
+    chord_state: &mut ChordState,
     event: PhysicalEvent,
 ) -> io::Result<()> {
     let profile = config
@@ -182,6 +245,34 @@ async fn handle_event(
     {
         toggle.stop().await;
         return Ok(());
+    }
+
+    // The Chord-detection machinery (ticket 01/40) takes priority over
+    // ordinary Binding lookup for any Input currently "owned" by it —
+    // either a fresh chord-eligible Down, or any later Repeat/Up for an
+    // Input already claimed by an open window or an active fired Chord
+    // (`chord_state.claimed`, not a fresh membership check, so a member
+    // that already resolved individually via `fire_individual_retroactively`
+    // is never routed back here).
+    let owned = chord_state.claimed.contains(&event.input);
+    if owned
+        || (event.state == EventState::Down
+            && !chord_keys_containing(profile.chords(*active_layer), event.input).is_empty())
+    {
+        return handle_chord_event(
+            injector,
+            config,
+            config_path,
+            toggles,
+            in_flight,
+            stepper_cursors,
+            *active_layer,
+            signal_emitter,
+            actuation_tx,
+            chord_state,
+            event,
+        )
+        .await;
     }
 
     // Cloned rather than matched by reference: an `Action::ProfileSwitch`
@@ -289,6 +380,382 @@ async fn handle_capture_mode_change(
     if let Some(emitter) = signal_emitter {
         let _ = Daemon::capture_mode_changed(emitter, mode.as_str()).await;
     }
+}
+
+/// Every `ChordKey` in `chords` that contains `input` among its members
+/// (ticket 01's amended Answer: an Input may belong to any number of
+/// Chords, so this can return more than one).
+fn chord_keys_containing(chords: &HashMap<ChordKey, Binding>, input: Input) -> Vec<ChordKey> {
+    chords
+        .keys()
+        .filter(|key| key.members().contains(&input))
+        .cloned()
+        .collect()
+}
+
+/// Resolves to the active Chord window's deadline, or never resolves if no
+/// window is open — the `tokio::select!` branch in `run` that drives
+/// `handle_chord_timeout` evaluates this fresh every loop iteration, so a
+/// window opened, extended, or cleared by `handle_event` in between is
+/// always picked up on the very next iteration (mirrors `run_depth_stream`'s
+/// own `interval_at` reasoning against a similarly-recreated-per-iteration
+/// future — recreating a `sleep_until` against the same absolute `Instant`
+/// every iteration doesn't lose or reset progress).
+async fn chord_window_deadline(window: &Option<ChordWindow>) {
+    match window {
+        Some(window) => tokio::time::sleep_until(window.deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// `fire`'s exact mirror for a Chord's own Trigger-mode dispatch (ticket
+/// 01/40): Fire-once/Hold-to-repeat share one Chord-scoped `FiringHandle`
+/// slot per `ChordKey`, Toggle spawns/tracks one `ActiveToggle` per
+/// `ChordKey`, both keyed by the Chord's member set rather than by a single
+/// Input. `ProfileSwitch` never reaches here — `SetChordBinding`/`parse`
+/// both refuse to let a Chord's Action be `ProfileSwitch` (see
+/// `ConfigError::InvalidChordProfileSwitch`), since `compile_action` panics
+/// on it (it has no `MacroStep` form, only `handle_event`'s single-Input
+/// path ever specially handles it).
+#[allow(clippy::too_many_arguments)]
+async fn fire_chord(
+    injector: &Injector,
+    chord_toggles: &mut HashMap<ChordKey, ActiveToggle>,
+    chord_in_flight: &mut HashMap<ChordKey, FiringHandle>,
+    key: ChordKey,
+    binding: &Binding,
+    state: EventState,
+    macros: &HashMap<MacroId, MacroDef>,
+    steppers: &HashMap<StepperId, StepperDef>,
+    stepper_cursors: &mut HashMap<StepperId, usize>,
+) -> io::Result<()> {
+    match (binding.trigger, state) {
+        (TriggerMode::FireOnce, EventState::Down)
+        | (TriggerMode::HoldToRepeat, EventState::Down | EventState::Repeat) => {
+            if let Some(handle) = chord_in_flight.get(&key)
+                && !handle.is_finished()
+            {
+                return Ok(());
+            }
+            let steps = compile_action(&binding.action, macros, steppers, stepper_cursors);
+            let handle = executor::spawn_fire_once(injector.clone(), steps);
+            chord_in_flight.insert(key, handle);
+            Ok(())
+        }
+        (TriggerMode::Toggle, EventState::Down) => {
+            let steps = compile_action(&binding.action, macros, steppers, stepper_cursors);
+            chord_toggles.insert(key, ActiveToggle::spawn(injector.clone(), steps));
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Fully releases one active Chord — a running Toggle is stopped, an
+/// in-flight Fire-once/Hold-to-repeat firing is force-released — regardless
+/// of its own Trigger mode (ticket 01's Answer: "releasing any one member
+/// ends the Chord's held/toggle state as a whole"). A Chord that never
+/// actually fired (still pending, or a FireOnce whose firing already
+/// finished on its own) has nothing to release here; both checks are
+/// no-ops in that case, same as `fire`'s own Up handling.
+async fn release_chord(
+    injector: &Injector,
+    chord_toggles: &mut HashMap<ChordKey, ActiveToggle>,
+    chord_in_flight: &HashMap<ChordKey, FiringHandle>,
+    key: &ChordKey,
+) {
+    if let Some(toggle) = chord_toggles.remove(key) {
+        toggle.stop().await;
+    }
+    if let Some(firing) = chord_in_flight.get(key) {
+        firing.force_release_stuck(injector).await;
+    }
+}
+
+/// Fires `input`'s own individual Binding as if its Down had just landed
+/// fresh — used once a chord-eligible Down never actually completes a Chord
+/// (the window elapsed, or the key was released early), per ticket 01's
+/// Answer: "the pending member's individual Binding fires retroactively
+/// (delayed by the window)". Mirrors `handle_event`'s own ordinary dispatch
+/// exactly, including the `ProfileSwitch`/passthrough branches — it must,
+/// since a Chord member's *own* individual Binding can be any ordinary
+/// Action (unlike a Chord's own Action, which can never be `ProfileSwitch`).
+#[allow(clippy::too_many_arguments)]
+async fn fire_individual_retroactively(
+    injector: &Injector,
+    config: &mut Config,
+    config_path: &Path,
+    toggles: &mut HashMap<Input, ActiveToggle>,
+    in_flight: &mut HashMap<Input, FiringHandle>,
+    stepper_cursors: &mut HashMap<StepperId, usize>,
+    actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
+    signal_emitter: &Option<SignalEmitter<'static>>,
+    layer: Layer,
+    input: Input,
+) -> io::Result<()> {
+    let profile = config
+        .active_profile()
+        .expect("load_or_seed validates active_profile names a real profile");
+    let binding = profile.layer(layer).get(&input).cloned();
+    match binding {
+        Some(binding) => {
+            if let Action::ProfileSwitch { target } = binding.action {
+                if switch_profile(config, config_path, toggles, actuation_tx, target.clone())
+                    .await
+                    .is_ok()
+                    && let Some(emitter) = signal_emitter
+                {
+                    let _ = Daemon::active_profile_changed(emitter, &target).await;
+                }
+                return Ok(());
+            }
+            fire(
+                injector,
+                toggles,
+                in_flight,
+                input,
+                &binding,
+                EventState::Down,
+                &config.macros,
+                &config.steppers,
+                stepper_cursors,
+            )
+            .await
+        }
+        None => injector
+            .inject_physical(PhysicalEvent {
+                input,
+                state: EventState::Down,
+                depth: None,
+            })
+            .await
+            .map_err(io::Error::other),
+    }
+}
+
+/// The Chord-detection state machine's own event routing (ticket 01/40) —
+/// `handle_event` diverts here for any Input currently "owned" by it. See
+/// the module's `ChordState`/`ChordWindow` doc comments and ticket 01's
+/// Answer for the model this implements.
+#[allow(clippy::too_many_arguments)]
+async fn handle_chord_event(
+    injector: &Injector,
+    config: &mut Config,
+    config_path: &Path,
+    toggles: &mut HashMap<Input, ActiveToggle>,
+    in_flight: &mut HashMap<Input, FiringHandle>,
+    stepper_cursors: &mut HashMap<StepperId, usize>,
+    active_layer: Layer,
+    signal_emitter: &Option<SignalEmitter<'static>>,
+    actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
+    chord_state: &mut ChordState,
+    event: PhysicalEvent,
+) -> io::Result<()> {
+    match event.state {
+        EventState::Down => {
+            chord_state.claimed.insert(event.input);
+            let window = chord_state.window.get_or_insert_with(|| ChordWindow {
+                down: BTreeSet::new(),
+                deadline: Instant::now() + CHORD_WINDOW,
+            });
+            window.down.insert(event.input);
+
+            // Every Chord whose full member set is now down, in one pass —
+            // firing one can only ever *shrink* `down` (its own members are
+            // removed below), never grow it, so a single completion pass is
+            // enough; a single Down can complete more than one Chord at once
+            // when an Input belongs to several of them (ticket 01's amended
+            // Answer — the thumbstick-diagonal worked example).
+            let profile = config
+                .active_profile()
+                .expect("load_or_seed validates active_profile names a real profile");
+            let chords = profile.chords(active_layer);
+            let down_snapshot = chord_state
+                .window
+                .as_ref()
+                .expect("just inserted above")
+                .down
+                .clone();
+            let completed: Vec<(ChordKey, Binding)> = chords
+                .iter()
+                .filter(|(key, _)| {
+                    // A stale-but-*finished* `chord_in_flight` entry must
+                    // not permanently exclude a FireOnce/HoldToRepeat Chord
+                    // from ever completing again — `release_chord` only
+                    // force-releases it, it never removes the map entry
+                    // (mirroring `fire`'s own single-Input `in_flight`,
+                    // which is never cleaned up either), so this must check
+                    // `is_finished()` itself rather than bare presence
+                    // (code-review finding: an earlier version of this
+                    // filter treated any entry as still-active forever).
+                    !chord_state.toggles.contains_key(*key)
+                        && !chord_state
+                            .in_flight
+                            .get(*key)
+                            .is_some_and(|handle| !handle.is_finished())
+                        && key.members().is_subset(&down_snapshot)
+                })
+                .map(|(key, binding)| (key.clone(), binding.clone()))
+                .collect();
+
+            for (key, binding) in completed {
+                fire_chord(
+                    injector,
+                    &mut chord_state.toggles,
+                    &mut chord_state.in_flight,
+                    key.clone(),
+                    &binding,
+                    EventState::Down,
+                    &config.macros,
+                    &config.steppers,
+                    stepper_cursors,
+                )
+                .await?;
+                if let Some(window) = chord_state.window.as_mut() {
+                    for member in key.members() {
+                        window.down.remove(member);
+                    }
+                }
+            }
+            if chord_state
+                .window
+                .as_ref()
+                .is_some_and(|w| w.down.is_empty())
+            {
+                chord_state.window = None;
+            }
+            Ok(())
+        }
+        EventState::Repeat => {
+            // A still-pending (not yet completed) member is "held, not
+            // fired" — Repeat is a no-op for it, mirroring `fire`'s own
+            // FireOnce/Toggle handling of Repeat. Only a member of an
+            // already-ACTIVE Hold-to-repeat Chord re-fires.
+            let profile = config
+                .active_profile()
+                .expect("load_or_seed validates active_profile names a real profile");
+            let chords = profile.chords(active_layer);
+            let due: Vec<(ChordKey, Binding)> = chord_keys_containing(chords, event.input)
+                .into_iter()
+                .filter(|key| chord_state.in_flight.contains_key(key))
+                .filter_map(|key| chords.get(&key).cloned().map(|b| (key, b)))
+                .filter(|(_, binding)| binding.trigger == TriggerMode::HoldToRepeat)
+                .collect();
+            for (key, binding) in due {
+                fire_chord(
+                    injector,
+                    &mut chord_state.toggles,
+                    &mut chord_state.in_flight,
+                    key,
+                    &binding,
+                    EventState::Repeat,
+                    &config.macros,
+                    &config.steppers,
+                    stepper_cursors,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+        EventState::Up => {
+            chord_state.claimed.remove(&event.input);
+
+            // Released before ever completing or timing out: resolves right
+            // now rather than waiting out the rest of the window on a key
+            // that's no longer even down (ticket 01: a pending member always
+            // eventually fires retroactively — an early release just means
+            // "now" instead of "at the deadline"), then immediately runs
+            // this same Up through the ordinary path to force-release
+            // whatever that retroactive Down just started.
+            let was_pending = chord_state
+                .window
+                .as_mut()
+                .is_some_and(|window| window.down.remove(&event.input));
+            if was_pending {
+                if chord_state
+                    .window
+                    .as_ref()
+                    .is_some_and(|w| w.down.is_empty())
+                {
+                    chord_state.window = None;
+                }
+                fire_individual_retroactively(
+                    injector,
+                    config,
+                    config_path,
+                    toggles,
+                    in_flight,
+                    stepper_cursors,
+                    actuation_tx,
+                    signal_emitter,
+                    active_layer,
+                    event.input,
+                )
+                .await?;
+                if let Some(firing) = in_flight.get(&event.input) {
+                    firing.force_release_stuck(injector).await;
+                }
+                return Ok(());
+            }
+
+            let profile = config
+                .active_profile()
+                .expect("load_or_seed validates active_profile names a real profile");
+            let keys = chord_keys_containing(profile.chords(active_layer), event.input);
+            for key in keys {
+                release_chord(
+                    injector,
+                    &mut chord_state.toggles,
+                    &chord_state.in_flight,
+                    &key,
+                )
+                .await;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Runs when the active Chord window's deadline elapses with members still
+/// unresolved (ticket 01's Answer): every Input still in `down` never
+/// completed a Chord, so each fires its own individual Binding retroactively
+/// — delayed by the window, exactly as designed, not a bug. Members already
+/// claimed by a fired Chord were removed from `down` when they fired (see
+/// `handle_chord_event`'s `Down` arm), so this only ever touches ones that
+/// are genuinely still pending.
+#[allow(clippy::too_many_arguments)]
+async fn handle_chord_timeout(
+    injector: &Injector,
+    config: &mut Config,
+    config_path: &Path,
+    active_layer: Layer,
+    toggles: &mut HashMap<Input, ActiveToggle>,
+    in_flight: &mut HashMap<Input, FiringHandle>,
+    stepper_cursors: &mut HashMap<StepperId, usize>,
+    actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
+    signal_emitter: &Option<SignalEmitter<'static>>,
+    chord_state: &mut ChordState,
+) -> io::Result<()> {
+    let Some(window) = chord_state.window.take() else {
+        return Ok(());
+    };
+    for input in window.down {
+        chord_state.claimed.remove(&input);
+        fire_individual_retroactively(
+            injector,
+            config,
+            config_path,
+            toggles,
+            in_flight,
+            stepper_cursors,
+            actuation_tx,
+            signal_emitter,
+            active_layer,
+            input,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Compiles a Binding's `Action` into the flat step sequence `fire` spawns —
@@ -442,6 +909,67 @@ fn reject_release_above_actuation(actuation: u8, release: u8) -> Result<(), Comm
     }
 }
 
+/// Shared by `SetBinding`/`SetChordBinding` (ticket 40): rejects a Binding
+/// whose Action/Trigger combination is structurally disallowed —
+/// `ProfileSwitch` paired with anything but Fire-once, a `ControllerButton`
+/// naming a non-gamepad code, a `Macro`/`Step` naming an unknown library
+/// entry, or a `Step` paired with Toggle. A Chord Binding is "just a Binding
+/// keyed by a Set<Input>" (ticket 01's Answer), so it's held to the exact
+/// same rules rather than a second, drifting copy of them.
+fn validate_binding(binding: &Binding, config: &Config) -> Result<(), CommandError> {
+    if matches!(binding.action, Action::ProfileSwitch { .. })
+        && binding.trigger != TriggerMode::FireOnce
+    {
+        return Err(CommandError::InvalidRequest(
+            "a Profile Switch Binding must use Fire-once".to_string(),
+        ));
+    }
+    if let Action::ControllerButton { button } = binding.action
+        && !crate::input::is_gamepad_button(button)
+    {
+        return Err(CommandError::InvalidRequest(format!(
+            "{button:?} is not a valid gamepad button"
+        )));
+    }
+    if let Action::Macro { macro_id } = &binding.action
+        && !config.macros.contains_key(macro_id)
+    {
+        return Err(CommandError::InvalidRequest(format!(
+            "{macro_id:?} does not name a Macro in the library"
+        )));
+    }
+    if let Action::Step { stepper, .. } = &binding.action {
+        if !config.steppers.contains_key(stepper) {
+            return Err(CommandError::InvalidRequest(format!(
+                "{stepper:?} does not name a Stepper in the library"
+            )));
+        }
+        if binding.trigger == TriggerMode::Toggle {
+            return Err(CommandError::InvalidRequest(
+                "Toggle is not allowed for a Stepper Binding".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `key`'s member set is a subset or superset of any *other*
+/// existing Chord's on `chords` (ticket 01's amended Answer) — the only
+/// case that stays genuinely ambiguous once an Input may belong to any
+/// number of Chords: completing the smaller one is indistinguishable from
+/// being partway into the larger one. Editing the exact same member set
+/// back (`key` already present in `chords`) is not a conflict with itself.
+fn chord_conflict(chords: &HashMap<ChordKey, Binding>, key: &ChordKey) -> Option<ChordKey> {
+    chords
+        .keys()
+        .find(|other| {
+            *other != key
+                && (key.members().is_subset(other.members())
+                    || other.members().is_subset(key.members()))
+        })
+        .cloned()
+}
+
 /// The `Default` Profile always exists — `load_or_seed` (issue 11) refuses
 /// to start a `Config` whose `active_profile` doesn't name a real Profile.
 fn active_profile_mut(config: &mut Config) -> &mut Profile {
@@ -533,31 +1061,37 @@ fn profile_switch_references(config: &Config, name: &str) -> bool {
     })
 }
 
-/// Whether any Profile's Base/Held Binding map contains an
+/// Whether any Profile's Base/Held *or Chord* Binding contains an
 /// `Action::Macro { macro_id }` naming `macro_id` — `DeleteMacro` refuses
 /// while this is true, so a dangling reference can never exist (ticket 15/
-/// 51), mirroring `profile_switch_references`'s identical shape.
+/// 51/40), mirroring `profile_switch_references`'s identical shape.
+/// `profile_switch_references` itself doesn't need this same widening:
+/// `chords_base`/`chords_held` can never contain a `ProfileSwitch` Action
+/// at all (`SetChordBinding`/`parse` both refuse it — see
+/// `ConfigError::InvalidChordProfileSwitch`), but Macro/Step Actions are
+/// fully allowed on a Chord, so a Chord referencing a since-deleted library
+/// entry is exactly as reachable as an ordinary Binding's (code-review
+/// finding: the original version of this function only scanned `base`/
+/// `held`, letting `DeleteMacro`/`DeleteStepper` leave a dangling Chord
+/// reference that then failed `load_or_seed`'s own validation — which does
+/// scan Chords — on the next Daemon restart).
 fn macro_references(config: &Config, macro_id: &MacroId) -> bool {
     config.profiles.values().any(|profile| {
-        [&profile.base, &profile.held].into_iter().any(|bindings| {
-            bindings.values().any(|binding| {
-                matches!(&binding.action, Action::Macro { macro_id: id } if id == macro_id)
-            })
-        })
+        config::profile_all_bindings(profile).any(
+            |binding| matches!(&binding.action, Action::Macro { macro_id: id } if id == macro_id),
+        )
     })
 }
 
-/// Whether any Profile's Base/Held Binding map contains an `Action::Step {
-/// stepper }` naming `stepper_id` (either direction) — `DeleteStepper`
+/// `macro_references`'s exact mirror for the Stepper library — whether any
+/// Profile's Base/Held *or Chord* Binding contains an `Action::Step {
+/// stepper }` naming `stepper_id` (either direction). `DeleteStepper`
 /// refuses while this is true, so a dangling reference can never exist
-/// (ticket 03/54), mirroring `macro_references`'s identical shape.
+/// (ticket 03/54/40).
 fn stepper_references(config: &Config, stepper_id: &StepperId) -> bool {
     config.profiles.values().any(|profile| {
-        [&profile.base, &profile.held].into_iter().any(|bindings| {
-            bindings.values().any(|binding| {
-                matches!(&binding.action, Action::Step { stepper, .. } if stepper == stepper_id)
-            })
-        })
+        config::profile_all_bindings(profile)
+            .any(|binding| matches!(&binding.action, Action::Step { stepper, .. } if stepper == stepper_id))
     })
 }
 
@@ -568,14 +1102,21 @@ fn stepper_references(config: &Config, stepper_id: &StepperId) -> bool {
 /// Input may ever carry a given (stepper, direction) at a time. `except`
 /// (the Input `SetBinding` is currently writing) is left untouched even if
 /// it already matches, so re-saving the same Input's own trigger mode isn't
-/// mistaken for a conflicting second owner. Returns what was removed so
-/// `SetBinding` can restore it if the persist that follows fails, mirroring
-/// every other mutating Command's rollback-on-failure discipline.
+/// mistaken for a conflicting second owner — `None` (used by
+/// `SetChordBinding`, which has no ordinary-Input identity of its own to
+/// exclude) steals from every matching Input unconditionally. Returns what
+/// was removed so the caller can restore it if the persist that follows
+/// fails, mirroring every other mutating Command's rollback-on-failure
+/// discipline. `take_stepper_direction_elsewhere_from_chords` is this
+/// function's exact mirror for a Chord's own Step action (ticket 40) — a
+/// Chord is exactly as exclusive an owner of (stepper, direction) as an
+/// ordinary Binding, so both keyspaces must be swept together whenever
+/// either kind of caller claims one.
 fn take_stepper_direction_elsewhere(
     config: &mut Config,
     stepper: &StepperId,
     direction: StepDirection,
-    except: (&str, Layer, Input),
+    except: Option<(&str, Layer, Input)>,
 ) -> Vec<(String, Layer, Input, Binding)> {
     let mut removed = Vec::new();
     for (profile_name, profile) in config.profiles.iter_mut() {
@@ -584,7 +1125,7 @@ fn take_stepper_direction_elsewhere(
             let matching: Vec<Input> = bindings
                 .iter()
                 .filter(|(input, binding)| {
-                    (profile_name.as_str(), layer, **input) != except
+                    except != Some((profile_name.as_str(), layer, **input))
                         && matches!(
                             &binding.action,
                             Action::Step { stepper: s, direction: d }
@@ -596,6 +1137,45 @@ fn take_stepper_direction_elsewhere(
             for input in matching {
                 if let Some(binding) = bindings.remove(&input) {
                     removed.push((profile_name.clone(), layer, input, binding));
+                }
+            }
+        }
+    }
+    removed
+}
+
+/// `take_stepper_direction_elsewhere`'s exact mirror for a Profile's Chord
+/// Bindings (ticket 40) — see its doc comment. `except` is the `ChordKey`
+/// `SetChordBinding` is currently writing, left untouched even if it
+/// already matches (re-saving an existing Step-action Chord's own Trigger
+/// mode isn't a conflicting second owner); `None` (used by `SetBinding`,
+/// which has no `ChordKey` identity of its own to exclude) steals from
+/// every matching Chord unconditionally.
+fn take_stepper_direction_elsewhere_from_chords(
+    config: &mut Config,
+    stepper: &StepperId,
+    direction: StepDirection,
+    except: Option<(&str, Layer, &ChordKey)>,
+) -> Vec<(String, Layer, ChordKey, Binding)> {
+    let mut removed = Vec::new();
+    for (profile_name, profile) in config.profiles.iter_mut() {
+        for layer in [Layer::Base, Layer::Held] {
+            let chords = profile.chords_mut(layer);
+            let matching: Vec<ChordKey> = chords
+                .iter()
+                .filter(|(key, binding)| {
+                    except != Some((profile_name.as_str(), layer, key))
+                        && matches!(
+                            &binding.action,
+                            Action::Step { stepper: s, direction: d }
+                                if s == stepper && *d == direction
+                        )
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in matching {
+                if let Some(binding) = chords.remove(&key) {
+                    removed.push((profile_name.clone(), layer, key, binding));
                 }
             }
         }
@@ -646,60 +1226,34 @@ async fn handle_command(
             binding,
             reply,
         } => {
-            if matches!(binding.action, Action::ProfileSwitch { .. })
-                && binding.trigger != TriggerMode::FireOnce
-            {
-                let _ = reply.send(Err(CommandError::InvalidRequest(
-                    "a Profile Switch Binding must use Fire-once".to_string(),
-                )));
+            if let Err(err) = validate_binding(&binding, config) {
+                let _ = reply.send(Err(err));
                 return;
-            }
-            if let Action::ControllerButton { button } = binding.action
-                && !crate::input::is_gamepad_button(button)
-            {
-                let _ = reply.send(Err(CommandError::InvalidRequest(format!(
-                    "{button:?} is not a valid gamepad button"
-                ))));
-                return;
-            }
-            if let Action::Macro { macro_id } = &binding.action
-                && !config.macros.contains_key(macro_id)
-            {
-                let _ = reply.send(Err(CommandError::InvalidRequest(format!(
-                    "{macro_id:?} does not name a Macro in the library"
-                ))));
-                return;
-            }
-            if let Action::Step { stepper, .. } = &binding.action {
-                if !config.steppers.contains_key(stepper) {
-                    let _ = reply.send(Err(CommandError::InvalidRequest(format!(
-                        "{stepper:?} does not name a Stepper in the library"
-                    ))));
-                    return;
-                }
-                if binding.trigger == TriggerMode::Toggle {
-                    let _ = reply.send(Err(CommandError::InvalidRequest(
-                        "Toggle is not allowed for a Stepper Binding".to_string(),
-                    )));
-                    return;
-                }
             }
             // Ticket 03's Answer: assigning a Stepper list to a new Input
             // silently moves it off its old one — no reject-at-save step,
-            // since at most one Input may carry a given (stepper, direction)
-            // at a time. Collected before the target insert below so both
-            // can roll back together on a persist failure.
-            let moved_stepper_bindings =
+            // since at most one Input *or Chord* may carry a given
+            // (stepper, direction) at a time (ticket 40 widened this
+            // invariant to cover Chords too — a Step-action Chord is just
+            // as exclusive an owner). Collected before the target insert
+            // below so all three can roll back together on a persist
+            // failure.
+            let (moved_stepper_bindings, moved_stepper_chord_bindings) =
                 if let Action::Step { stepper, direction } = &binding.action {
                     let active_profile = config.active_profile.clone();
-                    take_stepper_direction_elsewhere(
-                        config,
-                        stepper,
-                        *direction,
-                        (&active_profile, layer, input),
+                    (
+                        take_stepper_direction_elsewhere(
+                            config,
+                            stepper,
+                            *direction,
+                            Some((&active_profile, layer, input)),
+                        ),
+                        take_stepper_direction_elsewhere_from_chords(
+                            config, stepper, *direction, None,
+                        ),
                     )
                 } else {
-                    Vec::new()
+                    (Vec::new(), Vec::new())
                 };
             let previous = active_profile_mut(config)
                 .layer_mut(layer)
@@ -725,6 +1279,15 @@ async fn handle_command(
                         profile
                             .layer_mut(moved_layer)
                             .insert(moved_input, moved_binding);
+                    }
+                }
+                for (profile_name, moved_layer, moved_key, moved_binding) in
+                    moved_stepper_chord_bindings
+                {
+                    if let Some(profile) = config.profiles.get_mut(&profile_name) {
+                        profile
+                            .chords_mut(moved_layer)
+                            .insert(moved_key, moved_binding);
                     }
                 }
             }
@@ -1160,6 +1723,116 @@ async fn handle_command(
                 if let Some(cursor) = stepper_cursors.get_mut(&stepper_id) {
                     *cursor = (*cursor).min(new_len - 1);
                 }
+            }
+            let _ = reply.send(result);
+        }
+        Command::SetChordBinding {
+            inputs,
+            layer,
+            binding,
+            reply,
+        } => {
+            if inputs.len() < 2 {
+                let _ = reply.send(Err(CommandError::InvalidRequest(
+                    "a Chord needs at least two member Inputs".to_string(),
+                )));
+                return;
+            }
+            if matches!(binding.action, Action::ProfileSwitch { .. }) {
+                // See `ConfigError::InvalidChordProfileSwitch` — a Chord's
+                // own Action can never be ProfileSwitch, since
+                // `fire_chord`/`compile_action` have no `&mut Config` to
+                // actually run a switch through (unlike a Chord *member*'s
+                // own individual Binding, which can be anything — see
+                // `fire_individual_retroactively`).
+                let _ = reply.send(Err(CommandError::InvalidRequest(
+                    "a Chord's Binding can't be a Profile Switch".to_string(),
+                )));
+                return;
+            }
+            if let Err(err) = validate_binding(&binding, config) {
+                let _ = reply.send(Err(err));
+                return;
+            }
+            let key = ChordKey::new(inputs);
+            if let Some(conflicting) =
+                chord_conflict(active_profile_mut(config).chords(layer), &key)
+            {
+                let _ = reply.send(Err(CommandError::InvalidRequest(format!(
+                    "conflicts with the existing Chord {conflicting}: one member set fully contains the other"
+                ))));
+                return;
+            }
+            // Ticket 40: a Step-action Chord is exactly as exclusive an
+            // owner of (stepper, direction) as an ordinary Binding's
+            // (ticket 03's Answer) — steal it from wherever else it
+            // currently lives, in either keyspace, mirroring `SetBinding`'s
+            // own handler.
+            let (moved_stepper_bindings, moved_stepper_chord_bindings) =
+                if let Action::Step { stepper, direction } = &binding.action {
+                    let active_profile = config.active_profile.clone();
+                    (
+                        take_stepper_direction_elsewhere(config, stepper, *direction, None),
+                        take_stepper_direction_elsewhere_from_chords(
+                            config,
+                            stepper,
+                            *direction,
+                            Some((&active_profile, layer, &key)),
+                        ),
+                    )
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+            let previous = active_profile_mut(config)
+                .chords_mut(layer)
+                .insert(key.clone(), binding);
+            let result = persist(config, config_path).await;
+            if result.is_err() {
+                let chords = active_profile_mut(config).chords_mut(layer);
+                match previous {
+                    Some(prev) => {
+                        chords.insert(key, prev);
+                    }
+                    None => {
+                        chords.remove(&key);
+                    }
+                }
+                for (profile_name, moved_layer, moved_input, moved_binding) in
+                    moved_stepper_bindings
+                {
+                    if let Some(profile) = config.profiles.get_mut(&profile_name) {
+                        profile
+                            .layer_mut(moved_layer)
+                            .insert(moved_input, moved_binding);
+                    }
+                }
+                for (profile_name, moved_layer, moved_key, moved_binding) in
+                    moved_stepper_chord_bindings
+                {
+                    if let Some(profile) = config.profiles.get_mut(&profile_name) {
+                        profile
+                            .chords_mut(moved_layer)
+                            .insert(moved_key, moved_binding);
+                    }
+                }
+            }
+            let _ = reply.send(result);
+        }
+        Command::ClearChordBinding {
+            inputs,
+            layer,
+            reply,
+        } => {
+            let key = ChordKey::new(inputs);
+            let Some(previous) = active_profile_mut(config).chords_mut(layer).remove(&key) else {
+                let _ = reply.send(Err(CommandError::NotFound));
+                return;
+            };
+            let result = persist(config, config_path).await;
+            if result.is_err() {
+                active_profile_mut(config)
+                    .chords_mut(layer)
+                    .insert(key, previous);
             }
             let _ = reply.send(result);
         }
@@ -1889,6 +2562,42 @@ mod tests {
             rx.await.unwrap()
         }
 
+        async fn set_chord_binding(
+            &self,
+            inputs: impl IntoIterator<Item = Input>,
+            layer: Layer,
+            binding: Binding,
+        ) -> Result<(), CommandError> {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::SetChordBinding {
+                    inputs: inputs.into_iter().collect(),
+                    layer,
+                    binding,
+                    reply,
+                })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
+        async fn clear_chord_binding(
+            &self,
+            inputs: impl IntoIterator<Item = Input>,
+            layer: Layer,
+        ) -> Result<(), CommandError> {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::ClearChordBinding {
+                    inputs: inputs.into_iter().collect(),
+                    layer,
+                    reply,
+                })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
         async fn set_mode_key_role(&self, role: ModeKeyRole) -> Result<(), CommandError> {
             let (reply, rx) = oneshot::channel();
             self.cmd_tx
@@ -2217,6 +2926,369 @@ mod tests {
                 key,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn a_fire_once_chord_fires_again_after_being_fully_released_and_re_pressed() {
+        // Regression test (code-review finding on this ticket's own build):
+        // `release_chord` only force-releases a FireOnce/HoldToRepeat
+        // Chord's in-flight firing, it never removes the `chord_in_flight`
+        // map entry (mirroring `fire`'s own single-Input `in_flight`, which
+        // is never cleaned up either) — an earlier version of the
+        // completion-detection filter treated bare presence in that map as
+        // "still active," which permanently excluded the Chord from ever
+        // completing again after its very first firing.
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness
+            .set_chord_binding(
+                [Input::Grid(1, 1), Input::Grid(1, 2)],
+                Layer::Base,
+                keypress_binding(evdev::KeyCode::KEY_C),
+            )
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            harness.press(Input::Grid(1, 1)).await;
+            harness.press(Input::Grid(1, 2)).await;
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            harness.release(Input::Grid(1, 1)).await;
+            harness.release(Input::Grid(1, 2)).await;
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let batches = harness.shut_down().await;
+
+        // Two full firings — not just one — each a KeyDown/KeyUp pair.
+        assert_eq!(batches.len(), 4);
+        for pair in batches.chunks(2) {
+            let evdev::EventSummary::Key(_, down_code, down_value) = pair[0][0].destructure()
+            else {
+                panic!("expected a key event");
+            };
+            let evdev::EventSummary::Key(_, up_code, up_value) = pair[1][0].destructure() else {
+                panic!("expected a key event");
+            };
+            assert_eq!((down_code, down_value), (evdev::KeyCode::KEY_C, 1));
+            assert_eq!((up_code, up_value), (evdev::KeyCode::KEY_C, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_macro_command_rejects_deleting_a_macro_still_referenced_only_by_a_chord() {
+        // Regression test: `macro_references` originally only scanned
+        // `base`/`held`, so a Macro referenced solely by a Chord's Action
+        // could be deleted, leaving `chords_base`/`chords_held` with a
+        // dangling `macro_id` that then failed `load_or_seed`'s own
+        // validation (which does scan Chords) on the next Daemon restart.
+        let (action, macros) = macro_action("test-macro", vec![MacroStepDto::Delay(1)]);
+        let macro_id = macros.keys().next().unwrap().clone();
+        let harness =
+            CommandHarness::spawn(config_with_bindings_and_macros(HashMap::new(), macros));
+        harness
+            .set_chord_binding(
+                [Input::Grid(1, 1), Input::Grid(1, 2)],
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::FireOnce,
+                    action,
+                },
+            )
+            .await
+            .unwrap();
+
+        let result = harness.delete_macro(macro_id).await;
+
+        assert!(matches!(result, Err(CommandError::InvalidRequest(_))));
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn set_binding_and_set_chord_binding_each_steal_a_stepper_direction_from_the_other() {
+        // Regression test: `SetChordBinding` originally never called
+        // `take_stepper_direction_elsewhere` at all, so an ordinary Binding
+        // and a Chord could both independently own the same
+        // `(stepper, direction)` — violating ticket 03's "at most one owner
+        // at a time" invariant. Covers both directions of the theft.
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        let stepper_id = harness
+            .create_stepper(
+                "Weapon Wheel",
+                vec![crate::config::StepperItem::Key {
+                    key: evdev::KeyCode::KEY_1,
+                    modifiers: Modifiers::default(),
+                }],
+            )
+            .await
+            .unwrap();
+        let step_binding = Binding {
+            trigger: TriggerMode::FireOnce,
+            action: Action::Step {
+                stepper: stepper_id.clone(),
+                direction: StepDirection::Forward,
+            },
+        };
+
+        // An ordinary Binding owns it first...
+        harness
+            .set_binding(Input::Grid(1, 1), Layer::Base, step_binding.clone())
+            .await
+            .unwrap();
+        // ...then a Chord steals it.
+        harness
+            .set_chord_binding(
+                [Input::Grid(2, 1), Input::Grid(2, 2)],
+                Layer::Base,
+                step_binding.clone(),
+            )
+            .await
+            .unwrap();
+
+        let config = harness.get_config().await;
+        assert!(
+            !config.profiles[DEFAULT_PROFILE_NAME]
+                .base
+                .contains_key(&Input::Grid(1, 1))
+        );
+        let chord_key = ChordKey::new(BTreeSet::from([Input::Grid(2, 1), Input::Grid(2, 2)]));
+        assert!(
+            config.profiles[DEFAULT_PROFILE_NAME]
+                .chords_base
+                .contains_key(&chord_key)
+        );
+
+        // ...then an ordinary Binding steals it back from the Chord.
+        harness
+            .set_binding(Input::Grid(3, 1), Layer::Base, step_binding)
+            .await
+            .unwrap();
+
+        let config = harness.get_config().await;
+        assert!(
+            !config.profiles[DEFAULT_PROFILE_NAME]
+                .chords_base
+                .contains_key(&chord_key)
+        );
+        assert!(
+            config.profiles[DEFAULT_PROFILE_NAME]
+                .base
+                .contains_key(&Input::Grid(3, 1))
+        );
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn thumbstick_diagonals_fire_independently_and_share_a_member() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        harness
+            .set_chord_binding(
+                [
+                    Input::Thumbstick(Direction::Up),
+                    Input::Thumbstick(Direction::Right),
+                ],
+                Layer::Base,
+                keypress_binding(evdev::KeyCode::KEY_1),
+            )
+            .await
+            .expect("Up-Right must be settable");
+        harness
+            .set_chord_binding(
+                [
+                    Input::Thumbstick(Direction::Up),
+                    Input::Thumbstick(Direction::Left),
+                ],
+                Layer::Base,
+                keypress_binding(evdev::KeyCode::KEY_2),
+            )
+            .await
+            .expect("Up-Left must be settable despite sharing Up with Up-Right");
+
+        harness.press(Input::Thumbstick(Direction::Up)).await;
+        harness.press(Input::Thumbstick(Direction::Right)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        harness.release(Input::Thumbstick(Direction::Up)).await;
+        harness.release(Input::Thumbstick(Direction::Right)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        // Up is reusable across both diagonals once released and re-pressed
+        // fresh (ticket 01's Answer).
+        harness.press(Input::Thumbstick(Direction::Up)).await;
+        harness.press(Input::Thumbstick(Direction::Left)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        harness.release(Input::Thumbstick(Direction::Up)).await;
+        harness.release(Input::Thumbstick(Direction::Left)).await;
+
+        let batches = harness.shut_down().await;
+
+        // Two Chords each fired exactly once — KEY_1 (Up-Right), then KEY_2
+        // (Up-Left) — never the thumbstick directions' own passthrough.
+        assert_eq!(batches.len(), 4);
+        let evdev::EventSummary::Key(_, code, value) = batches[0][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_1, 1));
+        let evdev::EventSummary::Key(_, code, value) = batches[1][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_1, 0));
+        let evdev::EventSummary::Key(_, code, value) = batches[2][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_2, 1));
+        let evdev::EventSummary::Key(_, code, value) = batches[3][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_2, 0));
+    }
+
+    #[tokio::test]
+    async fn hold_to_repeat_chord_refires_on_repeat_for_any_member() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness
+            .set_chord_binding(
+                [Input::Grid(1, 1), Input::Grid(1, 2)],
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::HoldToRepeat,
+                    action: Action::Keypress {
+                        modifiers: Modifiers::default(),
+                        key: evdev::KeyCode::KEY_C,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        harness.press(Input::Grid(1, 1)).await;
+        harness.press(Input::Grid(1, 2)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        // A Repeat on *either* member re-fires the Chord — not just the one
+        // that happened to complete it.
+        harness.repeat(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        let batches = harness.shut_down().await;
+
+        // The initial completion, plus one Repeat re-fire — each a
+        // KeyDown/KeyUp pair.
+        assert_eq!(batches.len(), 4);
+        for pair in batches.chunks(2) {
+            let evdev::EventSummary::Key(_, down_code, down_value) = pair[0][0].destructure()
+            else {
+                panic!("expected a key event");
+            };
+            let evdev::EventSummary::Key(_, up_code, up_value) = pair[1][0].destructure() else {
+                panic!("expected a key event");
+            };
+            assert_eq!((down_code, down_value), (evdev::KeyCode::KEY_C, 1));
+            assert_eq!((up_code, up_value), (evdev::KeyCode::KEY_C, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn toggle_chord_is_stopped_by_releasing_any_member_not_a_fresh_press() {
+        // Deliberately unbalanced (no matching KeyUp step) so the Toggle's
+        // stop is what force-releases it, mirroring ticket 33's
+        // reproduction and this map's single-Input Toggle tests.
+        let (action, macros) = macro_action(
+            "stuck",
+            vec![MacroStepDto::KeyDown(evdev::KeyCode::KEY_LEFTCTRL)],
+        );
+        let harness =
+            CommandHarness::spawn(config_with_bindings_and_macros(HashMap::new(), macros));
+        harness
+            .set_chord_binding(
+                [Input::Grid(1, 1), Input::Grid(1, 2)],
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::Toggle,
+                    action,
+                },
+            )
+            .await
+            .unwrap();
+
+        harness.press(Input::Grid(1, 1)).await;
+        harness.press(Input::Grid(1, 2)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        // Releasing just ONE member ends the Chord's Toggle entirely — not
+        // a fresh Down of the exact same set (ticket 01's Answer).
+        harness.release(Input::Grid(1, 1)).await;
+
+        let batches = harness.shut_down().await;
+
+        assert_eq!(batches.len(), 2, "one KeyDown lap, then the force-release");
+        let evdev::EventSummary::Key(_, code, value) = batches[0][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_LEFTCTRL, 1));
+        let evdev::EventSummary::Key(_, code, value) = batches[1][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_LEFTCTRL, 0));
+    }
+
+    #[tokio::test]
+    async fn set_chord_binding_command_persists_and_clear_chord_binding_removes_it() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        harness
+            .set_chord_binding(
+                [Input::Grid(1, 1), Input::Grid(1, 2)],
+                Layer::Base,
+                keypress_binding(evdev::KeyCode::KEY_C),
+            )
+            .await
+            .expect("SetChordBinding must succeed");
+
+        let key = ChordKey::new(BTreeSet::from([Input::Grid(1, 1), Input::Grid(1, 2)]));
+        let config = harness.get_config().await;
+        assert!(
+            config.profiles[DEFAULT_PROFILE_NAME]
+                .chords(Layer::Base)
+                .contains_key(&key)
+        );
+        let on_disk = std::fs::read_to_string(&harness.config_path).unwrap();
+        assert!(on_disk.contains("grid_r1c1+grid_r1c2"));
+
+        harness
+            .clear_chord_binding([Input::Grid(1, 1), Input::Grid(1, 2)], Layer::Base)
+            .await
+            .expect("ClearChordBinding must succeed");
+
+        let config = harness.get_config().await;
+        assert!(
+            !config.profiles[DEFAULT_PROFILE_NAME]
+                .chords(Layer::Base)
+                .contains_key(&key)
+        );
+
+        let err = harness
+            .clear_chord_binding([Input::Grid(1, 1), Input::Grid(1, 2)], Layer::Base)
+            .await
+            .expect_err("clearing an already-cleared Chord must fail");
+        assert!(matches!(err, CommandError::NotFound));
+
+        harness.shut_down().await;
     }
 
     #[tokio::test]

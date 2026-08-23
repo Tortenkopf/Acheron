@@ -19,6 +19,8 @@ def test_fresh_stub_matches_the_seed_configs_shape():
                 "mode_key_role": "layer_switch",
                 "default_actuation": {"actuation": 128, "release": 112},
                 "actuation_overrides": {},
+                "chords_base": {},
+                "chords_held": {},
             }
         },
         "force_digital": False,
@@ -105,6 +107,8 @@ def test_create_profile_adds_an_empty_profile():
         "mode_key_role": "layer_switch",
         "default_actuation": {"actuation": 128, "release": 112},
         "actuation_overrides": {},
+        "chords_base": {},
+        "chords_held": {},
     }
     assert stub.calls == [("create_profile", "Gaming")]
 
@@ -467,3 +471,75 @@ def test_switch_profile_clears_active_toggles():
     stub.switch_profile("Gaming")
 
     assert stub.get_state()["active_toggles"] == []
+
+
+def test_set_chord_binding_persists_keyed_by_the_plus_joined_sorted_members():
+    stub = DaemonStub()
+
+    stub.set_chord_binding(
+        ["grid_r1c2", "grid_r1c1"], "base", {"trigger": "fire_once", "type": "keypress", "key": "KEY_C"}
+    )
+
+    chords = stub.get_config()["profiles"]["Default"]["chords_base"]
+    assert chords["grid_r1c1+grid_r1c2"]["key"] == "KEY_C"
+
+
+def test_chord_key_orders_members_like_the_real_daemons_input_ord_not_alphabetically():
+    # Regression test: a plain alphabetical sort disagrees with the real
+    # Daemon's `ChordKey` Display (ordered by `Input`'s own derived `Ord`:
+    # ModeKey < Grid < Thumbstick < Wheel) for any Chord mixing Input
+    # variant kinds — "grid_r1c1" < "mode_key" alphabetically, but ModeKey
+    # sorts first under the real Ord.
+    stub = DaemonStub()
+
+    stub.set_chord_binding(
+        ["grid_r1c1", "mode_key"], "base", {"trigger": "fire_once", "type": "keypress", "key": "KEY_C"}
+    )
+
+    assert "mode_key+grid_r1c1" in stub.get_config()["profiles"]["Default"]["chords_base"]
+
+
+def test_set_chord_binding_rejects_fewer_than_two_inputs():
+    stub = DaemonStub()
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_chord_binding(["grid_r1c1"], "base", {"trigger": "fire_once", "type": "keypress", "key": "KEY_C"})
+
+
+def test_set_chord_binding_rejects_a_subset_superset_conflict_but_allows_intersection():
+    stub = DaemonStub()
+    binding = {"trigger": "fire_once", "type": "keypress", "key": "KEY_C"}
+    stub.set_chord_binding(["grid_r1c1", "grid_r1c2"], "base", binding)
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_chord_binding(["grid_r1c1", "grid_r1c2", "mode_key"], "base", binding)
+
+    # Intersects (shares grid_r1c1, each has a member the other lacks) —
+    # allowed, per ticket 01's amended Answer.
+    stub.set_chord_binding(["grid_r1c1", "mode_key"], "base", binding)
+    assert set(stub.get_config()["profiles"]["Default"]["chords_base"]) == {
+        "grid_r1c1+grid_r1c2",
+        "mode_key+grid_r1c1",
+    }
+
+
+def test_set_chord_binding_rejects_a_profile_switch_action():
+    stub = DaemonStub()
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_chord_binding(
+            ["grid_r1c1", "grid_r1c2"], "base", {"trigger": "fire_once", "type": "profile_switch", "target": "Gaming"}
+        )
+
+
+def test_clear_chord_binding_removes_it_and_an_unknown_one_raises_not_found():
+    stub = DaemonStub()
+    stub.set_chord_binding(
+        ["grid_r1c1", "grid_r1c2"], "base", {"trigger": "fire_once", "type": "keypress", "key": "KEY_C"}
+    )
+
+    stub.clear_chord_binding(["grid_r1c2", "grid_r1c1"], "base")
+
+    assert stub.get_config()["profiles"]["Default"]["chords_base"] == {}
+    with pytest.raises(NotFoundError):
+        stub.clear_chord_binding(["grid_r1c1", "grid_r1c2"], "base")

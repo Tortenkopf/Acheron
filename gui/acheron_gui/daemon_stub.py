@@ -47,6 +47,11 @@ class DaemonStub:
         # with (ticket 26).
         "default_actuation": {"actuation": 128, "release": 112},
         "actuation_overrides": {},
+        # Ticket 40: a Profile's Chord Bindings, keyed the same way the real
+        # Daemon's wire shape does — a "+"-joined, sorted string of member
+        # Input strings (mirrors `daemon/src/config.rs::ChordKey`'s Display).
+        "chords_base": {},
+        "chords_held": {},
     }
 
     def __init__(self, active_profile: str = "Default"):
@@ -112,9 +117,13 @@ class DaemonStub:
             },
         }
 
-    def set_binding(self, input_str: str, layer: str, binding: dict) -> None:
-        # Ticket 51: mirrors the real Daemon's SetBinding validation — a
-        # Macro Action naming an unknown macro_id is rejected outright.
+    def _validate_binding_action(self, binding: dict) -> None:
+        # Ticket 51/03/54/40: mirrors the real Daemon's shared
+        # `dispatch::validate_binding` — a Macro/Step Action naming an
+        # unknown library entry, or a Step paired with Toggle, is rejected
+        # outright. Shared by `set_binding` and `set_chord_binding` (a Chord
+        # Binding is "just a Binding keyed by a Set<Input>", ticket 01's
+        # Answer, held to the exact same rules).
         if binding.get("type") == "macro" and binding.get("macro_id") not in self._macros:
             raise InvalidBindingError(
                 f"{binding.get('macro_id')!r} does not name a Macro in the library"
@@ -125,9 +134,14 @@ class DaemonStub:
                 raise InvalidBindingError(f"{stepper_id!r} does not name a Stepper in the library")
             if binding.get("trigger") == "toggle":
                 raise InvalidBindingError("Toggle is not allowed for a Stepper Binding")
+
+    def set_binding(self, input_str: str, layer: str, binding: dict) -> None:
+        self._validate_binding_action(binding)
+        if binding.get("type") == "step":
             # Ticket 03's Answer: assigning a Stepper list to a new Input
             # silently moves it off its old one — no reject-at-save step,
             # mirroring the real Daemon's `take_stepper_direction_elsewhere`.
+            stepper_id = binding.get("stepper_id")
             direction = binding.get("direction")
             for profile in self._profiles.values():
                 for layer_bindings in (profile["base"], profile["held"]):
@@ -146,6 +160,77 @@ class DaemonStub:
         stored = copy.deepcopy(binding)
         self._profiles[self._active_profile][layer][input_str] = stored
         self.calls.append(("set_binding", input_str, layer, copy.deepcopy(stored)))
+
+    @staticmethod
+    def _input_sort_key(inp: str) -> tuple:
+        # Mirrors `daemon/src/input.rs::Input`'s *derived* `Ord` exactly —
+        # ModeKey < Grid(row, col) < Thumbstick(Direction) < Wheel(WheelEvent),
+        # each variant's own fields compared in declaration order (Grid by
+        # (row, col); Direction/WheelEvent by their own declared variant
+        # order). A plain alphabetical sort disagrees for any Chord mixing
+        # Input variant kinds — e.g. {mode_key, grid_r1c1}: the real Daemon's
+        # `ChordKey` Display is "mode_key+grid_r1c1" (ModeKey sorts first),
+        # not "grid_r1c1+mode_key" (code-review finding).
+        if inp == "mode_key":
+            return (0,)
+        grid_match = re.fullmatch(r"grid_r(\d+)c(\d+)", inp)
+        if grid_match:
+            return (1, int(grid_match.group(1)), int(grid_match.group(2)))
+        direction_order = {
+            "thumbstick_up": 0,
+            "thumbstick_down": 1,
+            "thumbstick_left": 2,
+            "thumbstick_right": 3,
+        }
+        if inp in direction_order:
+            return (2, direction_order[inp])
+        wheel_order = {"wheel_scroll_up": 0, "wheel_scroll_down": 1, "wheel_middle": 2}
+        return (3, wheel_order[inp])
+
+    @classmethod
+    def _chord_key(cls, inputs: list[str]) -> str:
+        # Mirrors `daemon/src/config.rs::ChordKey`'s Display: a "+"-joined
+        # string of member Input strings, ordered by `Input`'s own `Ord`
+        # (see `_input_sort_key`), not alphabetically.
+        return "+".join(sorted(inputs, key=cls._input_sort_key))
+
+    @staticmethod
+    def _chord_conflict(chords: dict, key: str, members: set[str]) -> str | None:
+        # Ticket 01's amended Answer: only a subset/superset relationship
+        # between two Chords' member sets conflicts — a plain intersection
+        # (the thumbstick-diagonal shape) does not.
+        for other_key in chords:
+            if other_key == key:
+                continue
+            other_members = set(other_key.split("+"))
+            if members <= other_members or other_members <= members:
+                return other_key
+        return None
+
+    def set_chord_binding(self, inputs: list[str], layer: str, binding: dict) -> None:
+        if len(inputs) < 2:
+            raise InvalidBindingError("a Chord needs at least two member Inputs")
+        if binding.get("type") == "profile_switch":
+            raise InvalidBindingError("a Chord's Binding can't be a Profile Switch")
+        self._validate_binding_action(binding)
+        key = self._chord_key(inputs)
+        chords = self._profiles[self._active_profile][f"chords_{layer}"]
+        conflicting = self._chord_conflict(chords, key, set(inputs))
+        if conflicting is not None:
+            raise InvalidBindingError(
+                f"conflicts with the existing Chord {conflicting}: one member set fully "
+                "contains the other"
+            )
+        chords[key] = copy.deepcopy(binding)
+        self.calls.append(("set_chord_binding", list(inputs), layer, copy.deepcopy(binding)))
+
+    def clear_chord_binding(self, inputs: list[str], layer: str) -> None:
+        key = self._chord_key(inputs)
+        chords = self._profiles[self._active_profile][f"chords_{layer}"]
+        if key not in chords:
+            raise NotFoundError(f"no Chord with members {key!r}")
+        del chords[key]
+        self.calls.append(("clear_chord_binding", list(inputs), layer))
 
     def clear_binding(self, input_str: str, layer: str) -> None:
         bindings = self._profiles[self._active_profile][layer]

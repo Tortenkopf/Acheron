@@ -33,7 +33,7 @@ impl Node {
     pub const ALL: [Node; 3] = [Node::Main, Node::If01, Node::If02];
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Direction {
     Up,
     Down,
@@ -41,7 +41,7 @@ pub enum Direction {
     Right,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum WheelEvent {
     ScrollUp,
     ScrollDown,
@@ -49,7 +49,11 @@ pub enum WheelEvent {
 }
 
 /// One physical control on the Tartarus Pro that can be bound (CONTEXT.md: Input).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `PartialOrd`/`Ord` (ticket 40) exist solely so a Chord's membership can
+/// live in a `BTreeSet<Input>` (`config::ChordKey`) — the derived order is
+/// otherwise arbitrary and carries no meaning of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Input {
     ModeKey,
     /// 1-indexed: row 1-4, column 1-5.

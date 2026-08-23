@@ -108,16 +108,146 @@ def test_grid_destination_selection_survives_a_rebuild():
     assert len(input_buttons) == len(ALL_INPUTS)
 
 
-def test_grid_destination_has_a_reserved_chords_slot_naming_ticket_40():
+def _grid_button(root, label, profile="Default", layer="base"):
+    """Locates one specific device button by the title its
+    `binding_editor_window` was built with — every device button carries
+    this attribute (`make_input_button`), unique per `(profile, layer,
+    input_label)`."""
+    title = f"{profile} / {layer} / {label}"
+    return find_one(
+        root,
+        lambda w: isinstance(w, Gtk.Button)
+        and getattr(w, "binding_editor_window", None) is not None
+        and w.binding_editor_window.get_title() == title,
+    )
+
+
+def test_grid_destination_shows_the_real_chords_section_with_a_selecting_toggle():
     stub = DaemonStub()
 
     root = _build(stub, {})
 
     find_one(root, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "Chords")
-    placeholder = find_one(
-        root, lambda w: isinstance(w, Gtk.Label) and "ticket 40" in w.get_label().lower()
+    selecting_btn = find_one(
+        root, lambda w: isinstance(w, Gtk.ToggleButton) and w.get_label() == "Select Chord members"
     )
-    assert placeholder.get_label()
+    assert not selecting_btn.get_active()
+    find_one(root, lambda w: isinstance(w, Gtk.Label) and "no chords" in w.get_label().lower())
+
+
+def test_enabling_chord_selecting_reroutes_grid_clicks_to_the_selection_instead_of_the_editor():
+    stub = DaemonStub()
+    ui_state = {}
+
+    root = _build(stub, ui_state)
+    selecting_btn = find_one(
+        root, lambda w: isinstance(w, Gtk.ToggleButton) and w.get_label() == "Select Chord members"
+    )
+    selecting_btn.set_active(True)
+    assert ui_state["chord"]["selecting"] is True
+
+    rebuilt = _build(stub, ui_state)
+    grid_r1c1 = _grid_button(rebuilt, "1")
+    grid_r1c1.emit("clicked")
+
+    # The click was consumed by Chord selection, not the Binding editor —
+    # ordinary editing is unaffected while selecting is off.
+    assert ui_state["chord"]["recorded"] == ["grid_r1c1"]
+
+    # Clicking it again removes it from the selection.
+    rebuilt_again = _build(stub, ui_state)
+    _grid_button(rebuilt_again, "1").emit("clicked")
+    assert ui_state["chord"]["recorded"] == []
+
+
+def test_binding_button_is_disabled_until_two_inputs_are_selected_and_enables_a_chord_save():
+    stub = DaemonStub()
+    ui_state = {"chord": {"selecting": True, "recorded": ["grid_r1c1"], "edit_key": None, "preview": None}}
+
+    root = _build(stub, ui_state)
+    binding_btn = find_one(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Binding →")
+    assert not binding_btn.get_sensitive()
+
+    ui_state["chord"]["recorded"].append("grid_r1c2")
+    rebuilt = _build(stub, ui_state)
+    binding_btn = find_one(rebuilt, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Binding →")
+    assert binding_btn.get_sensitive()
+
+    binding_btn.emit("clicked")
+    dialog = binding_btn.last_chord_dialog
+    assert dialog.get_title() == "Chord binding"
+    save_btn = find_one(dialog, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Save Chord")
+    save_btn.emit("clicked")
+
+    assert stub.get_config()["profiles"]["Default"]["chords_base"]["grid_r1c1+grid_r1c2"]["type"] == "keypress"
+    # Saving clears the in-progress selection (fresh ui_state read below is
+    # only meaningful once app.py's own rebuild runs; here we assert the
+    # in-place mutation directly).
+    assert ui_state["chord"]["recorded"] == []
+
+
+def test_a_subset_superset_conflict_disables_binding_and_offers_edit_conflicting_chord():
+    stub = DaemonStub()
+    stub.set_chord_binding(
+        ["grid_r1c1", "grid_r1c2"], "base", {"trigger": "fire_once", "type": "keypress", "key": "KEY_C"}
+    )
+    ui_state = {
+        "chord": {
+            "selecting": True,
+            "recorded": ["grid_r1c1", "grid_r1c2", "mode_key"],
+            "edit_key": None,
+            "preview": None,
+        }
+    }
+
+    root = _build(stub, ui_state)
+
+    binding_btn = find_one(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Binding →")
+    assert not binding_btn.get_sensitive()
+    conflict_btn = find_one(
+        root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Edit conflicting Chord"
+    )
+
+    conflict_btn.emit("clicked")
+    assert sorted(ui_state["chord"]["recorded"]) == ["grid_r1c1", "grid_r1c2"]
+    assert ui_state["chord"]["edit_key"] == "grid_r1c1+grid_r1c2"
+
+
+def test_clicking_edit_on_an_existing_chord_reenters_selection_mode_preloaded():
+    stub = DaemonStub()
+    stub.set_chord_binding(
+        ["grid_r1c1", "grid_r1c2"], "base", {"trigger": "fire_once", "type": "keypress", "key": "KEY_C"}
+    )
+    ui_state = {}
+
+    root = _build(stub, ui_state)
+    edit_btn = find_one(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Edit")
+    edit_btn.emit("clicked")
+
+    assert ui_state["chord"]["selecting"] is True
+    assert sorted(ui_state["chord"]["recorded"]) == ["grid_r1c1", "grid_r1c2"]
+    assert ui_state["chord"]["edit_key"] == "grid_r1c1+grid_r1c2"
+
+
+def test_removing_a_chord_calls_clear_chord_binding():
+    stub = DaemonStub()
+    stub.set_chord_binding(
+        ["grid_r1c1", "grid_r1c2"], "base", {"trigger": "fire_once", "type": "keypress", "key": "KEY_C"}
+    )
+    ui_state = {}
+
+    root = _build(stub, ui_state)
+    # Disambiguated from the Profile sidebar's own "×" delete button by its
+    # tooltip — both share the same glyph label.
+    remove_btn = find_one(
+        root,
+        lambda w: isinstance(w, Gtk.Button)
+        and w.get_label() == "×"
+        and (w.get_tooltip_text() or "").startswith("Delete the"),
+    )
+    remove_btn.emit("clicked")
+
+    assert stub.get_config()["profiles"]["Default"]["chords_base"] == {}
 
 
 def test_steppers_tab_shows_the_real_panel_through_device_overview():

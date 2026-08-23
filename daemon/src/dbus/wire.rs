@@ -20,8 +20,9 @@ use zbus::zvariant::{OwnedValue, Value};
 
 use crate::command::State;
 use crate::config::{
-    Action, ActuationPoint, Binding, Config, Layer, MacroDef, MacroId, MacroStepDto, ModeKeyRole,
-    Modifiers, Profile, StepDirection, StepperDef, StepperId, StepperItem, TriggerMode,
+    Action, ActuationPoint, Binding, ChordKey, Config, Layer, MacroDef, MacroId, MacroStepDto,
+    ModeKeyRole, Modifiers, Profile, StepDirection, StepperDef, StepperId, StepperItem,
+    TriggerMode,
 };
 
 /// The `a{sv}` shape every `Action`/`MacroStep`/`Binding`/`Config` entity
@@ -294,10 +295,30 @@ fn actuation_overrides_to_dict(overrides: &HashMap<crate::input::Input, Actuatio
         .collect()
 }
 
+/// A Profile's Chord Bindings marshal keyed by their `ChordKey`'s own
+/// `+`-joined `Display` string (e.g. `"grid_r1c1+grid_r1c2"`) — the GUI
+/// splits that string on `+` to recover the member `Input` list, the same
+/// convention `ChordKey`'s `FromStr` uses to parse it back out of
+/// `config.toml` (ticket 40).
+fn chords_to_dict(chords: &HashMap<ChordKey, Binding>) -> Dict {
+    chords
+        .iter()
+        .map(|(key, binding)| (key.to_string(), scalar(binding_to_dict(binding))))
+        .collect()
+}
+
 fn profile_to_dict(profile: &Profile) -> Dict {
     let mut dict = Dict::new();
     dict.insert("base".to_string(), scalar(bindings_to_dict(&profile.base)));
     dict.insert("held".to_string(), scalar(bindings_to_dict(&profile.held)));
+    dict.insert(
+        "chords_base".to_string(),
+        scalar(chords_to_dict(&profile.chords_base)),
+    );
+    dict.insert(
+        "chords_held".to_string(),
+        scalar(chords_to_dict(&profile.chords_held)),
+    );
     dict.insert(
         "mode_key_role".to_string(),
         scalar(mode_key_role_str(profile.mode_key_role).to_string()),
@@ -906,6 +927,70 @@ mod tests {
             u8::try_from(get(&override_point, "release").unwrap()).unwrap(),
             180
         );
+    }
+
+    /// Ticket 40: `config_to_dict` must serialize a Profile's Chord
+    /// Bindings, keyed by their `+`-joined member string.
+    #[test]
+    fn config_to_dict_serializes_chord_bindings() {
+        use crate::input::Input;
+        use std::collections::BTreeSet;
+        use std::collections::HashMap as StdHashMap;
+
+        let mut chords_base = StdHashMap::new();
+        chords_base.insert(
+            ChordKey::new(BTreeSet::from([Input::Grid(1, 1), Input::Grid(1, 2)])),
+            Binding {
+                trigger: TriggerMode::FireOnce,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: KeyCode::KEY_C,
+                },
+            },
+        );
+        let mut profiles = StdHashMap::new();
+        profiles.insert(
+            "Default".to_string(),
+            Profile {
+                chords_base,
+                ..Default::default()
+            },
+        );
+        let config = Config {
+            schema_version: 1,
+            active_profile: "Default".to_string(),
+            profiles,
+            force_digital: false,
+            macros: StdHashMap::new(),
+            steppers: StdHashMap::new(),
+        };
+
+        let dict = config_to_dict(&config);
+        let profiles_dict: Dict = get(&dict, "profiles").unwrap().clone().try_into().unwrap();
+        let default_profile: Dict = profiles_dict
+            .get("Default")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let chords_base_dict: Dict = get(&default_profile, "chords_base")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let chord_dict: Dict = chords_base_dict
+            .get("grid_r1c1+grid_r1c2")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(dict_get_string(&chord_dict, "type"), "keypress");
+        let chords_held_dict: Dict = get(&default_profile, "chords_held")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert!(chords_held_dict.is_empty());
     }
 
     #[test]
