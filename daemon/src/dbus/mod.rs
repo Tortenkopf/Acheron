@@ -1881,6 +1881,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_stepper_items_over_real_dbus_round_trips_modifiers() {
+        // Ticket 63's live-testing follow-up: reproduces the GUI's actual
+        // SetStepperItems -> GetConfig round trip over a real D-Bus
+        // connection (not just the in-process wire:: functions), to rule
+        // out a marshaling gap the unit tests can't see.
+        let server = TestServer::start().await;
+        let stepper_id = server.create_stepper("Test stepper", vec![]).await;
+
+        let new_items: Vec<wire::Dict> = vec![wire::stepper_item_to_dict(
+            &crate::config::StepperItem::Key {
+                key: evdev::KeyCode::KEY_3,
+                modifiers: crate::config::Modifiers {
+                    ctrl: true,
+                    shift: false,
+                    alt: false,
+                    super_key: false,
+                },
+            },
+        )];
+        server
+            .proxy
+            .set_stepper_items(&stepper_id, new_items)
+            .await
+            .expect("SetStepperItems must succeed");
+
+        let config = server.proxy.get_config().await.unwrap();
+        server.shut_down().await;
+
+        let steppers: wire::Dict = config.get("steppers").unwrap().clone().try_into().unwrap();
+        let def: wire::Dict = steppers
+            .get(&stepper_id)
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let items: Vec<wire::Dict> = def.get("items").unwrap().clone().try_into().unwrap();
+        assert_eq!(items.len(), 1);
+        let modifiers: Vec<String> = items[0]
+            .get("modifiers")
+            .expect("modifiers must survive the real GetConfig() round trip")
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(modifiers, vec!["ctrl".to_string()]);
+    }
+
+    #[tokio::test]
     async fn set_stepper_items_over_real_dbus_on_an_unknown_stepper_id_returns_not_found() {
         let server = TestServer::start().await;
 

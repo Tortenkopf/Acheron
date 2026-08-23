@@ -549,6 +549,28 @@ mod tests {
     }
 
     #[test]
+    fn stepper_item_with_modifiers_round_trips_through_a_dict() {
+        let item = StepperItem::Key {
+            key: KeyCode::KEY_3,
+            modifiers: crate::config::Modifiers {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                super_key: false,
+            },
+        };
+
+        let dict = stepper_item_to_dict(&item);
+        assert_eq!(dict_get_string(&dict, "type"), "key");
+        assert_eq!(dict_get_string(&dict, "key"), "KEY_3");
+        let modifiers: Vec<String> = dict.get("modifiers").unwrap().clone().try_into().unwrap();
+        assert_eq!(modifiers, vec!["ctrl".to_string()]);
+
+        let round_tripped = stepper_item_from_dict(&dict).unwrap();
+        assert_eq!(round_tripped, item);
+    }
+
+    #[test]
     fn profile_switch_action_round_trips_through_a_dict() {
         let action = Action::ProfileSwitch {
             target: "Gaming".to_string(),
