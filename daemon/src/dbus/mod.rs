@@ -1788,6 +1788,7 @@ mod tests {
                 "Weapon Wheel",
                 vec![crate::config::StepperItem::Key {
                     key: evdev::KeyCode::KEY_1,
+                    modifiers: crate::config::Modifiers::default(),
                 }],
             )
             .await;
@@ -1842,6 +1843,7 @@ mod tests {
                 "Test stepper",
                 vec![crate::config::StepperItem::Key {
                     key: evdev::KeyCode::KEY_1,
+                    modifiers: crate::config::Modifiers::default(),
                 }],
             )
             .await;
@@ -1849,9 +1851,11 @@ mod tests {
         let new_items: Vec<wire::Dict> = vec![
             wire::stepper_item_to_dict(&crate::config::StepperItem::Key {
                 key: evdev::KeyCode::KEY_2,
+                modifiers: crate::config::Modifiers::default(),
             }),
             wire::stepper_item_to_dict(&crate::config::StepperItem::Key {
                 key: evdev::KeyCode::KEY_3,
+                modifiers: crate::config::Modifiers::default(),
             }),
         ];
         server
@@ -1900,6 +1904,7 @@ mod tests {
                 "Test stepper",
                 vec![crate::config::StepperItem::Key {
                     key: evdev::KeyCode::KEY_1,
+                    modifiers: crate::config::Modifiers::default(),
                 }],
             )
             .await;
@@ -1967,9 +1972,11 @@ mod tests {
                 vec![
                     crate::config::StepperItem::Key {
                         key: evdev::KeyCode::KEY_1,
+                        modifiers: crate::config::Modifiers::default(),
                     },
                     crate::config::StepperItem::Key {
                         key: evdev::KeyCode::KEY_2,
+                        modifiers: crate::config::Modifiers::default(),
                     },
                 ],
             )
@@ -2020,6 +2027,7 @@ mod tests {
                 "Weapon Wheel",
                 vec![crate::config::StepperItem::Key {
                     key: evdev::KeyCode::KEY_1,
+                    modifiers: crate::config::Modifiers::default(),
                 }],
             )
             .await;

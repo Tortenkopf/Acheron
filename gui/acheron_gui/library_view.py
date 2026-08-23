@@ -360,7 +360,9 @@ def _sorted_stepper_ids(steppers: dict) -> list[str]:
 
 def describe_stepper_item(item: dict) -> str:
     raw_key = item["key"]
-    return LABEL_BY_CODE.get(raw_key, raw_key)
+    key = LABEL_BY_CODE.get(raw_key, raw_key)
+    mods = "+".join(m.capitalize() for m in item.get("modifiers", []))
+    return f"{mods}+{key}" if mods else key
 
 
 def _stepper_pair_inputs(bindings: dict, stepper_id: str) -> dict[str, str | None]:
@@ -637,7 +639,7 @@ def build_stepper_editor(
     # already covers both keyboard keys and mouse buttons in one widget, so
     # there is nothing left for a dropdown to choose between.
     add_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-    new_item_value = {"key": "KEY_A"}
+    new_item_value = {"key": "KEY_A", "modifiers": []}
 
     def on_value_key_changed(code: str) -> None:
         new_item_value["key"] = code
@@ -655,10 +657,40 @@ def build_stepper_editor(
     )
     add_box.append(labeled_row("New item", value_picker))
 
+    # The same Ctrl/Shift/Alt/Super checkbox block `binding_editor.py`
+    # renders for Keypress (ticket 62's Answer) — a Stepper item's modifier
+    # combination compiles through the same canned mods-down/key/mods-up
+    # sequence as Keypress (ticket 63).
+    mod_box = Gtk.Box(spacing=8)
+    for m in ("ctrl", "shift", "alt", "super"):
+        cb = Gtk.CheckButton(label=m)
+        cb.set_active(m in new_item_value["modifiers"])
+
+        def on_mod(c, m=m):
+            cur = set(new_item_value["modifiers"])
+            if c.get_active():
+                cur.add(m)
+            else:
+                cur.discard(m)
+            new_item_value["modifiers"] = sorted(cur)
+
+        cb.connect("toggled", on_mod)
+        mod_box.append(cb)
+    add_box.append(mod_box)
+
     add_btn = Gtk.Button(label="+ Add item")
 
     def on_add(_b):
-        persist(list(items) + [{"type": "key", "key": new_item_value["key"]}])
+        persist(
+            list(items)
+            + [
+                {
+                    "type": "key",
+                    "key": new_item_value["key"],
+                    "modifiers": sorted(new_item_value["modifiers"]),
+                }
+            ]
+        )
 
     add_btn.connect("clicked", on_add)
     add_box.append(add_btn)

@@ -311,13 +311,15 @@ fn compile_action(
 
 /// Advances/retreats a Stepper's per-list cursor (Daemon-side-only runtime
 /// state, ticket 03/54 — CONTEXT.md: Stepper) and compiles the
-/// newly-selected item into a bare `KeyDown`/`KeyUp` pair — "one motion
-/// moves the cursor and fires," ticket 03's Answer's firing semantics. A
-/// missing cursor entry means "at the list's first item" (index 0), matching
-/// `stepper_cursors`'s own always-resets-to-first-item-on-restart
-/// convention. Wraps at either end. A `stepper` with zero items compiles to
-/// no steps at all — nothing to select, nothing to fire, cursor left
-/// untouched.
+/// newly-selected item through `executor::keypress_steps` — "one motion
+/// moves the cursor and fires," ticket 03's Answer's firing semantics, now
+/// carrying the item's own modifier combination if it has one (ticket 62's
+/// Answer: a Stepper item's fire sequence reuses `Action::Keypress`'s
+/// mods-down/key/mods-up compile path, atomically). A missing cursor entry
+/// means "at the list's first item" (index 0), matching `stepper_cursors`'s
+/// own always-resets-to-first-item-on-restart convention. Wraps at either
+/// end. A `stepper` with zero items compiles to no steps at all — nothing to
+/// select, nothing to fire, cursor left untouched.
 fn resolve_step(
     steppers: &HashMap<StepperId, StepperDef>,
     stepper_cursors: &mut HashMap<StepperId, usize>,
@@ -341,11 +343,8 @@ fn resolve_step(
         StepDirection::Backward => (current + len - 1) % len,
     };
     stepper_cursors.insert(stepper.clone(), next);
-    let StepperItem::Key { key } = def.items[next];
-    vec![
-        executor::MacroStep::KeyDown(key),
-        executor::MacroStep::KeyUp(key),
-    ]
+    let StepperItem::Key { key, modifiers } = def.items[next];
+    executor::keypress_steps(modifiers, key)
 }
 
 /// Branches on `TriggerMode` x event state, per ticket 17: Fire-once fires
@@ -3279,6 +3278,7 @@ mod tests {
                 "Weapon Wheel",
                 vec![crate::config::StepperItem::Key {
                     key: evdev::KeyCode::KEY_1,
+                    modifiers: Modifiers::default(),
                 }],
             )
             .await
@@ -3294,7 +3294,8 @@ mod tests {
         assert_eq!(
             def.items,
             vec![crate::config::StepperItem::Key {
-                key: evdev::KeyCode::KEY_1
+                key: evdev::KeyCode::KEY_1,
+                modifiers: Modifiers::default(),
             }]
         );
         assert!(on_disk.contains("weapon-wheel"));
@@ -3371,6 +3372,7 @@ mod tests {
                 "Weapon Wheel",
                 vec![crate::config::StepperItem::Key {
                     key: evdev::KeyCode::KEY_1,
+                    modifiers: Modifiers::default(),
                 }],
             )
             .await
@@ -3429,6 +3431,7 @@ mod tests {
                 "Weapon Wheel",
                 vec![crate::config::StepperItem::Key {
                     key: evdev::KeyCode::KEY_1,
+                    modifiers: Modifiers::default(),
                 }],
             )
             .await
@@ -3440,9 +3443,11 @@ mod tests {
                 vec![
                     crate::config::StepperItem::Key {
                         key: evdev::KeyCode::KEY_2,
+                        modifiers: Modifiers::default(),
                     },
                     crate::config::StepperItem::Key {
                         key: evdev::KeyCode::KEY_3,
+                        modifiers: Modifiers::default(),
                     },
                 ],
             )
@@ -3459,10 +3464,12 @@ mod tests {
             def.items,
             vec![
                 crate::config::StepperItem::Key {
-                    key: evdev::KeyCode::KEY_2
+                    key: evdev::KeyCode::KEY_2,
+                    modifiers: Modifiers::default(),
                 },
                 crate::config::StepperItem::Key {
-                    key: evdev::KeyCode::KEY_3
+                    key: evdev::KeyCode::KEY_3,
+                    modifiers: Modifiers::default(),
                 },
             ]
         );
@@ -3513,6 +3520,7 @@ mod tests {
                 "Weapon Wheel",
                 vec![crate::config::StepperItem::Key {
                     key: evdev::KeyCode::KEY_1,
+                    modifiers: Modifiers::default(),
                 }],
             )
             .await
@@ -3549,6 +3557,7 @@ mod tests {
                 "Weapon Wheel",
                 vec![crate::config::StepperItem::Key {
                     key: evdev::KeyCode::KEY_1,
+                    modifiers: Modifiers::default(),
                 }],
             )
             .await
@@ -3624,9 +3633,11 @@ mod tests {
                 vec![
                     crate::config::StepperItem::Key {
                         key: evdev::KeyCode::KEY_1,
+                        modifiers: Modifiers::default(),
                     },
                     crate::config::StepperItem::Key {
                         key: evdev::KeyCode::KEY_2,
+                        modifiers: Modifiers::default(),
                     },
                 ],
             )
@@ -3669,6 +3680,47 @@ mod tests {
         assert_eq!((code, value), (evdev::KeyCode::KEY_2, 0));
     }
 
+    /// Ticket 63: `resolve_step` no longer hardcodes a bare KeyDown/KeyUp
+    /// pair — a modifier-bearing item compiles through the same canned
+    /// mods-down/key/mods-up sequence as `Action::Keypress`, mirroring
+    /// `executor::tests::compile_keypress_is_a_canned_modifier_key_sequence`'s
+    /// shape.
+    #[test]
+    fn resolve_step_with_modifiers_compiles_the_canned_mods_down_key_up_sequence() {
+        let stepper_id = StepperId::from("hotkey-pages");
+        let mut steppers = HashMap::new();
+        steppers.insert(
+            stepper_id.clone(),
+            StepperDef {
+                name: "Hotkey Pages".to_string(),
+                items: vec![crate::config::StepperItem::Key {
+                    key: evdev::KeyCode::KEY_3,
+                    modifiers: Modifiers {
+                        ctrl: true,
+                        shift: true,
+                        alt: false,
+                        super_key: false,
+                    },
+                }],
+            },
+        );
+        let mut cursors = HashMap::new();
+
+        let steps = resolve_step(&steppers, &mut cursors, &stepper_id, StepDirection::Forward);
+
+        assert_eq!(
+            steps,
+            vec![
+                executor::MacroStep::KeyDown(evdev::KeyCode::KEY_LEFTCTRL),
+                executor::MacroStep::KeyDown(evdev::KeyCode::KEY_LEFTSHIFT),
+                executor::MacroStep::KeyDown(evdev::KeyCode::KEY_3),
+                executor::MacroStep::KeyUp(evdev::KeyCode::KEY_3),
+                executor::MacroStep::KeyUp(evdev::KeyCode::KEY_LEFTSHIFT),
+                executor::MacroStep::KeyUp(evdev::KeyCode::KEY_LEFTCTRL),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn step_binding_wraps_around_at_either_end() {
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
@@ -3678,9 +3730,11 @@ mod tests {
                 vec![
                     crate::config::StepperItem::Key {
                         key: evdev::KeyCode::KEY_1,
+                        modifiers: Modifiers::default(),
                     },
                     crate::config::StepperItem::Key {
                         key: evdev::KeyCode::KEY_2,
+                        modifiers: Modifiers::default(),
                     },
                 ],
             )
@@ -3721,12 +3775,15 @@ mod tests {
                 vec![
                     crate::config::StepperItem::Key {
                         key: evdev::KeyCode::KEY_1,
+                        modifiers: Modifiers::default(),
                     },
                     crate::config::StepperItem::Key {
                         key: evdev::KeyCode::KEY_2,
+                        modifiers: Modifiers::default(),
                     },
                     crate::config::StepperItem::Key {
                         key: evdev::KeyCode::KEY_3,
+                        modifiers: Modifiers::default(),
                     },
                 ],
             )
@@ -3770,6 +3827,7 @@ mod tests {
                 "Weapon Wheel",
                 vec![crate::config::StepperItem::Key {
                     key: evdev::KeyCode::KEY_1,
+                    modifiers: Modifiers::default(),
                 }],
             )
             .await
@@ -3796,9 +3854,11 @@ mod tests {
                 vec![
                     crate::config::StepperItem::Key {
                         key: evdev::KeyCode::KEY_1,
+                        modifiers: Modifiers::default(),
                     },
                     crate::config::StepperItem::Key {
                         key: evdev::KeyCode::KEY_2,
+                        modifiers: Modifiers::default(),
                     },
                 ],
             )
@@ -3856,12 +3916,15 @@ mod tests {
                 vec![
                     crate::config::StepperItem::Key {
                         key: evdev::KeyCode::KEY_1,
+                        modifiers: Modifiers::default(),
                     },
                     crate::config::StepperItem::Key {
                         key: evdev::KeyCode::KEY_2,
+                        modifiers: Modifiers::default(),
                     },
                     crate::config::StepperItem::Key {
                         key: evdev::KeyCode::KEY_3,
+                        modifiers: Modifiers::default(),
                     },
                 ],
             )
@@ -3900,6 +3963,7 @@ mod tests {
                 stepper_id.clone(),
                 vec![crate::config::StepperItem::Key {
                     key: evdev::KeyCode::KEY_9,
+                    modifiers: Modifiers::default(),
                 }],
             )
             .await
@@ -3921,9 +3985,11 @@ mod tests {
                 vec![
                     crate::config::StepperItem::Key {
                         key: evdev::KeyCode::KEY_1,
+                        modifiers: Modifiers::default(),
                     },
                     crate::config::StepperItem::Key {
                         key: evdev::KeyCode::KEY_2,
+                        modifiers: Modifiers::default(),
                     },
                 ],
             )
@@ -3970,6 +4036,7 @@ mod tests {
                 "Weapon Wheel",
                 vec![crate::config::StepperItem::Key {
                     key: evdev::KeyCode::KEY_1,
+                    modifiers: Modifiers::default(),
                 }],
             )
             .await

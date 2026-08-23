@@ -53,7 +53,11 @@ fn modifier_codes(modifiers: Modifiers) -> Vec<KeyCode> {
     codes
 }
 
-fn keypress_steps(modifiers: Modifiers, key: KeyCode) -> Vec<MacroStep> {
+/// `pub(crate)` (rather than private) so `dispatch::resolve_step` can reuse
+/// the same canned mods-down/key/mods-up sequence for a Stepper item's
+/// modifier combination (ticket 63) — the two callers share the exact
+/// balanced-firing semantics `Action::Keypress` established.
+pub(crate) fn keypress_steps(modifiers: Modifiers, key: KeyCode) -> Vec<MacroStep> {
     let mods = modifier_codes(modifiers);
     let mut steps = Vec::with_capacity(mods.len() * 2 + 2);
     steps.extend(mods.iter().map(|&m| MacroStep::KeyDown(m)));

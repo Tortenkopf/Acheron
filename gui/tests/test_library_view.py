@@ -3,7 +3,12 @@ from gi.repository import Gtk
 from acheron_gui.daemon_client import DaemonError
 from acheron_gui.daemon_stub import DaemonStub
 from acheron_gui.inputs import ALL_INPUTS
-from acheron_gui.library_view import build_library_view, macro_used_by_count, stepper_used_by_count
+from acheron_gui.library_view import (
+    build_library_view,
+    describe_stepper_item,
+    macro_used_by_count,
+    stepper_used_by_count,
+)
 
 from .widget_tree import button_labeled, find_all, find_one
 
@@ -401,7 +406,40 @@ def test_adding_an_item_calls_set_stepper_items_and_appends():
     button_labeled(picker_row, "F1").emit("clicked")
     button_labeled(root, "+ Add item").emit("clicked")
 
-    assert stub.get_config()["steppers"][stepper_id]["items"] == [{"type": "key", "key": "KEY_F1"}]
+    assert stub.get_config()["steppers"][stepper_id]["items"] == [
+        {"type": "key", "key": "KEY_F1", "modifiers": []}
+    ]
+
+
+def test_adding_an_item_with_a_modifier_checked_round_trips_through_on_add_and_the_list_row():
+    # Ticket 62/63: the "New item" row gains the same Ctrl/Shift/Alt/Super
+    # mod_box binding_editor.py renders for Keypress — checking one must
+    # reach on_add's persisted item and then describe_stepper_item's label
+    # on the next render.
+    stub = DaemonStub()
+    stepper_id = stub.create_stepper("Weapon Wheel", [])
+
+    root = _build_steppers(stub)
+    picker_row = _row_labeled(root, "New item")
+    button_labeled(picker_row, "F1").emit("clicked")
+    find_one(root, lambda w: isinstance(w, Gtk.CheckButton) and w.get_label() == "ctrl").set_active(True)
+    button_labeled(root, "+ Add item").emit("clicked")
+
+    assert stub.get_config()["steppers"][stepper_id]["items"] == [
+        {"type": "key", "key": "KEY_F1", "modifiers": ["ctrl"]}
+    ]
+
+    rebuilt = _build_steppers(stub)
+    assert find_one(rebuilt, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "Ctrl+F1")
+
+
+def test_describe_stepper_item_prefixes_the_modifier_combo():
+    assert describe_stepper_item({"key": "KEY_3", "modifiers": ["ctrl", "shift"]}) == "Ctrl+Shift+3"
+
+
+def test_describe_stepper_item_with_no_modifiers_shows_a_bare_key_label():
+    assert describe_stepper_item({"key": "KEY_3", "modifiers": []}) == "3"
+    assert describe_stepper_item({"key": "KEY_3"}) == "3"
 
 
 def test_picking_a_bare_modifier_for_a_new_item_shows_no_modifier_warning():

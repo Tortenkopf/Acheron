@@ -398,7 +398,15 @@ impl From<&str> for StepperId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StepperItem {
-    Key { key: KeyCode },
+    Key {
+        key: KeyCode,
+        /// The item's modifier combination (ticket 62's Answer) — e.g.
+        /// Ctrl+1 for an MMORPG hotkey page. `#[serde(default)]` so an
+        /// omitted `modifiers` key in `config.toml` still parses, matching
+        /// `Action::Keypress`'s own convention.
+        #[serde(default)]
+        modifiers: Modifiers,
+    },
 }
 
 /// A library entry in `Config.steppers` (ticket 03/54 — CONTEXT.md:
@@ -1190,12 +1198,72 @@ action = { type = "step", stepper = "weapon-wheel", direction = "forward" }
             def.items,
             vec![
                 StepperItem::Key {
-                    key: KeyCode::KEY_1
+                    key: KeyCode::KEY_1,
+                    modifiers: Modifiers::default(),
                 },
                 StepperItem::Key {
-                    key: KeyCode::KEY_2
+                    key: KeyCode::KEY_2,
+                    modifiers: Modifiers::default(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn a_stepper_item_with_no_modifiers_key_defaults_to_no_modifiers() {
+        // A config.toml written before ticket 63 has no `modifiers` field on
+        // a stepper item at all — must still parse, defaulting to
+        // `Modifiers::default()`, per the field's `#[serde(default)]`.
+        let toml = r#"
+schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base]
+
+[steppers.weapon-wheel]
+name = "Weapon Wheel"
+items = [
+  { type = "key", key = "KEY_1" },
+]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let def = &config.steppers[&StepperId::from("weapon-wheel")];
+        assert_eq!(
+            def.items,
+            vec![StepperItem::Key {
+                key: KeyCode::KEY_1,
+                modifiers: Modifiers::default(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_stepper_item_round_trips_a_modifier_combination() {
+        let toml = r#"
+schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base]
+
+[steppers.hotkey-pages]
+name = "Hotkey Pages"
+items = [
+  { type = "key", key = "KEY_1", modifiers = { ctrl = true } },
+]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let def = &config.steppers[&StepperId::from("hotkey-pages")];
+        assert_eq!(
+            def.items,
+            vec![StepperItem::Key {
+                key: KeyCode::KEY_1,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    shift: false,
+                    alt: false,
+                    super_key: false,
+                },
+            }]
         );
     }
 

@@ -342,9 +342,13 @@ fn macros_to_dict(macros: &HashMap<MacroId, MacroDef>) -> Dict {
 pub fn stepper_item_to_dict(item: &StepperItem) -> Dict {
     let mut dict = Dict::new();
     match item {
-        StepperItem::Key { key } => {
+        StepperItem::Key { key, modifiers } => {
             dict.insert("type".to_string(), scalar("key".to_string()));
             dict.insert("key".to_string(), scalar(key_to_string(*key)));
+            let modifiers = modifiers_to_vec(*modifiers);
+            if !modifiers.is_empty() {
+                dict.insert("modifiers".to_string(), scalar(modifiers));
+            }
         }
     }
     dict
@@ -352,9 +356,19 @@ pub fn stepper_item_to_dict(item: &StepperItem) -> Dict {
 
 pub fn stepper_item_from_dict(dict: &Dict) -> Result<StepperItem, String> {
     match get_str(dict, "type")? {
-        "key" => Ok(StepperItem::Key {
-            key: key_from_str(get_str(dict, "key")?)?,
-        }),
+        "key" => {
+            let key = key_from_str(get_str(dict, "key")?)?;
+            let modifiers = match dict.get("modifiers") {
+                Some(value) => {
+                    let names: Vec<String> = Vec::try_from(value.clone()).map_err(|_| {
+                        "field \"modifiers\" is not an array of strings".to_string()
+                    })?;
+                    modifiers_from_slice(&names)?
+                }
+                None => Modifiers::default(),
+            };
+            Ok(StepperItem::Key { key, modifiers })
+        }
         other => Err(format!("{other:?} is not a valid StepperItem type")),
     }
 }
@@ -523,6 +537,7 @@ mod tests {
     fn stepper_item_round_trips_through_a_dict() {
         let item = StepperItem::Key {
             key: KeyCode::BTN_LEFT,
+            modifiers: crate::config::Modifiers::default(),
         };
 
         let dict = stepper_item_to_dict(&item);
@@ -757,9 +772,11 @@ mod tests {
                 items: vec![
                     StepperItem::Key {
                         key: KeyCode::KEY_1,
+                        modifiers: crate::config::Modifiers::default(),
                     },
                     StepperItem::Key {
                         key: KeyCode::KEY_2,
+                        modifiers: crate::config::Modifiers::default(),
                     },
                 ],
             },

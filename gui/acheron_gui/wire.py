@@ -36,12 +36,18 @@ def macro_step_to_variant(step: dict) -> dict[str, GLib.Variant]:
 
 
 def stepper_item_to_variant(item: dict) -> dict[str, GLib.Variant]:
-    """`item` is `{"type": "key", "key": "KEY_A"}`, matching `StepperItem`'s
-    wire tag — today's sole `Key` variant, mirroring `macro_step_to_variant`'s
-    shape."""
+    """`item` is `{"type": "key", "key": "KEY_A", "modifiers": [...]}`,
+    matching `StepperItem`'s wire tag — today's sole `Key` variant, mirroring
+    `macro_step_to_variant`'s shape. `modifiers` (ticket 62/63's Answer)
+    follows `action_to_variant`'s own convention: an empty list is omitted
+    entirely rather than sent as `[]`."""
     kind = item["type"]
     if kind == "key":
-        return {"type": GLib.Variant("s", "key"), "key": GLib.Variant("s", item["key"])}
+        result = {"type": GLib.Variant("s", "key"), "key": GLib.Variant("s", item["key"])}
+        modifiers = item.get("modifiers") or []
+        if modifiers:
+            result["modifiers"] = GLib.Variant("as", modifiers)
+        return result
     raise ValueError(f"{kind!r} is not a valid StepperItem type")
 
 

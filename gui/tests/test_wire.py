@@ -74,3 +74,20 @@ def test_stepper_item_to_variant_round_trips():
     unpacked = {k: v.unpack() for k, v in variant_dict.items()}
 
     assert unpacked == item
+
+
+def test_stepper_item_with_modifiers_round_trips_through_a_variant():
+    item = {"type": "key", "key": "KEY_3", "modifiers": ["ctrl", "shift"]}
+
+    variant_dict = wire.stepper_item_to_variant(item)
+    unpacked = {k: v.unpack() for k, v in variant_dict.items()}
+
+    assert unpacked == item
+
+
+def test_stepper_item_with_no_modifiers_omits_the_modifiers_field():
+    item = {"type": "key", "key": "KEY_A", "modifiers": []}
+
+    variant_dict = wire.stepper_item_to_variant(item)
+
+    assert "modifiers" not in variant_dict
