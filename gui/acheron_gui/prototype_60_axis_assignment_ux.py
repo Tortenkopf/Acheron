@@ -276,7 +276,21 @@ def mock_digital_body() -> Gtk.Widget:
 # =======================================================================
 
 
-def build_stick_cross(title: str, x_base: str, y_base: str, current: str | None, on_pick) -> Gtk.Widget:
+def build_stick_cross(
+    title: str,
+    x_base: str,
+    y_base: str,
+    current: str | None,
+    on_pick,
+    trigger: tuple[str, str, int] | None = None,
+) -> Gtk.Widget:
+    """A stick's X/Y cross, optionally with a trigger button placed *in the
+    same Gtk.Grid* as an extra row above it — `trigger` is
+    `(code, caption, column)`, where `column` is 0 (X−'s column) or 2 (X+'s
+    column), never 1 (Y's own column). Sharing one grid, rather than
+    stacking a separately-centered trigger button over a second widget, is
+    what makes the trigger land pixel-exact above X−/X+ instead of merely
+    close to it."""
     col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
     col.append(Gtk.Label(label=title, css_classes=["section-label"]))
     grid = Gtk.Grid(row_spacing=2, column_spacing=2)
@@ -288,11 +302,19 @@ def build_stick_cross(title: str, x_base: str, y_base: str, current: str | None,
         b.connect("clicked", lambda _b, c=code: on_pick(c))
         return b
 
-    grid.attach(mk(f"{y_base}_POS", "Y+"), 1, 0, 1, 1)
-    grid.attach(mk(f"{x_base}_NEG", "X−"), 0, 1, 1, 1)
-    grid.attach(Gtk.Label(label="⊕", css_classes=["dim"]), 1, 1, 1, 1)
-    grid.attach(mk(f"{x_base}_POS", "X+"), 2, 1, 1, 1)
-    grid.attach(mk(f"{y_base}_NEG", "Y−"), 1, 2, 1, 1)
+    row = 0
+    if trigger is not None:
+        t_code, t_cap, t_col = trigger
+        tbtn = mk(t_code, t_cap)
+        tbtn.set_margin_bottom(6)
+        grid.attach(tbtn, t_col, row, 1, 1)
+        row += 1
+
+    grid.attach(mk(f"{y_base}_POS", "Y+"), 1, row, 1, 1)
+    grid.attach(mk(f"{x_base}_NEG", "X−"), 0, row + 1, 1, 1)
+    grid.attach(Gtk.Label(label="⊕", css_classes=["dim"]), 1, row + 1, 1, 1)
+    grid.attach(mk(f"{x_base}_POS", "X+"), 2, row + 1, 1, 1)
+    grid.attach(mk(f"{y_base}_NEG", "Y−"), 1, row + 2, 1, 1)
     col.append(grid)
     return col
 
@@ -320,22 +342,22 @@ def build_axis_picker_diagram(state: dict, render) -> Gtk.Widget:
         state["axis_target"] = code
         render()
 
-    # Top: LT/RT sit directly above their corresponding stick, mirroring a
-    # real gamepad's physical layout (shoulder triggers above the sticks
-    # they sit over), rather than being listed in a separate column.
-    def stick_column(trigger_code: str, trigger_cap: str, stick_title: str, x_base: str, y_base: str) -> Gtk.Widget:
-        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, halign=Gtk.Align.CENTER)
-        classes = ["axis-btn"] + (["axis-btn-current"] if trigger_code == state["axis_target"] else [])
-        tbtn = Gtk.Button(label=trigger_cap, css_classes=classes, halign=Gtk.Align.CENTER)
-        tbtn.set_tooltip_text(LABEL_BY_TARGET[trigger_code])
-        tbtn.connect("clicked", lambda _b, c=trigger_code: on_pick(c))
-        col.append(tbtn)
-        col.append(build_stick_cross(stick_title, x_base, y_base, state["axis_target"], on_pick))
-        return col
-
+    # Top: LT/RT sit directly above their stick's *outer* column — X− for
+    # the Left stick, X+ for the Right stick — pushing them further apart
+    # than a plain center-above-the-stick placement would, matching where
+    # shoulder triggers actually sit relative to the sticks on a real
+    # gamepad (outboard of them, not directly overhead).
     top_row = Gtk.Box(spacing=24, halign=Gtk.Align.CENTER)
-    top_row.append(stick_column("ABS_Z", "LT", "Left Stick", "ABS_X", "ABS_Y"))
-    top_row.append(stick_column("ABS_RZ", "RT", "Right Stick", "ABS_RX", "ABS_RY"))
+    top_row.append(
+        build_stick_cross(
+            "Left Stick", "ABS_X", "ABS_Y", state["axis_target"], on_pick, trigger=("ABS_Z", "LT", 0)
+        )
+    )
+    top_row.append(
+        build_stick_cross(
+            "Right Stick", "ABS_RX", "ABS_RY", state["axis_target"], on_pick, trigger=("ABS_RZ", "RT", 2)
+        )
+    )
     box.append(top_row)
 
     box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
@@ -343,14 +365,17 @@ def build_axis_picker_diagram(state: dict, render) -> Gtk.Widget:
     # Below the line: the remaining 7 targets split into two named groups
     # rather than one flat list — Driving (Wheel, Gas, Brake) and Flight
     # (Rudder, Throttle), grouped by which genre of game actually uses them
-    # together rather than by unsigned/signed shape.
-    def unsigned_row(code: str, label: str) -> Gtk.Widget:
+    # together rather than by unsigned/signed shape. Each group is a single
+    # inline row — the unsigned targets sit alongside their signed pair
+    # rather than stacked in their own rows below it, to save vertical
+    # space.
+    def unsigned_btn(code: str, label: str) -> Gtk.Widget:
         classes = ["axis-btn"] + (["axis-btn-current"] if code == state["axis_target"] else [])
-        b = Gtk.Button(label=label, css_classes=classes, halign=Gtk.Align.START)
+        b = Gtk.Button(label=label, css_classes=classes)
         b.connect("clicked", lambda _b, c=code: on_pick(c))
         return b
 
-    def signed_pair_row(base: str, name: str) -> Gtk.Widget:
+    def signed_pair_row(base: str, name: str, extra: list[tuple[str, str]]) -> Gtk.Widget:
         row = Gtk.Box(spacing=4)
         row.append(Gtk.Label(label=name, halign=Gtk.Align.START))
         for suffix, sign in (("_NEG", "−"), ("_POS", "+")):
@@ -359,24 +384,25 @@ def build_axis_picker_diagram(state: dict, render) -> Gtk.Widget:
             b = Gtk.Button(label=sign, css_classes=classes)
             b.connect("clicked", lambda _b, c=code: on_pick(c))
             row.append(b)
+        extra_box = Gtk.Box(spacing=4)
+        extra_box.set_margin_start(10)
+        for code, label in extra:
+            extra_box.append(unsigned_btn(code, label))
+        row.append(extra_box)
         return row
 
-    def group_box(title: str, rows: list[Gtk.Widget]) -> Gtk.Widget:
+    def group_box(title: str, row: Gtk.Widget) -> Gtk.Widget:
         col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         col.append(Gtk.Label(label=title, xalign=0, css_classes=["section-label"]))
-        for r in rows:
-            col.append(r)
+        col.append(row)
         return col
 
     bottom_row = Gtk.Box(spacing=28)
     bottom_row.append(
-        group_box(
-            "Driving",
-            [signed_pair_row("ABS_WHEEL", "Wheel"), unsigned_row("ABS_GAS", "Gas"), unsigned_row("ABS_BRAKE", "Brake")],
-        )
+        group_box("Driving", signed_pair_row("ABS_WHEEL", "Wheel", [("ABS_GAS", "Gas"), ("ABS_BRAKE", "Brake")]))
     )
     bottom_row.append(
-        group_box("Flight", [signed_pair_row("ABS_RUDDER", "Rudder"), unsigned_row("ABS_THROTTLE", "Throttle")])
+        group_box("Flight", signed_pair_row("ABS_RUDDER", "Rudder", [("ABS_THROTTLE", "Throttle")]))
     )
     box.append(bottom_row)
 
