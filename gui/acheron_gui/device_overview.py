@@ -7,16 +7,25 @@ a separate paddle below it. Clicking any control opens the shared Binding
 editor (`binding_editor.build_binding_editor`) in a popover.
 
 Ticket 48 replaced the old permanent grid+Action-Table-sidebar layout with
-a Grid/Library destination switcher (`build_destination_switch`): the
-Profile sidebar stays exactly as it was (ticket 47's round-2 fix pins it
-at a stable width via `set_hexpand(False)`), the Action Table is cut
-outright (superseded by ticket 42's inline key/mouse-button picker), and
-selecting "Library" fully replaces the content area with the real Library
-screen (`library_view.build_library_view`, ticket 52 — a Steppers/Macros
-tab-switched panel pair; both panels are real as of ticket 55). The Grid
-destination keeps the real
-`build_layer_bar` above the grid, plus an always-visible slot beside it
-(`build_chords_section`, ticket 40) holding the real Chord-recording flow.
+a Grid/Library destination switcher (`build_destination_switch`); the
+Action Table is cut outright (superseded by ticket 42's inline key/
+mouse-button picker). The Grid destination keeps the real `build_layer_bar`
+above the grid, plus an always-visible slot beside it (`build_chords_section`,
+ticket 40) holding the real Chord-recording flow.
+
+Column 1 — `build_profile_sidebar`'s slot in `build_main_view` — is
+destination-dependent as of ticket 69/70, superseding ticket 48's original
+"Profile sidebar stays exactly as it is, in both destinations": Grid shows
+the Profile sidebar exactly as before; Library shows
+`library_view.build_library_sidebar` instead — the Steppers/Macros tab row
+plus the selected panel's browse list, full swap, no "Profiles" chrome.
+Both share `gtk_utils.build_pinned_sidebar_box`'s fixed 220px width so
+nothing visibly resizes when flipping destinations — Profile switching is
+simply unreachable while Library is showing (Macros/Steppers are
+Profile-agnostic, ticket 69's Answer). The rest of the Library destination
+— the selected item's name/steps-or-items column plus its editor controls —
+is `library_view.build_library_content` (ticket 52 for Macros, ticket 55
+for Steppers, reorganized into three columns by ticket 70).
 
 Ticket 40's Chord recording (settled in the prototype's variant A, round 3
 — `.scratch/tartarus-input-expansion/issues/30-prototype-chord-recording-ux.md`):
@@ -65,9 +74,9 @@ from gi.repository import Gtk, Pango
 
 from .binding_editor import action_summary, build_binding_editor, build_chord_binding_dialog
 from .daemon_client import DaemonError
-from .gtk_utils import build_name_prompt_popover
+from .gtk_utils import build_name_prompt_popover, build_pinned_sidebar_box
 from .inputs import GRID_COLS, GRID_ROWS, grid_input, input_label
-from .library_view import build_library_view
+from .library_view import build_library_content, build_library_sidebar
 
 # Ticket 12/20 — Daemon/device status surface. Mirrors
 # prototype/12-daemon-device-status-indicators/prototype.py's STATUS_STATES
@@ -158,9 +167,7 @@ def build_layer_bar(
 
 
 def build_profile_sidebar(client, config: dict, profile: str, on_change: Callable[[], None]) -> Gtk.Box:
-    sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-    sidebar.add_css_class("sidebar")
-    sidebar.set_size_request(150, -1)
+    sidebar = build_pinned_sidebar_box()
     heading = Gtk.Label(label="Profiles", xalign=0)
     heading.add_css_class("heading")
     sidebar.append(heading)
@@ -242,17 +249,6 @@ def build_profile_sidebar(client, config: dict, profile: str, on_change: Callabl
 
     new_btn.set_popover(build_name_prompt_popover("Creating a Profile", "", "Create", on_create_submitted))
     sidebar.append(new_btn)
-
-    # Ticket 47's round-2 fix, caught live: a plain Gtk.Box with no explicit
-    # hexpand still computes one via GTK4's expand-propagation — it infers
-    # from a row's `switch_btn` (`hexpand=True`, three container levels
-    # down) that the sidebar itself wants to expand, so it competes for
-    # whatever horizontal slack the *other* destination's content leaves
-    # unclaimed in `build_main_view` (Library claims less than the grid,
-    # so the sidebar visibly widened only there). Pin it explicitly so it
-    # stays exactly its own `set_size_request(150, -1)` width regardless of
-    # which destination is showing — measured at a stable 197px in both.
-    sidebar.set_hexpand(False)
     return sidebar
 
 
@@ -410,6 +406,15 @@ def make_input_button(
         window.close()
         on_change()
 
+    # No scrolling wrapper here — this window has no other container
+    # imposing a height on it, so it always sizes to `editor`'s own natural
+    # height, and `build_binding_editor` itself (ticket 70 follow-up)
+    # already defers only its Actuation & release section (grid Inputs
+    # only, needed less often) behind an internal scroll, so this window
+    # is guaranteed tall enough on first open for everything above that —
+    # heading, error, the Trigger/Action fields including the inline key/
+    # mouse-button picker's full expanded shape — without scrolling, per
+    # the user's own "always reachable" ask for those specifically.
     editor = build_binding_editor(client, config, profile, layer, inp, on_saved, capture_mode)
     window.set_child(editor)
 
@@ -696,7 +701,10 @@ def build_main_view(
     root.set_margin_start(12)
     root.set_margin_end(12)
 
-    root.append(build_profile_sidebar(client, config, profile, on_change))
+    if dest == "library":
+        root.append(build_library_sidebar(client, config, ui_state, on_change))
+    else:
+        root.append(build_profile_sidebar(client, config, profile, on_change))
 
     right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
     right.set_hexpand(True)
@@ -712,7 +720,7 @@ def build_main_view(
     right.append(Gtk.Separator())
 
     if dest == "library":
-        right.append(build_library_view(client, config, profile, selected_layer, ui_state, on_change))
+        right.append(build_library_content(client, config, profile, selected_layer, ui_state, on_change))
     else:
         main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         main.set_hexpand(True)

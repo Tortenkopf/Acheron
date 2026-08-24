@@ -6,6 +6,34 @@ settled on (variant B: two adjacent panels, never merged into one list,
 from `device_overview.build_main_view` whenever `ui_state["dest"] ==
 "library"`.
 
+Ticket 69/70 reorganized the Library destination into three columns,
+reusing the Profile-sidebar's own slot rather than adding a fourth (and
+superseding ticket 48's original "Profile sidebar stays exactly as it is,
+in both destinations" for the Library case specifically):
+
+- **Column 1** — `build_library_sidebar`, mounted by `device_overview.
+  build_main_view` in the Profile-sidebar's own slot whenever `dest ==
+  "library"`: `build_library_tabs` directly above the selected panel's
+  browse list and "+ New" button — no "Profiles" chrome, no per-panel
+  "Macros"/"Steppers" heading (the tab row already says which). Pinned at
+  the same fixed 220px as `device_overview.build_profile_sidebar`
+  (`gtk_utils.build_pinned_sidebar_box`) so nothing visibly resizes when
+  flipping Grid↔Library.
+- **Column 2** — the selected Macro/Stepper's own name heading plus its
+  steps/items `ScrolledWindow` (unchanged 240px-cap treatment), now with
+  the full vertical space column 1's old list used to occupy.
+- **Column 3** — everything else that used to share one `editor_box` with
+  column 2: the "Changes save automatically" hint, the error/toast label,
+  the add-new-step/add-new-item controls, and (Stepper only) the
+  `build_stepper_assignment_row`.
+
+`build_library_content` builds columns 2+3 together (mounted by
+`build_main_view` in the same "right" slot the Grid destination's own
+device grid occupies); `build_library_sidebar` builds column 1 separately.
+Profile switching is unreachable while Library is showing — accepted
+directly (ticket 69's Answer): Macros/Steppers are Profile-agnostic
+entities, and no ticket has surfaced a need to switch Profile mid-edit.
+
 The Macro step editor is relocated near-verbatim from `binding_editor.py`'s
 pre-ticket-51 inline step editor (git history, commit cb20cc9~1), now
 operating against `MacroDef.steps` via the library (`client.set_macro_steps`,
@@ -17,15 +45,15 @@ calls the Daemon and then a full `on_change()` rebuild, with no local
 Save button, mirroring the Profile sidebar's own autosave convention
 (ticket 31's Answer) — which is why the editor pane says so upfront.
 
-The Steppers panel (`build_steppers_panel`) mirrors the Macros panel's list-
-plus-editor shape closely, with two settled differences (ticket 31 round
-2's Answer) plus one deliberate parity choice: delete is gated exactly like
-Macro's — disabled with a "Used by N Binding(s) — can't delete" tooltip
-while `stepper_used_by_count` is nonzero (`dispatch.rs`'s `DeleteStepper`
-handler, landed by ticket 54, refuses exactly like `DeleteMacro` does; this
-ticket's own text originally read that as "no gate," since ticket 03 never
-specified an "in use" *concept*, but the user directed the GUI treatment to
-match Macro's regardless — consistent delete UX across both library panels
+The Steppers panel mirrors the Macros panel's browse-list-plus-editor shape
+closely, with two settled differences (ticket 31 round 2's Answer) plus one
+deliberate parity choice: delete is gated exactly like Macro's — disabled
+with a "Used by N Binding(s) — can't delete" tooltip while
+`stepper_used_by_count` is nonzero (`dispatch.rs`'s `DeleteStepper` handler,
+landed by ticket 54, refuses exactly like `DeleteMacro` does; this ticket's
+own text originally read that as "no gate," since ticket 03 never specified
+an "in use" *concept*, but the user directed the GUI treatment to match
+Macro's regardless — consistent delete UX across both library panels
 outweighs that textual distinction). The two real differences: (1) the item
 editor has no step-kind selector, since `StepperItem` has exactly one wire
 variant (`Key`, covering both keyboard keys and mouse buttons through
@@ -50,7 +78,7 @@ from gi.repository import Gtk
 
 from .binding_editor import describe_step, labeled_row
 from .daemon_client import DaemonError
-from .gtk_utils import build_name_prompt_popover, clear_children
+from .gtk_utils import build_name_prompt_popover, build_pinned_sidebar_box, clear_children
 from .inputs import ALL_INPUTS, input_label
 from .key_picker import LABEL_BY_CODE, build_inline_key_picker
 
@@ -153,15 +181,104 @@ def build_macro_row(
     return row
 
 
-def build_macro_editor(
+def _selected_macro_id(config: dict, ui_state: dict) -> str | None:
+    macros = config.get("macros", {})
+    selected_macro_id = ui_state.get("library_selected_macro")
+    if selected_macro_id not in macros:
+        selected_macro_id = _sorted_macro_ids(macros)[0] if macros else None
+        ui_state["library_selected_macro"] = selected_macro_id
+    return selected_macro_id
+
+
+def build_macros_browse_list(client, config: dict, ui_state: dict, on_change: Callable[[], None]) -> Gtk.Widget:
+    """Column 1's Macro-tab content (ticket 70): the browse rows and "+ New"
+    button alone — no heading (the tab row above already reads "Macros")
+    and no width/`sidebar`-css treatment of its own, since the caller
+    (`build_library_sidebar`) already wraps column 1 in
+    `gtk_utils.build_pinned_sidebar_box`."""
+    macros = config.get("macros", {})
+    macro_ids = _sorted_macro_ids(macros)
+    selected_macro_id = _selected_macro_id(config, ui_state)
+
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+
+    error_label = Gtk.Label(xalign=0, wrap=True)
+    error_label.add_css_class("error")
+    error_label.set_visible(False)
+    box.append(error_label)
+
+    def show_error(exc: Exception) -> None:
+        error_label.set_label(str(exc))
+        error_label.set_visible(True)
+
+    rows_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+    for macro_id in macro_ids:
+        rows_list.append(
+            build_macro_row(client, config, macro_id, selected_macro_id, ui_state, on_change, show_error)
+        )
+    rows_scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+    # Ticket 70 follow-up, live-verified: column 1 now has the grid/chords
+    # section's full height to work with (no editor_box crowding it below,
+    # unlike ticket 61's original two-column layout), so a short list left
+    # a slab of dead space beneath it under ticket 61's own "cap at 240,
+    # size to content" treatment. `vexpand` alone (no `propagate_natural_
+    # height`/`max_content_height`) lets the ScrolledWindow claim whatever
+    # height column 1 actually has and still scroll past it — it does not
+    # reintroduce ticket 61's "window grows past the screen" bug, since
+    # that came from an unbounded plain Gtk.Box driving the window's own
+    # natural-size request, not from a ScrolledWindow filling space it's
+    # already been given.
+    rows_scroller.set_vexpand(True)
+    rows_scroller.set_child(rows_list)
+    box.append(rows_scroller)
+
+    new_btn = Gtk.MenuButton(label="+ New")
+
+    def on_create_submitted(name: str):
+        macro_id = client.create_macro(name, [])
+        ui_state["library_selected_macro"] = macro_id
+        on_change()
+
+    new_btn.set_popover(build_name_prompt_popover("Creating a Macro", "", "Create", on_create_submitted))
+    box.append(new_btn)
+
+    return box
+
+
+def build_macro_editor_columns(
     client, config: dict, macro_id: str, on_change: Callable[[], None]
-) -> Gtk.Widget:
+) -> tuple[Gtk.Widget, Gtk.Widget]:
+    """Columns 2+3 for the selected Macro (ticket 70): column 2 is the name
+    heading plus the steps list; column 3 is the error label and
+    "+ Add step" pinned above a `_vscrollable` body holding the save-hint
+    and the kind selector/key-value picker (ticket 70 follow-up) — both
+    stay visible regardless of where the body is scrolled to, rather than
+    merely sitting above the picker within the same scrolled content.
+    Split from one `editor_box` so `build_library_content` can place them
+    either side of column 1's old space, per the map's settled
+    three-column shape."""
     macro = config["macros"][macro_id]
     steps = macro["steps"]
 
-    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-    box.append(Gtk.Label(label=macro["name"], xalign=0, css_classes=["heading"]))
-    box.append(
+    col2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    col2.append(Gtk.Label(label=macro["name"], xalign=0, css_classes=["heading"]))
+
+    # col3 is an unscrolled outer container: the error label and
+    # "+ Add step" (appended below) stay pinned at the top, with the hint
+    # and the kind selector/key-value picker inside a `_vscrollable` body
+    # beneath them (ticket 70 follow-up, live-verified: the picker's own
+    # expandable content can grow tall enough to scroll everything below
+    # it out of view — the error label, the button, and (Stepper's own)
+    # toast message are exactly what the user asked to stay visible
+    # regardless of scroll position).
+    col3 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+    error_label = Gtk.Label(xalign=0, wrap=True, css_classes=["error"])
+    error_label.set_visible(False)
+    col3.append(error_label)
+
+    body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    body.append(
         Gtk.Label(
             label="Changes save automatically.",
             xalign=0,
@@ -169,10 +286,6 @@ def build_macro_editor(
             css_classes=["dim"],
         )
     )
-
-    error_label = Gtk.Label(xalign=0, wrap=True, css_classes=["error"])
-    error_label.set_visible(False)
-    box.append(error_label)
 
     def persist(new_steps: list[dict]) -> None:
         try:
@@ -227,10 +340,37 @@ def build_macro_editor(
         steps_list.append(row_box)
 
     steps_scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
-    steps_scroller.set_propagate_natural_height(True)
-    steps_scroller.set_max_content_height(240)
+    # Ticket 70 follow-up, same fix/reasoning as the browse list (see
+    # build_macros_browse_list) — column 2 now has the same full column
+    # height column 1's old list used to occupy, so the old 240px cap left
+    # dead space beneath a short step list.
+    steps_scroller.set_vexpand(True)
     steps_scroller.set_child(steps_list)
-    box.append(steps_scroller)
+    col2.append(steps_scroller)
+
+    # "+ Add step" is appended straight into col3 (not body), pinning it
+    # above the scrolled area entirely rather than merely above add_box
+    # within it. `on_add` closes over `step_kind_dd`/`new_step_value`, both
+    # assigned below but only read here at click time (Python's
+    # late-binding closures), so construction order doesn't need to match
+    # visual order.
+    new_step_value = {"key": "KEY_A", "ms_text": "0"}
+
+    add_btn = Gtk.Button(label="+ Add step")
+
+    def on_add(_b):
+        kind_i = step_kind_dd.get_selected()
+        if kind_i == 0:
+            step = {"type": "key_down", "key": new_step_value["key"]}
+        elif kind_i == 1:
+            step = {"type": "key_up", "key": new_step_value["key"]}
+        else:
+            val = new_step_value["ms_text"]
+            step = {"type": "delay_ms", "ms": int(val) if val.isdigit() else 0}
+        persist(list(steps) + [step])
+
+    add_btn.connect("clicked", on_add)
+    col3.append(add_btn)
 
     add_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
     step_kind_dd = Gtk.DropDown(model=Gtk.StringList.new(["KeyDown", "KeyUp", "Delay (ms)"]))
@@ -238,8 +378,6 @@ def build_macro_editor(
 
     value_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
     add_box.append(value_slot)
-
-    new_step_value = {"key": "KEY_A", "ms_text": "0"}
 
     def render_value_slot():
         clear_children(value_slot)
@@ -262,96 +400,10 @@ def build_macro_editor(
     step_kind_dd.connect("notify::selected", lambda *_: render_value_slot())
     render_value_slot()
 
-    add_btn = Gtk.Button(label="+ Add step")
+    body.append(add_box)
+    col3.append(_vscrollable(body))
 
-    def on_add(_b):
-        kind_i = step_kind_dd.get_selected()
-        if kind_i == 0:
-            step = {"type": "key_down", "key": new_step_value["key"]}
-        elif kind_i == 1:
-            step = {"type": "key_up", "key": new_step_value["key"]}
-        else:
-            val = new_step_value["ms_text"]
-            step = {"type": "delay_ms", "ms": int(val) if val.isdigit() else 0}
-        persist(list(steps) + [step])
-
-    add_btn.connect("clicked", on_add)
-    add_box.append(add_btn)
-    box.append(add_box)
-
-    return box
-
-
-def build_macros_panel(
-    client, config: dict, ui_state: dict, on_change: Callable[[], None]
-) -> Gtk.Widget:
-    macros = config.get("macros", {})
-    macro_ids = _sorted_macro_ids(macros)
-
-    selected_macro_id = ui_state.get("library_selected_macro")
-    if selected_macro_id not in macros:
-        selected_macro_id = macro_ids[0] if macro_ids else None
-        ui_state["library_selected_macro"] = selected_macro_id
-
-    root = Gtk.Box(spacing=16)
-
-    list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-    list_box.add_css_class("sidebar")
-    list_box.set_size_request(220, -1)
-    heading = Gtk.Label(label="Macros", xalign=0)
-    heading.add_css_class("heading")
-    list_box.append(heading)
-
-    error_label = Gtk.Label(xalign=0, wrap=True)
-    error_label.add_css_class("error")
-    error_label.set_visible(False)
-    list_box.append(error_label)
-
-    def show_error(exc: Exception) -> None:
-        error_label.set_label(str(exc))
-        error_label.set_visible(True)
-
-    rows_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-    for macro_id in macro_ids:
-        rows_list.append(
-            build_macro_row(client, config, macro_id, selected_macro_id, ui_state, on_change, show_error)
-        )
-    rows_scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
-    rows_scroller.set_propagate_natural_height(True)
-    rows_scroller.set_max_content_height(240)
-    rows_scroller.set_child(rows_list)
-    list_box.append(rows_scroller)
-
-    new_btn = Gtk.MenuButton(label="+ New")
-
-    def on_create_submitted(name: str):
-        macro_id = client.create_macro(name, [])
-        ui_state["library_selected_macro"] = macro_id
-        on_change()
-
-    new_btn.set_popover(build_name_prompt_popover("Creating a Macro", "", "Create", on_create_submitted))
-    list_box.append(new_btn)
-    # Same round-2 fix as build_profile_sidebar: pin the list's width so it
-    # doesn't compete for slack the editor pane below leaves unclaimed.
-    list_box.set_hexpand(False)
-    root.append(list_box)
-
-    editor_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-    editor_box.set_hexpand(True)
-    if selected_macro_id is None:
-        editor_box.append(
-            Gtk.Label(
-                label="No Macros yet — use “+ New” to create one.",
-                xalign=0,
-                wrap=True,
-                css_classes=["dim"],
-            )
-        )
-    else:
-        editor_box.append(build_macro_editor(client, config, selected_macro_id, on_change))
-    root.append(editor_box)
-
-    return root
+    return col2, col3
 
 
 def _sorted_stepper_ids(steppers: dict) -> list[str]:
@@ -475,13 +527,13 @@ def build_stepper_assignment_row(
     ticket 54). Two things it does *not* announce, and this function
     detects itself (by reading the target Input's existing Binding before
     calling `SetBinding`), leaving a one-shot toast in
-    `ui_state["stepper_toast"]` for `build_stepper_editor`'s next render to
-    show: a plain overwrite stealing a *different* list's Binding at the
-    newly-picked Input, and — since `take_stepper_direction_elsewhere` only
-    guards the *same* direction living on two Inputs — this *same* list's
-    other direction already sitting on the newly-picked Input (e.g.
-    reassigning Forward onto the Input that's currently this list's own
-    Backward), which an ordinary Binding-slot overwrite would otherwise
+    `ui_state["stepper_toast"]` for `build_stepper_editor_columns`'s next
+    render to show: a plain overwrite stealing a *different* list's Binding
+    at the newly-picked Input, and — since `take_stepper_direction_
+    elsewhere` only guards the *same* direction living on two Inputs — this
+    *same* list's other direction already sitting on the newly-picked Input
+    (e.g. reassigning Forward onto the Input that's currently this list's
+    own Backward), which an ordinary Binding-slot overwrite would otherwise
     drop with no signal at all.
     """
     bindings = config["profiles"][profile][layer]
@@ -542,7 +594,59 @@ def build_stepper_assignment_row(
     return box
 
 
-def build_stepper_editor(
+def _selected_stepper_id(config: dict, ui_state: dict) -> str | None:
+    steppers = config.get("steppers", {})
+    selected_stepper_id = ui_state.get("library_selected_stepper")
+    if selected_stepper_id not in steppers:
+        selected_stepper_id = _sorted_stepper_ids(steppers)[0] if steppers else None
+        ui_state["library_selected_stepper"] = selected_stepper_id
+    return selected_stepper_id
+
+
+def build_steppers_browse_list(client, config: dict, ui_state: dict, on_change: Callable[[], None]) -> Gtk.Widget:
+    """Column 1's Stepper-tab content — the Macro browse list's counterpart,
+    see `build_macros_browse_list`."""
+    steppers = config.get("steppers", {})
+    stepper_ids = _sorted_stepper_ids(steppers)
+    selected_stepper_id = _selected_stepper_id(config, ui_state)
+
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+
+    error_label = Gtk.Label(xalign=0, wrap=True)
+    error_label.add_css_class("error")
+    error_label.set_visible(False)
+    box.append(error_label)
+
+    def show_error(exc: Exception) -> None:
+        error_label.set_label(str(exc))
+        error_label.set_visible(True)
+
+    rows_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+    for stepper_id in stepper_ids:
+        rows_list.append(
+            build_stepper_row(client, config, stepper_id, selected_stepper_id, ui_state, on_change, show_error)
+        )
+    rows_scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+    # See build_macros_browse_list's matching comment — same fix, same
+    # reasoning, for the Steppers browse list.
+    rows_scroller.set_vexpand(True)
+    rows_scroller.set_child(rows_list)
+    box.append(rows_scroller)
+
+    new_btn = Gtk.MenuButton(label="+ New")
+
+    def on_create_submitted(name: str):
+        stepper_id = client.create_stepper(name, [])
+        ui_state["library_selected_stepper"] = stepper_id
+        on_change()
+
+    new_btn.set_popover(build_name_prompt_popover("Creating a Stepper", "", "Create", on_create_submitted))
+    box.append(new_btn)
+
+    return box
+
+
+def build_stepper_editor_columns(
     client,
     config: dict,
     profile: str,
@@ -550,13 +654,39 @@ def build_stepper_editor(
     stepper_id: str,
     ui_state: dict,
     on_change: Callable[[], None],
-) -> Gtk.Widget:
+) -> tuple[Gtk.Widget, Gtk.Widget]:
+    """Columns 2+3 for the selected Stepper (ticket 70) — the Macro editor
+    columns' counterpart, see `build_macro_editor_columns`. Column 3's
+    pinned header — the toast (if any), the error label, "+ Add item", and
+    the Forward/Backward `build_stepper_assignment_row` — sits above a
+    `_vscrollable` body holding the hint label and the "New item" key
+    picker (ticket 70 follow-up): the header stays visible regardless of
+    where the body is scrolled to, rather than merely sitting above the
+    picker within the same scrolled content."""
     stepper = config["steppers"][stepper_id]
     items = stepper["items"]
 
-    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-    box.append(Gtk.Label(label=stepper["name"], xalign=0, css_classes=["heading"]))
-    box.append(
+    col2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    col2.append(Gtk.Label(label=stepper["name"], xalign=0, css_classes=["heading"]))
+
+    # col3 is an unscrolled outer container: the toast/error-label/
+    # "+ Add item"/assignment-row header (appended below) stays pinned at
+    # the top, with the hint and the "New item" key picker inside a
+    # `_vscrollable` body beneath it. The buttons, the error label, and the
+    # toast are exactly what the user asked to stay visible regardless of
+    # scroll position (ticket 70 follow-up, live-verified).
+    col3 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+    toast = ui_state.pop("stepper_toast", None)
+    if toast is not None:
+        col3.append(Gtk.Label(label=toast, xalign=0, wrap=True, css_classes=["toast"]))
+
+    error_label = Gtk.Label(xalign=0, wrap=True, css_classes=["error"])
+    error_label.set_visible(False)
+    col3.append(error_label)
+
+    body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    body.append(
         Gtk.Label(
             label="Changes save automatically.",
             xalign=0,
@@ -564,14 +694,6 @@ def build_stepper_editor(
             css_classes=["dim"],
         )
     )
-
-    toast = ui_state.pop("stepper_toast", None)
-    if toast is not None:
-        box.append(Gtk.Label(label=toast, xalign=0, wrap=True, css_classes=["toast"]))
-
-    error_label = Gtk.Label(xalign=0, wrap=True, css_classes=["error"])
-    error_label.set_visible(False)
-    box.append(error_label)
 
     def show_error(exc: Exception) -> None:
         error_label.set_label(str(exc))
@@ -629,17 +751,47 @@ def build_stepper_editor(
         items_list.append(row_box)
 
     items_scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
-    items_scroller.set_propagate_natural_height(True)
-    items_scroller.set_max_content_height(240)
+    # See build_macro_editor_columns's matching comment — same fix, same
+    # reasoning, for the Stepper item list.
+    items_scroller.set_vexpand(True)
     items_scroller.set_child(items_list)
-    box.append(items_scroller)
+    col2.append(items_scroller)
+
+    # "+ Add item" and the Forward/Backward assignment row are appended
+    # straight into col3 (not body), pinning them above the scrolled area
+    # entirely rather than merely above add_box within it. `on_add` closes
+    # over `new_item_value`, assigned below but only read here at click
+    # time (Python's late-binding closures), so construction order doesn't
+    # need to match visual order.
+    new_item_value = {"key": "KEY_A", "modifiers": []}
+
+    add_btn = Gtk.Button(label="+ Add item")
+
+    def on_add(_b):
+        persist(
+            list(items)
+            + [
+                {
+                    "type": "key",
+                    "key": new_item_value["key"],
+                    "modifiers": sorted(new_item_value["modifiers"]),
+                }
+            ]
+        )
+
+    add_btn.connect("clicked", on_add)
+    col3.append(add_btn)
+
+    col3.append(
+        build_stepper_assignment_row(client, config, profile, layer, stepper_id, ui_state, on_change, show_error)
+    )
+    col3.append(Gtk.Separator())
 
     # No kind selector here (unlike Macro's step editor) — `StepperItem` has
     # exactly one wire variant (`Key`), and `key_picker`'s inline picker
     # already covers both keyboard keys and mouse buttons in one widget, so
     # there is nothing left for a dropdown to choose between.
     add_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-    new_item_value = {"key": "KEY_A", "modifiers": []}
 
     def on_value_key_changed(code: str) -> None:
         new_item_value["key"] = code
@@ -678,126 +830,102 @@ def build_stepper_editor(
         mod_box.append(cb)
     add_box.append(mod_box)
 
-    add_btn = Gtk.Button(label="+ Add item")
+    body.append(add_box)
+    col3.append(_vscrollable(body))
 
-    def on_add(_b):
-        persist(
-            list(items)
-            + [
-                {
-                    "type": "key",
-                    "key": new_item_value["key"],
-                    "modifiers": sorted(new_item_value["modifiers"]),
-                }
-            ]
-        )
-
-    add_btn.connect("clicked", on_add)
-    add_box.append(add_btn)
-    box.append(add_box)
-
-    box.append(Gtk.Separator())
-    box.append(
-        build_stepper_assignment_row(client, config, profile, layer, stepper_id, ui_state, on_change, show_error)
-    )
-
-    return box
+    return col2, col3
 
 
-def build_steppers_panel(
-    client, config: dict, profile: str, layer: str, ui_state: dict, on_change: Callable[[], None]
-) -> Gtk.Widget:
-    steppers = config.get("steppers", {})
-    stepper_ids = _sorted_stepper_ids(steppers)
-
-    selected_stepper_id = ui_state.get("library_selected_stepper")
-    if selected_stepper_id not in steppers:
-        selected_stepper_id = stepper_ids[0] if stepper_ids else None
-        ui_state["library_selected_stepper"] = selected_stepper_id
-
-    root = Gtk.Box(spacing=16)
-
-    list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-    list_box.add_css_class("sidebar")
-    list_box.set_size_request(220, -1)
-    heading = Gtk.Label(label="Steppers", xalign=0)
-    heading.add_css_class("heading")
-    list_box.append(heading)
-
-    error_label = Gtk.Label(xalign=0, wrap=True)
-    error_label.add_css_class("error")
-    error_label.set_visible(False)
-    list_box.append(error_label)
-
-    def show_error(exc: Exception) -> None:
-        error_label.set_label(str(exc))
-        error_label.set_visible(True)
-
-    rows_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-    for stepper_id in stepper_ids:
-        rows_list.append(
-            build_stepper_row(client, config, stepper_id, selected_stepper_id, ui_state, on_change, show_error)
-        )
-    rows_scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
-    rows_scroller.set_propagate_natural_height(True)
-    rows_scroller.set_max_content_height(240)
-    rows_scroller.set_child(rows_list)
-    list_box.append(rows_scroller)
-
-    new_btn = Gtk.MenuButton(label="+ New")
-
-    def on_create_submitted(name: str):
-        stepper_id = client.create_stepper(name, [])
-        ui_state["library_selected_stepper"] = stepper_id
-        on_change()
-
-    new_btn.set_popover(build_name_prompt_popover("Creating a Stepper", "", "Create", on_create_submitted))
-    list_box.append(new_btn)
-    list_box.set_hexpand(False)
-    root.append(list_box)
-
-    editor_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-    editor_box.set_hexpand(True)
-    if selected_stepper_id is None:
-        editor_box.append(
-            Gtk.Label(
-                label="No Steppers yet — use “+ New” to create one.",
-                xalign=0,
-                wrap=True,
-                css_classes=["dim"],
-            )
-        )
-    else:
-        editor_box.append(
-            build_stepper_editor(client, config, profile, layer, selected_stepper_id, ui_state, on_change)
-        )
-    root.append(editor_box)
-
-    return root
-
-
-def build_library_view(
-    client, config: dict, profile: str, layer: str, ui_state: dict, on_change: Callable[[], None]
-) -> Gtk.Widget:
-    # Defaults to the Macros tab, not the display order's "Steppers" first —
-    # kept as ticket 52 originally settled it (Steppers being an inert stub
-    # at the time) rather than revisited here, since both panels are real
-    # as of this ticket and there's no new reason to prefer one first look
-    # over the other.
+def build_library_sidebar(client, config: dict, ui_state: dict, on_change: Callable[[], None]) -> Gtk.Widget:
+    """Column 1 for the Library destination (ticket 70) — mounted by
+    `device_overview.build_main_view` in the Profile-sidebar's own slot.
+    The tab row plus the selected panel's browse list, pinned to the same
+    fixed 220px width `device_overview.build_profile_sidebar` uses so
+    nothing visibly resizes when flipping Grid↔Library."""
     selected_tab = ui_state.setdefault("library_tab", "macros")
 
-    root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+    sidebar = build_pinned_sidebar_box()
 
     def on_tab_select(tab_key: str) -> None:
         ui_state["library_tab"] = tab_key
         on_change()
 
-    root.append(build_library_tabs(selected_tab, on_tab_select))
-    root.append(Gtk.Separator())
+    sidebar.append(build_library_tabs(selected_tab, on_tab_select))
+    sidebar.append(Gtk.Separator())
 
     if selected_tab == "steppers":
-        root.append(build_steppers_panel(client, config, profile, layer, ui_state, on_change))
+        sidebar.append(build_steppers_browse_list(client, config, ui_state, on_change))
     else:
-        root.append(build_macros_panel(client, config, ui_state, on_change))
+        sidebar.append(build_macros_browse_list(client, config, ui_state, on_change))
+
+    return sidebar
+
+
+def _vscrollable(widget: Gtk.Widget) -> Gtk.Widget:
+    """Wraps `widget` in a vertically-scrolling, horizontally-fixed
+    `Gtk.ScrolledWindow` — column 3's fallback once its content grows
+    taller than the window, ticket 70 follow-up: the inline key/item
+    picker's own expandable modifier-group toggles (`key_picker`'s "hi
+    keycaps"/numpad reveals) can make it far taller than column 3's own
+    natural content. Used on column 3's *body* sub-box specifically (below
+    "+ Add step"/"+ Add item" and, for Stepper, the toast/assignment row —
+    a second ticket 70 follow-up), so those stay pinned above the scrolled
+    area rather than scrolling away with everything else."""
+    scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+    scroller.set_vexpand(True)
+    scroller.set_hexpand(True)
+    scroller.set_child(widget)
+    return scroller
+
+
+def build_library_content(
+    client, config: dict, profile: str, layer: str, ui_state: dict, on_change: Callable[[], None]
+) -> Gtk.Widget:
+    """Columns 2+3 for the Library destination (ticket 70) — mounted by
+    `device_overview.build_main_view` in the "right" slot below the
+    Grid/Library switcher, the same slot the Grid destination's own device
+    grid occupies. Reads `ui_state["library_tab"]`, already established by
+    `build_library_sidebar`'s own render this cycle."""
+    selected_tab = ui_state.setdefault("library_tab", "macros")
+
+    root = Gtk.Box(spacing=16)
+    root.set_hexpand(True)
+
+    if selected_tab == "steppers":
+        selected_stepper_id = _selected_stepper_id(config, ui_state)
+        if selected_stepper_id is None:
+            root.append(
+                Gtk.Label(
+                    label="No Steppers yet — use “+ New” to create one.",
+                    xalign=0,
+                    wrap=True,
+                    css_classes=["dim"],
+                )
+            )
+        else:
+            col2, col3 = build_stepper_editor_columns(
+                client, config, profile, layer, selected_stepper_id, ui_state, on_change
+            )
+            col2.set_hexpand(True)
+            col3.set_hexpand(True)
+            root.append(col2)
+            root.append(col3)
+    else:
+        selected_macro_id = _selected_macro_id(config, ui_state)
+        if selected_macro_id is None:
+            root.append(
+                Gtk.Label(
+                    label="No Macros yet — use “+ New” to create one.",
+                    xalign=0,
+                    wrap=True,
+                    css_classes=["dim"],
+                )
+            )
+        else:
+            col2, col3 = build_macro_editor_columns(client, config, selected_macro_id, on_change)
+            col2.set_hexpand(True)
+            col3.set_hexpand(True)
+            root.append(col2)
+            root.append(col3)
 
     return root

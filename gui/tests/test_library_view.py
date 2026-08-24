@@ -4,7 +4,8 @@ from acheron_gui.daemon_client import DaemonError
 from acheron_gui.daemon_stub import DaemonStub
 from acheron_gui.inputs import ALL_INPUTS
 from acheron_gui.library_view import (
-    build_library_view,
+    build_library_content,
+    build_library_sidebar,
     describe_stepper_item,
     macro_used_by_count,
     stepper_used_by_count,
@@ -36,7 +37,15 @@ def _reorder_buttons(root, glyph):
 
 
 def _build(stub, ui_state, on_change=lambda: None):
-    return build_library_view(stub, stub.get_config(), _PROFILE, _LAYER, ui_state, on_change)
+    # Combines column 1 (build_library_sidebar) and columns 2+3
+    # (build_library_content) into one tree, mirroring how
+    # device_overview.build_main_view mounts them as siblings of `root` —
+    # tests search across both without caring which column something is in.
+    config = stub.get_config()
+    root = Gtk.Box()
+    root.append(build_library_sidebar(stub, config, ui_state, on_change))
+    root.append(build_library_content(stub, config, _PROFILE, _LAYER, ui_state, on_change))
+    return root
 
 
 def _dropdown_labeled(root, label_text):
@@ -73,9 +82,8 @@ def test_steppers_tab_shows_the_real_panel_and_no_macro_chrome():
 
     root = _build(stub, {"library_tab": "steppers"})
 
-    assert find_one(
-        root, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "Steppers" and "heading" in w.get_css_classes()
-    )
+    steppers_tab = find_one(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Steppers")
+    assert "suggested-action" in steppers_tab.get_css_classes()
     assert find_one(root, lambda w: isinstance(w, Gtk.Label) and "No Steppers yet" in w.get_label())
     assert find_all(root, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "Test macro") == []
 

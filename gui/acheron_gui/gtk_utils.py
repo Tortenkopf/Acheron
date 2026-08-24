@@ -9,6 +9,18 @@ from gi.repository import Gtk
 from .daemon_client import DaemonError
 
 
+def build_pinned_sidebar_box() -> Gtk.Box:
+    """The fixed-220px, non-expanding column-1 shape shared by the Profile
+    sidebar (Grid destination) and the Library browse column (ticket 70) —
+    factored out so both destinations' column 1 stay pixel-identical width,
+    per ticket 69's "nothing visibly resizes when flipping destinations."""
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+    box.add_css_class("sidebar")
+    box.set_size_request(220, -1)
+    box.set_hexpand(False)
+    return box
+
+
 def clear_children(container: Gtk.Widget) -> None:
     """Removes every direct child of `container` — the "rebuild this box
     from scratch" pattern used throughout the GUI (Save/Clear re-rendering

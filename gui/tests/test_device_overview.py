@@ -3,6 +3,7 @@ from gi.repository import Gtk
 from acheron_gui.daemon_client import AlreadyExistsError, DaemonError, NotFoundError
 from acheron_gui.daemon_stub import DaemonStub
 from acheron_gui.device_overview import build_main_view, build_status_wrapped_view, compute_status
+from acheron_gui.library_view import build_library_sidebar
 from acheron_gui.inputs import ALL_INPUTS
 
 from .widget_tree import editor_content, find_all, find_one
@@ -255,15 +256,14 @@ def test_steppers_tab_shows_the_real_panel_through_device_overview():
     # currently-selected Profile/Layer `make_input_button`'s own editor
     # popovers use (build_main_view's `profile`/`selected_layer`) — this
     # exercises that threading end-to-end rather than only unit-testing
-    # library_view.build_library_view directly (test_library_view.py's job).
+    # library_view.build_library_content directly (test_library_view.py's job).
     stub = DaemonStub()
     ui_state = {"dest": "library", "library_tab": "steppers"}
 
     root = _build(stub, ui_state)
 
-    assert find_one(
-        root, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "Steppers" and "heading" in w.get_css_classes()
-    )
+    steppers_tab = find_one(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Steppers")
+    assert "suggested-action" in steppers_tab.get_css_classes()
     assert find_one(root, lambda w: isinstance(w, Gtk.Label) and "No Steppers yet" in w.get_label())
 
 
@@ -290,12 +290,18 @@ def test_profile_sidebar_does_not_widen_between_destinations():
     stub = DaemonStub()
 
     grid_root = _build(stub, {"dest": "grid"})
-    library_root = _build(stub, {"dest": "library"})
-
     grid_sidebar = _profile_sidebar(grid_root)
-    library_sidebar = _profile_sidebar(library_root)
     assert grid_sidebar.get_hexpand() is False
+
+    # Ticket 69/70: column 1 for the Library destination is a different
+    # widget (build_library_sidebar, no "Profiles" chrome) — built directly
+    # here rather than located via _profile_sidebar's "Profiles"-label
+    # anchor, which no longer exists while Library is showing. It must
+    # still share the Grid sidebar's exact pinned width so nothing visibly
+    # resizes when flipping destinations.
+    library_sidebar = build_library_sidebar(stub, stub.get_config(), {}, lambda: None)
     assert library_sidebar.get_hexpand() is False
+    assert library_sidebar.get_size_request().width == grid_sidebar.get_size_request().width == 220
 
 
 def _profile_sidebar(root: Gtk.Widget) -> Gtk.Widget:

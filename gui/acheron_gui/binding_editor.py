@@ -605,7 +605,7 @@ def build_action_and_trigger_fields(
             # dropdown sits alongside the Stepper dropdown; full item
             # authoring and the Forward/Backward *Input*-pair assignment
             # both live in the Library screen
-            # (`library_view.build_stepper_editor`), not here — this
+            # (`library_view.build_stepper_editor_columns`), not here — this
             # popover only ever assigns `stepper_id`/`direction` to the
             # Binding on this one Input, exactly like every other branch
             # here only assigns its own field(s).
@@ -664,7 +664,7 @@ def build_action_and_trigger_fields(
             # internal) plus "+ New Macro" to create one inline and assign it
             # right away, replacing ticket 51's temporary read-only stub.
             # Full step authoring lives in the Library screen
-            # (`library_view.build_macro_editor`), not here — this popover
+            # (`library_view.build_macro_editor_columns`), not here — this popover
             # only ever assigns a `macro_id` to the Binding, exactly like the
             # Controller-button/Profile-switch branches only ever assign
             # their own single field.
@@ -840,7 +840,25 @@ def build_binding_editor(
     box.append(btn_row)
 
     if is_grid_input(inp):
-        box.append(build_actuation_section(client, config, profile, inp, capture_mode, on_saved))
+        # Ticket 70 follow-up, live-verified: on first open, the window
+        # this sits in (device_overview.make_input_button) should always
+        # be tall enough to show everything above this point — heading,
+        # error, the Trigger/Action fields including the inline key/
+        # mouse-button picker's full expanded shape, and the Save/Clear
+        # row — without scrolling, since the user always wants those
+        # reachable. Only the Actuation & release section (this one, grid-
+        # Inputs only) is deferred behind its own scroll: it's needed less
+        # often, and it's the section whose live depth bar/marker controls
+        # can push the window past the screen if left unbounded. Wrapping
+        # just this section, rather than the whole editor (as an earlier
+        # pass here did), keeps the rest of the window sized to its own
+        # natural height instead of being capped along with it.
+        actuation_scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        actuation_scroller.set_propagate_natural_width(True)
+        actuation_scroller.set_propagate_natural_height(True)
+        actuation_scroller.set_max_content_height(320)
+        actuation_scroller.set_child(build_actuation_section(client, config, profile, inp, capture_mode, on_saved))
+        box.append(actuation_scroller)
 
     return box
 
@@ -886,6 +904,14 @@ def build_chord_binding_dialog(
     outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     for setter in (outer.set_margin_top, outer.set_margin_bottom, outer.set_margin_start, outer.set_margin_end):
         setter(10)
+    # No scrolling wrapper here (unlike build_binding_editor's own Actuation
+    # & release section) — this dialog has nothing past `fields` that's
+    # reasonable to defer behind a scroll the way a grid Input's Actuation
+    # section is. `fields` can include the inline key picker (a Keypress
+    # Action), whose expandable modifier-group toggles are exactly what the
+    # user always wants reachable without scrolling — `set_default_size`
+    # above is only the *initial* suggested size; the dialog still grows to
+    # fit `outer`'s full natural height when the picker needs more room.
     dialog.set_child(outer)
 
     heading = Gtk.Label(label=" + ".join(input_label(m) for m in members), xalign=0)
