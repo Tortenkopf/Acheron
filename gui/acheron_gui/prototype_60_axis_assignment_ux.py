@@ -17,11 +17,15 @@ palette swap on one shared layout:
     A - Toggle + Diagram + Toast + Grey-out
         A plain toggle button sits above the ordinary Action-kind dropdown;
         turning it on swaps the whole Action/Trigger area for a hand-drawn
-        gamepad-style diagram (trigger column, two stick crosses, Rudder/
-        Wheel pairs — Gtk.Fixed-free, all plain Buttons/Grids, same
-        cairo-avoidance as ticket 19/38's prototypes). Picking a target
-        already claimed by another key shows a one-shot banner reusing the
-        real app's existing `.toast` convention (ticket 55's steal-toast).
+        gamepad-style diagram (ROUND 3: LT/RT sit directly above their
+        stick, matching a real gamepad's physical layout, over the Left/
+        Right stick crosses; a horizontal rule below the sticks separates
+        them from two named groups underneath — Driving: Wheel/Gas/Brake,
+        Flight: Rudder/Throttle — Gtk.Fixed-free, all plain Buttons/Grids,
+        same cairo-avoidance as ticket 19/38's prototypes). Picking a
+        target already claimed by another key shows a one-shot banner
+        reusing the real app's existing `.toast` convention (ticket 55's
+        steal-toast).
         Axis-assigned grid keys go fully insensitive (grey, unclickable,
         tooltipped) the moment Chord-member selection is toggled on.
 
@@ -34,9 +38,10 @@ palette swap on one shared layout:
         than seeing it and having it disabled. Trigger-mode locks
         insensitive with a tooltip, mirroring Profile Switch's existing
         lock in the real `binding_editor.py`. Picking "Axis" swaps in
-        variant A's own diagram picker unchanged (trigger column + stick
-        crosses + Rudder/Wheel pairs, `.toast` steal-banner included) —
-        `build_axis_picker_diagram` is shared code, not a re-implementation.
+        variant A's own diagram picker (ROUND 3 layout: LT/RT above their
+        stick, a rule under the sticks, Driving/Flight groups below it,
+        `.toast` steal-banner included) — `build_axis_picker_diagram` is
+        shared code, not a re-implementation.
         Axis-assigned grid keys stay fully clickable at all times and carry
         an always-visible purple diagonal-stripe look (not just during
         Chord selection, and not merely a tooltip) tying the same accent
@@ -315,35 +320,65 @@ def build_axis_picker_diagram(state: dict, render) -> Gtk.Widget:
         state["axis_target"] = code
         render()
 
-    row = Gtk.Box(spacing=16)
-    box.append(row)
+    # Top: LT/RT sit directly above their corresponding stick, mirroring a
+    # real gamepad's physical layout (shoulder triggers above the sticks
+    # they sit over), rather than being listed in a separate column.
+    def stick_column(trigger_code: str, trigger_cap: str, stick_title: str, x_base: str, y_base: str) -> Gtk.Widget:
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, halign=Gtk.Align.CENTER)
+        classes = ["axis-btn"] + (["axis-btn-current"] if trigger_code == state["axis_target"] else [])
+        tbtn = Gtk.Button(label=trigger_cap, css_classes=classes, halign=Gtk.Align.CENTER)
+        tbtn.set_tooltip_text(LABEL_BY_TARGET[trigger_code])
+        tbtn.connect("clicked", lambda _b, c=trigger_code: on_pick(c))
+        col.append(tbtn)
+        col.append(build_stick_cross(stick_title, x_base, y_base, state["axis_target"], on_pick))
+        return col
 
-    trig_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-    trig_col.append(Gtk.Label(label="Triggers / Pedals", css_classes=["section-label"]))
-    for code, label in UNSIGNED:
+    top_row = Gtk.Box(spacing=24, halign=Gtk.Align.CENTER)
+    top_row.append(stick_column("ABS_Z", "LT", "Left Stick", "ABS_X", "ABS_Y"))
+    top_row.append(stick_column("ABS_RZ", "RT", "Right Stick", "ABS_RX", "ABS_RY"))
+    box.append(top_row)
+
+    box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+    # Below the line: the remaining 7 targets split into two named groups
+    # rather than one flat list — Driving (Wheel, Gas, Brake) and Flight
+    # (Rudder, Throttle), grouped by which genre of game actually uses them
+    # together rather than by unsigned/signed shape.
+    def unsigned_row(code: str, label: str) -> Gtk.Widget:
         classes = ["axis-btn"] + (["axis-btn-current"] if code == state["axis_target"] else [])
         b = Gtk.Button(label=label, css_classes=classes, halign=Gtk.Align.START)
         b.connect("clicked", lambda _b, c=code: on_pick(c))
-        trig_col.append(b)
-    row.append(trig_col)
+        return b
 
-    row.append(build_stick_cross("Left Stick", "ABS_X", "ABS_Y", state["axis_target"], on_pick))
-    row.append(build_stick_cross("Right Stick", "ABS_RX", "ABS_RY", state["axis_target"], on_pick))
-
-    rw_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-    for base, name in (("ABS_RUDDER", "Rudder"), ("ABS_WHEEL", "Wheel")):
-        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        col.append(Gtk.Label(label=name, css_classes=["section-label"]))
-        pair = Gtk.Box(spacing=2)
+    def signed_pair_row(base: str, name: str) -> Gtk.Widget:
+        row = Gtk.Box(spacing=4)
+        row.append(Gtk.Label(label=name, halign=Gtk.Align.START))
         for suffix, sign in (("_NEG", "−"), ("_POS", "+")):
             code = base + suffix
             classes = ["axis-btn"] + (["axis-btn-current"] if code == state["axis_target"] else [])
             b = Gtk.Button(label=sign, css_classes=classes)
             b.connect("clicked", lambda _b, c=code: on_pick(c))
-            pair.append(b)
-        col.append(pair)
-        rw_col.append(col)
-    row.append(rw_col)
+            row.append(b)
+        return row
+
+    def group_box(title: str, rows: list[Gtk.Widget]) -> Gtk.Widget:
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        col.append(Gtk.Label(label=title, xalign=0, css_classes=["section-label"]))
+        for r in rows:
+            col.append(r)
+        return col
+
+    bottom_row = Gtk.Box(spacing=28)
+    bottom_row.append(
+        group_box(
+            "Driving",
+            [signed_pair_row("ABS_WHEEL", "Wheel"), unsigned_row("ABS_GAS", "Gas"), unsigned_row("ABS_BRAKE", "Brake")],
+        )
+    )
+    bottom_row.append(
+        group_box("Flight", [signed_pair_row("ABS_RUDDER", "Rudder"), unsigned_row("ABS_THROTTLE", "Throttle")])
+    )
+    box.append(bottom_row)
 
     return box
 
@@ -448,14 +483,18 @@ def build_variant_a() -> Gtk.Widget:
 # Round 2, folded in after live reaction: the user picked B's fork
 # mechanism (Axis as a 6th Action-kind entry, absent — not disabled — for
 # non-grid Inputs) and B's always-visible purple diagonal stripe on the
-# grid strip, but wanted variant A's diagram-style Axis Target picker
-# (trigger column + stick crosses) in place of B's flat category list —
-# `build_axis_picker_diagram` is reused verbatim below, toast and all,
-# rather than re-implemented, since it was already factored out as its
-# own function. `build_axis_picker_list`/`AXIS_CATEGORIES`'s flat-list
-# rendering is no longer used by any variant after this swap; kept only
-# as `AXIS_CATEGORIES`, which variant C's group-then-value picker still
-# depends on for its own catalog partition.
+# grid strip, but wanted variant A's diagram-style Axis Target picker in
+# place of B's flat category list — `build_axis_picker_diagram` is reused
+# verbatim below, toast and all, rather than re-implemented, since it was
+# already factored out as its own function. `build_axis_picker_list`'s
+# flat-list rendering is no longer used by any variant after this swap;
+# `AXIS_CATEGORIES` survives only as variant C's own catalog partition.
+#
+# Round 3, also folded into the shared `build_axis_picker_diagram`: LT/RT
+# moved to sit directly above their corresponding stick (gamepad-style),
+# a horizontal rule now separates the sticks from the remaining 7 targets,
+# and those split into two named groups — Driving (Wheel/Gas/Brake) and
+# Flight (Rudder/Throttle) — instead of one flat trigger column.
 # =======================================================================
 
 ACTION_KINDS_B = ["Keypress", "Controller Button", "Macro", "Stepper", "Profile Switch", "Axis"]
