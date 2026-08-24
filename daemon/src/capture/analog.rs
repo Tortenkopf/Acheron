@@ -280,11 +280,24 @@ fn is_grid_absent(err: &io::Error) -> bool {
         || err.raw_os_error() == Some(EIO)
 }
 
-fn read_repeat_schedule() -> RepeatSchedule {
-    let repeat = Device::open(Node::If01.device_path())
+/// The shared impure primitive: attempts the live kernel-autorepeat read off
+/// `Node::If01`, `None` if the node is absent or doesn't report `EV_REP`.
+/// `pub(crate)` beyond this module's own grid task — ticket 68's Toggle
+/// pacing reads the same live cadence, off the same node, so there is
+/// exactly one place the read itself happens. Each caller applies its own
+/// domain-appropriate fallback on `None` rather than sharing one (this
+/// module's `DEFAULT_REPEAT_DELAY_MS`/`DEFAULT_REPEAT_PERIOD_MS` are tuned
+/// for synthesizing a live Depth-driven Repeat stream, not for Toggle's
+/// flood-safety floor — the two must not silently drift onto one shared
+/// number).
+pub(crate) fn read_kernel_auto_repeat() -> Option<evdev::AutoRepeat> {
+    Device::open(Node::If01.device_path())
         .ok()
-        .and_then(|device| device.get_auto_repeat());
-    match repeat {
+        .and_then(|device| device.get_auto_repeat())
+}
+
+fn read_repeat_schedule() -> RepeatSchedule {
+    match read_kernel_auto_repeat() {
         Some(evdev::AutoRepeat { delay, period }) => RepeatSchedule::new(delay, period),
         None => RepeatSchedule::new(DEFAULT_REPEAT_DELAY_MS, DEFAULT_REPEAT_PERIOD_MS),
     }

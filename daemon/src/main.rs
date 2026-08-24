@@ -114,6 +114,10 @@ async fn main() -> io::Result<()> {
             .into_owned();
 
     let force_digital = config.force_digital;
+    // Ticket 68: read once, here, before dispatch's event loop starts — the
+    // kernel autorepeat rate this reflects never changes while the Daemon
+    // is running, so there is no reason to re-read it on every Toggle press.
+    let toggle_lap_target = acheron_daemon::executor::resolve_toggle_lap_target().await;
     let dispatch_handle = tokio::spawn(dispatch::run(
         event_rx,
         connection_rx,
@@ -125,6 +129,7 @@ async fn main() -> io::Result<()> {
         actuation_tx,
         capture_mode_rx,
         capture_control_tx,
+        toggle_lap_target,
     ));
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;

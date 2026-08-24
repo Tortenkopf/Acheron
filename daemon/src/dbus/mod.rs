@@ -1107,6 +1107,7 @@ mod tests {
                 actuation_tx,
                 capture_mode_rx,
                 capture_control_tx,
+                crate::executor::MIN_TOGGLE_LAP,
             ));
 
             TestServer {
@@ -2588,6 +2589,7 @@ mod tests {
             actuation_tx,
             capture_mode_rx,
             capture_control_tx,
+            crate::executor::MIN_TOGGLE_LAP,
         ));
 
         {

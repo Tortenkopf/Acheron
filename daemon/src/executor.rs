@@ -19,6 +19,7 @@ use evdev::KeyCode;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::capture::analog;
 use crate::config::{Action, MacroDef, MacroId, MacroStepDto, Modifiers};
 use crate::injector::{Injector, InjectorClosed};
 
@@ -223,10 +224,16 @@ pub struct ActiveToggle {
 impl ActiveToggle {
     /// Spawns the Toggle's own task: loops `steps` indefinitely
     /// (`tokio::time::sleep` between `Delay` steps) until cancelled, then
-    /// force-releases exactly the keys it was still holding.
-    pub fn spawn(injector: Injector, steps: Vec<MacroStep>) -> Self {
+    /// force-releases exactly the keys it was still holding. `target_lap`
+    /// (ticket 68) is resolved once by the caller — at Daemon startup, via
+    /// `resolve_toggle_lap_target` — and passed down as a plain value here,
+    /// rather than read fresh on every Toggle press: a per-press blocking
+    /// device read would put a real (if small) async hop ahead of every
+    /// Toggle's very first fire, on dispatch's own hot path, for a kernel
+    /// setting that in practice never changes while the Daemon is running.
+    pub fn spawn(injector: Injector, steps: Vec<MacroStep>, target_lap: Duration) -> Self {
         let cancel = CancellationToken::new();
-        let handle = tokio::spawn(run_toggle_loop(injector, steps, cancel.clone()));
+        let handle = tokio::spawn(run_toggle_loop(injector, steps, cancel.clone(), target_lap));
         ActiveToggle { cancel, handle }
     }
 
@@ -240,17 +247,54 @@ impl ActiveToggle {
     }
 }
 
-/// Floor pacing between Toggle laps, independent of the compiled steps' own
-/// `Delay` total. Found live (ticket 26, 2026-08-15): a Toggle wrapping a
-/// plain `Action::Keypress` compiles (`keypress_steps`) to `[KeyDown,
-/// KeyUp]` with no `Delay` step at all, so without this floor a lap ran as
-/// fast as the injector channel + `uinput` write allowed — an unbounded
-/// flood of synthetic keystrokes that froze the focused app and then the
-/// whole input pipeline, hard enough to require a power cycle. Every lap,
-/// however it's compiled, now takes at least this long.
-const MIN_TOGGLE_LAP: Duration = Duration::from_millis(20);
+/// Hard safety floor beneath the live-cadence target `resolve_toggle_lap_
+/// target` resolves (ticket 68) — no longer the pacing target itself. Found
+/// live (ticket 26, 2026-08-15): a Toggle wrapping a plain `Action::Keypress`
+/// compiles (`keypress_steps`) to `[KeyDown, KeyUp]` with no `Delay` step at
+/// all, so without a floor a lap ran as fast as the injector channel +
+/// `uinput` write allowed — an unbounded flood of synthetic keystrokes that
+/// froze the focused app and then the whole input pipeline, hard enough to
+/// require a power cycle. Kept as a guard against a degenerate live-read
+/// cadence (e.g. an unusually fast configured kernel repeat rate) rather
+/// than tuned to feel right on its own.
+pub(crate) const MIN_TOGGLE_LAP: Duration = Duration::from_millis(20);
 
-async fn run_toggle_loop(injector: Injector, steps: Vec<MacroStep>, cancel: CancellationToken) {
+/// Combines the live kernel-repeat period with `MIN_TOGGLE_LAP`'s hard
+/// floor — pure and unit-tested on its own, independent of the device read
+/// that produces `kernel_period` in production (ticket 68).
+fn combine_toggle_lap_target(kernel_period: Duration) -> Duration {
+    kernel_period.max(MIN_TOGGLE_LAP)
+}
+
+/// The impure boundary ticket 68 adds, called once at Daemon startup
+/// (`main.rs`, before dispatch's event loop starts) rather than per Toggle
+/// spawn: reads the same live kernel-autorepeat cadence Hold-to-repeat
+/// already sources from (`analog::read_kernel_auto_repeat`, off
+/// `Node::If01`), off the blocking pool so the device open/ioctl never runs
+/// on an async task's own thread. No device (no udev access, no real
+/// Tartarus Pro attached, or a `spawn_blocking` panic — the last never
+/// observed, only theoretically possible) falls back to `MIN_TOGGLE_LAP`
+/// directly, which is also this module's own pre-ticket-68 pacing constant —
+/// so a sandboxed/hardware-less run resolves to exactly the old hardcoded
+/// behavior.
+pub async fn resolve_toggle_lap_target() -> Duration {
+    let kernel_period = tokio::task::spawn_blocking(|| {
+        analog::read_kernel_auto_repeat()
+            .map(|repeat| Duration::from_millis(u64::from(repeat.period)))
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(MIN_TOGGLE_LAP);
+    combine_toggle_lap_target(kernel_period)
+}
+
+async fn run_toggle_loop(
+    injector: Injector,
+    steps: Vec<MacroStep>,
+    cancel: CancellationToken,
+    target_lap: Duration,
+) {
     let mut held: HashSet<KeyCode> = HashSet::new();
     'running: loop {
         if steps.is_empty() {
@@ -275,12 +319,12 @@ async fn run_toggle_loop(injector: Injector, steps: Vec<MacroStep>, cancel: Canc
         // only adds sleep when the lap's own steps (its own Delay total)
         // didn't already take this long — covers a bare Action::Keypress
         // (no Delay at all) and an under-paced Macro alike, and stays a
-        // no-op for any Macro that already paces itself past the floor.
+        // no-op for any Macro that already paces itself past the target.
         let elapsed = lap_start.elapsed();
-        if elapsed < MIN_TOGGLE_LAP {
+        if elapsed < target_lap {
             tokio::select! {
                 _ = cancel.cancelled() => break 'running,
-                _ = tokio::time::sleep(MIN_TOGGLE_LAP - elapsed) => {}
+                _ = tokio::time::sleep(target_lap - elapsed) => {}
             }
         }
     }
@@ -462,7 +506,7 @@ mod tests {
             MacroStep::Delay(Duration::from_millis(10)),
         ];
         tokio::task::yield_now().await;
-        let toggle = ActiveToggle::spawn(inj.clone(), steps);
+        let toggle = ActiveToggle::spawn(inj.clone(), steps, MIN_TOGGLE_LAP);
         tokio::task::yield_now().await;
 
         // Let a few full laps run — advancing in steps matching each
@@ -499,7 +543,7 @@ mod tests {
             MacroStep::KeyDown(KeyCode::KEY_A),
             MacroStep::Delay(Duration::from_millis(50)),
         ];
-        let toggle = ActiveToggle::spawn(inj.clone(), steps);
+        let toggle = ActiveToggle::spawn(inj.clone(), steps, MIN_TOGGLE_LAP);
 
         // Advance into the middle of the Delay, so KEY_A is definitely held
         // (KeyDown sent) and not yet due for another KeyDown.
@@ -549,7 +593,7 @@ mod tests {
             MacroStep::KeyDown(KeyCode::KEY_A),
             MacroStep::Delay(Duration::from_millis(50)),
         ];
-        let toggle = ActiveToggle::spawn(inj.clone(), steps);
+        let toggle = ActiveToggle::spawn(inj.clone(), steps, MIN_TOGGLE_LAP);
 
         // KEY_A's KeyDown is sent for real while unsuppressed.
         tokio::time::advance(Duration::from_millis(10)).await;
@@ -599,7 +643,7 @@ mod tests {
             MacroStep::KeyUp(KeyCode::KEY_A),
             MacroStep::Delay(Duration::from_millis(10)),
         ];
-        let toggle = ActiveToggle::spawn(inj.clone(), steps);
+        let toggle = ActiveToggle::spawn(inj.clone(), steps, MIN_TOGGLE_LAP);
 
         // KEY_A's KeyDown is sent for real while unsuppressed.
         tokio::time::advance(Duration::from_millis(10)).await;
@@ -647,7 +691,7 @@ mod tests {
         let sink = RecordingSink::new();
         let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
 
-        let toggle = ActiveToggle::spawn(inj.clone(), Vec::new());
+        let toggle = ActiveToggle::spawn(inj.clone(), Vec::new(), MIN_TOGGLE_LAP);
         tokio::task::yield_now().await;
         toggle.stop().await;
 
@@ -662,7 +706,10 @@ mod tests {
         // Regression test for ticket 26's live-hardware incident: a Toggle
         // wrapping a plain Action::Keypress compiles to [KeyDown, KeyUp]
         // with no Delay step at all, so without a floor the loop would
-        // busy-spin as fast as the injector channel allowed.
+        // busy-spin as fast as the injector channel allowed. Passes
+        // `MIN_TOGGLE_LAP` directly as `target_lap` (ticket 68) — this test
+        // is about the floor mechanism itself, not about whatever cadence a
+        // live device read would resolve to in production.
         let sink = RecordingSink::new();
         let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
 
@@ -677,7 +724,7 @@ mod tests {
         );
 
         tokio::task::yield_now().await;
-        let toggle = ActiveToggle::spawn(inj.clone(), steps);
+        let toggle = ActiveToggle::spawn(inj.clone(), steps, MIN_TOGGLE_LAP);
         tokio::task::yield_now().await;
 
         // Advance in floor-sized ticks. Without a floor, every lap would
@@ -721,7 +768,7 @@ mod tests {
         let steps = vec![MacroStep::KeyDown(KeyCode::KEY_A)];
 
         tokio::task::yield_now().await;
-        let toggle = ActiveToggle::spawn(inj.clone(), steps);
+        let toggle = ActiveToggle::spawn(inj.clone(), steps, MIN_TOGGLE_LAP);
         tokio::task::yield_now().await;
 
         for _ in 0..3 {
@@ -750,5 +797,60 @@ mod tests {
             (KeyCode::KEY_A, 0),
             "stop() must force-release the key still held"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn toggle_paces_to_an_arbitrary_target_lap_not_just_min_toggle_lap() {
+        // Ticket 68: `run_toggle_loop` must actually pace off whatever
+        // `target_lap` it's given (in production, the live kernel-autorepeat
+        // period), not a hardcoded constant — this is the regression guard
+        // for that parameterization, independent of `combine_toggle_lap_
+        // target`'s own pure floor test below.
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
+
+        let target_lap = Duration::from_millis(50);
+        let steps = vec![MacroStep::KeyDown(KeyCode::KEY_A)];
+
+        tokio::task::yield_now().await;
+        let toggle = ActiveToggle::spawn(inj.clone(), steps, target_lap);
+        tokio::task::yield_now().await;
+
+        // 150ms at a 50ms target should complete exactly 3 laps; at the old
+        // hardcoded 20ms floor it would have completed 7+.
+        for _ in 0..3 {
+            tokio::time::advance(target_lap).await;
+            tokio::task::yield_now().await;
+        }
+
+        toggle.stop().await;
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+
+        let batches = sink.batches();
+        assert!(
+            (4..=6).contains(&batches.len()),
+            "expected laps paced to the given 50ms target, got {} batches: {batches:?}",
+            batches.len()
+        );
+    }
+
+    #[test]
+    fn toggle_lap_target_floors_an_implausibly_fast_kernel_period() {
+        assert_eq!(
+            combine_toggle_lap_target(Duration::from_millis(5)),
+            MIN_TOGGLE_LAP
+        );
+    }
+
+    #[test]
+    fn toggle_lap_target_uses_a_slower_kernel_period_unfloored() {
+        let slower = Duration::from_millis(40);
+        assert_eq!(combine_toggle_lap_target(slower), slower);
+    }
+
+    #[test]
+    fn toggle_lap_target_at_exactly_the_floor_is_unchanged() {
+        assert_eq!(combine_toggle_lap_target(MIN_TOGGLE_LAP), MIN_TOGGLE_LAP);
     }
 }

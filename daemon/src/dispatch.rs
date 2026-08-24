@@ -102,6 +102,12 @@ pub async fn run(
     actuation_tx: watch::Sender<HashMap<Input, ActuationPoint>>,
     mut rx_capture_mode: mpsc::Receiver<CaptureMode>,
     capture_control_tx: mpsc::Sender<bool>,
+    // Ticket 68: resolved once at Daemon startup (`main.rs`, before this
+    // task's event loop starts) and threaded down to every `ActiveToggle::
+    // spawn` call site as a plain value, rather than re-read per Toggle
+    // press — the kernel autorepeat rate it reflects never changes while
+    // the Daemon is running.
+    toggle_lap_target: Duration,
 ) -> io::Result<()> {
     // Published once up front so the analog capture source's grid task
     // (ticket 22/23) has a correct snapshot to threshold against from the
@@ -170,6 +176,7 @@ pub async fn run(
                     &signal_emitter,
                     &actuation_tx,
                     &mut chord_state,
+                    toggle_lap_target,
                     event,
                 )
                 .await?;
@@ -186,6 +193,7 @@ pub async fn run(
                     &actuation_tx,
                     &signal_emitter,
                     &mut chord_state,
+                    toggle_lap_target,
                 )
                 .await?;
             }
@@ -224,6 +232,7 @@ async fn handle_event(
     signal_emitter: &Option<SignalEmitter<'static>>,
     actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
     chord_state: &mut ChordState,
+    toggle_lap_target: Duration,
     event: PhysicalEvent,
 ) -> io::Result<()> {
     let profile = config
@@ -270,6 +279,7 @@ async fn handle_event(
             signal_emitter,
             actuation_tx,
             chord_state,
+            toggle_lap_target,
             event,
         )
         .await;
@@ -310,6 +320,7 @@ async fn handle_event(
                 &config.macros,
                 &config.steppers,
                 stepper_cursors,
+                toggle_lap_target,
             )
             .await
         }
@@ -428,6 +439,7 @@ async fn fire_chord(
     macros: &HashMap<MacroId, MacroDef>,
     steppers: &HashMap<StepperId, StepperDef>,
     stepper_cursors: &mut HashMap<StepperId, usize>,
+    toggle_lap_target: Duration,
 ) -> io::Result<()> {
     match (binding.trigger, state) {
         (TriggerMode::FireOnce, EventState::Down)
@@ -444,7 +456,10 @@ async fn fire_chord(
         }
         (TriggerMode::Toggle, EventState::Down) => {
             let steps = compile_action(&binding.action, macros, steppers, stepper_cursors);
-            chord_toggles.insert(key, ActiveToggle::spawn(injector.clone(), steps));
+            chord_toggles.insert(
+                key,
+                ActiveToggle::spawn(injector.clone(), steps, toggle_lap_target),
+            );
             Ok(())
         }
         _ => Ok(()),
@@ -496,6 +511,7 @@ async fn fire_individual_retroactively(
     signal_emitter: &Option<SignalEmitter<'static>>,
     layer: Layer,
     input: Input,
+    toggle_lap_target: Duration,
 ) -> io::Result<()> {
     let profile = config
         .active_profile()
@@ -523,6 +539,7 @@ async fn fire_individual_retroactively(
                 &config.macros,
                 &config.steppers,
                 stepper_cursors,
+                toggle_lap_target,
             )
             .await
         }
@@ -553,6 +570,7 @@ async fn handle_chord_event(
     signal_emitter: &Option<SignalEmitter<'static>>,
     actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
     chord_state: &mut ChordState,
+    toggle_lap_target: Duration,
     event: PhysicalEvent,
 ) -> io::Result<()> {
     match event.state {
@@ -627,6 +645,7 @@ async fn handle_chord_event(
                     &config.macros,
                     &config.steppers,
                     stepper_cursors,
+                    toggle_lap_target,
                 )
                 .await?;
                 if let Some(window) = chord_state.window.as_mut() {
@@ -692,6 +711,7 @@ async fn handle_chord_event(
                     &config.macros,
                     &config.steppers,
                     stepper_cursors,
+                    toggle_lap_target,
                 )
                 .await?;
             }
@@ -730,6 +750,7 @@ async fn handle_chord_event(
                     signal_emitter,
                     active_layer,
                     event.input,
+                    toggle_lap_target,
                 )
                 .await?;
                 if let Some(firing) = in_flight.get(&event.input) {
@@ -769,6 +790,7 @@ async fn handle_chord_timeout(
     actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
     signal_emitter: &Option<SignalEmitter<'static>>,
     chord_state: &mut ChordState,
+    toggle_lap_target: Duration,
 ) -> io::Result<()> {
     let Some(window) = chord_state.window.take() else {
         return Ok(());
@@ -786,6 +808,7 @@ async fn handle_chord_timeout(
             signal_emitter,
             active_layer,
             input,
+            toggle_lap_target,
         )
         .await?;
     }
@@ -870,6 +893,7 @@ async fn fire(
     macros: &HashMap<MacroId, MacroDef>,
     steppers: &HashMap<StepperId, StepperDef>,
     stepper_cursors: &mut HashMap<StepperId, usize>,
+    toggle_lap_target: Duration,
 ) -> io::Result<()> {
     match (binding.trigger, state) {
         (TriggerMode::FireOnce, EventState::Down)
@@ -897,7 +921,10 @@ async fn fire(
         }
         (TriggerMode::Toggle, EventState::Down) => {
             let steps = compile_action(&binding.action, macros, steppers, stepper_cursors);
-            toggles.insert(input, ActiveToggle::spawn(injector.clone(), steps));
+            toggles.insert(
+                input,
+                ActiveToggle::spawn(injector.clone(), steps, toggle_lap_target),
+            );
             Ok(())
         }
         (TriggerMode::FireOnce | TriggerMode::HoldToRepeat, EventState::Up) => {
@@ -2027,6 +2054,7 @@ mod tests {
             actuation_channel(),
             capture_mode_channel(),
             capture_control_channel(),
+            executor::MIN_TOGGLE_LAP,
         ));
 
         FakeCaptureSource::new(scripted)
@@ -2196,6 +2224,7 @@ mod tests {
             actuation_channel(),
             capture_mode_channel(),
             capture_control_channel(),
+            executor::MIN_TOGGLE_LAP,
         ));
 
         // Real evdev autorepeat events land tens of milliseconds apart —
@@ -2281,6 +2310,7 @@ mod tests {
             actuation_channel(),
             capture_mode_channel(),
             capture_control_channel(),
+            executor::MIN_TOGGLE_LAP,
         ));
 
         tx.send(PhysicalEvent {
@@ -2359,6 +2389,7 @@ mod tests {
             actuation_channel(),
             capture_mode_channel(),
             capture_control_channel(),
+            executor::MIN_TOGGLE_LAP,
         ));
 
         // Down starts a firing that immediately sends KeyDown, then sleeps
@@ -2549,6 +2580,7 @@ mod tests {
                 actuation_tx,
                 capture_mode_channel(),
                 capture_control_channel(),
+                executor::MIN_TOGGLE_LAP,
             ));
 
             CommandHarness {
