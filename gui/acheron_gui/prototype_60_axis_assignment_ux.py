@@ -17,15 +17,16 @@ palette swap on one shared layout:
     A - Toggle + Diagram + Toast + Grey-out
         A plain toggle button sits above the ordinary Action-kind dropdown;
         turning it on swaps the whole Action/Trigger area for a hand-drawn
-        gamepad-style diagram (ROUND 3: LT/RT sit directly above their
-        stick, matching a real gamepad's physical layout, over the Left/
-        Right stick crosses; a horizontal rule below the sticks separates
-        them from two named groups underneath — Driving: Wheel/Gas/Brake,
-        Flight: Rudder/Throttle — Gtk.Fixed-free, all plain Buttons/Grids,
-        same cairo-avoidance as ticket 19/38's prototypes). Picking a
-        target already claimed by another key shows a one-shot banner
-        reusing the real app's existing `.toast` convention (ticket 55's
-        steal-toast).
+        gamepad-style diagram (ROUND 5: LT sits beside the Left stick, RT
+        beside the Right stick — left/right of it, not above — so each
+        stick's cross sits directly under its own label with nothing in
+        between; a horizontal rule below the sticks separates them from
+        two named groups underneath — Driving: Wheel +/- with Gas/Brake
+        inline, Flight: Rudder +/- with Throttle inline — Gtk.Fixed-free,
+        all plain Buttons/Grids, same cairo-avoidance as ticket 19/38's
+        prototypes). Picking a target already claimed by another key shows
+        a one-shot banner reusing the real app's existing `.toast`
+        convention (ticket 55's steal-toast).
         Axis-assigned grid keys go fully insensitive (grey, unclickable,
         tooltipped) the moment Chord-member selection is toggled on.
 
@@ -38,7 +39,7 @@ palette swap on one shared layout:
         than seeing it and having it disabled. Trigger-mode locks
         insensitive with a tooltip, mirroring Profile Switch's existing
         lock in the real `binding_editor.py`. Picking "Axis" swaps in
-        variant A's own diagram picker (ROUND 3 layout: LT/RT above their
+        variant A's own diagram picker (ROUND 5 layout: LT/RT beside their
         stick, a rule under the sticks, Driving/Flight groups below it,
         `.toast` steal-banner included) — `build_axis_picker_diagram` is
         shared code, not a re-implementation.
@@ -276,21 +277,10 @@ def mock_digital_body() -> Gtk.Widget:
 # =======================================================================
 
 
-def build_stick_cross(
-    title: str,
-    x_base: str,
-    y_base: str,
-    current: str | None,
-    on_pick,
-    trigger: tuple[str, str, int] | None = None,
-) -> Gtk.Widget:
-    """A stick's X/Y cross, optionally with a trigger button placed *in the
-    same Gtk.Grid* as an extra row above it — `trigger` is
-    `(code, caption, column)`, where `column` is 0 (X−'s column) or 2 (X+'s
-    column), never 1 (Y's own column). Sharing one grid, rather than
-    stacking a separately-centered trigger button over a second widget, is
-    what makes the trigger land pixel-exact above X−/X+ instead of merely
-    close to it."""
+def build_stick_cross(title: str, x_base: str, y_base: str, current: str | None, on_pick) -> Gtk.Widget:
+    """A stick's label directly above its X/Y cross — nothing else sits
+    between them. A trigger, when shown, is placed *beside* this whole
+    column by the caller, not inside it."""
     col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
     col.append(Gtk.Label(label=title, css_classes=["section-label"]))
     grid = Gtk.Grid(row_spacing=2, column_spacing=2)
@@ -302,21 +292,21 @@ def build_stick_cross(
         b.connect("clicked", lambda _b, c=code: on_pick(c))
         return b
 
-    row = 0
-    if trigger is not None:
-        t_code, t_cap, t_col = trigger
-        tbtn = mk(t_code, t_cap)
-        tbtn.set_margin_bottom(6)
-        grid.attach(tbtn, t_col, row, 1, 1)
-        row += 1
-
-    grid.attach(mk(f"{y_base}_POS", "Y+"), 1, row, 1, 1)
-    grid.attach(mk(f"{x_base}_NEG", "X−"), 0, row + 1, 1, 1)
-    grid.attach(Gtk.Label(label="⊕", css_classes=["dim"]), 1, row + 1, 1, 1)
-    grid.attach(mk(f"{x_base}_POS", "X+"), 2, row + 1, 1, 1)
-    grid.attach(mk(f"{y_base}_NEG", "Y−"), 1, row + 2, 1, 1)
+    grid.attach(mk(f"{y_base}_POS", "Y+"), 1, 0, 1, 1)
+    grid.attach(mk(f"{x_base}_NEG", "X−"), 0, 1, 1, 1)
+    grid.attach(Gtk.Label(label="⊕", css_classes=["dim"]), 1, 1, 1, 1)
+    grid.attach(mk(f"{x_base}_POS", "X+"), 2, 1, 1, 1)
+    grid.attach(mk(f"{y_base}_NEG", "Y−"), 1, 2, 1, 1)
     col.append(grid)
     return col
+
+
+def build_trigger_button(code: str, cap: str, current: str | None, on_pick) -> Gtk.Widget:
+    classes = ["axis-btn"] + (["axis-btn-current"] if code == current else [])
+    b = Gtk.Button(label=cap, css_classes=classes, valign=Gtk.Align.CENTER)
+    b.set_tooltip_text(LABEL_BY_TARGET[code])
+    b.connect("clicked", lambda _b, c=code: on_pick(c))
+    return b
 
 
 def build_axis_picker_diagram(state: dict, render) -> Gtk.Widget:
@@ -342,22 +332,15 @@ def build_axis_picker_diagram(state: dict, render) -> Gtk.Widget:
         state["axis_target"] = code
         render()
 
-    # Top: LT/RT sit directly above their stick's *outer* column — X− for
-    # the Left stick, X+ for the Right stick — pushing them further apart
-    # than a plain center-above-the-stick placement would, matching where
-    # shoulder triggers actually sit relative to the sticks on a real
-    # gamepad (outboard of them, not directly overhead).
-    top_row = Gtk.Box(spacing=24, halign=Gtk.Align.CENTER)
-    top_row.append(
-        build_stick_cross(
-            "Left Stick", "ABS_X", "ABS_Y", state["axis_target"], on_pick, trigger=("ABS_Z", "LT", 0)
-        )
-    )
-    top_row.append(
-        build_stick_cross(
-            "Right Stick", "ABS_RX", "ABS_RY", state["axis_target"], on_pick, trigger=("ABS_RZ", "RT", 2)
-        )
-    )
+    # Top: LT/RT sit beside their stick — Left Trigger to the left of the
+    # Left stick, Right Trigger to the right of the Right stick — rather
+    # than above it, so each stick's cross sits directly under its own
+    # label with nothing in between.
+    top_row = Gtk.Box(spacing=16, halign=Gtk.Align.CENTER)
+    top_row.append(build_trigger_button("ABS_Z", "LT", state["axis_target"], on_pick))
+    top_row.append(build_stick_cross("Left Stick", "ABS_X", "ABS_Y", state["axis_target"], on_pick))
+    top_row.append(build_stick_cross("Right Stick", "ABS_RX", "ABS_RY", state["axis_target"], on_pick))
+    top_row.append(build_trigger_button("ABS_RZ", "RT", state["axis_target"], on_pick))
     box.append(top_row)
 
     box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
@@ -516,11 +499,18 @@ def build_variant_a() -> Gtk.Widget:
 # flat-list rendering is no longer used by any variant after this swap;
 # `AXIS_CATEGORIES` survives only as variant C's own catalog partition.
 #
-# Round 3, also folded into the shared `build_axis_picker_diagram`: LT/RT
-# moved to sit directly above their corresponding stick (gamepad-style),
-# a horizontal rule now separates the sticks from the remaining 7 targets,
-# and those split into two named groups — Driving (Wheel/Gas/Brake) and
-# Flight (Rudder/Throttle) — instead of one flat trigger column.
+# Round 3, also folded into the shared `build_axis_picker_diagram`: a
+# horizontal rule now separates the sticks from the remaining 7 targets,
+# split into two named groups — Driving (Wheel/Gas/Brake) and Flight
+# (Rudder/Throttle) — instead of one flat trigger column.
+#
+# Round 4: Driving/Flight collapsed to one inline row apiece (Gas/Brake
+# beside Wheel +/-, Throttle beside Rudder +/-) instead of stacked rows.
+#
+# Round 5: LT/RT moved beside their stick (Left Trigger left of the Left
+# stick, Right Trigger right of the Right stick) instead of above it, so
+# each stick's cross sits directly under its own label with nothing else
+# between them.
 # =======================================================================
 
 ACTION_KINDS_B = ["Keypress", "Controller Button", "Macro", "Stepper", "Profile Switch", "Axis"]
