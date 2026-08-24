@@ -25,21 +25,24 @@ palette swap on one shared layout:
         Axis-assigned grid keys go fully insensitive (grey, unclickable,
         tooltipped) the moment Chord-member selection is toggled on.
 
-    B - 6th dropdown entry + Flat category list + Inline note + Stripe
-        "Axis" is simply a 6th entry in the existing Action-kind dropdown
-        (Keypress / Controller Button / Macro / Stepper / Profile Switch /
-        Axis) for grid keys — non-grid Inputs never see the option at all,
-        rather than seeing it and having it disabled. Trigger-mode locks
+    B - 6th dropdown entry + Diagram (from A) + Toast (from A) + Stripe
+        ROUND 2, after live reaction: the user's pick, combining B's fork
+        mechanism and grid treatment with A's picker. "Axis" is simply a
+        6th entry in the existing Action-kind dropdown (Keypress /
+        Controller Button / Macro / Stepper / Profile Switch / Axis) for
+        grid keys — non-grid Inputs never see the option at all, rather
+        than seeing it and having it disabled. Trigger-mode locks
         insensitive with a tooltip, mirroring Profile Switch's existing
-        lock in the real `binding_editor.py`. The catalog is an always-
-        expanded categorized list (Triggers/Pedals, Left Stick, Right
-        Stick, Rudder, Wheel), signed halves listed as two separate rows.
-        A claimed target gets a persistent dim note under the list (no
-        dismiss, unlike A's toast). Axis-assigned grid keys stay fully
-        clickable at all times and carry a diagonal-stripe look always
-        visible (not just during Chord selection); clicking one while
-        selecting Chord members surfaces an inline error line instead of
-        toggling it into the selection.
+        lock in the real `binding_editor.py`. Picking "Axis" swaps in
+        variant A's own diagram picker unchanged (trigger column + stick
+        crosses + Rudder/Wheel pairs, `.toast` steal-banner included) —
+        `build_axis_picker_diagram` is shared code, not a re-implementation.
+        Axis-assigned grid keys stay fully clickable at all times and carry
+        an always-visible purple diagonal-stripe look (not just during
+        Chord selection, and not merely a tooltip) tying the same accent
+        color used for every "this is an axis" affordance across the whole
+        pane; clicking a striped key while selecting Chord members surfaces
+        an inline error line instead of toggling it into the selection.
 
     C - Segmented control + Group-then-value + Proactive dot + Padlock
         A two-button Digital/Axis segmented control *replaces* the Action
@@ -440,36 +443,22 @@ def build_variant_a() -> Gtk.Widget:
 
 
 # =======================================================================
-# Variant B — 6th dropdown entry + Flat category list + Inline note + Stripe
+# Variant B — 6th dropdown entry + Diagram (from A) + Toast (from A) + Stripe
+#
+# Round 2, folded in after live reaction: the user picked B's fork
+# mechanism (Axis as a 6th Action-kind entry, absent — not disabled — for
+# non-grid Inputs) and B's always-visible purple diagonal stripe on the
+# grid strip, but wanted variant A's diagram-style Axis Target picker
+# (trigger column + stick crosses) in place of B's flat category list —
+# `build_axis_picker_diagram` is reused verbatim below, toast and all,
+# rather than re-implemented, since it was already factored out as its
+# own function. `build_axis_picker_list`/`AXIS_CATEGORIES`'s flat-list
+# rendering is no longer used by any variant after this swap; kept only
+# as `AXIS_CATEGORIES`, which variant C's group-then-value picker still
+# depends on for its own catalog partition.
 # =======================================================================
 
 ACTION_KINDS_B = ["Keypress", "Controller Button", "Macro", "Stepper", "Profile Switch", "Axis"]
-
-
-def build_axis_picker_list(state: dict, render) -> Gtk.Widget:
-    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, css_classes=["picker-panel"])
-    box.append(Gtk.Label(label="Axis target", xalign=0, css_classes=["section-label"]))
-
-    def on_pick(code: str) -> None:
-        state["axis_target"] = code
-        render()
-
-    for category, entries in AXIS_CATEGORIES.items():
-        box.append(Gtk.Label(label=category, xalign=0, css_classes=["category-row", "dim"]))
-        for code, label in entries:
-            marker = "●" if code == state["axis_target"] else "○"
-            classes = ["axis-list-btn"] + (["axis-btn-current"] if code == state["axis_target"] else [])
-            btn = Gtk.Button(label=f"{marker} {label}", halign=Gtk.Align.START, css_classes=classes)
-            btn.connect("clicked", lambda _b, c=code: on_pick(c))
-            box.append(btn)
-
-    claimant = CLAIMS.get(state["axis_target"]) if state["axis_target"] else None
-    if state["axis_target"] and claimant and claimant != state["input"]:
-        # Persistent, no dismiss — unlike variant A's one-shot toast, this
-        # stays as long as the claimed value stays selected.
-        box.append(Gtk.Label(label=f"Also assigned to {claimant}.", xalign=0, css_classes=["inline-note"]))
-
-    return box
 
 
 def build_editor_pane_b(state: dict, render) -> Gtk.Widget:
@@ -501,7 +490,7 @@ def build_editor_pane_b(state: dict, render) -> Gtk.Widget:
     pane.append(labeled_row("Trigger mode", trigger_dd))
 
     if state["is_axis"]:
-        pane.append(build_axis_picker_list(state, render))
+        pane.append(build_axis_picker_diagram(state, render))
     else:
         pane.append(Gtk.Label(label="(ordinary Action body — not mocked here, see tickets 32/38/55)", xalign=0, css_classes=["dim"]))
 
@@ -767,7 +756,7 @@ def build_variant_c() -> Gtk.Widget:
 
 VARIANTS = [
     ("A", "Toggle + Diagram + Toast + Grey-out", build_variant_a),
-    ("B", "6th dropdown entry + Category list + Inline note + Stripe", build_variant_b),
+    ("B", "6th dropdown entry + Diagram (from A) + Toast (from A) + Stripe — round 2 pick", build_variant_b),
     ("C", "Segmented control + Group-then-value + Proactive dot + Padlock", build_variant_c),
 ]
 
