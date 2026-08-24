@@ -161,6 +161,56 @@ def test_enabling_chord_selecting_reroutes_grid_clicks_to_the_selection_instead_
     assert ui_state["chord"]["recorded"] == []
 
 
+def test_axis_assigned_grid_key_always_carries_the_stripe_even_outside_chord_selecting():
+    stub = DaemonStub()
+    stub.set_axis_assignment("grid_r1c1", "base", "left_trigger")
+
+    root = _build(stub, {})
+
+    grid_r1c1 = _grid_button(root, "1")
+    assert "axis-stripe" in grid_r1c1.get_css_classes()
+
+
+def test_clicking_an_axis_assigned_key_while_selecting_chord_members_shows_an_inline_error():
+    stub = DaemonStub()
+    stub.set_axis_assignment("grid_r1c1", "base", "left_trigger")
+    ui_state = {"chord": {"selecting": True, "recorded": [], "edit_key": None, "preview": None}}
+
+    root = _build(stub, ui_state)
+    _grid_button(root, "1").emit("clicked")
+
+    assert ui_state["chord"]["recorded"] == []
+    assert ui_state["chord"]["axis_error"] == "1 is Axis-assigned — can't join a Chord"
+
+    rebuilt = _build(stub, ui_state)
+    find_one(
+        rebuilt,
+        lambda w: isinstance(w, Gtk.Label)
+        and "error" in w.get_css_classes()
+        and w.get_label() == "1 is Axis-assigned — can't join a Chord",
+    )
+
+
+def test_clicking_an_ordinary_key_after_an_axis_error_clears_it():
+    stub = DaemonStub()
+    stub.set_axis_assignment("grid_r1c1", "base", "left_trigger")
+    ui_state = {
+        "chord": {
+            "selecting": True,
+            "recorded": [],
+            "edit_key": None,
+            "preview": None,
+            "axis_error": "1 is Axis-assigned — can't join a Chord",
+        }
+    }
+
+    root = _build(stub, ui_state)
+    _grid_button(root, "2").emit("clicked")
+
+    assert ui_state["chord"]["recorded"] == ["grid_r1c2"]
+    assert ui_state["chord"]["axis_error"] is None
+
+
 def test_binding_button_is_disabled_until_two_inputs_are_selected_and_enables_a_chord_save():
     stub = DaemonStub()
     ui_state = {"chord": {"selecting": True, "recorded": ["grid_r1c1"], "edit_key": None, "preview": None}}
@@ -212,6 +262,34 @@ def test_a_subset_superset_conflict_disables_binding_and_offers_edit_conflicting
     conflict_btn.emit("clicked")
     assert sorted(ui_state["chord"]["recorded"]) == ["grid_r1c1", "grid_r1c2"]
     assert ui_state["chord"]["edit_key"] == "grid_r1c1+grid_r1c2"
+
+
+def test_editing_a_conflicting_chord_clears_a_stale_axis_error():
+    # Code-review finding: every other reset site (on_selecting_toggled,
+    # on_saved, on_clear, on_edit) already clears `axis_error` — this one
+    # didn't, so a stale "<key> is Axis-assigned" message could survive
+    # switching to editing the real conflicting Chord.
+    stub = DaemonStub()
+    stub.set_chord_binding(
+        ["grid_r1c1", "grid_r1c2"], "base", {"trigger": "fire_once", "type": "keypress", "key": "KEY_C"}
+    )
+    ui_state = {
+        "chord": {
+            "selecting": True,
+            "recorded": ["grid_r1c1", "grid_r1c2", "mode_key"],
+            "edit_key": None,
+            "preview": None,
+            "axis_error": "3 is Axis-assigned — can't join a Chord",
+        }
+    }
+
+    root = _build(stub, ui_state)
+    conflict_btn = find_one(
+        root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Edit conflicting Chord"
+    )
+    conflict_btn.emit("clicked")
+
+    assert ui_state["chord"]["axis_error"] is None
 
 
 def test_clicking_edit_on_an_existing_chord_reenters_selection_mode_preloaded():

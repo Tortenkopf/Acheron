@@ -132,6 +132,17 @@ CSS = """
    stay visually distinct from it). */
 .chord-selected { border: 3px solid #2ecc71; }
 .chord-preview { border: 3px solid #e6991a; }
+/* Ticket 71: the real axis-target diagram picker (axis_picker.py) and
+   Device Overview's Axis-assigned grid-key treatment — one shared purple
+   accent (#8e44ad, ticket 60's Answer) ties the picker's "current pick"
+   highlight to the grid's "this key is Axis-assigned" stripe. */
+.axis-target-current { background-color: alpha(#8e44ad, 0.45); }
+.axis-stripe {
+    background-image: repeating-linear-gradient(
+        45deg, alpha(#8e44ad, 0.35) 0px, alpha(#8e44ad, 0.35) 4px,
+        transparent 4px, transparent 8px
+    );
+}
 """
 
 

@@ -102,4 +102,13 @@ ACTION_TYPES = [
     ("step", "Stepper"),
     ("profile_switch", "Profile Switch"),
     ("controller_button", "Controller Button"),
+    # Ticket 71: offered only when `is_grid_input(inp)` — non-grid Inputs
+    # (Mode key, thumbstick, wheel) never see this option at all, rather
+    # than seeing it disabled (ticket 60's Answer). Callers that build a
+    # dropdown for a non-grid Input, or for a Chord's own Binding (which
+    # can no more "drive an axis continuously" than it can be a Profile
+    # Switch — a Chord fires on a discrete Down), must filter this entry
+    # out, mirroring `binding_editor.build_chord_binding_dialog`'s existing
+    # `profile_switch` exclusion.
+    ("axis", "Axis"),
 ]

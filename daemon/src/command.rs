@@ -9,7 +9,7 @@ use std::collections::{BTreeSet, HashMap};
 use tokio::sync::oneshot;
 
 use crate::config::{
-    Binding, Config, Layer, MacroId, MacroStepDto, ModeKeyRole, StepperId, StepperItem,
+    AxisTarget, Binding, Config, Layer, MacroId, MacroStepDto, ModeKeyRole, StepperId, StepperItem,
 };
 use crate::input::Input;
 
@@ -256,6 +256,27 @@ pub enum Command {
     /// no Chord with exactly that member set exists on `layer`.
     ClearChordBinding {
         inputs: BTreeSet<Input>,
+        layer: Layer,
+        reply: oneshot::Sender<Result<(), CommandError>>,
+    },
+    /// Creates or edits an Axis assignment on the active Profile (ticket
+    /// 59/71 — CONTEXT.md: Axis assignment): atomic/immediately-applied/
+    /// immediately-persisted, mirroring `SetBinding` exactly but clearing
+    /// any existing Binding *and* any Chord membership for `(layer, input)`
+    /// atomically alongside the insert (ticket 59 §2's mutual exclusion —
+    /// unlike `SetBinding`/`SetChordBinding`, which reject rather than
+    /// overwrite an existing Axis assignment there). Fails `InvalidRequest`
+    /// if `input` isn't a `Grid` variant.
+    SetAxisAssignment {
+        input: Input,
+        layer: Layer,
+        target: AxisTarget,
+        reply: oneshot::Sender<Result<(), CommandError>>,
+    },
+    /// Removes an Axis assignment, reverting `input` to ordinary passthrough
+    /// on `layer`. Fails `NotFound` if `input` has no Axis assignment there.
+    ClearAxisAssignment {
+        input: Input,
         layer: Layer,
         reply: oneshot::Sender<Result<(), CommandError>>,
     },

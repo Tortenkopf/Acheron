@@ -25,6 +25,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use evdev::AbsoluteAxisCode;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use zbus::object_server::SignalEmitter;
@@ -32,13 +33,22 @@ use zbus::object_server::SignalEmitter;
 use crate::capture::{CaptureMode, EventState, PhysicalEvent};
 use crate::command::{Command, CommandError, State};
 use crate::config::{
-    self, Action, ActuationPoint, Binding, ChordKey, Config, Layer, MacroDef, MacroId, ModeKeyRole,
-    Profile, StepDirection, StepperDef, StepperId, StepperItem, TriggerMode,
+    self, Action, ActuationPoint, AxisPolarity, AxisTarget, Binding, ChordKey, Config, Layer,
+    MacroDef, MacroId, ModeKeyRole, Profile, StepDirection, StepperDef, StepperId, StepperItem,
+    TriggerMode,
 };
 use crate::dbus::Daemon;
 use crate::executor::{self, ActiveToggle, FiringHandle};
 use crate::injector::Injector;
 use crate::input::Input;
+
+/// The Digital Capture mode fallback's per-press step size (ticket 59 §6 /
+/// ticket 71): press/release step-increment in place of a continuous Depth
+/// stream, since Digital-sourced events carry no Depth at all. A build-time-
+/// tuned constant, same precedent as Analog-repeat's four TBD constants
+/// (ticket 20) — exact feel to be adjusted against real hardware in ticket
+/// 72, not designed here.
+const AXIS_DIGITAL_STEP: u8 = 64;
 
 /// The fixed simultaneity window between a Chord's first and last member
 /// going down (ticket 01's Answer, §"Simultaneity detection") — a Rust
@@ -80,6 +90,158 @@ struct ChordState {
     claimed: HashSet<Input>,
 }
 
+/// Every piece of Daemon-owned runtime state Axis-assignment resolution
+/// needs (ticket 59/71), mirroring `toggles`/`chord_state`'s own per-Input
+/// runtime-state shape. `contributions` is the live, per-Input 0-255 output
+/// value every Axis-assigned Input currently wants to drive its target
+/// with — written by `handle_depth_update` (the continuous Analog half of
+/// ticket 59 §7's `(Depth, edge_event) -> axis_value` seam,
+/// `config::resolve_axis_value`) and by `handle_axis_edge_event` (the
+/// Digital-mode step-increment fallback, ticket 59 §6) alike, so both flows
+/// feed the exact same conflict-resolution/emit path
+/// (`recompute_and_emit_axes`) rather than two drifting copies of it.
+/// `owners` is which single Input currently "wins" each signed axis's
+/// opposite-half suppression (ticket 59 §5) — absent means neither half is
+/// currently outputting.
+#[derive(Default)]
+struct AxisState {
+    contributions: HashMap<Input, u8>,
+    owners: HashMap<AbsoluteAxisCode, Input>,
+}
+
+/// The runtime-conflict half of ticket 59 §5, as a pure/unit-testable
+/// function: `positive`/`negative` are every currently-nonzero contributor
+/// sharing one `ABS_*` code, split by `AxisTarget::polarity` (an unsigned
+/// target's single contribution always lands in `positive` — there is no
+/// opposite half for it to conflict with, so this reduces to the same
+/// "greater Depth wins" rule ticket 59 §5 gives same-half sharing, with no
+/// special-casing needed). Two keys sharing one same-signed target take the
+/// greater of the two Depths (`positive`/`negative` are each reduced to
+/// their own max independently); two keys on opposite halves resolve by
+/// "whichever key is already actively outputting suppresses the other" —
+/// `current_owner` (persisted across calls in `AxisState::owners`) keeps the
+/// already-active half winning once both go nonzero, defaulting to the
+/// positive half only the first time both activate with no prior owner at
+/// all (an arbitrary but harmless tie-break: ticket 59 doesn't specify one
+/// for a genuinely simultaneous first activation, and live tuning against
+/// real hardware is ticket 72's job, not this one's).
+fn resolve_axis_contribution(
+    positive: &[(Input, u8)],
+    negative: &[(Input, u8)],
+    current_owner: Option<Input>,
+) -> (i32, Option<Input>) {
+    let pos = positive
+        .iter()
+        .copied()
+        .filter(|&(_, v)| v > 0)
+        .max_by_key(|&(_, v)| v);
+    let neg = negative
+        .iter()
+        .copied()
+        .filter(|&(_, v)| v > 0)
+        .max_by_key(|&(_, v)| v);
+    match (pos, neg) {
+        (Some(p), Some(n)) => {
+            if current_owner == Some(n.0) {
+                (-i32::from(n.1), Some(n.0))
+            } else {
+                (i32::from(p.1), Some(p.0))
+            }
+        }
+        (Some(p), None) => (i32::from(p.1), Some(p.0)),
+        (None, Some(n)) => (-i32::from(n.1), Some(n.0)),
+        (None, None) => (0, None),
+    }
+}
+
+/// Recomputes and writes every `ABS_*` code `axis_map` (the active Layer's
+/// resolved Axis-assignment map) currently touches, from `axis_state`'s
+/// latest per-Input contributions — the shared tail end of both the
+/// continuous Analog path (`handle_depth_update`) and the Digital-mode edge
+/// path (`handle_axis_edge_event`), per `AxisState`'s own doc comment.
+async fn recompute_and_emit_axes(
+    injector: &Injector,
+    axis_state: &mut AxisState,
+    axis_map: &HashMap<Input, AxisTarget>,
+) -> io::Result<()> {
+    // Positive-polarity contributors, negative-polarity contributors, per
+    // `ABS_*` code — see `resolve_axis_contribution`'s own doc comment for
+    // why unsigned targets always land in the positive side.
+    type Contributors = (Vec<(Input, u8)>, Vec<(Input, u8)>);
+    let mut by_code: HashMap<AbsoluteAxisCode, Contributors> = HashMap::new();
+    for (&input, &target) in axis_map {
+        let value = axis_state.contributions.get(&input).copied().unwrap_or(0);
+        let (positive, negative) = by_code.entry(target.abs_code()).or_default();
+        match target.polarity() {
+            None | Some(AxisPolarity::Positive) => positive.push((input, value)),
+            Some(AxisPolarity::Negative) => negative.push((input, value)),
+        }
+    }
+    // A code this Input used to own but that no longer has *any* contributor
+    // at all in `axis_map` (its last remaining Input was cleared/retargeted
+    // to a different `ABS_*` code) would otherwise never be revisited by the
+    // loop below, which only ever iterates codes `axis_map` currently names
+    // — leaving its last-written value stuck (code-review finding).
+    let stale_codes: Vec<AbsoluteAxisCode> = axis_state
+        .owners
+        .keys()
+        .filter(|code| !by_code.contains_key(code))
+        .copied()
+        .collect();
+    for code in stale_codes {
+        axis_state.owners.remove(&code);
+        injector
+            .set_axis_value(code, 0)
+            .await
+            .map_err(io::Error::other)?;
+    }
+
+    for (code, (positive, negative)) in by_code {
+        let current_owner = axis_state.owners.get(&code).copied();
+        let (value, new_owner) = resolve_axis_contribution(&positive, &negative, current_owner);
+        match new_owner {
+            Some(owner) => {
+                axis_state.owners.insert(code, owner);
+            }
+            None => {
+                axis_state.owners.remove(&code);
+            }
+        }
+        injector
+            .set_axis_value(code, value)
+            .await
+            .map_err(io::Error::other)?;
+    }
+    Ok(())
+}
+
+/// Centers every `ABS_*` code `axis_state` currently has an owner for back
+/// to 0 and clears every piece of `AxisState`, so a Layer or Profile switch
+/// never leaves a stale axis value driving output for an Input that's no
+/// longer even Axis-assigned on the newly-active Layer/Profile — mirrors
+/// `stop_all_toggles`'s identical "force-stop on switch" precedent for
+/// Toggles. A true no-op (no injector writes at all) when no Axis
+/// assignment has ever driven output — the overwhelmingly common case for
+/// most Profiles/Layers — so an ordinary Layer/Profile switch that never
+/// touches Axis assignment stays exactly as write-free as it was before
+/// ticket 71.
+async fn reset_axis_outputs(injector: &Injector, axis_state: &mut AxisState) -> io::Result<()> {
+    if axis_state.owners.is_empty() {
+        axis_state.contributions.clear();
+        return Ok(());
+    }
+    let codes: Vec<AbsoluteAxisCode> = axis_state.owners.keys().copied().collect();
+    axis_state.contributions.clear();
+    axis_state.owners.clear();
+    for code in codes {
+        injector
+            .set_axis_value(code, 0)
+            .await
+            .map_err(io::Error::other)?;
+    }
+    Ok(())
+}
+
 /// Returns an error once the injector channel closes, or the capture
 /// channel closes (meaning the capture task has died) — per issue 07, a
 /// genuine, fatal capture-pipeline error rather than something to swallow
@@ -108,6 +270,14 @@ pub async fn run(
     // press — the kernel autorepeat rate it reflects never changes while
     // the Daemon is running.
     toggle_lap_target: Duration,
+    // Ticket 71: the same live-Depth watch channel the Analog grid task
+    // already publishes into on every incoming report (`capture::analog`,
+    // ticket 26) — reused here as the continuous half of Axis-assignment
+    // resolution (`(Depth, edge_event) -> axis_value`, ticket 59 §7) rather
+    // than growing `PhysicalEvent`'s own contract, since only this task
+    // owns the `Config`/active-Layer state needed to know which Inputs are
+    // currently Axis-assigned at all.
+    mut rx_depth: watch::Receiver<HashMap<Input, u8>>,
 ) -> io::Result<()> {
     // Published once up front so the analog capture source's grid task
     // (ticket 22/23) has a correct snapshot to threshold against from the
@@ -161,6 +331,11 @@ pub async fn run(
     // Chord's Trigger-mode state (ticket 01/40) — reset fresh on every
     // dispatch task start, same as `toggles`/`active_layer`.
     let mut chord_state = ChordState::default();
+    // Owns every Axis-assigned Input's live contribution/opposite-half
+    // ownership (ticket 59/71) — reset fresh on every dispatch task start,
+    // same as `chord_state`.
+    let mut axis_state = AxisState::default();
+    let mut depth_open = true;
     loop {
         tokio::select! {
             event = rx_events.recv() => {
@@ -176,10 +351,20 @@ pub async fn run(
                     &signal_emitter,
                     &actuation_tx,
                     &mut chord_state,
+                    &mut axis_state,
                     toggle_lap_target,
                     event,
                 )
                 .await?;
+            }
+            changed = rx_depth.changed(), if depth_open => {
+                match changed {
+                    Ok(()) => {
+                        let snapshot = rx_depth.borrow_and_update().clone();
+                        handle_depth_update(&injector, &config, active_layer, &mut axis_state, snapshot).await?;
+                    }
+                    Err(_) => depth_open = false,
+                }
             }
             () = chord_window_deadline(&chord_state.window) => {
                 handle_chord_timeout(
@@ -193,6 +378,7 @@ pub async fn run(
                     &actuation_tx,
                     &signal_emitter,
                     &mut chord_state,
+                    &mut axis_state,
                     toggle_lap_target,
                 )
                 .await?;
@@ -211,7 +397,7 @@ pub async fn run(
             }
             cmd = rx_commands.recv(), if commands_open => {
                 match cmd {
-                    Some(cmd) => handle_command(&mut config, &config_path, &mut toggles, &mut stepper_cursors, &active_layer, device_connected, capture_mode, &signal_emitter, &actuation_tx, &capture_control_tx, cmd).await,
+                    Some(cmd) => handle_command(&injector, &mut config, &config_path, &mut toggles, &mut stepper_cursors, &mut axis_state, &active_layer, device_connected, capture_mode, &signal_emitter, &actuation_tx, &capture_control_tx, cmd).await,
                     None => commands_open = false,
                 }
             }
@@ -232,6 +418,7 @@ async fn handle_event(
     signal_emitter: &Option<SignalEmitter<'static>>,
     actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
     chord_state: &mut ChordState,
+    axis_state: &mut AxisState,
     toggle_lap_target: Duration,
     event: PhysicalEvent,
 ) -> io::Result<()> {
@@ -240,7 +427,14 @@ async fn handle_event(
         .expect("load_or_seed validates active_profile names a real profile");
 
     if event.input == Input::ModeKey && profile.mode_key_role == ModeKeyRole::LayerSwitch {
-        handle_layer_switch(active_layer, signal_emitter, event.state).await;
+        handle_layer_switch(
+            injector,
+            active_layer,
+            signal_emitter,
+            axis_state,
+            event.state,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -254,6 +448,25 @@ async fn handle_event(
     {
         toggle.stop().await;
         return Ok(());
+    }
+
+    // An Axis-assigned Input (ticket 59/71) is structurally excluded from
+    // both `bindings_*` and Chord membership on this Layer (enforced
+    // atomically by `SetAxisAssignment`/rejected up front by `SetBinding`/
+    // `SetChordBinding`), so it must never reach the ordinary Binding lookup
+    // or passthrough below. An Analog-sourced event (`event.depth` is
+    // `Some`) is swallowed here — the continuous `rx_depth` watch-channel
+    // path (`handle_depth_update`) already drives this Input's output on
+    // every report, not just on a Down/Up/Repeat transition; a Digital-
+    // sourced one (`None`) runs the press/release step-increment fallback
+    // (ticket 59 §6).
+    let axis_map = profile.axis_layer(*active_layer);
+    if axis_map.contains_key(&event.input) {
+        return if event.depth.is_some() {
+            Ok(())
+        } else {
+            handle_axis_edge_event(injector, axis_state, axis_map, event.input, event.state).await
+        };
     }
 
     // The Chord-detection machinery (ticket 01/40) takes priority over
@@ -279,6 +492,7 @@ async fn handle_event(
             signal_emitter,
             actuation_tx,
             chord_state,
+            axis_state,
             toggle_lap_target,
             event,
         )
@@ -300,10 +514,17 @@ async fn handle_event(
                 // `MacroStep` form to compile/spawn, so it's handled here
                 // instead of reaching `fire`/`executor::compile` at all.
                 if event.state == EventState::Down {
-                    let succeeded =
-                        switch_profile(config, config_path, toggles, actuation_tx, target.clone())
-                            .await
-                            .is_ok();
+                    let succeeded = switch_profile(
+                        injector,
+                        config,
+                        config_path,
+                        toggles,
+                        actuation_tx,
+                        axis_state,
+                        target.clone(),
+                    )
+                    .await
+                    .is_ok();
                     if succeeded && let Some(emitter) = signal_emitter {
                         let _ = Daemon::active_profile_changed(emitter, &target).await;
                     }
@@ -336,23 +557,31 @@ async fn handle_event(
 /// held modifier key carries no new information here). Emits
 /// `ActiveLayerChanged` only on an actual transition — a `signal_emitter` of
 /// `None` (unit tests with no live D-Bus connection) simply skips the push.
+/// Also resets every Axis output (ticket 71) on an actual transition — the
+/// outgoing Layer's Axis-assignment map generally differs from the incoming
+/// one, so any live output must not be left driving a target the newly-
+/// active Layer no longer even assigns.
 async fn handle_layer_switch(
+    injector: &Injector,
     active_layer: &mut Layer,
     signal_emitter: &Option<SignalEmitter<'static>>,
+    axis_state: &mut AxisState,
     state: EventState,
-) {
+) -> io::Result<()> {
     let new_layer = match state {
         EventState::Down => Layer::Held,
         EventState::Up => Layer::Base,
-        EventState::Repeat => return,
+        EventState::Repeat => return Ok(()),
     };
     if new_layer == *active_layer {
-        return;
+        return Ok(());
     }
     *active_layer = new_layer;
+    reset_axis_outputs(injector, axis_state).await?;
     if let Some(emitter) = signal_emitter {
         let _ = Daemon::active_layer_changed(emitter, new_layer.as_str()).await;
     }
+    Ok(())
 }
 
 /// Updates the dispatch task's view of device connectivity (ticket 20) and
@@ -391,6 +620,72 @@ async fn handle_capture_mode_change(
     if let Some(emitter) = signal_emitter {
         let _ = Daemon::capture_mode_changed(emitter, mode.as_str()).await;
     }
+}
+
+/// The Digital Capture mode fallback (ticket 59 §6/71): press/release
+/// step-increment for an Axis-assigned Input carrying no Depth at all —
+/// `handle_event` only ever routes a genuinely Digital-sourced event here
+/// (`event.depth` is `None`); an Analog-sourced one is fully handled by the
+/// continuous `handle_depth_update` path instead. Reuses the kernel's own
+/// autorepeat cadence (the same `Repeat` stream Hold-to-repeat rides) to
+/// ramp up by `AXIS_DIGITAL_STEP` on every Down/Repeat, saturating at 255;
+/// `Up` resets to 0 — the closest digital emulation of "Depth rises while
+/// held, drops to 0 on release" ticket 59 §6 asks for.
+async fn handle_axis_edge_event(
+    injector: &Injector,
+    axis_state: &mut AxisState,
+    axis_map: &HashMap<Input, AxisTarget>,
+    input: Input,
+    state: EventState,
+) -> io::Result<()> {
+    let current = axis_state.contributions.get(&input).copied().unwrap_or(0);
+    let next = match state {
+        EventState::Down | EventState::Repeat => current.saturating_add(AXIS_DIGITAL_STEP),
+        EventState::Up => 0,
+    };
+    axis_state.contributions.insert(input, next);
+    recompute_and_emit_axes(injector, axis_state, axis_map).await
+}
+
+/// The continuous Analog half of ticket 59 §7's `(Depth, edge_event) ->
+/// axis_value` seam: reacts to every change of the live-Depth watch channel
+/// (`capture::analog`'s grid task, ticket 26) by resolving
+/// `config::resolve_axis_value` for every Input the active Layer currently
+/// Axis-assigns, then running the shared conflict-resolution/emit path.
+/// Every Grid key's raw depth is published on every incoming hidraw report
+/// regardless of Binding/Axis status (`capture::analog::relay_grid_blocking`),
+/// so this only ever *reads* `depths` for the subset that's actually
+/// Axis-assigned right now — an empty Axis map (the common case) short-
+/// circuits immediately, doing no work on every ordinary depth tick.
+async fn handle_depth_update(
+    injector: &Injector,
+    config: &Config,
+    active_layer: Layer,
+    axis_state: &mut AxisState,
+    depths: HashMap<Input, u8>,
+) -> io::Result<()> {
+    let profile = config
+        .active_profile()
+        .expect("load_or_seed validates active_profile names a real profile");
+    let axis_map = profile.axis_layer(active_layer);
+    if axis_map.is_empty() {
+        return Ok(());
+    }
+    // Ticket 71 code-review finding: reads each relevant Input's own
+    // Actuation/Release point directly, rather than building
+    // `resolved_actuation_points()`'s full 20-entry `HashMap` just to read
+    // the 1-4 entries an Axis-assigned Profile actually needs — this runs on
+    // every live-Depth tick (sub-millisecond while a key is moving, per
+    // ticket 13), so the redundant O(20) rebuild was real hot-path waste.
+    for &input in axis_map.keys() {
+        if let Some(&depth) = depths.get(&input) {
+            let point = profile.resolved_actuation_point(input);
+            axis_state
+                .contributions
+                .insert(input, config::resolve_axis_value(depth, point));
+        }
+    }
+    recompute_and_emit_axes(injector, axis_state, axis_map).await
 }
 
 /// Every `ChordKey` in `chords` that contains `input` among its members
@@ -508,6 +803,7 @@ async fn fire_individual_retroactively(
     in_flight: &mut HashMap<Input, FiringHandle>,
     stepper_cursors: &mut HashMap<StepperId, usize>,
     actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
+    axis_state: &mut AxisState,
     signal_emitter: &Option<SignalEmitter<'static>>,
     layer: Layer,
     input: Input,
@@ -520,9 +816,17 @@ async fn fire_individual_retroactively(
     match binding {
         Some(binding) => {
             if let Action::ProfileSwitch { target } = binding.action {
-                if switch_profile(config, config_path, toggles, actuation_tx, target.clone())
-                    .await
-                    .is_ok()
+                if switch_profile(
+                    injector,
+                    config,
+                    config_path,
+                    toggles,
+                    actuation_tx,
+                    axis_state,
+                    target.clone(),
+                )
+                .await
+                .is_ok()
                     && let Some(emitter) = signal_emitter
                 {
                     let _ = Daemon::active_profile_changed(emitter, &target).await;
@@ -570,6 +874,7 @@ async fn handle_chord_event(
     signal_emitter: &Option<SignalEmitter<'static>>,
     actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
     chord_state: &mut ChordState,
+    axis_state: &mut AxisState,
     toggle_lap_target: Duration,
     event: PhysicalEvent,
 ) -> io::Result<()> {
@@ -747,6 +1052,7 @@ async fn handle_chord_event(
                     in_flight,
                     stepper_cursors,
                     actuation_tx,
+                    axis_state,
                     signal_emitter,
                     active_layer,
                     event.input,
@@ -790,6 +1096,7 @@ async fn handle_chord_timeout(
     actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
     signal_emitter: &Option<SignalEmitter<'static>>,
     chord_state: &mut ChordState,
+    axis_state: &mut AxisState,
     toggle_lap_target: Duration,
 ) -> io::Result<()> {
     let Some(window) = chord_state.window.take() else {
@@ -805,6 +1112,7 @@ async fn handle_chord_timeout(
             in_flight,
             stepper_cursors,
             actuation_tx,
+            axis_state,
             signal_emitter,
             active_layer,
             input,
@@ -937,16 +1245,20 @@ async fn fire(
     }
 }
 
-/// Shared by `SetActuationPoint`/`ClearActuationPoint` (ticket 17 §3): an
-/// actuation point is a property of a physical Grid key, so setting or
-/// clearing one on any other `Input` variant is rejected.
-fn reject_non_grid_input(input: Input) -> Result<(), CommandError> {
+/// Shared by `SetActuationPoint`/`ClearActuationPoint` (ticket 17 §3) and
+/// `SetAxisAssignment` (ticket 59 §1): both an actuation point and an Axis
+/// assignment are properties of a physical Grid key's Depth, so setting or
+/// clearing either on any other `Input` variant is rejected. `what` names
+/// the caller's own concept (e.g. `"actuation points"`, `"Axis assignments"`)
+/// so the error text stays specific to what was actually being set, rather
+/// than every caller sharing one hardcoded noun.
+fn reject_non_grid_input(input: Input, what: &str) -> Result<(), CommandError> {
     if matches!(input, Input::Grid(_, _)) {
         Ok(())
     } else {
-        Err(CommandError::InvalidRequest(
-            "actuation points can only be set on Grid Inputs".to_string(),
-        ))
+        Err(CommandError::InvalidRequest(format!(
+            "{what} can only be set on Grid Inputs"
+        )))
     }
 }
 
@@ -1031,6 +1343,15 @@ fn chord_conflict(chords: &HashMap<ChordKey, Binding>, key: &ChordKey) -> Option
         .cloned()
 }
 
+/// Whether `input` already carries an Axis assignment on `layer` (ticket
+/// 59 §2's mutual exclusion) — `SetBinding`/`SetChordBinding` both reject a
+/// grid key already Axis-assigned there with a specific error rather than
+/// silently overwriting it, the mirror image of `SetAxisAssignment`'s own
+/// atomic steal-from-Binding/Chord-membership behavior.
+fn axis_conflict(profile: &Profile, layer: Layer, input: Input) -> bool {
+    profile.axis_layer(layer).contains_key(&input)
+}
+
 /// The `Default` Profile always exists — `load_or_seed` (issue 11) refuses
 /// to start a `Config` whose `active_profile` doesn't name a real Profile.
 fn active_profile_mut(config: &mut Config) -> &mut Profile {
@@ -1069,10 +1390,12 @@ fn publish_actuation_snapshot(
 /// special-cased — it still persists, force-stops Toggles, and republishes,
 /// an intentional no-op-except-for-Toggles per ticket 05's design.
 async fn switch_profile(
+    injector: &Injector,
     config: &mut Config,
     config_path: &Path,
     toggles: &mut HashMap<Input, ActiveToggle>,
     actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
+    axis_state: &mut AxisState,
     name: String,
 ) -> Result<(), CommandError> {
     if !config.profiles.contains_key(&name) {
@@ -1085,6 +1408,11 @@ async fn switch_profile(
     } else {
         stop_all_toggles(toggles).await;
         publish_actuation_snapshot(config, actuation_tx);
+        // Ticket 71: the new Profile's Axis-assignment map generally
+        // differs from the old one — same reset-on-switch reasoning as
+        // `handle_layer_switch`'s own call, just for a Profile switch
+        // instead of a Layer one.
+        let _ = reset_axis_outputs(injector, axis_state).await;
     }
     result
 }
@@ -1246,10 +1574,12 @@ fn take_stepper_direction_elsewhere_from_chords(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_command(
+    injector: &Injector,
     config: &mut Config,
     config_path: &Path,
     toggles: &mut HashMap<Input, ActiveToggle>,
     stepper_cursors: &mut HashMap<StepperId, usize>,
+    axis_state: &mut AxisState,
     active_layer: &Layer,
     device_connected: bool,
     capture_mode: CaptureMode,
@@ -1289,6 +1619,15 @@ async fn handle_command(
         } => {
             if let Err(err) = validate_binding(&binding, config) {
                 let _ = reply.send(Err(err));
+                return;
+            }
+            let profile = config
+                .active_profile()
+                .expect("load_or_seed validates active_profile names a real profile");
+            if axis_conflict(profile, layer, input) {
+                let _ = reply.send(Err(CommandError::InvalidRequest(format!(
+                    "{input} already has an Axis assignment on this Layer — clear it first"
+                ))));
                 return;
             }
             // Ticket 03's Answer: assigning a Stepper list to a new Input
@@ -1480,8 +1819,16 @@ async fn handle_command(
             let _ = reply.send(result);
         }
         Command::SwitchProfile { name, reply } => {
-            let result =
-                switch_profile(config, config_path, toggles, actuation_tx, name.clone()).await;
+            let result = switch_profile(
+                injector,
+                config,
+                config_path,
+                toggles,
+                actuation_tx,
+                axis_state,
+                name.clone(),
+            )
+            .await;
             let succeeded = result.is_ok();
             // The reply is sent *before* the signal, deliberately: the
             // caller's own SwitchProfile call is typically a blocking D-Bus
@@ -1509,7 +1856,7 @@ async fn handle_command(
             release,
             reply,
         } => {
-            if let Err(err) = reject_non_grid_input(input) {
+            if let Err(err) = reject_non_grid_input(input, "actuation points") {
                 let _ = reply.send(Err(err));
                 return;
             }
@@ -1538,7 +1885,7 @@ async fn handle_command(
             let _ = reply.send(result);
         }
         Command::ClearActuationPoint { input, reply } => {
-            if let Err(err) = reject_non_grid_input(input) {
+            if let Err(err) = reject_non_grid_input(input, "actuation points") {
                 let _ = reply.send(Err(err));
                 return;
             }
@@ -1815,6 +2162,15 @@ async fn handle_command(
                 let _ = reply.send(Err(err));
                 return;
             }
+            let profile = config
+                .active_profile()
+                .expect("load_or_seed validates active_profile names a real profile");
+            if let Some(&axis_input) = inputs.iter().find(|&&i| axis_conflict(profile, layer, i)) {
+                let _ = reply.send(Err(CommandError::InvalidRequest(format!(
+                    "{axis_input} already has an Axis assignment on this Layer — clear it first"
+                ))));
+                return;
+            }
             let key = ChordKey::new(inputs);
             if let Some(conflicting) =
                 chord_conflict(active_profile_mut(config).chords(layer), &key)
@@ -1894,6 +2250,89 @@ async fn handle_command(
                 active_profile_mut(config)
                     .chords_mut(layer)
                     .insert(key, previous);
+            }
+            let _ = reply.send(result);
+        }
+        Command::SetAxisAssignment {
+            input,
+            layer,
+            target,
+            reply,
+        } => {
+            if let Err(err) = reject_non_grid_input(input, "Axis assignments") {
+                let _ = reply.send(Err(err));
+                return;
+            }
+            // Ticket 59 §2's mutual exclusion: atomically clears any
+            // existing Binding *and* any Chord membership for (layer,
+            // input) alongside the insert, mirroring `SetBinding`'s own
+            // atomic-persist precedent — unlike `SetBinding`/
+            // `SetChordBinding` (see `axis_conflict` below), which reject
+            // rather than silently steal from an existing Axis assignment.
+            let previous_binding = active_profile_mut(config).layer_mut(layer).remove(&input);
+            let removed_chords: Vec<(ChordKey, Binding)> = {
+                let chords = active_profile_mut(config).chords_mut(layer);
+                let keys: Vec<ChordKey> = chords
+                    .keys()
+                    .filter(|key| key.members().contains(&input))
+                    .cloned()
+                    .collect();
+                keys.into_iter()
+                    .filter_map(|key| chords.remove(&key).map(|binding| (key, binding)))
+                    .collect()
+            };
+            let previous_axis = active_profile_mut(config)
+                .axis_layer_mut(layer)
+                .insert(input, target);
+            let result = persist(config, config_path).await;
+            if result.is_err() {
+                let axis_map = active_profile_mut(config).axis_layer_mut(layer);
+                match previous_axis {
+                    Some(prev) => {
+                        axis_map.insert(input, prev);
+                    }
+                    None => {
+                        axis_map.remove(&input);
+                    }
+                }
+                let chords = active_profile_mut(config).chords_mut(layer);
+                for (key, binding) in removed_chords {
+                    chords.insert(key, binding);
+                }
+                if let Some(binding) = previous_binding {
+                    active_profile_mut(config)
+                        .layer_mut(layer)
+                        .insert(input, binding);
+                }
+            } else if layer == *active_layer {
+                let axis_map = active_profile_mut(config).axis_layer(layer).clone();
+                let _ = recompute_and_emit_axes(injector, axis_state, &axis_map).await;
+            }
+            let _ = reply.send(result);
+        }
+        Command::ClearAxisAssignment {
+            input,
+            layer,
+            reply,
+        } => {
+            let Some(previous) = active_profile_mut(config)
+                .axis_layer_mut(layer)
+                .remove(&input)
+            else {
+                let _ = reply.send(Err(CommandError::NotFound));
+                return;
+            };
+            let result = persist(config, config_path).await;
+            if result.is_err() {
+                active_profile_mut(config)
+                    .axis_layer_mut(layer)
+                    .insert(input, previous);
+            } else {
+                axis_state.contributions.remove(&input);
+                if layer == *active_layer {
+                    let axis_map = active_profile_mut(config).axis_layer(layer).clone();
+                    let _ = recompute_and_emit_axes(injector, axis_state, &axis_map).await;
+                }
             }
             let _ = reply.send(result);
         }
@@ -2033,6 +2472,15 @@ mod tests {
         mpsc::channel(8).0
     }
 
+    /// A fresh live-Depth `Receiver` for tests that don't exercise the
+    /// continuous Analog axis-resolution path (ticket 71) — the paired
+    /// `Sender` is dropped immediately, so `dispatch::run`'s
+    /// `rx_depth.changed()` arm just closes on its first poll, mirroring
+    /// `capture_mode_channel`.
+    fn depth_channel() -> watch::Receiver<HashMap<Input, u8>> {
+        watch::channel(HashMap::new()).1
+    }
+
     async fn run_scripted(
         scripted: Vec<PhysicalEvent>,
         bindings: HashMap<Input, Binding>,
@@ -2055,6 +2503,7 @@ mod tests {
             capture_mode_channel(),
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
+            depth_channel(),
         ));
 
         FakeCaptureSource::new(scripted)
@@ -2225,6 +2674,7 @@ mod tests {
             capture_mode_channel(),
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
+            depth_channel(),
         ));
 
         // Real evdev autorepeat events land tens of milliseconds apart —
@@ -2311,6 +2761,7 @@ mod tests {
             capture_mode_channel(),
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
+            depth_channel(),
         ));
 
         tx.send(PhysicalEvent {
@@ -2390,6 +2841,7 @@ mod tests {
             capture_mode_channel(),
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
+            depth_channel(),
         ));
 
         // Down starts a firing that immediately sends KeyDown, then sleeps
@@ -2552,7 +3004,9 @@ mod tests {
         event_tx: mpsc::Sender<PhysicalEvent>,
         conn_tx: mpsc::Sender<bool>,
         actuation_rx: watch::Receiver<HashMap<Input, ActuationPoint>>,
+        depth_tx: watch::Sender<HashMap<Input, u8>>,
         sink: RecordingSink,
+        gamepad_sink: RecordingSink,
         dispatch_handle: tokio::task::JoinHandle<io::Result<()>>,
         inj_handle: tokio::task::JoinHandle<io::Result<()>>,
     }
@@ -2564,11 +3018,13 @@ mod tests {
             config::write(&config_path, &config).unwrap();
 
             let sink = RecordingSink::new();
-            let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
+            let gamepad_sink = RecordingSink::new();
+            let (inj, inj_handle) = injector::spawn(sink.clone(), gamepad_sink.clone());
             let (event_tx, event_rx) = mpsc::channel(8);
             let (conn_tx, conn_rx) = mpsc::channel(8);
             let (cmd_tx, cmd_rx) = mpsc::channel(8);
             let (actuation_tx, actuation_rx) = watch::channel(HashMap::new());
+            let (depth_tx, depth_rx) = watch::channel(HashMap::new());
             let dispatch_handle = tokio::spawn(run(
                 event_rx,
                 conn_rx,
@@ -2581,6 +3037,7 @@ mod tests {
                 capture_mode_channel(),
                 capture_control_channel(),
                 executor::MIN_TOGGLE_LAP,
+                depth_rx,
             ));
 
             CommandHarness {
@@ -2589,8 +3046,10 @@ mod tests {
                 cmd_tx,
                 event_tx,
                 actuation_rx,
+                depth_tx,
                 conn_tx,
                 sink,
+                gamepad_sink,
                 dispatch_handle,
                 inj_handle,
             }
@@ -2964,6 +3423,74 @@ mod tests {
                 })
                 .await
                 .unwrap();
+        }
+
+        /// An Analog-sourced transition (`depth: Some(_)`) — used to exercise
+        /// `handle_event`'s "swallow rather than passthrough" branch for an
+        /// Axis-assigned Input (ticket 71), distinct from `press`/`release`/
+        /// `repeat`'s Digital-sourced (`depth: None`) shape.
+        async fn press_analog(&self, input: Input, depth: u8) {
+            self.event_tx
+                .send(PhysicalEvent {
+                    input,
+                    state: EventState::Down,
+                    depth: Some(depth),
+                })
+                .await
+                .unwrap();
+        }
+
+        /// Publishes a fresh live-Depth snapshot (ticket 26/71) — the same
+        /// seam `capture::analog`'s grid task drives via `depth_tx.
+        /// send_replace(...)` on every incoming report; `dispatch::run`'s
+        /// continuous axis-resolution path (`handle_depth_update`) reacts to
+        /// this exactly as it would the real channel.
+        fn push_depth(&self, values: impl IntoIterator<Item = (Input, u8)>) {
+            self.depth_tx.send_replace(values.into_iter().collect());
+        }
+
+        async fn set_axis_assignment(
+            &self,
+            input: Input,
+            layer: Layer,
+            target: AxisTarget,
+        ) -> Result<(), CommandError> {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::SetAxisAssignment {
+                    input,
+                    layer,
+                    target,
+                    reply,
+                })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
+        async fn clear_axis_assignment(
+            &self,
+            input: Input,
+            layer: Layer,
+        ) -> Result<(), CommandError> {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::ClearAxisAssignment {
+                    input,
+                    layer,
+                    reply,
+                })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
+        /// The gamepad device's own recorded batches (ticket 71) — every
+        /// `Action::ControllerButton`/Axis write lands here, never in
+        /// `self.sink` (the keyboard/mouse device), mirroring `injector.rs`'s
+        /// own two-sink routing split.
+        fn gamepad_batches(&self) -> Vec<Vec<evdev::InputEvent>> {
+            self.gamepad_sink.batches()
         }
 
         /// Stands in for the `CaptureSource`'s poll loop reporting a
@@ -5889,5 +6416,428 @@ mod tests {
         harness.shut_down().await;
 
         assert!(config.force_digital);
+    }
+
+    // --- Axis assignment (ticket 59/71) ---
+
+    fn abs_axis_and_value(event: evdev::InputEvent) -> (evdev::AbsoluteAxisCode, i32) {
+        match event.destructure() {
+            evdev::EventSummary::AbsoluteAxis(_, axis, value) => (axis, value),
+            other => panic!("expected an absolute-axis event, got {other:?}"),
+        }
+    }
+
+    /// Every `AbsoluteAxisCode, value` pair across every gamepad batch, in
+    /// order — the shape most axis tests below want to assert against,
+    /// rather than each batch's own boundaries (every axis write is its own
+    /// single-event batch, mirroring `set_key_state`'s one-`SYN_REPORT`-per-
+    /// transition shape).
+    fn flat_axis_writes(
+        batches: Vec<Vec<evdev::InputEvent>>,
+    ) -> Vec<(evdev::AbsoluteAxisCode, i32)> {
+        batches
+            .into_iter()
+            .flatten()
+            .map(abs_axis_and_value)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn set_axis_assignment_command_persists_and_is_reflected_in_get_config() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        harness
+            .set_axis_assignment(Input::Grid(1, 1), Layer::Base, AxisTarget::LeftTrigger)
+            .await
+            .expect("SetAxisAssignment must succeed");
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+
+        assert_eq!(
+            config.profiles[DEFAULT_PROFILE_NAME].axis_base[&Input::Grid(1, 1)],
+            AxisTarget::LeftTrigger
+        );
+    }
+
+    #[tokio::test]
+    async fn set_axis_assignment_rejects_a_non_grid_input() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .set_axis_assignment(Input::ModeKey, Layer::Base, AxisTarget::LeftTrigger)
+            .await
+            .expect_err("a non-Grid Input must be rejected");
+        harness.shut_down().await;
+
+        assert!(matches!(err, CommandError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn set_axis_assignment_atomically_clears_an_existing_binding_on_the_same_input_and_layer()
+    {
+        let mut bindings = HashMap::new();
+        bindings.insert(Input::Grid(1, 1), keypress_binding(evdev::KeyCode::KEY_F1));
+        let harness = CommandHarness::spawn(config_with_bindings(bindings));
+
+        harness
+            .set_axis_assignment(Input::Grid(1, 1), Layer::Base, AxisTarget::LeftTrigger)
+            .await
+            .expect("SetAxisAssignment must succeed");
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+
+        assert!(
+            !config.profiles[DEFAULT_PROFILE_NAME]
+                .base
+                .contains_key(&Input::Grid(1, 1))
+        );
+        assert_eq!(
+            config.profiles[DEFAULT_PROFILE_NAME].axis_base[&Input::Grid(1, 1)],
+            AxisTarget::LeftTrigger
+        );
+    }
+
+    #[tokio::test]
+    async fn set_axis_assignment_atomically_clears_chord_membership_on_the_same_input_and_layer() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness
+            .set_chord_binding(
+                [Input::Grid(1, 1), Input::Grid(1, 2)],
+                Layer::Base,
+                keypress_binding(evdev::KeyCode::KEY_C),
+            )
+            .await
+            .expect("SetChordBinding must succeed");
+
+        harness
+            .set_axis_assignment(Input::Grid(1, 1), Layer::Base, AxisTarget::LeftTrigger)
+            .await
+            .expect("SetAxisAssignment must succeed");
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+
+        assert!(
+            config.profiles[DEFAULT_PROFILE_NAME].chords_base.is_empty(),
+            "the whole Chord must be removed, not just input's own membership"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_binding_rejects_an_input_already_axis_assigned_on_the_same_layer() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness
+            .set_axis_assignment(Input::Grid(1, 1), Layer::Base, AxisTarget::LeftTrigger)
+            .await
+            .expect("SetAxisAssignment must succeed");
+
+        let err = harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                keypress_binding(evdev::KeyCode::KEY_F1),
+            )
+            .await
+            .expect_err("SetBinding on an Axis-assigned Input must be rejected");
+        harness.shut_down().await;
+
+        assert!(matches!(err, CommandError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn set_binding_on_a_different_layer_than_an_axis_assignment_is_allowed() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness
+            .set_axis_assignment(Input::Grid(1, 1), Layer::Base, AxisTarget::LeftTrigger)
+            .await
+            .expect("SetAxisAssignment must succeed");
+
+        harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Held,
+                keypress_binding(evdev::KeyCode::KEY_F1),
+            )
+            .await
+            .expect("a Binding on the other Layer must be allowed");
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn set_chord_binding_rejects_a_member_already_axis_assigned_on_the_same_layer() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness
+            .set_axis_assignment(Input::Grid(1, 1), Layer::Base, AxisTarget::LeftTrigger)
+            .await
+            .expect("SetAxisAssignment must succeed");
+
+        let err = harness
+            .set_chord_binding(
+                [Input::Grid(1, 1), Input::Grid(1, 2)],
+                Layer::Base,
+                keypress_binding(evdev::KeyCode::KEY_C),
+            )
+            .await
+            .expect_err("a Chord with an Axis-assigned member must be rejected");
+        harness.shut_down().await;
+
+        assert!(matches!(err, CommandError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn clear_axis_assignment_removes_it_and_persists() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness
+            .set_axis_assignment(Input::Grid(1, 1), Layer::Base, AxisTarget::LeftTrigger)
+            .await
+            .expect("SetAxisAssignment must succeed");
+
+        harness
+            .clear_axis_assignment(Input::Grid(1, 1), Layer::Base)
+            .await
+            .expect("ClearAxisAssignment must succeed");
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+
+        assert!(config.profiles[DEFAULT_PROFILE_NAME].axis_base.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clear_axis_assignment_zeroes_a_still_live_output_that_dropped_out_of_the_map() {
+        // Code-review finding: `recompute_and_emit_axes` used to only ever
+        // walk the codes `axis_map` currently names — a code that drops out
+        // entirely (its last remaining Input cleared) was never revisited,
+        // so its last-written nonzero value stuck forever.
+        let mut config = config_with_bindings(HashMap::new());
+        config
+            .active_profile_mut()
+            .unwrap()
+            .axis_base
+            .insert(Input::Grid(1, 1), AxisTarget::LeftTrigger);
+        let harness = CommandHarness::spawn(config);
+
+        harness.push_depth([(Input::Grid(1, 1), 200)]);
+        tokio::task::yield_now().await;
+
+        harness
+            .clear_axis_assignment(Input::Grid(1, 1), Layer::Base)
+            .await
+            .expect("ClearAxisAssignment must succeed");
+
+        let writes = flat_axis_writes(harness.gamepad_batches());
+        harness.shut_down().await;
+
+        assert_eq!(
+            writes,
+            vec![
+                (evdev::AbsoluteAxisCode::ABS_Z, 200),
+                (evdev::AbsoluteAxisCode::ABS_Z, 0),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn retargeting_an_axis_assignment_zeroes_the_old_abs_code() {
+        let mut config = config_with_bindings(HashMap::new());
+        config
+            .active_profile_mut()
+            .unwrap()
+            .axis_base
+            .insert(Input::Grid(1, 1), AxisTarget::LeftTrigger);
+        let harness = CommandHarness::spawn(config);
+
+        harness.push_depth([(Input::Grid(1, 1), 200)]);
+        tokio::task::yield_now().await;
+
+        harness
+            .set_axis_assignment(Input::Grid(1, 1), Layer::Base, AxisTarget::RightTrigger)
+            .await
+            .expect("SetAxisAssignment must succeed");
+
+        let writes = flat_axis_writes(harness.gamepad_batches());
+        harness.shut_down().await;
+
+        // The old code (ABS_Z) is zeroed by the stale-code sweep; the
+        // now-retargeted Input's carried-over Depth immediately drives the
+        // new code (ABS_RZ) in the same recompute pass.
+        assert_eq!(
+            writes,
+            vec![
+                (evdev::AbsoluteAxisCode::ABS_Z, 200),
+                (evdev::AbsoluteAxisCode::ABS_Z, 0),
+                (evdev::AbsoluteAxisCode::ABS_RZ, 200),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_axis_assignment_on_an_unassigned_input_returns_not_found() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .clear_axis_assignment(Input::Grid(1, 1), Layer::Base)
+            .await
+            .expect_err("clearing an unassigned Input must fail");
+        harness.shut_down().await;
+
+        assert!(matches!(err, CommandError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn an_analog_sourced_event_on_an_axis_assigned_key_never_passes_through() {
+        let mut config = config_with_bindings(HashMap::new());
+        config
+            .active_profile_mut()
+            .unwrap()
+            .axis_base
+            .insert(Input::Grid(1, 1), AxisTarget::LeftTrigger);
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 200).await;
+        tokio::task::yield_now().await;
+
+        let batches = harness.shut_down().await;
+        assert!(
+            batches.is_empty(),
+            "an Axis-assigned key's own discrete transition must never fall through to passthrough"
+        );
+    }
+
+    #[tokio::test]
+    async fn digital_mode_step_fallback_ramps_up_on_repeat_and_resets_on_release() {
+        let mut config = config_with_bindings(HashMap::new());
+        config
+            .active_profile_mut()
+            .unwrap()
+            .axis_base
+            .insert(Input::Grid(1, 1), AxisTarget::LeftTrigger);
+        let harness = CommandHarness::spawn(config);
+
+        harness.press(Input::Grid(1, 1)).await;
+        harness.repeat(Input::Grid(1, 1)).await;
+        harness.release(Input::Grid(1, 1)).await;
+        tokio::task::yield_now().await;
+
+        let writes = flat_axis_writes(harness.gamepad_batches());
+        harness.shut_down().await;
+
+        assert_eq!(
+            writes,
+            vec![
+                (evdev::AbsoluteAxisCode::ABS_Z, i32::from(AXIS_DIGITAL_STEP)),
+                (
+                    evdev::AbsoluteAxisCode::ABS_Z,
+                    i32::from(AXIS_DIGITAL_STEP) * 2
+                ),
+                (evdev::AbsoluteAxisCode::ABS_Z, 0),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn continuous_depth_updates_drive_the_assigned_axis_live() {
+        let mut config = config_with_bindings(HashMap::new());
+        config
+            .active_profile_mut()
+            .unwrap()
+            .axis_base
+            .insert(Input::Grid(1, 1), AxisTarget::LeftTrigger);
+        let harness = CommandHarness::spawn(config);
+
+        harness.push_depth([(Input::Grid(1, 1), 200)]);
+        tokio::task::yield_now().await;
+
+        let writes = flat_axis_writes(harness.gamepad_batches());
+        harness.shut_down().await;
+
+        assert_eq!(writes, vec![(evdev::AbsoluteAxisCode::ABS_Z, 200)]);
+    }
+
+    #[tokio::test]
+    async fn two_keys_sharing_one_same_signed_target_take_the_greater_depth() {
+        let mut config = config_with_bindings(HashMap::new());
+        {
+            let profile = config.active_profile_mut().unwrap();
+            profile
+                .axis_base
+                .insert(Input::Grid(1, 1), AxisTarget::LeftTrigger);
+            profile
+                .axis_base
+                .insert(Input::Grid(1, 2), AxisTarget::LeftTrigger);
+        }
+        let harness = CommandHarness::spawn(config);
+
+        harness.push_depth([(Input::Grid(1, 1), 150), (Input::Grid(1, 2), 200)]);
+        tokio::task::yield_now().await;
+
+        let writes = flat_axis_writes(harness.gamepad_batches());
+        harness.shut_down().await;
+
+        assert_eq!(writes, vec![(evdev::AbsoluteAxisCode::ABS_Z, 200)]);
+    }
+
+    #[tokio::test]
+    async fn opposite_signed_halves_let_the_already_active_key_keep_driving() {
+        let mut config = config_with_bindings(HashMap::new());
+        {
+            let profile = config.active_profile_mut().unwrap();
+            profile
+                .axis_base
+                .insert(Input::Grid(1, 1), AxisTarget::LeftStickXPos);
+            profile
+                .axis_base
+                .insert(Input::Grid(1, 2), AxisTarget::LeftStickXNeg);
+        }
+        let harness = CommandHarness::spawn(config);
+
+        // Positive half activates alone first.
+        harness.push_depth([(Input::Grid(1, 1), 200)]);
+        tokio::task::yield_now().await;
+        // Negative half now also activates — the already-active positive
+        // half must keep winning (ticket 59 §5).
+        harness.push_depth([(Input::Grid(1, 1), 200), (Input::Grid(1, 2), 220)]);
+        tokio::task::yield_now().await;
+
+        let writes = flat_axis_writes(harness.gamepad_batches());
+        harness.shut_down().await;
+
+        assert_eq!(
+            writes,
+            vec![
+                (evdev::AbsoluteAxisCode::ABS_X, 200),
+                (evdev::AbsoluteAxisCode::ABS_X, 200),
+            ],
+            "the positive half must keep suppressing the newcomer negative half"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_layer_switch_centers_any_live_axis_output() {
+        let mut config = config_with_bindings(HashMap::new());
+        config
+            .active_profile_mut()
+            .unwrap()
+            .axis_base
+            .insert(Input::Grid(1, 1), AxisTarget::LeftTrigger);
+        let harness = CommandHarness::spawn(config);
+
+        harness.push_depth([(Input::Grid(1, 1), 200)]);
+        tokio::task::yield_now().await;
+        harness.press(Input::ModeKey).await;
+        tokio::task::yield_now().await;
+
+        let writes = flat_axis_writes(harness.gamepad_batches());
+        harness.shut_down().await;
+
+        assert_eq!(
+            writes,
+            vec![
+                (evdev::AbsoluteAxisCode::ABS_Z, 200),
+                (evdev::AbsoluteAxisCode::ABS_Z, 0),
+            ]
+        );
     }
 }

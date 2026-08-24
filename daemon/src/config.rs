@@ -14,7 +14,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use evdev::KeyCode;
+use evdev::{AbsoluteAxisCode, KeyCode};
 use serde::{Deserialize, Serialize};
 
 use crate::input::Input;
@@ -158,6 +158,19 @@ pub struct Profile {
     /// `chords_base`'s exact mirror for the Held Layer.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub chords_held: HashMap<ChordKey, Binding>,
+    /// Axis assignments active while this Profile's Base Layer is active
+    /// (ticket 59/71 — CONTEXT.md: Axis assignment): a parallel per-Layer
+    /// map alongside `base`, not a new `Action` variant — Trigger-mode has
+    /// no coherent meaning for a continuous value. An Input present here is
+    /// structurally excluded from `base`'s Binding map *and* from Chord
+    /// membership on this Layer, enforced by `SetAxisAssignment`/
+    /// `SetBinding`/`SetChordBinding` and, for a hand-edited `config.toml`,
+    /// by `parse` below.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub axis_base: HashMap<Input, AxisTarget>,
+    /// `axis_base`'s exact mirror for the Held Layer.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub axis_held: HashMap<Input, AxisTarget>,
 }
 
 impl Profile {
@@ -172,15 +185,23 @@ impl Profile {
         for row in 1..=4u8 {
             for col in 1..=5u8 {
                 let input = Input::Grid(row, col);
-                let point = self
-                    .actuation_overrides
-                    .get(&input)
-                    .copied()
-                    .unwrap_or(self.default_actuation);
-                resolved.insert(input, point);
+                resolved.insert(input, self.resolved_actuation_point(input));
             }
         }
         resolved
+    }
+
+    /// `resolved_actuation_points`'s single-`Input` mirror — `actuation_
+    /// overrides` where set, `default_actuation` otherwise. Exists
+    /// separately for a hot-path caller (`dispatch::handle_depth_update`,
+    /// ticket 71) that only ever needs the handful of Inputs currently
+    /// Axis-assigned, not a full 20-entry `HashMap` rebuilt from scratch on
+    /// every live-Depth tick (code-review finding).
+    pub fn resolved_actuation_point(&self, input: Input) -> ActuationPoint {
+        self.actuation_overrides
+            .get(&input)
+            .copied()
+            .unwrap_or(self.default_actuation)
     }
 
     pub fn layer(&self, layer: Layer) -> &HashMap<Input, Binding> {
@@ -210,6 +231,22 @@ impl Profile {
         match layer {
             Layer::Base => &mut self.chords_base,
             Layer::Held => &mut self.chords_held,
+        }
+    }
+
+    /// `layer`'s exact mirror for a Profile's Axis assignments (ticket 71).
+    pub fn axis_layer(&self, layer: Layer) -> &HashMap<Input, AxisTarget> {
+        match layer {
+            Layer::Base => &self.axis_base,
+            Layer::Held => &self.axis_held,
+        }
+    }
+
+    /// `layer_mut`'s exact mirror for a Profile's Axis assignments.
+    pub fn axis_layer_mut(&mut self, layer: Layer) -> &mut HashMap<Input, AxisTarget> {
+        match layer {
+            Layer::Base => &mut self.axis_base,
+            Layer::Held => &mut self.axis_held,
         }
     }
 }
@@ -320,6 +357,131 @@ impl Default for ActuationPoint {
             actuation: 128,
             release: 112,
         }
+    }
+}
+
+/// CONTEXT.md: Axis assignment. One of the 17 targets ticket 59 §3 settled —
+/// 5 unsigned single-key axes (raw Depth 0-255, no polar opposite) and 6
+/// signed axes split into two independently-assignable +/- halves each (12
+/// half-axis targets), so two independent grid keys can cover both halves of
+/// one physical axis. `#[serde(rename_all = "snake_case")]` gives every
+/// variant a plain lowercase `config.toml` string (e.g. `"left_trigger"`,
+/// `"right_stick_x_pos"`) with no hand-written `Display`/`FromStr` needed,
+/// unlike `Input` — there's no map-key grammar to validate here, just a
+/// closed enum value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AxisTarget {
+    LeftTrigger,
+    RightTrigger,
+    Throttle,
+    Gas,
+    Brake,
+    LeftStickXPos,
+    LeftStickXNeg,
+    LeftStickYPos,
+    LeftStickYNeg,
+    RightStickXPos,
+    RightStickXNeg,
+    RightStickYPos,
+    RightStickYNeg,
+    RudderPos,
+    RudderNeg,
+    WheelPos,
+    WheelNeg,
+}
+
+/// A signed `AxisTarget`'s polarity — which independently-assignable half of
+/// its underlying `ABS_*` code it drives. `None` (via `AxisTarget::polarity`)
+/// for the 5 unsigned targets, which have no opposite half and so never
+/// participate in the opposite-half suppression rule (ticket 59 §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AxisPolarity {
+    Positive,
+    Negative,
+}
+
+impl AxisTarget {
+    pub const ALL: [AxisTarget; 17] = [
+        AxisTarget::LeftTrigger,
+        AxisTarget::RightTrigger,
+        AxisTarget::Throttle,
+        AxisTarget::Gas,
+        AxisTarget::Brake,
+        AxisTarget::LeftStickXPos,
+        AxisTarget::LeftStickXNeg,
+        AxisTarget::LeftStickYPos,
+        AxisTarget::LeftStickYNeg,
+        AxisTarget::RightStickXPos,
+        AxisTarget::RightStickXNeg,
+        AxisTarget::RightStickYPos,
+        AxisTarget::RightStickYNeg,
+        AxisTarget::RudderPos,
+        AxisTarget::RudderNeg,
+        AxisTarget::WheelPos,
+        AxisTarget::WheelNeg,
+    ];
+
+    /// The underlying uinput `ABS_*` code this target drives (ticket 59 §3)
+    /// — the 6 signed axes' two independently-assignable halves share one
+    /// code each, distinguished only by `polarity`.
+    pub fn abs_code(self) -> AbsoluteAxisCode {
+        match self {
+            AxisTarget::LeftTrigger => AbsoluteAxisCode::ABS_Z,
+            AxisTarget::RightTrigger => AbsoluteAxisCode::ABS_RZ,
+            AxisTarget::Throttle => AbsoluteAxisCode::ABS_THROTTLE,
+            AxisTarget::Gas => AbsoluteAxisCode::ABS_GAS,
+            AxisTarget::Brake => AbsoluteAxisCode::ABS_BRAKE,
+            AxisTarget::LeftStickXPos | AxisTarget::LeftStickXNeg => AbsoluteAxisCode::ABS_X,
+            AxisTarget::LeftStickYPos | AxisTarget::LeftStickYNeg => AbsoluteAxisCode::ABS_Y,
+            AxisTarget::RightStickXPos | AxisTarget::RightStickXNeg => AbsoluteAxisCode::ABS_RX,
+            AxisTarget::RightStickYPos | AxisTarget::RightStickYNeg => AbsoluteAxisCode::ABS_RY,
+            AxisTarget::RudderPos | AxisTarget::RudderNeg => AbsoluteAxisCode::ABS_RUDDER,
+            AxisTarget::WheelPos | AxisTarget::WheelNeg => AbsoluteAxisCode::ABS_WHEEL,
+        }
+    }
+
+    pub fn polarity(self) -> Option<AxisPolarity> {
+        match self {
+            AxisTarget::LeftTrigger
+            | AxisTarget::RightTrigger
+            | AxisTarget::Throttle
+            | AxisTarget::Gas
+            | AxisTarget::Brake => None,
+            AxisTarget::LeftStickXPos
+            | AxisTarget::LeftStickYPos
+            | AxisTarget::RightStickXPos
+            | AxisTarget::RightStickYPos
+            | AxisTarget::RudderPos
+            | AxisTarget::WheelPos => Some(AxisPolarity::Positive),
+            AxisTarget::LeftStickXNeg
+            | AxisTarget::LeftStickYNeg
+            | AxisTarget::RightStickXNeg
+            | AxisTarget::RightStickYNeg
+            | AxisTarget::RudderNeg
+            | AxisTarget::WheelNeg => Some(AxisPolarity::Negative),
+        }
+    }
+}
+
+/// Live/linear axis resolution (ticket 59 §4/§7's `(Depth, edge_event) ->
+/// axis_value` seam — this is its Depth half, reused unmodified as the
+/// Digital-mode step fallback's own final-value clamp): 0 below the key's
+/// Release point, a linear ramp from 0 (at Release) up to raw Depth (at
+/// Actuation), and raw Depth unchanged above Actuation — reuses the key's
+/// own already-tunable Actuation/Release points as the axis's start/end
+/// thresholds rather than a separate deadzone (ticket 59 §4). Continuous at
+/// both boundaries: `resolve_axis_value(release, point) == 0` and
+/// `resolve_axis_value(actuation, point) == actuation`.
+pub fn resolve_axis_value(depth: u8, point: ActuationPoint) -> u8 {
+    if depth <= point.release {
+        0
+    } else if depth >= point.actuation {
+        depth
+    } else {
+        let span = u32::from(point.actuation - point.release);
+        let progress = u32::from(depth - point.release);
+        (progress * u32::from(point.actuation) / span) as u8
     }
 }
 
@@ -616,6 +778,20 @@ pub enum ConfigError {
     /// enforced both here (a hand-edited `config.toml`) and by
     /// `SetChordBinding`'s own validation (a live D-Bus caller).
     InvalidChordProfileSwitch,
+    /// An `axis_base`/`axis_held` entry (ticket 71) keyed by an `Input` that
+    /// isn't a `Grid` variant — only grid keys have Depth to drive an axis
+    /// with (ticket 59 §1).
+    InvalidAxisInput(String),
+    /// An Input present in both a Layer's Axis map *and* its Binding map
+    /// (ticket 59 §2's mutual exclusion) — only reachable via a hand-edited
+    /// `config.toml`; `SetBinding`/`SetAxisAssignment` both refuse to create
+    /// this live.
+    AxisBindingConflict(String),
+    /// An Input present in both a Layer's Axis map and some Chord's member
+    /// set on that same Layer (ticket 59 §2's mutual exclusion) — only
+    /// reachable via a hand-edited `config.toml`; `SetChordBinding`/
+    /// `SetAxisAssignment` both refuse to create this live.
+    AxisChordConflict(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -664,6 +840,18 @@ impl fmt::Display for ConfigError {
             ConfigError::InvalidChordProfileSwitch => write!(
                 f,
                 "config.toml contains a Chord Binding whose Action is profile_switch, which is not supported on a Chord"
+            ),
+            ConfigError::InvalidAxisInput(input) => write!(
+                f,
+                "config.toml contains an Axis assignment on {input:?}, which is not a Grid Input"
+            ),
+            ConfigError::AxisBindingConflict(input) => write!(
+                f,
+                "config.toml contains both an Axis assignment and a Binding for {input:?} on the same Layer"
+            ),
+            ConfigError::AxisChordConflict(input) => write!(
+                f,
+                "config.toml contains both an Axis assignment for {input:?} and a Chord that has it as a member, on the same Layer"
             ),
         }
     }
@@ -764,6 +952,44 @@ fn parse(contents: &str) -> Result<Config, ConfigError> {
     });
     if has_chord_profile_switch {
         return Err(ConfigError::InvalidChordProfileSwitch);
+    }
+    let invalid_axis_input = config.profiles.values().find_map(|profile| {
+        [Layer::Base, Layer::Held].into_iter().find_map(|layer| {
+            profile
+                .axis_layer(layer)
+                .keys()
+                .find(|input| !matches!(input, Input::Grid(_, _)))
+                .copied()
+        })
+    });
+    if let Some(input) = invalid_axis_input {
+        return Err(ConfigError::InvalidAxisInput(input.to_string()));
+    }
+    let axis_binding_conflict = config.profiles.values().find_map(|profile| {
+        [Layer::Base, Layer::Held].into_iter().find_map(|layer| {
+            profile
+                .axis_layer(layer)
+                .keys()
+                .find(|input| profile.layer(layer).contains_key(input))
+                .copied()
+        })
+    });
+    if let Some(input) = axis_binding_conflict {
+        return Err(ConfigError::AxisBindingConflict(input.to_string()));
+    }
+    let axis_chord_conflict = config.profiles.values().find_map(|profile| {
+        [Layer::Base, Layer::Held].into_iter().find_map(|layer| {
+            profile.axis_layer(layer).keys().find_map(|input| {
+                profile
+                    .chords(layer)
+                    .keys()
+                    .any(|key| key.members().contains(input))
+                    .then_some(*input)
+            })
+        })
+    });
+    if let Some(input) = axis_chord_conflict {
+        return Err(ConfigError::AxisChordConflict(input.to_string()));
     }
     Ok(config)
 }
@@ -1036,6 +1262,39 @@ action = { type = "keypress", key = "KEY_F1" }
         );
         assert_eq!(
             resolved[&Input::Grid(1, 1)],
+            ActuationPoint {
+                actuation: 100,
+                release: 80,
+            }
+        );
+    }
+
+    #[test]
+    fn resolved_actuation_point_matches_the_full_maps_own_entry_default_and_overridden() {
+        let mut profile = Profile {
+            default_actuation: ActuationPoint {
+                actuation: 100,
+                release: 80,
+            },
+            ..Default::default()
+        };
+        profile.actuation_overrides.insert(
+            Input::Grid(2, 3),
+            ActuationPoint {
+                actuation: 200,
+                release: 190,
+            },
+        );
+
+        assert_eq!(
+            profile.resolved_actuation_point(Input::Grid(2, 3)),
+            ActuationPoint {
+                actuation: 200,
+                release: 190,
+            }
+        );
+        assert_eq!(
+            profile.resolved_actuation_point(Input::Grid(1, 1)),
             ActuationPoint {
                 actuation: 100,
                 release: 80,
@@ -1548,6 +1807,210 @@ action = { type = "macro", macro_id = "does-not-exist" }
 
         let err = load_or_seed(&path).expect_err("a dangling Chord macro_id must refuse to start");
         assert!(matches!(err, ConfigError::UnknownMacro(id) if id == "does-not-exist"));
+    }
+
+    #[test]
+    fn axis_target_serializes_as_a_flat_snake_case_string() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Wrapper {
+            target: AxisTarget,
+        }
+        let toml = toml::to_string(&Wrapper {
+            target: AxisTarget::RightStickXNeg,
+        })
+        .unwrap();
+        assert_eq!(toml.trim(), "target = \"right_stick_x_neg\"");
+        let parsed: Wrapper = toml::from_str(&toml).unwrap();
+        assert_eq!(parsed.target, AxisTarget::RightStickXNeg);
+    }
+
+    #[test]
+    fn every_axis_target_has_a_distinct_abs_code_and_polarity_consistent_with_its_name() {
+        assert_eq!(AxisTarget::ALL.len(), 17);
+        assert_eq!(AxisTarget::LeftTrigger.polarity(), None);
+        assert_eq!(
+            AxisTarget::LeftStickXPos.polarity(),
+            Some(AxisPolarity::Positive)
+        );
+        assert_eq!(
+            AxisTarget::LeftStickXNeg.polarity(),
+            Some(AxisPolarity::Negative)
+        );
+        assert_eq!(
+            AxisTarget::LeftStickXPos.abs_code(),
+            AxisTarget::LeftStickXNeg.abs_code(),
+            "a signed axis's two halves must share one ABS_* code"
+        );
+        // Every unsigned target's code is unique to it; every signed axis's
+        // code is shared by exactly its own two halves — 5 + 6 = 11 distinct
+        // codes across the 17 targets.
+        let mut codes: Vec<_> = AxisTarget::ALL.iter().map(|t| t.abs_code()).collect();
+        codes.sort_by_key(|c| c.0);
+        codes.dedup();
+        assert_eq!(codes.len(), 11);
+    }
+
+    #[test]
+    fn resolve_axis_value_is_zero_below_release_and_raw_depth_above_actuation() {
+        let point = ActuationPoint {
+            actuation: 128,
+            release: 112,
+        };
+        assert_eq!(resolve_axis_value(0, point), 0);
+        assert_eq!(resolve_axis_value(112, point), 0);
+        assert_eq!(resolve_axis_value(128, point), 128);
+        assert_eq!(resolve_axis_value(255, point), 255);
+    }
+
+    #[test]
+    fn resolve_axis_value_ramps_linearly_between_release_and_actuation() {
+        let point = ActuationPoint {
+            actuation: 120,
+            release: 100,
+        };
+        // Halfway between release (100) and actuation (120) ramps to
+        // halfway between 0 and the actuation value (120): 60.
+        assert_eq!(resolve_axis_value(110, point), 60);
+    }
+
+    #[test]
+    fn a_pre_ticket_71_config_defaults_empty_axis_maps() {
+        let toml = r#"
+schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base.grid_r1c1]
+trigger = "fire_once"
+action = { type = "keypress", key = "KEY_F1" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let profile = &config.profiles["Default"];
+        assert!(profile.axis_base.is_empty());
+        assert!(profile.axis_held.is_empty());
+    }
+
+    #[test]
+    fn parses_an_axis_assignment_shape_on_both_layers() {
+        let toml = r#"
+schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.axis_base]
+grid_r1c1 = "left_trigger"
+
+[profiles.Default.axis_held]
+grid_r2c2 = "right_stick_x_pos"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let profile = &config.profiles["Default"];
+        assert_eq!(
+            profile.axis_layer(Layer::Base)[&Input::Grid(1, 1)],
+            AxisTarget::LeftTrigger
+        );
+        assert_eq!(
+            profile.axis_layer(Layer::Held)[&Input::Grid(2, 2)],
+            AxisTarget::RightStickXPos
+        );
+    }
+
+    #[test]
+    fn axis_assignments_survive_a_full_write_and_reparse_round_trip() {
+        let (_dir, path) = temp_config_path();
+        let mut config = Config::seed();
+        let profile = config.active_profile_mut().unwrap();
+        profile
+            .axis_base
+            .insert(Input::Grid(1, 1), AxisTarget::Brake);
+
+        write(&path, &config).unwrap();
+        let reparsed = load_or_seed(&path).unwrap();
+
+        assert_eq!(reparsed, config);
+    }
+
+    #[test]
+    fn refuses_to_start_when_an_axis_assignment_targets_a_non_grid_input() {
+        let (_dir, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.axis_base]
+mode_key = "left_trigger"
+"#;
+        fs::write(&path, original).unwrap();
+
+        let err = load_or_seed(&path)
+            .expect_err("an Axis assignment on a non-Grid Input must refuse to start");
+        assert!(matches!(err, ConfigError::InvalidAxisInput(input) if input == "mode_key"));
+    }
+
+    #[test]
+    fn refuses_to_start_when_an_input_has_both_an_axis_assignment_and_a_binding_on_the_same_layer()
+    {
+        let (_dir, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.axis_base]
+grid_r1c1 = "left_trigger"
+
+[profiles.Default.base.grid_r1c1]
+trigger = "fire_once"
+action = { type = "keypress", key = "KEY_F1" }
+"#;
+        fs::write(&path, original).unwrap();
+
+        let err = load_or_seed(&path)
+            .expect_err("an Input with both an Axis assignment and a Binding must refuse to start");
+        assert!(matches!(err, ConfigError::AxisBindingConflict(input) if input == "grid_r1c1"));
+    }
+
+    #[test]
+    fn refuses_to_start_when_an_input_has_both_an_axis_assignment_and_chord_membership_on_the_same_layer()
+     {
+        let (_dir, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.axis_base]
+grid_r1c1 = "left_trigger"
+
+[profiles.Default.chords_base."grid_r1c1+grid_r1c2"]
+trigger = "fire_once"
+action = { type = "keypress", key = "KEY_C" }
+"#;
+        fs::write(&path, original).unwrap();
+
+        let err = load_or_seed(&path).expect_err(
+            "an Input with both an Axis assignment and Chord membership must refuse to start",
+        );
+        assert!(matches!(err, ConfigError::AxisChordConflict(input) if input == "grid_r1c1"));
+    }
+
+    #[test]
+    fn an_axis_assignment_on_a_different_layer_than_a_conflicting_binding_is_allowed() {
+        // Ticket 59 §2: the same physical grid key may be Axis-assigned on
+        // one Layer and carry an ordinary Binding on the other — only a
+        // same-Layer conflict is refused.
+        let toml = r#"
+schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.axis_base]
+grid_r1c1 = "left_trigger"
+
+[profiles.Default.held.grid_r1c1]
+trigger = "fire_once"
+action = { type = "keypress", key = "KEY_F1" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.profiles["Default"].axis_base[&Input::Grid(1, 1)],
+            AxisTarget::LeftTrigger
+        );
     }
 
     #[test]

@@ -95,6 +95,10 @@ class DaemonClient(Protocol):
 
     def clear_chord_binding(self, inputs: list[str], layer: str) -> None: ...
 
+    def set_axis_assignment(self, input_str: str, layer: str, target: str) -> None: ...
+
+    def clear_axis_assignment(self, input_str: str, layer: str) -> None: ...
+
     def set_mode_key_role(self, role: str) -> None: ...
 
     def create_profile(self, name: str) -> None: ...
@@ -202,6 +206,12 @@ class DBusDaemonClient:
 
     def clear_chord_binding(self, inputs: list[str], layer: str) -> None:
         self._call("ClearChordBinding", GLib.Variant("(ass)", (inputs, layer)))
+
+    def set_axis_assignment(self, input_str: str, layer: str, target: str) -> None:
+        self._call("SetAxisAssignment", GLib.Variant("(sss)", (input_str, layer, target)))
+
+    def clear_axis_assignment(self, input_str: str, layer: str) -> None:
+        self._call("ClearAxisAssignment", GLib.Variant("(ss)", (input_str, layer)))
 
     def set_mode_key_role(self, role: str) -> None:
         self._call("SetModeKeyRole", GLib.Variant("(s)", (role,)))

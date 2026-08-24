@@ -1,6 +1,8 @@
+import pytest
 from gi.repository import Gtk
 
 from acheron_gui.binding_editor import DepthTrack, action_summary, build_binding_editor, build_chord_binding_dialog
+from acheron_gui.daemon_client import InvalidBindingError
 from acheron_gui.daemon_stub import DaemonStub
 from acheron_gui.device_overview import make_input_button
 from acheron_gui.inputs import ACTION_TYPES, TRIGGER_OPTIONS
@@ -908,3 +910,150 @@ def test_saving_an_edited_chord_with_unchanged_membership_does_not_clear_it():
 
     assert "clear_chord_binding" not in [call[0] for call in stub.calls]
     assert "grid_r1c1+grid_r1c2" in stub.get_config()["profiles"]["Default"]["chords_base"]
+
+
+# --- Axis assignment (ticket 71) ---
+
+
+def _click_axis_target(popover, tooltip: str) -> None:
+    find_one(popover, lambda w: isinstance(w, Gtk.Button) and w.get_tooltip_text() == tooltip).emit("clicked")
+
+
+def test_axis_is_offered_only_for_grid_inputs():
+    stub = DaemonStub()
+
+    grid_btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+    grid_popover = editor_content(grid_btn)
+    action_dd = _dropdown_labeled(grid_popover, "Action")
+    assert "Axis" in [action_dd.get_model().get_string(i) for i in range(action_dd.get_model().get_n_items())]
+
+    non_grid_btn = make_input_button(stub, stub.get_config(), "Default", "base", "mode_key", lambda: None)
+    non_grid_popover = editor_content(non_grid_btn)
+    non_grid_action_dd = _dropdown_labeled(non_grid_popover, "Action")
+    assert "Axis" not in [
+        non_grid_action_dd.get_model().get_string(i) for i in range(non_grid_action_dd.get_model().get_n_items())
+    ]
+
+
+def test_selecting_axis_disables_the_trigger_dropdown():
+    stub = DaemonStub()
+
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+    popover = editor_content(btn)
+
+    action_dd = _dropdown_labeled(popover, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("axis"))
+
+    trigger_dd = _dropdown_labeled(popover, "Trigger mode")
+    assert not trigger_dd.get_sensitive()
+
+
+def test_saving_an_axis_assignment_calls_set_axis_assignment_not_set_binding():
+    stub = DaemonStub()
+    changed = []
+
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
+    popover = editor_content(btn)
+
+    action_dd = _dropdown_labeled(popover, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("axis"))
+    _click_axis_target(popover, "Left Trigger")
+
+    button_labeled(popover, "Save").emit("clicked")
+
+    assert stub.calls == [("set_axis_assignment", "grid_r1c1", "base", "left_trigger")]
+    assert changed == [1]
+    assert "grid_r1c1" not in stub.get_config()["profiles"]["Default"]["base"]
+
+
+def test_save_stays_disabled_until_an_axis_target_is_picked():
+    stub = DaemonStub()
+
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+    popover = editor_content(btn)
+
+    action_dd = _dropdown_labeled(popover, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("axis"))
+
+    assert not button_labeled(popover, "Save").get_sensitive()
+
+
+def test_opening_an_axis_assigned_key_defaults_to_axis_with_the_current_target():
+    stub = DaemonStub()
+    stub.set_axis_assignment("grid_r1c1", "base", "right_trigger")
+
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+    popover = editor_content(btn)
+
+    action_dd = _dropdown_labeled(popover, "Action")
+    assert [k for k, _ in ACTION_TYPES][action_dd.get_selected()] == "axis"
+    summary = find_one(popover, lambda w: "controller-picker-summary" in w.get_css_classes())
+    assert summary.get_label() == "Selected: Right Trigger"
+
+
+def test_clearing_an_axis_assigned_key_calls_clear_axis_assignment():
+    stub = DaemonStub()
+    stub.set_axis_assignment("grid_r1c1", "base", "right_trigger")
+    stub.calls.clear()
+    changed = []
+
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
+    popover = editor_content(btn)
+
+    button_labeled(popover, "Clear (passthrough)").emit("clicked")
+
+    assert stub.calls == [("clear_axis_assignment", "grid_r1c1", "base")]
+    assert changed == [1]
+
+
+def test_axis_action_summary_has_no_trigger_suffix():
+    assert action_summary(None, "grid_r1c1", {}, axis_target="left_trigger") == "Axis: Left Trigger"
+
+
+def test_axis_assigned_grid_button_shows_axis_summary_in_its_label():
+    stub = DaemonStub()
+    stub.set_axis_assignment("grid_r1c1", "base", "left_trigger")
+
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    assert "axis-stripe" in btn.get_css_classes()
+    label = btn.get_child()
+    assert "Axis: Left Trigger" in label.get_label()
+
+
+def test_axis_assigned_grid_button_is_not_dimmed_as_empty():
+    # Code-review finding: `binding` is always `None` for an Axis-assigned
+    # key (mutual exclusion), so the old unconditional
+    # `add_css_class("bound" if binding else "empty")` dimmed it to 0.75
+    # opacity — contradicting the whole point of the always-visible stripe.
+    stub = DaemonStub()
+    stub.set_axis_assignment("grid_r1c1", "base", "left_trigger")
+
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    assert "empty" not in btn.get_css_classes()
+    assert "bound" not in btn.get_css_classes()
+
+
+def test_set_axis_assignment_rejects_an_unknown_target():
+    stub = DaemonStub()
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_axis_assignment("grid_r1c1", "base", "not_a_real_target")
+
+
+def test_chord_dialog_does_not_offer_axis_as_an_action_kind():
+    stub = DaemonStub()
+
+    dialog = build_chord_binding_dialog(
+        stub,
+        stub.get_config(),
+        "Default",
+        "base",
+        ["grid_r1c1", "grid_r1c2"],
+        None,
+        lambda: None,
+        None,
+    )
+    action_dd = _dropdown_labeled(dialog, "Action")
+    assert "Axis" not in [action_dd.get_model().get_string(i) for i in range(action_dd.get_model().get_n_items())]

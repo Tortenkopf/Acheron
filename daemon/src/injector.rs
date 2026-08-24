@@ -7,12 +7,50 @@ use std::io;
 use std::time::Duration;
 
 use evdev::uinput::VirtualDevice;
-use evdev::{AttributeSet, InputEvent, KeyCode, KeyEvent, RelativeAxisCode, RelativeAxisEvent};
+use evdev::{
+    AbsInfo, AbsoluteAxisCode, AbsoluteAxisEvent, AttributeSet, InputEvent, KeyCode, KeyEvent,
+    RelativeAxisCode, RelativeAxisEvent, UinputAbsSetup,
+};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::capture::{EventState, PhysicalEvent};
 use crate::input::{self, Input, WheelEvent};
+
+/// The 5 unsigned `AxisTarget`s' `ABS_*` codes (ticket 71) — each declared
+/// with a `0..=255` range, matching raw Depth directly with no rescaling.
+const UNSIGNED_AXIS_CODES: [AbsoluteAxisCode; 5] = [
+    AbsoluteAxisCode::ABS_Z,
+    AbsoluteAxisCode::ABS_RZ,
+    AbsoluteAxisCode::ABS_THROTTLE,
+    AbsoluteAxisCode::ABS_GAS,
+    AbsoluteAxisCode::ABS_BRAKE,
+];
+
+/// The 6 signed `AxisTarget` axes' `ABS_*` codes — each declared with a
+/// `-255..=255` range, since a signed axis's two independently-assignable
+/// halves emit `+depth`/`-depth` respectively (`dispatch`'s axis-conflict
+/// resolution).
+const SIGNED_AXIS_CODES: [AbsoluteAxisCode; 6] = [
+    AbsoluteAxisCode::ABS_X,
+    AbsoluteAxisCode::ABS_Y,
+    AbsoluteAxisCode::ABS_RX,
+    AbsoluteAxisCode::ABS_RY,
+    AbsoluteAxisCode::ABS_RUDDER,
+    AbsoluteAxisCode::ABS_WHEEL,
+];
+
+/// Every `ABS_*` code the gamepad `uinput` device advertises (ticket 71) —
+/// the 11 distinct codes backing the 17 `AxisTarget` values (`config::
+/// AxisTarget::abs_code`) that `build_gamepad_device`'s capability
+/// declaration below is built from, exposed so a caller/test can enumerate
+/// the same set without hand-duplicating it.
+pub fn all_axis_abs_codes() -> [AbsoluteAxisCode; 11] {
+    let mut codes = [AbsoluteAxisCode::ABS_Z; 11];
+    codes[..5].copy_from_slice(&UNSIGNED_AXIS_CODES);
+    codes[5..].copy_from_slice(&SIGNED_AXIS_CODES);
+    codes
+}
 
 /// Where the injector task writes translated evdev events. The real
 /// implementation wraps the single uinput `VirtualDevice`; tests substitute
@@ -57,16 +95,34 @@ pub fn build_device() -> io::Result<VirtualDevice> {
 /// all" case to leave room for). Kernel `joydev` auto-attaches a `/dev/input/
 /// jsX` node to any `uinput` device that advertises this `BTN_GAMEPAD`-class
 /// bit set — confirmed by ticket 37's research, zero extra work needed here.
+///
+/// Ticket 71 additionally declares the 11 `ABS_*` codes `config::AxisTarget`'s
+/// 17 targets drive — unsigned axes `0..=255` (matching raw Depth directly),
+/// signed axes `-255..=255` (their two independently-assignable halves emit
+/// `+depth`/`-depth`) — on this same single device, alongside the button
+/// range above: confirmed via ticket 59's research that mixing `BTN_GAMEPAD`
+/// buttons with HOTAS-style axes on one `uinput` device causes no OS/SDL
+/// classification conflict (ticket 59 §3), so no second device is needed.
 pub fn build_gamepad_device() -> io::Result<VirtualDevice> {
     let mut keys = AttributeSet::<KeyCode>::new();
     for code in input::gamepad_button_codes() {
         keys.insert(code);
     }
 
-    VirtualDevice::builder()?
+    let mut builder = VirtualDevice::builder()?
         .name("Acheron Virtual Controller")
-        .with_keys(&keys)?
-        .build()
+        .with_keys(&keys)?;
+    for code in UNSIGNED_AXIS_CODES {
+        builder = builder
+            .with_absolute_axis(&UinputAbsSetup::new(code, AbsInfo::new(0, 0, 255, 0, 0, 0)))?;
+    }
+    for code in SIGNED_AXIS_CODES {
+        builder = builder.with_absolute_axis(&UinputAbsSetup::new(
+            code,
+            AbsInfo::new(0, -255, 255, 0, 0, 0),
+        ))?;
+    }
+    builder.build()
 }
 
 /// Retries a fallible open on `PermissionDenied` alone, bounded by
@@ -128,6 +184,17 @@ enum InjectorMessage {
     },
     ForceRelease(KeyCode),
     SetSuppressed(bool),
+    /// One resolved `ABS_*` axis value (ticket 71's `dispatch`-owned axis
+    /// resolution — `config::resolve_axis_value` plus its runtime-conflict
+    /// merge), always routed to the gamepad sink: every `AxisTarget` lives
+    /// only on that device, unlike a `KeyState`/`ForceRelease` write, which
+    /// needs `sink_for`'s per-code routing decision because `Action::
+    /// Keypress`/`Action::ControllerButton` share one `KeyCode` type-space.
+    /// No reply channel — fire-and-forget, like `Physical`.
+    AxisValue {
+        code: AbsoluteAxisCode,
+        value: i32,
+    },
 }
 
 /// The injector task's channel has closed, meaning the task itself has
@@ -205,6 +272,21 @@ impl Injector {
             .await
             .map_err(|_| InjectorClosed)
     }
+
+    /// Writes one resolved `ABS_*` axis value (ticket 71) to the gamepad
+    /// device — always that device, never `sink_for`'s routing decision (see
+    /// `InjectorMessage::AxisValue`'s doc comment). Gated by suppression like
+    /// every write but `ForceRelease`.
+    pub async fn set_axis_value(
+        &self,
+        code: AbsoluteAxisCode,
+        value: i32,
+    ) -> Result<(), InjectorClosed> {
+        self.tx
+            .send(InjectorMessage::AxisValue { code, value })
+            .await
+            .map_err(|_| InjectorClosed)
+    }
 }
 
 /// Spawns the injector task, which owns both `sink` (keyboard/mouse) and
@@ -265,6 +347,11 @@ async fn injector_loop<S: InjectSink>(
                 sink_for(&mut sink, &mut gamepad_sink, key).emit(&[*KeyEvent::new(key, 0)])?;
             }
             InjectorMessage::SetSuppressed(value) => suppressed = value,
+            InjectorMessage::AxisValue { code, value } => {
+                if !suppressed {
+                    gamepad_sink.emit(&[*AbsoluteAxisEvent::new(code, value)])?;
+                }
+            }
         }
     }
     Ok(())
@@ -492,6 +579,55 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(KeyCode::BTN_TRIGGER_HAPPY1, 0)]
         );
+    }
+
+    #[tokio::test]
+    async fn set_axis_value_always_routes_to_the_gamepad_sink() {
+        let sink = testing::RecordingSink::new();
+        let gamepad_sink = testing::RecordingSink::new();
+        let (injector, handle) = spawn(sink.clone(), gamepad_sink.clone());
+
+        injector
+            .set_axis_value(evdev::AbsoluteAxisCode::ABS_X, -200)
+            .await
+            .unwrap();
+        drop(injector);
+        handle.await.unwrap().unwrap();
+
+        assert!(sink.batches().is_empty());
+        let batches = gamepad_sink.batches();
+        assert_eq!(batches.len(), 1);
+        match batches[0][0].destructure() {
+            evdev::EventSummary::AbsoluteAxis(_, axis, value) => {
+                assert_eq!(axis, evdev::AbsoluteAxisCode::ABS_X);
+                assert_eq!(value, -200);
+            }
+            other => panic!("expected an absolute-axis event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_axis_value_is_withheld_while_suppressed() {
+        let sink = testing::RecordingSink::new();
+        let (injector, handle) = spawn(sink.clone(), sink.clone());
+
+        injector.set_suppressed(true).await.unwrap();
+        injector
+            .set_axis_value(evdev::AbsoluteAxisCode::ABS_Z, 100)
+            .await
+            .unwrap();
+        drop(injector);
+        handle.await.unwrap().unwrap();
+
+        assert!(sink.batches().is_empty());
+    }
+
+    #[test]
+    fn build_gamepad_device_declares_all_11_axis_codes() {
+        let codes = all_axis_abs_codes();
+        assert_eq!(codes.len(), 11);
+        assert!(codes.contains(&AbsoluteAxisCode::ABS_Z));
+        assert!(codes.contains(&AbsoluteAxisCode::ABS_X));
     }
 
     #[tokio::test]

@@ -391,6 +391,54 @@ impl Daemon {
         rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
     }
 
+    /// Atomic: validates, applies in-memory, and rewrites `config.toml`
+    /// immediately — mirrors `set_binding` exactly (ticket 71), but
+    /// atomically clears any existing Binding *and* any Chord membership for
+    /// `(layer, input)` alongside the insert (ticket 59 §2's mutual
+    /// exclusion), rather than rejecting like `set_binding`/
+    /// `set_chord_binding` do against an existing Axis assignment there.
+    async fn set_axis_assignment(
+        &self,
+        input: String,
+        layer: String,
+        target: String,
+    ) -> Result<(), DaemonError> {
+        let input = Self::parse_input(&input)?;
+        let layer = wire::layer_from_str(&layer).map_err(DaemonError::InvalidBinding)?;
+        let target = wire::axis_target_from_str(&target).map_err(DaemonError::InvalidBinding)?;
+
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::SetAxisAssignment {
+                input,
+                layer,
+                target,
+                reply,
+            })
+            .await
+            .map_err(dispatch_gone)?;
+        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+    }
+
+    /// Atomic: removes the Axis assignment (ordinary passthrough resumes)
+    /// and rewrites `config.toml` immediately. Errors `NotFound` if `input`
+    /// has no Axis assignment to clear on `layer`.
+    async fn clear_axis_assignment(&self, input: String, layer: String) -> Result<(), DaemonError> {
+        let input = Self::parse_input(&input)?;
+        let layer = wire::layer_from_str(&layer).map_err(DaemonError::InvalidBinding)?;
+
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::ClearAxisAssignment {
+                input,
+                layer,
+                reply,
+            })
+            .await
+            .map_err(dispatch_gone)?;
+        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+    }
+
     /// Flips the active Profile's `mode_key_role` (ticket 18) —
     /// `"layer_switch"`/`"bound"`. Held-layer Bindings are retained either
     /// way; only which role governs the Mode key's dispatch changes.
@@ -967,6 +1015,8 @@ mod tests {
             binding: HashMap<String, OwnedValue>,
         ) -> zbus::Result<()>;
         fn clear_chord_binding(&self, inputs: Vec<String>, layer: &str) -> zbus::Result<()>;
+        fn set_axis_assignment(&self, input: &str, layer: &str, target: &str) -> zbus::Result<()>;
+        fn clear_axis_assignment(&self, input: &str, layer: &str) -> zbus::Result<()>;
         fn set_output_suppressed(&self, suppressed: bool) -> zbus::Result<()>;
         fn set_mode_key_role(&self, role: &str) -> zbus::Result<()>;
         fn create_profile(&self, name: &str) -> zbus::Result<()>;
@@ -1096,6 +1146,7 @@ mod tests {
             let (actuation_tx, _actuation_rx) = tokio::sync::watch::channel(HashMap::new());
             let (capture_mode_tx, capture_mode_rx) = mpsc::channel(8);
             let (capture_control_tx, capture_control_rx) = mpsc::channel(8);
+            let (_depth_tx, depth_rx) = tokio::sync::watch::channel(HashMap::new());
             let dispatch_handle = tokio::spawn(crate::dispatch::run(
                 event_rx,
                 conn_rx,
@@ -1108,6 +1159,7 @@ mod tests {
                 capture_mode_rx,
                 capture_control_tx,
                 crate::executor::MIN_TOGGLE_LAP,
+                depth_rx,
             ));
 
             TestServer {
@@ -2559,7 +2611,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (_depth_tx, depth_rx) = watch::channel(HashMap::new());
 
-        let daemon = Daemon::new(cmd_tx, inj.clone(), depth_rx);
+        let daemon = Daemon::new(cmd_tx, inj.clone(), depth_rx.clone());
         let guid = zbus::Guid::generate();
         let (server_transport, client_transport) = tokio::net::UnixStream::pair().unwrap();
 
@@ -2590,6 +2642,7 @@ mod tests {
             capture_mode_rx,
             capture_control_tx,
             crate::executor::MIN_TOGGLE_LAP,
+            depth_rx,
         ));
 
         {
@@ -3091,6 +3144,121 @@ mod tests {
             .expect_err("clearing an unknown Chord must fail");
         assert!(
             matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.NotFound")
+        );
+
+        server.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn set_axis_assignment_over_real_dbus_persists_and_updates_config() {
+        let server = TestServer::start().await;
+
+        server
+            .proxy
+            .set_axis_assignment("grid_r1c1", "base", "left_trigger")
+            .await
+            .expect("SetAxisAssignment over D-Bus must succeed");
+
+        let config = server.proxy.get_config().await.unwrap();
+        let profiles: wire::Dict = config.get("profiles").unwrap().clone().try_into().unwrap();
+        let default_profile: wire::Dict = profiles
+            .get(DEFAULT_PROFILE_NAME)
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let axis_base: wire::Dict = default_profile
+            .get("axis_base")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let target: String = axis_base
+            .get("grid_r1c1")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(target, "left_trigger");
+
+        let on_disk = std::fs::read_to_string(&server.config_path).unwrap();
+        server.shut_down().await;
+        assert!(on_disk.contains("left_trigger"));
+    }
+
+    #[tokio::test]
+    async fn set_axis_assignment_over_real_dbus_with_an_invalid_target_string_is_rejected() {
+        let server = TestServer::start().await;
+
+        let err = server
+            .proxy
+            .set_axis_assignment("grid_r1c1", "base", "not_a_target")
+            .await
+            .expect_err("an invalid Axis target string must be rejected");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.InvalidBinding")
+        );
+
+        server.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn set_axis_assignment_over_real_dbus_rejects_a_non_grid_input() {
+        let server = TestServer::start().await;
+
+        let err = server
+            .proxy
+            .set_axis_assignment("mode_key", "base", "left_trigger")
+            .await
+            .expect_err("a non-Grid Input must be rejected");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.InvalidBinding")
+        );
+
+        server.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn clear_axis_assignment_over_real_dbus_on_an_unassigned_input_returns_not_found() {
+        let server = TestServer::start().await;
+
+        let err = server
+            .proxy
+            .clear_axis_assignment("grid_r1c1", "base")
+            .await
+            .expect_err("clearing an unassigned Input must fail");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.NotFound")
+        );
+
+        server.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn set_binding_over_real_dbus_rejects_an_input_already_axis_assigned() {
+        let server = TestServer::start().await;
+
+        server
+            .proxy
+            .set_axis_assignment("grid_r1c1", "base", "left_trigger")
+            .await
+            .expect("SetAxisAssignment over D-Bus must succeed");
+
+        let mut binding = wire::action_to_dict(&crate::config::Action::Keypress {
+            modifiers: crate::config::Modifiers::default(),
+            key: evdev::KeyCode::KEY_F1,
+        });
+        binding.insert(
+            "trigger".to_string(),
+            OwnedValue::try_from(zbus::zvariant::Value::new("fire_once".to_string())).unwrap(),
+        );
+        let err = server
+            .proxy
+            .set_binding("grid_r1c1", "base", binding)
+            .await
+            .expect_err("SetBinding on an Axis-assigned Input must be rejected");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.InvalidBinding")
         );
 
         server.shut_down().await;

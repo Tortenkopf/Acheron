@@ -102,7 +102,11 @@ async fn main() -> io::Result<()> {
         .map_err(io::Error::other)?
         .serve_at(
             "/com/acheron/Daemon",
-            Daemon::new(cmd_tx, inj.clone(), depth_rx),
+            // Ticket 71: dispatch also holds its own clone of `depth_rx`
+            // below — the continuous half of Axis-assignment resolution
+            // (`(Depth, edge_event) -> axis_value`) — alongside the D-Bus
+            // layer's own pre-existing `DepthChanged` streaming use of it.
+            Daemon::new(cmd_tx, inj.clone(), depth_rx.clone()),
         )
         .map_err(io::Error::other)?
         .build()
@@ -130,6 +134,7 @@ async fn main() -> io::Result<()> {
         capture_mode_rx,
         capture_control_tx,
         toggle_lap_target,
+        depth_rx,
     ));
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;

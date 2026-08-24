@@ -104,7 +104,21 @@ _OVERLAY_MESSAGES = {
 PLACEHOLDER_CONFIG = {
     "schema_version": 1,
     "active_profile": "Default",
-    "profiles": {"Default": {"base": {}, "held": {}, "mode_key_role": "layer_switch"}},
+    "profiles": {
+        "Default": {
+            "base": {},
+            "held": {},
+            "mode_key_role": "layer_switch",
+            "chords_base": {},
+            "chords_held": {},
+            # Ticket 71: read unconditionally by `build_binding_editor`
+            # (every grid-button popover build) and `make_input_button`'s
+            # own axis-stripe check, so this placeholder needs both present
+            # too, not just the real seed Profile shape.
+            "axis_base": {},
+            "axis_held": {},
+        }
+    },
 }
 
 
@@ -336,8 +350,10 @@ def make_input_button(
     on_click_override: Callable[[str], None] | None = None,
 ) -> Gtk.Button:
     binding = config["profiles"][profile][layer].get(inp)
+    axis_target = config["profiles"][profile][f"axis_{layer}"].get(inp)
     inner = Gtk.Label(
-        label=f"{input_label(inp)}\n{action_summary(binding, inp, config.get('macros', {}), config.get('steppers', {}))}",
+        label=f"{input_label(inp)}\n"
+        f"{action_summary(binding, inp, config.get('macros', {}), config.get('steppers', {}), axis_target)}",
         justify=Gtk.Justification.CENTER,
     )
     inner.set_wrap(True)
@@ -372,7 +388,18 @@ def make_input_button(
     # now that `btn` is a plain Gtk.Button, not a Gtk.MenuButton — both
     # default to halign FILL.)
     btn.set_halign(Gtk.Align.CENTER)
-    btn.add_css_class("bound" if binding else "empty")
+    if axis_target is not None:
+        # Ticket 60's Answer: always-visible, regardless of Chord-selection
+        # mode — unlike `chord_classes` below, which only ever applies while
+        # `chord_ui["selecting"]` gates them. Neither "bound" (a Binding
+        # exists) nor "empty" (nothing is configured) applies here — an
+        # Axis-assigned key has `binding is None` but is very much
+        # configured, so falling into "empty" (code-review finding) would
+        # dim it to 0.75 opacity, visually contradicting the whole point of
+        # the always-visible stripe.
+        btn.add_css_class("axis-stripe")
+    else:
+        btn.add_css_class("bound" if binding else "empty")
     for cls in chord_classes or []:
         btn.add_css_class(cls)
     btn.set_sensitive(sensitive)
@@ -494,6 +521,7 @@ def build_chords_section(
         if not chord_ui["selecting"]:
             chord_ui["recorded"] = []
             chord_ui["edit_key"] = None
+            chord_ui["axis_error"] = None
         on_change()
 
     selecting_btn.connect("toggled", on_selecting_toggled)
@@ -505,6 +533,10 @@ def build_chords_section(
             if len(chord_ui["recorded"]) >= 2
             else None
         )
+
+        axis_error = chord_ui.get("axis_error")
+        if axis_error is not None:
+            box.append(Gtk.Label(label=axis_error, xalign=0, wrap=True, css_classes=["error"]))
 
         status = Gtk.Label(xalign=0, wrap=True, css_classes=["dim"])
         if conflict_key is not None:
@@ -534,6 +566,7 @@ def build_chords_section(
             def on_saved():
                 chord_ui["recorded"] = []
                 chord_ui["edit_key"] = None
+                chord_ui["axis_error"] = None
                 on_change()
 
             dialog = build_chord_binding_dialog(
@@ -564,6 +597,7 @@ def build_chords_section(
         def on_clear(b):
             chord_ui["recorded"] = []
             chord_ui["edit_key"] = None
+            chord_ui["axis_error"] = None
             on_change()
 
         clear_btn.connect("clicked", on_clear)
@@ -576,6 +610,7 @@ def build_chords_section(
             def on_edit_conflict(b, key=conflict_key):
                 chord_ui["edit_key"] = key
                 chord_ui["recorded"] = _chord_members(key)
+                chord_ui["axis_error"] = None
                 on_change()
 
             conflict_btn.connect("clicked", on_edit_conflict)
@@ -618,6 +653,7 @@ def build_chords_section(
             chord_ui["edit_key"] = key
             chord_ui["recorded"] = _chord_members(key)
             chord_ui["preview"] = None
+            chord_ui["axis_error"] = None
             on_change()
 
         edit_btn.connect("clicked", on_edit)
@@ -665,11 +701,24 @@ def build_main_view(
     # rebuild the same way `dest`/`selected_layer` do — mutated in place by
     # `build_chords_section` and `input_btn`'s own click-override below.
     chord_ui = ui_state.setdefault(
-        "chord", {"selecting": False, "recorded": [], "edit_key": None, "preview": None}
+        "chord",
+        {"selecting": False, "recorded": [], "edit_key": None, "preview": None, "axis_error": None},
     )
     chords_on_layer = config["profiles"][profile][f"chords_{selected_layer}"]
 
     def chord_click_override(inp: str) -> None:
+        # Ticket 71: an Axis-assigned Input can't produce the discrete
+        # Down/Up transitions a Chord's own membership depends on (ticket
+        # 59 §2) — clicking one while selecting surfaces an inline error
+        # instead of toggling it into the selection or disabling the
+        # button outright (ticket 60's Answer; the button itself stays
+        # fully clickable at all times, per `make_input_button`'s own
+        # always-visible `.axis-stripe` treatment).
+        if inp in config["profiles"][profile][f"axis_{selected_layer}"]:
+            chord_ui["axis_error"] = f"{input_label(inp)} is Axis-assigned — can't join a Chord"
+            on_change()
+            return
+        chord_ui["axis_error"] = None
         if inp in chord_ui["recorded"]:
             chord_ui["recorded"].remove(inp)
         else:

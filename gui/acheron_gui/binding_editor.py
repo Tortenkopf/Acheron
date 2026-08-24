@@ -22,12 +22,23 @@ from gi.repository import Gtk, GLib
 from .daemon_client import DaemonError
 from .gtk_utils import build_name_prompt_popover, clear_children
 from .inputs import ACTION_TYPES, INPUT_DEFAULT_LABEL, TRIGGER_OPTIONS, TRIGGER_SHORT, input_label, is_grid_input
+from .axis_picker import AXIS_LABEL_BY_TARGET, build_inline_axis_picker
 from .controller_picker import LABEL_BY_CODE as CONTROLLER_LABEL_BY_CODE
 from .controller_picker import build_inline_controller_picker
 from .key_picker import LABEL_BY_CODE, build_inline_key_picker
 
 
-def action_summary(binding: dict | None, inp: str, macros: dict, steppers: dict | None = None) -> str:
+def action_summary(
+    binding: dict | None, inp: str, macros: dict, steppers: dict | None = None, axis_target: str | None = None
+) -> str:
+    if axis_target is not None:
+        # Ticket 71: an Axis-assigned Input never has a `binding` at all
+        # (ticket 59 §2's mutual exclusion) — checked first, ahead of the
+        # `if not binding:` passthrough-label branch below, since `binding`
+        # is always `None` here anyway. No Trigger-mode suffix, mirroring
+        # Profile Switch's own "always the same" reasoning — Axis output has
+        # no Trigger mode at all (ticket 60's Answer).
+        return f"Axis: {AXIS_LABEL_BY_TARGET[axis_target]}"
     if not binding:
         # No "passthrough" qualifier: it's jargon the user doesn't need, it's
         # too long to fit the smaller (52px) buttons, and — once a running
@@ -444,6 +455,8 @@ def build_action_and_trigger_fields(
     starting: dict,
     save_btn: Gtk.Button,
     available_action_types: list[tuple[str, str]] = ACTION_TYPES,
+    inp: str | None = None,
+    layer: str | None = None,
 ) -> tuple[Gtk.Widget, Gtk.DropDown, Callable[[], dict]]:
     """The Trigger-mode/Action editor core — everything below a Binding's
     own heading, shared verbatim by `build_binding_editor`'s per-Input
@@ -518,6 +531,7 @@ def build_action_and_trigger_fields(
         "controller_button": {"button": starting.get("button", "BTN_SOUTH")}
         if starting["type"] == "controller_button"
         else {"button": "BTN_SOUTH"},
+        "axis": {"target": starting.get("target")} if starting["type"] == "axis" else {"target": None},
     }
 
     # Ticket 42: the keypress Key field's modifier warning also depends on
@@ -539,10 +553,17 @@ def build_action_and_trigger_fields(
         # other kind must not stay disabled from a previous render.
         save_btn.set_sensitive(True)
         # Profile Switch has no coherent held/toggled meaning (ticket 05) —
-        # locked to Fire-once here and again, defensively, in on_save.
-        trigger_dd.set_sensitive(kind != "profile_switch")
+        # locked to Fire-once here and again, defensively, in on_save. Axis
+        # output has no Trigger mode at all (ticket 60's Answer) — same
+        # lock mechanism, reused for a second kind, with its own tooltip
+        # explaining why (reset to none for every other kind, so a stale
+        # tooltip doesn't survive switching away from Axis).
+        trigger_dd.set_sensitive(kind not in ("profile_switch", "axis"))
+        trigger_dd.set_tooltip_text(None)
         if kind == "profile_switch":
             trigger_dd.set_selected([k for k, _ in TRIGGER_OPTIONS].index("fire_once"))
+        elif kind == "axis":
+            trigger_dd.set_tooltip_text("Axis output has no Trigger mode")
 
         if kind == "keypress":
             def on_key_changed(code: str) -> None:
@@ -596,6 +617,23 @@ def build_action_and_trigger_fields(
                 draft["controller_button"].get("button", "BTN_SOUTH"), on_button_changed
             )
             editor_slot.append(labeled_row("Button", controller_picker))
+        elif kind == "axis":
+            def on_axis_changed(target: str) -> None:
+                draft["axis"]["target"] = target
+
+            # Ticket 60's cross-key toast: which other key (if any) already
+            # claims each target on this same Layer — `inp`/`layer` are
+            # `None` for `build_chord_binding_dialog`'s call (which excludes
+            # "axis" from its own `available_action_types`, so this branch
+            # never actually runs there; the `or {}` just keeps this
+            # defensive rather than reaching for a missing config key).
+            axis_map = config["profiles"][profile][f"axis_{layer}"] if layer else {}
+            claimed_by = {target: input_label(other) for other, target in axis_map.items() if other != inp}
+            axis_picker = build_inline_axis_picker(
+                draft["axis"].get("target"), on_axis_changed, claimed_by
+            )
+            editor_slot.append(labeled_row("Target", axis_picker))
+            save_btn.set_sensitive(draft["axis"].get("target") is not None)
         elif kind == "step":
             # Ticket 55: the real assignment flow, mirroring the Macro
             # branch below almost exactly — a dropdown of existing library
@@ -733,6 +771,13 @@ def build_action_and_trigger_fields(
 
     def get_binding() -> dict:
         kind = available_action_types[action_dd.get_selected()][0]
+        if kind == "axis":
+            # Not a Binding at all (ticket 59 §2 — Axis assignment is a
+            # parallel, structurally independent concept, no Trigger mode/
+            # Action). The caller (`build_binding_editor`'s `on_save`) must
+            # branch on this `"type"` and call `client.set_axis_assignment`
+            # instead of `client.set_binding`.
+            return {"type": "axis", "target": draft["axis"].get("target")}
         if kind == "keypress":
             return {
                 "trigger": TRIGGER_OPTIONS[trigger_dd.get_selected()][0],
@@ -781,7 +826,19 @@ def build_binding_editor(
 ) -> Gtk.Widget:
     bindings = config["profiles"][profile][layer]
     existing = bindings.get(inp)
-    starting = existing or {"trigger": "fire_once", "type": "keypress", "key": "KEY_A", "modifiers": []}
+    # Ticket 71: an Axis-assigned Input never has a `binding` at all (ticket
+    # 59 §2's mutual exclusion) — checked ahead of `existing`, so the editor
+    # defaults to the "Axis" dropdown entry with the current target seeded,
+    # rather than falling through to `existing`'s always-`None` value here.
+    current_axis_target = config["profiles"][profile][f"axis_{layer}"].get(inp)
+    if current_axis_target is not None:
+        starting = {"trigger": "fire_once", "type": "axis", "target": current_axis_target}
+    else:
+        starting = existing or {"trigger": "fire_once", "type": "keypress", "key": "KEY_A", "modifiers": []}
+    # "Axis" is offered only for grid keys (ticket 60's Answer) — non-grid
+    # Inputs (Mode key, thumbstick, wheel) never see the option at all,
+    # rather than seeing it disabled.
+    available_action_types = ACTION_TYPES if is_grid_input(inp) else [e for e in ACTION_TYPES if e[0] != "axis"]
 
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     box.set_margin_top(10)
@@ -800,7 +857,9 @@ def build_binding_editor(
     save_btn = Gtk.Button(label="Save")
     save_btn.add_css_class("suggested-action")
 
-    fields, _trigger_dd, get_binding = build_action_and_trigger_fields(client, config, profile, starting, save_btn)
+    fields, _trigger_dd, get_binding = build_action_and_trigger_fields(
+        client, config, profile, starting, save_btn, available_action_types, inp, layer
+    )
     box.append(fields)
 
     def show_error(exc: Exception):
@@ -812,7 +871,10 @@ def build_binding_editor(
     def on_save(b):
         binding = get_binding()
         try:
-            client.set_binding(inp, layer, binding)
+            if binding["type"] == "axis":
+                client.set_axis_assignment(inp, layer, binding["target"])
+            else:
+                client.set_binding(inp, layer, binding)
         except DaemonError as exc:
             show_error(exc)
             return
@@ -824,6 +886,14 @@ def build_binding_editor(
     clear_btn = Gtk.Button(label="Clear (passthrough)")
 
     def on_clear(b):
+        if current_axis_target is not None:
+            try:
+                client.clear_axis_assignment(inp, layer)
+            except DaemonError as exc:
+                show_error(exc)
+                return
+            on_saved()
+            return
         if existing is None:
             # Already passthrough — nothing to clear, no D-Bus call needed.
             on_saved()
@@ -897,7 +967,12 @@ def build_chord_binding_dialog(
     removed).
     """
     starting = existing or {"trigger": "fire_once", "type": "keypress", "key": "KEY_A", "modifiers": []}
-    chord_action_types = [(k, lbl) for k, lbl in ACTION_TYPES if k != "profile_switch"]
+    # Neither Profile Switch nor Axis has anywhere coherent to run from a
+    # Chord's own Binding — Profile Switch because `fire_chord` has no
+    # `&mut Config` to run a switch through, Axis because it isn't a Binding
+    # at all (ticket 59 §2) and a Chord fires on a discrete Down, not a
+    # continuous value.
+    chord_action_types = [(k, lbl) for k, lbl in ACTION_TYPES if k not in ("profile_switch", "axis")]
 
     dialog = Gtk.Window(transient_for=win, modal=True, title="Chord binding")
     dialog.set_default_size(320, 280)

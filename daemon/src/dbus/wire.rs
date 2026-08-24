@@ -20,9 +20,9 @@ use zbus::zvariant::{OwnedValue, Value};
 
 use crate::command::State;
 use crate::config::{
-    Action, ActuationPoint, Binding, ChordKey, Config, Layer, MacroDef, MacroId, MacroStepDto,
-    ModeKeyRole, Modifiers, Profile, StepDirection, StepperDef, StepperId, StepperItem,
-    TriggerMode,
+    Action, ActuationPoint, AxisTarget, Binding, ChordKey, Config, Layer, MacroDef, MacroId,
+    MacroStepDto, ModeKeyRole, Modifiers, Profile, StepDirection, StepperDef, StepperId,
+    StepperItem, TriggerMode,
 };
 
 /// The `a{sv}` shape every `Action`/`MacroStep`/`Binding`/`Config` entity
@@ -121,6 +121,55 @@ fn trigger_mode_from_str(s: &str) -> Result<TriggerMode, String> {
         "hold_to_repeat" => Ok(TriggerMode::HoldToRepeat),
         "toggle" => Ok(TriggerMode::Toggle),
         other => Err(format!("{other:?} is not a valid trigger mode")),
+    }
+}
+
+/// `AxisTarget` marshals as its own flat lowercase string (ticket 71),
+/// matching its `config.toml` serde form (`#[serde(rename_all =
+/// "snake_case")]`) exactly — reused identically for `SetAxisAssignment`'s
+/// `target` argument and `GetConfig()`'s `axis_base`/`axis_held` map values.
+pub fn axis_target_str(target: AxisTarget) -> &'static str {
+    match target {
+        AxisTarget::LeftTrigger => "left_trigger",
+        AxisTarget::RightTrigger => "right_trigger",
+        AxisTarget::Throttle => "throttle",
+        AxisTarget::Gas => "gas",
+        AxisTarget::Brake => "brake",
+        AxisTarget::LeftStickXPos => "left_stick_x_pos",
+        AxisTarget::LeftStickXNeg => "left_stick_x_neg",
+        AxisTarget::LeftStickYPos => "left_stick_y_pos",
+        AxisTarget::LeftStickYNeg => "left_stick_y_neg",
+        AxisTarget::RightStickXPos => "right_stick_x_pos",
+        AxisTarget::RightStickXNeg => "right_stick_x_neg",
+        AxisTarget::RightStickYPos => "right_stick_y_pos",
+        AxisTarget::RightStickYNeg => "right_stick_y_neg",
+        AxisTarget::RudderPos => "rudder_pos",
+        AxisTarget::RudderNeg => "rudder_neg",
+        AxisTarget::WheelPos => "wheel_pos",
+        AxisTarget::WheelNeg => "wheel_neg",
+    }
+}
+
+pub fn axis_target_from_str(s: &str) -> Result<AxisTarget, String> {
+    match s {
+        "left_trigger" => Ok(AxisTarget::LeftTrigger),
+        "right_trigger" => Ok(AxisTarget::RightTrigger),
+        "throttle" => Ok(AxisTarget::Throttle),
+        "gas" => Ok(AxisTarget::Gas),
+        "brake" => Ok(AxisTarget::Brake),
+        "left_stick_x_pos" => Ok(AxisTarget::LeftStickXPos),
+        "left_stick_x_neg" => Ok(AxisTarget::LeftStickXNeg),
+        "left_stick_y_pos" => Ok(AxisTarget::LeftStickYPos),
+        "left_stick_y_neg" => Ok(AxisTarget::LeftStickYNeg),
+        "right_stick_x_pos" => Ok(AxisTarget::RightStickXPos),
+        "right_stick_x_neg" => Ok(AxisTarget::RightStickXNeg),
+        "right_stick_y_pos" => Ok(AxisTarget::RightStickYPos),
+        "right_stick_y_neg" => Ok(AxisTarget::RightStickYNeg),
+        "rudder_pos" => Ok(AxisTarget::RudderPos),
+        "rudder_neg" => Ok(AxisTarget::RudderNeg),
+        "wheel_pos" => Ok(AxisTarget::WheelPos),
+        "wheel_neg" => Ok(AxisTarget::WheelNeg),
+        other => Err(format!("{other:?} is not a valid Axis target")),
     }
 }
 
@@ -307,6 +356,21 @@ fn chords_to_dict(chords: &HashMap<ChordKey, Binding>) -> Dict {
         .collect()
 }
 
+/// A Profile's Axis assignments marshal as `input.to_string() ->
+/// axis_target_str(target)` — a flat map of plain strings, simpler than
+/// `bindings_to_dict`'s nested-dict shape since there's no Trigger-mode/
+/// Action structure to bundle (ticket 71).
+fn axis_map_to_dict(map: &HashMap<crate::input::Input, AxisTarget>) -> Dict {
+    map.iter()
+        .map(|(input, target)| {
+            (
+                input.to_string(),
+                scalar(axis_target_str(*target).to_string()),
+            )
+        })
+        .collect()
+}
+
 fn profile_to_dict(profile: &Profile) -> Dict {
     let mut dict = Dict::new();
     dict.insert("base".to_string(), scalar(bindings_to_dict(&profile.base)));
@@ -318,6 +382,14 @@ fn profile_to_dict(profile: &Profile) -> Dict {
     dict.insert(
         "chords_held".to_string(),
         scalar(chords_to_dict(&profile.chords_held)),
+    );
+    dict.insert(
+        "axis_base".to_string(),
+        scalar(axis_map_to_dict(&profile.axis_base)),
+    );
+    dict.insert(
+        "axis_held".to_string(),
+        scalar(axis_map_to_dict(&profile.axis_held)),
     );
     dict.insert(
         "mode_key_role".to_string(),
@@ -991,6 +1063,68 @@ mod tests {
             .try_into()
             .unwrap();
         assert!(chords_held_dict.is_empty());
+    }
+
+    #[test]
+    fn axis_target_round_trips_through_its_wire_string() {
+        for target in AxisTarget::ALL {
+            let s = axis_target_str(target);
+            assert_eq!(axis_target_from_str(s).unwrap(), target);
+        }
+    }
+
+    #[test]
+    fn axis_target_from_str_rejects_an_unknown_string() {
+        assert!(axis_target_from_str("not_a_target").is_err());
+    }
+
+    #[test]
+    fn config_to_dict_serializes_axis_assignments() {
+        use crate::input::Input;
+        use std::collections::HashMap as StdHashMap;
+
+        let mut axis_base = StdHashMap::new();
+        axis_base.insert(Input::Grid(1, 1), AxisTarget::LeftTrigger);
+        let mut profiles = StdHashMap::new();
+        profiles.insert(
+            "Default".to_string(),
+            Profile {
+                axis_base,
+                ..Default::default()
+            },
+        );
+        let config = Config {
+            schema_version: 1,
+            active_profile: "Default".to_string(),
+            profiles,
+            force_digital: false,
+            macros: StdHashMap::new(),
+            steppers: StdHashMap::new(),
+        };
+
+        let dict = config_to_dict(&config);
+        let profiles_dict: Dict = get(&dict, "profiles").unwrap().clone().try_into().unwrap();
+        let default_profile: Dict = profiles_dict
+            .get("Default")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let axis_base_dict: Dict = get(&default_profile, "axis_base")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            dict_get_string(&axis_base_dict, "grid_r1c1"),
+            "left_trigger"
+        );
+        let axis_held_dict: Dict = get(&default_profile, "axis_held")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert!(axis_held_dict.is_empty());
     }
 
     #[test]

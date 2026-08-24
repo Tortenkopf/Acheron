@@ -34,7 +34,9 @@ import copy
 import re
 from typing import Callable
 
+from .axis_picker import AXIS_LABEL_BY_TARGET
 from .daemon_client import AlreadyExistsError, InvalidBindingError, NotFoundError
+from .inputs import is_grid_input
 
 
 class DaemonStub:
@@ -52,6 +54,12 @@ class DaemonStub:
         # Input strings (mirrors `daemon/src/config.rs::ChordKey`'s Display).
         "chords_base": {},
         "chords_held": {},
+        # Ticket 71: a Profile's Axis assignments, keyed by Input like
+        # `base`/`held` — mirrors the real Daemon's wire shape (a flat
+        # Input -> target-wire-string map, `daemon/src/dbus/wire.rs::
+        # axis_map_to_dict`).
+        "axis_base": {},
+        "axis_held": {},
     }
 
     def __init__(self, active_profile: str = "Default"):
@@ -135,7 +143,18 @@ class DaemonStub:
             if binding.get("trigger") == "toggle":
                 raise InvalidBindingError("Toggle is not allowed for a Stepper Binding")
 
+    def _reject_if_axis_assigned(self, input_str: str, layer: str) -> None:
+        # Ticket 59 §2's mutual exclusion: `SetBinding`/`SetChordBinding`
+        # both reject a grid key already Axis-assigned on this Layer with a
+        # specific error, not a silent overwrite — mirrors the real
+        # Daemon's `dispatch::axis_conflict` check.
+        if input_str in self._profiles[self._active_profile][f"axis_{layer}"]:
+            raise InvalidBindingError(
+                f"{input_str!r} already has an Axis assignment on this Layer — clear it first"
+            )
+
     def set_binding(self, input_str: str, layer: str, binding: dict) -> None:
+        self._reject_if_axis_assigned(input_str, layer)
         self._validate_binding_action(binding)
         if binding.get("type") == "step":
             # Ticket 03's Answer: assigning a Stepper list to a new Input
@@ -212,6 +231,8 @@ class DaemonStub:
             raise InvalidBindingError("a Chord needs at least two member Inputs")
         if binding.get("type") == "profile_switch":
             raise InvalidBindingError("a Chord's Binding can't be a Profile Switch")
+        for input_str in inputs:
+            self._reject_if_axis_assigned(input_str, layer)
         self._validate_binding_action(binding)
         key = self._chord_key(inputs)
         chords = self._profiles[self._active_profile][f"chords_{layer}"]
@@ -231,6 +252,35 @@ class DaemonStub:
             raise NotFoundError(f"no Chord with members {key!r}")
         del chords[key]
         self.calls.append(("clear_chord_binding", list(inputs), layer))
+
+    def set_axis_assignment(self, input_str: str, layer: str, target: str) -> None:
+        if not is_grid_input(input_str):
+            raise InvalidBindingError(f"{input_str!r} is not a Grid Input")
+        if target not in AXIS_LABEL_BY_TARGET:
+            # Mirrors the real Daemon's `wire::axis_target_from_str`
+            # rejecting an unknown target string outright (code-review
+            # finding: without this, a stub-based test can't catch a typo/
+            # desync between `axis_picker.py`'s target strings and the
+            # Daemon's own 17-entry wire catalog).
+            raise InvalidBindingError(f"{target!r} is not a valid Axis target")
+        profile = self._profiles[self._active_profile]
+        # Ticket 59 §2's mutual exclusion: atomically clears any existing
+        # Binding *and* any Chord membership for (layer, input_str)
+        # alongside the insert — mirrors the real Daemon's `SetAxisAssignment`
+        # handler, the mirror image of `_reject_if_axis_assigned` above.
+        profile[layer].pop(input_str, None)
+        chords = profile[f"chords_{layer}"]
+        for key in [k for k in chords if input_str in k.split("+")]:
+            del chords[key]
+        profile[f"axis_{layer}"][input_str] = target
+        self.calls.append(("set_axis_assignment", input_str, layer, target))
+
+    def clear_axis_assignment(self, input_str: str, layer: str) -> None:
+        axis_map = self._profiles[self._active_profile][f"axis_{layer}"]
+        if input_str not in axis_map:
+            raise NotFoundError(f"no Axis assignment is set for {input_str!r}")
+        del axis_map[input_str]
+        self.calls.append(("clear_axis_assignment", input_str, layer))
 
     def clear_binding(self, input_str: str, layer: str) -> None:
         bindings = self._profiles[self._active_profile][layer]
