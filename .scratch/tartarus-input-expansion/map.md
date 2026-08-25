@@ -464,6 +464,24 @@ Like the previous map, this one carries execution.
   Action::ControllerButton](./issues/78-decide-controller-button-trigger-mode-applicability.md)
   remains open on the frontier, unrelated to this strand.
 
+- [Decide sustained-hold Toggle for mouse-button output](./issues/82-decide-mouse-button-sustained-hold-toggle.md)
+  — surfaced directly by the user right after ticket 81 closed: Toggle has the exact same
+  drag-breaking gap Hold-to-repeat had, confirmed in code (`ActiveToggle::spawn`'s loop mash-
+  clicks a mouse-button Keypress at `toggle_lap_target` cadence instead of holding it). Settled
+  as an unconditional mirror of [ticket 79](./issues/79-decide-mouse-button-sustained-hold-drag.md) —
+  a mouse-button Toggle becomes a real sustained hold (`KeyDown` on toggle-on, `KeyUp` on
+  toggle-off, no loop) — after the user explicitly weighed and still declined the
+  toggle-driven-auto-clicker angle (a stronger use case than Hold-to-repeat's mash-click ever
+  was, since it costs no physical hold, but drag still won). Mechanism: a new
+  `ActiveToggle::spawn_held(injector, key)` constructor alongside the existing loop `spawn`,
+  same `{cancel, handle}` shape so `stop()` needs no changes; the carve-out lives in both
+  `fire()`'s and `fire_chord()`'s Toggle arms, guarded on `is_mouse_button` exactly like
+  ticket 80's `HoldToRepeat` carve-out. Keyboard-key Toggle and `ControllerButton` Toggle
+  untouched. Spawned [Build the mouse-button sustained-hold Toggle
+  fix](./issues/83-task-build-mouse-button-sustained-hold-toggle.md) and [Verify the
+  mouse-button sustained-hold Toggle fix on
+  hardware](./issues/84-task-verify-mouse-button-sustained-hold-toggle-on-hardware.md).
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.
