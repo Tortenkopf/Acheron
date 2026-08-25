@@ -448,6 +448,22 @@ Like the previous map, this one carries execution.
   +4), `cargo clippy --all-targets`/`cargo fmt --check` clean. Unblocks
   [ticket 81](./issues/81-task-verify-mouse-button-sustained-hold-on-hardware.md).
 
+- [Verify the mouse-button sustained-hold fix on hardware](./issues/81-task-verify-mouse-button-sustained-hold-on-hardware.md)
+  — all five checklist items confirmed live against the real Tartarus Pro, first pass, no bugs
+  found: a real click-and-drag in an actual application for the Hold-to-repeat case, Fire-once
+  unchanged, a Chord's mouse-button Action getting the same sustained-hold treatment (verified
+  via raw `evtest` capture on the virtual output device — clean single Down/Up per press across
+  four attempts, no re-fires), the hand-edited-`config.toml` wide-range code `BTN_TASK`
+  reaching live dispatch (confirming `is_mouse_button`'s range isn't just unit-tested), and both
+  keyboard-key Keypress (still mash-clicks on Repeat) and `Action::ControllerButton` (still
+  ticket 76's sustained-hold, unaffected) regressions holding up. No code changes needed; the
+  five temporary test bindings used for the session were removed from `config.toml` afterward
+  (restored byte-identical to its pre-session backup). Closes the map's mouse-button
+  sustained-hold strand (decide → build → verify, tickets 79-81), mirroring the Controller-button
+  pulse-fix strand's tickets 75-77. [Decide Trigger-mode applicability for
+  Action::ControllerButton](./issues/78-decide-controller-button-trigger-mode-applicability.md)
+  remains open on the frontier, unrelated to this strand.
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.
