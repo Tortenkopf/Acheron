@@ -401,6 +401,18 @@ Like the previous map, this one carries execution.
   treatment. 343 Rust tests green (5 new), `cargo clippy`/`cargo fmt --check` clean.
   Unblocks [ticket 77](./issues/77-task-verify-controller-button-pulse-fix-on-hardware.md).
 
+- [Verify the Controller-button pulse fix on hardware](./issues/77-task-verify-controller-button-pulse-fix-on-hardware.md)
+  — all five checklist items confirmed live against the real Tartarus Pro and Shantae
+  and the Pirate's Curse, first pass, no bugs found beyond what ticket 76's own tests/
+  review already caught: Fire-once single-press, Hold-to-repeat sustained-hold, both
+  Chord+`ControllerButton` variants, and a Keypress/mouse-button Hold-to-repeat
+  regression spot-check all passed. The 35ms Fire-once dwell held up unchanged — no
+  missed/double registrations, no tuning needed. One process note for future live-game
+  verification tickets: the original test-binding buttons (Mode/shoulders/stick-click)
+  turned out unused by the test game and had to be rebound mid-session to the face
+  buttons (A/B/X/Y) — pick buttons the target game actually binds. Closes the map's
+  entire Controller-button pulse-fix strand (decide → build → verify, tickets 75-77).
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.
