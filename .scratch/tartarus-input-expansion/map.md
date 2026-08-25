@@ -491,6 +491,19 @@ Like the previous map, this one carries execution.
   needed zero changes. 351 Rust tests green (net +4), `cargo clippy --all-targets`/`cargo fmt
   --check` clean. Unblocks [ticket 84](./issues/84-task-verify-mouse-button-sustained-hold-toggle-on-hardware.md).
 
+- [Verify the mouse-button sustained-hold Toggle fix on hardware](./issues/84-task-verify-mouse-button-sustained-hold-toggle-on-hardware.md)
+  — all checklist items confirmed live against the real Tartarus Pro, first pass, no bugs found:
+  a real held drag-select in an actual application for the Toggle case (second press releases
+  cleanly), a Chord's mouse-button Action getting the same treatment (`evtest`-verified, clean
+  single Down/Up), the hand-edited `BTN_TASK` wide-range code reaching live Toggle dispatch,
+  keyboard-key Toggle still mash-looping (80 repeats observed) and `ControllerButton` Toggle
+  still pulse-looping (85 pulses observed) both confirmed unaffected as-designed, and both
+  `StopAllToggles` and a live profile switch (via `gdbus call`) cleanly force-releasing a held
+  mouse-button Toggle. The narrow Mode-key-`Bound` force-stop path wasn't separately exercised
+  live — untouched by this fix, judged adequately covered by existing unit tests. No code
+  changes needed. Closes the map's mouse-button sustained-hold Toggle strand (decide → build →
+  verify, tickets 82-84), mirroring the Hold-to-repeat strand's tickets 79-81.
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.
