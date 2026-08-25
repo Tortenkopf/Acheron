@@ -364,6 +364,27 @@ Like the previous map, this one carries execution.
   matching every other build ticket's own build → verify precedent on this map. This was the
   map's last open non-blocking fast-follow build item.
 
+- [Verify and tune Analog-repeat on hardware](./issues/73-task-verify-and-tune-analog-repeat-on-hardware.md)
+  — live-verified against the real Daemon/Tartarus Pro/GUI; all five placeholder constants
+  (`ANALOG_REPEAT_DEADZONE=12`, `_MIN_HZ=2.0`, `_MAX_HZ=20.0`, `_PULSE_HOLD=15ms`,
+  `_HOLD_SOLID=235`) **confirmed as-is**, no code change. A `dbus-monitor` capture of the raw
+  `DepthChanged` signal showed a clean, continuous 0→255 depth ramp across the key's full press
+  (no early saturation) — an initial live-feel report that the rate change felt narrow-banded
+  traced to an imprecise first test press, not a real defect; a small amount of physical switch
+  overtravel past the 8-bit HID ceiling explains a separate report that the GUI's depth bar
+  "saturates before full mechanical travel," a hardware property, not a bug. All checklist items
+  (dropdown gating, tap/hold-solid/release behavior, Digital Capture fallback at kernel cadence,
+  Layer/Profile-switch and mid-tap force_digital-toggle cleanly stopping an in-flight task)
+  confirmed live and cross-checked against `evtest`/`dbus-monitor` captures, no anomalies found.
+  Two real state changes leaked into the user's daily-driver `config.toml` during testing
+  (`force_digital` left `true`; a stray `grid_r1c1` actuation override from an inadvertent
+  depth-bar drag) — both cleared live via `SetForceDigital`/`ClearActuationPoint`, config
+  confirmed structurally identical to its pre-session backup. This closes the map's entire analog
+  fast-follow strand (capture, trigger-point UX, and Analog-repeat all now built and
+  live-hardware-verified) — the required floor and every non-blocking fast-follow item are now
+  resolved; only [release documentation](./issues/35-task-write-release-documentation.md) remains
+  open on the frontier.
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.
