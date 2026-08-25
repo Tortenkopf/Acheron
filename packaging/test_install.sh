@@ -30,10 +30,7 @@ assert_contains "Type=simple"
 assert_contains "ExecStart=%h/.local/bin/acheron-daemon"
 assert_contains "After=graphical-session.target"
 assert_contains "WantedBy=default.target"
-assert_contains "Restart=on-failure"
-assert_contains "RestartSec=1"
-assert_contains "StartLimitIntervalSec=60"
-assert_contains "StartLimitBurst=5"
+assert_contains "Restart=no"
 echo "PASS: unit file contains all required directives"
 
 # --- udev rule content (ticket 23, ticket 18 §8) --------------------------

@@ -1,5 +1,6 @@
 Type: task
 Blocked by: None — can start immediately
+Status: resolved
 
 ## Question
 
@@ -11,3 +12,17 @@ Decide and build one of:
 - Or, at minimum, a guard: `parse()` recognizes the old shape specifically (rather than falling through to serde's generic "missing field" error) and refuses to start with a clear, actionable message naming the affected Binding(s) and what to do — and the systemd unit's restart policy is reviewed so this failure mode doesn't crash-loop (e.g. `Restart=no` or a backoff long enough to be readable in `systemctl status`, rather than the current rapid-restart-then-give-up).
 
 Whichever direction: no live hardware required to decide or build (config-parsing/systemd-unit work only, mirrors ticket 51/54's own AFK Daemon-only precedent) — hardware only needed if the settled direction is later re-verified end-to-end, which can be its own follow-up if warranted.
+
+## Answer
+
+**Guard**, not migration — decided directly with the user rather than via a full grilling session, since this ticket already framed the two options concretely. The ticket's premise that a rewrite-on-load precedent already exists in `config.rs` didn't hold up: the only related comment found is the opposite — `// (issue 06's "sparse" data model / no forced migration)` on a test guarding that old sparse files still parse via serde defaults, not that they get rewritten. Given that documented stance, and that this codebase's actual precedent for an incompatible old shape is a dedicated `ConfigError` variant that refuses to start with a clear message (`AxisBindingConflict`, `InvalidChordProfileSwitch`, etc.), the guard was both the simpler build and the one consistent with existing conventions — no risk of silently rewriting a user's file or picking a synthesized macro name they didn't choose.
+
+**Built, AFK, no hardware needed:**
+
+- New `find_legacy_macro_bindings()` (`daemon/src/config.rs`) walks the raw `toml::Value` — not the strongly-typed `Config` — looking for any table matching `type = "macro"` + a `steps` array + no `macro_id`, anywhere in the tree (so it catches the shape under `base`, `held`, `chords_base`, or `chords_held`, on any Profile, without hardcoding those four paths). Returns a dotted breadcrumb per match (e.g. `profiles.Default.base.grid_r1c1.action`).
+- `parse()` runs this check right after the `schema_version` check and before the strongly-typed `toml::from_str::<Config>()` call — the strongly-typed parse would otherwise fail first, on the first legacy Binding it hit, with serde's generic "missing field `macro_id`" and no indication of which Binding(s) or that this is a known, fixable shape.
+- New `ConfigError::LegacyInlineMacroBinding(Vec<String>)`, with a `Display` message naming every affected Binding's breadcrumb and stating the fix directly (`{ type = "macro", macro_id = "..." }` referencing `[macros.*]`, or recreate the Binding from the GUI).
+- New regression test `refuses_to_start_on_a_pre_ticket_51_inline_macro_binding_and_names_it`, mirroring the existing `refuses_to_start_when_a_macro_binding_names_an_unknown_macro_id` test's shape, including the same "file on disk is untouched" assertion (this ticket chose a guard, not a migration).
+- `packaging/acheron-daemon.service`: `Restart=on-failure`/`RestartSec=1`/`StartLimitIntervalSec=60`/`StartLimitBurst=5` replaced with `Restart=no`. Reasoning goes beyond just this one failure class: *any* fatal Daemon exit at startup (a `ConfigError`, a failed `uinput`/D-Bus init, …) is a permanent condition until something on disk or in the environment changes — retrying just reproduces the identical failure faster than a human can read it, which is exactly what turned this ticket's triggering incident into `systemd`'s own `"Start request repeated too quickly"` instead of the Daemon's own readable message. `Restart=no` means one clean failure, real error visible via `systemctl --user status acheron-daemon`. `packaging/test_install.sh`'s unit-file assertions updated to match (`Restart=no`, the four removed lines' assertions dropped).
+
+330 Rust tests (329 + 1 new) + 284 Python tests green, `packaging/test_install.sh` green, `cargo fmt`/`clippy` clean. No GUI/D-Bus/CONTEXT.md changes — this is a load-time-only guard, invisible to any config that doesn't have the old shape on disk.

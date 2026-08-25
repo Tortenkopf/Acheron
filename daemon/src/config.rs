@@ -792,6 +792,17 @@ pub enum ConfigError {
     /// reachable via a hand-edited `config.toml`; `SetChordBinding`/
     /// `SetAxisAssignment` both refuse to create this live.
     AxisChordConflict(String),
+    /// A pre-ticket-51 `config.toml` still carrying the old inline
+    /// `Action::Macro { steps: [...] }` shape (`type = "macro"` with a
+    /// `steps` array and no `macro_id`) — ticket 51 replaced it with a
+    /// reference into `[macros.*]`, and nothing migrates an old file
+    /// automatically (issue 06's "sparse data model, no forced migration"
+    /// precedent — see `parse`'s other sparse-default tests). Detected
+    /// specifically against the raw TOML, ahead of the strongly-typed parse,
+    /// so the failure names the affected Binding(s) instead of surfacing as
+    /// serde's opaque "missing field `macro_id`" (ticket 57, spawned live
+    /// from ticket 53 hitting exactly this against a real config.toml).
+    LegacyInlineMacroBinding(Vec<String>),
 }
 
 impl fmt::Display for ConfigError {
@@ -853,6 +864,11 @@ impl fmt::Display for ConfigError {
                 f,
                 "config.toml contains both an Axis assignment for {input:?} and a Chord that has it as a member, on the same Layer"
             ),
+            ConfigError::LegacyInlineMacroBinding(paths) => write!(
+                f,
+                "config.toml contains an old-style inline Action::Macro Binding (from before named macros were introduced) at: {} — replace each one with {{ type = \"macro\", macro_id = \"...\" }} referencing an entry under [macros.*], or recreate the Binding from the GUI",
+                paths.join(", ")
+            ),
         }
     }
 }
@@ -875,6 +891,40 @@ pub fn load_or_seed(path: &Path) -> Result<Config, ConfigError> {
     }
 }
 
+/// Walks `value` looking for the pre-ticket-51 inline `Action::Macro` shape
+/// (`type = "macro"` with a `steps` array and no `macro_id`) and returns a
+/// dotted breadcrumb (e.g. `profiles.Default.base.grid_r2c1.action`) for
+/// each one found — `parse` runs this against the raw TOML, ahead of the
+/// strongly-typed deserialize, since that deserialize would otherwise fail
+/// on the first one with serde's generic "missing field `macro_id`" instead
+/// of naming which Binding(s) need fixing (ticket 57).
+fn find_legacy_macro_bindings(value: &toml::Value) -> Vec<String> {
+    fn walk(value: &toml::Value, path: &str, out: &mut Vec<String>) {
+        let toml::Value::Table(table) = value else {
+            return;
+        };
+        let is_legacy_macro_shape = table.get("type").and_then(toml::Value::as_str)
+            == Some("macro")
+            && table.contains_key("steps")
+            && !table.contains_key("macro_id");
+        if is_legacy_macro_shape {
+            out.push(path.to_string());
+            return;
+        }
+        for (key, child) in table {
+            let child_path = if path.is_empty() {
+                key.clone()
+            } else {
+                format!("{path}.{key}")
+            };
+            walk(child, &child_path, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(value, "", &mut out);
+    out
+}
+
 fn parse(contents: &str) -> Result<Config, ConfigError> {
     // Checked separately (and first) so a version mismatch is reported as
     // such, rather than surfacing as whatever generic deserialize error a
@@ -887,6 +937,10 @@ fn parse(contents: &str) -> Result<Config, ConfigError> {
             Some(version) => return Err(ConfigError::UnsupportedSchemaVersion(version)),
             None => return Err(ConfigError::InvalidSchemaVersion(format!("{raw:?}"))),
         },
+    }
+    let legacy_macro_bindings = find_legacy_macro_bindings(&value);
+    if !legacy_macro_bindings.is_empty() {
+        return Err(ConfigError::LegacyInlineMacroBinding(legacy_macro_bindings));
     }
 
     let config: Config = toml::from_str(contents).map_err(ConfigError::Parse)?;
@@ -1445,6 +1499,36 @@ action = { type = "macro", macro_id = "does-not-exist" }
         let err = load_or_seed(&path).expect_err("a dangling macro_id must refuse to start");
         assert!(matches!(err, ConfigError::UnknownMacro(id) if id == "does-not-exist"));
 
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn refuses_to_start_on_a_pre_ticket_51_inline_macro_binding_and_names_it() {
+        // ticket 57: a config.toml written before named macros existed still
+        // has `type = "macro"` with a `steps` array and no `macro_id` — this
+        // must surface as a specific, readable error naming the Binding,
+        // not serde's generic "missing field `macro_id`".
+        let (_dir, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base.grid_r1c1]
+trigger = "fire_once"
+action = { type = "macro", steps = [{ key_down = "KEY_A" }, { key_up = "KEY_A" }] }
+"#;
+        fs::write(&path, original).unwrap();
+
+        let err = load_or_seed(&path)
+            .expect_err("a pre-ticket-51 inline Macro Binding must refuse to start");
+        assert!(matches!(
+            err,
+            ConfigError::LegacyInlineMacroBinding(paths)
+                if paths == vec!["profiles.Default.base.grid_r1c1.action".to_string()]
+        ));
+
+        // Refused, not silently rewritten (this ticket chose a guard, not a
+        // migration) — the file on disk is untouched.
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 
