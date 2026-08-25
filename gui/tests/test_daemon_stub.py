@@ -426,6 +426,29 @@ def test_set_binding_rejects_a_toggle_step_binding():
         )
 
 
+def test_set_binding_rejects_analog_repeat_on_a_non_grid_input():
+    stub = DaemonStub()
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_binding(
+            "mode_key",
+            "base",
+            {"trigger": "analog_repeat", "type": "keypress", "key": "KEY_A", "modifiers": []},
+        )
+
+
+def test_set_binding_accepts_analog_repeat_on_a_grid_input():
+    stub = DaemonStub()
+
+    stub.set_binding(
+        "grid_r1c1",
+        "base",
+        {"trigger": "analog_repeat", "type": "keypress", "key": "KEY_A", "modifiers": []},
+    )
+
+    assert stub.get_config()["profiles"]["Default"]["base"]["grid_r1c1"]["trigger"] == "analog_repeat"
+
+
 def test_set_binding_silently_moves_a_stepper_direction_off_its_old_input():
     stub = DaemonStub()
     stepper_id = stub.create_stepper("Test stepper", [{"type": "key", "key": "KEY_1"}])
@@ -533,6 +556,17 @@ def test_set_chord_binding_rejects_a_profile_switch_action():
     with pytest.raises(InvalidBindingError):
         stub.set_chord_binding(
             ["grid_r1c1", "grid_r1c2"], "base", {"trigger": "fire_once", "type": "profile_switch", "target": "Gaming"}
+        )
+
+
+def test_set_chord_binding_rejects_analog_repeat():
+    stub = DaemonStub()
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_chord_binding(
+            ["grid_r1c1", "grid_r1c2"],
+            "base",
+            {"trigger": "analog_repeat", "type": "keypress", "key": "KEY_C"},
         )
 
 

@@ -486,8 +486,21 @@ def build_action_and_trigger_fields(
     """
     fields = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
 
-    trigger_dd = Gtk.DropDown(model=Gtk.StringList.new([lbl for _, lbl in TRIGGER_OPTIONS]))
-    trigger_dd.set_selected([k for k, _ in TRIGGER_OPTIONS].index(starting["trigger"]))
+    # Analog-repeat only has meaning for a grid key (ticket 20/39 — only a
+    # Grid Input has Depth) — excluded outright for a non-grid Input or a
+    # Chord's own Binding (`inp is None`), mirroring `available_action_
+    # types`'s own `is_grid_input`-gated "Axis" exclusion above it. The
+    # Daemon's own `parse`/`SetBinding`/`SetChordBinding` validation
+    # (ticket 39) makes it structurally impossible for `starting["trigger"]`
+    # to be "analog_repeat" here when this filters it out.
+    trigger_options = (
+        TRIGGER_OPTIONS
+        if inp is not None and is_grid_input(inp)
+        else [(k, lbl) for k, lbl in TRIGGER_OPTIONS if k != "analog_repeat"]
+    )
+    trigger_keys = [k for k, _ in trigger_options]
+    trigger_dd = Gtk.DropDown(model=Gtk.StringList.new([lbl for _, lbl in trigger_options]))
+    trigger_dd.set_selected(trigger_keys.index(starting["trigger"]))
     fields.append(labeled_row("Trigger mode", trigger_dd))
 
     known_action_kinds = [k for k, _ in available_action_types]
@@ -561,7 +574,7 @@ def build_action_and_trigger_fields(
         trigger_dd.set_sensitive(kind not in ("profile_switch", "axis"))
         trigger_dd.set_tooltip_text(None)
         if kind == "profile_switch":
-            trigger_dd.set_selected([k for k, _ in TRIGGER_OPTIONS].index("fire_once"))
+            trigger_dd.set_selected(trigger_keys.index("fire_once"))
         elif kind == "axis":
             trigger_dd.set_tooltip_text("Axis output has no Trigger mode")
 
@@ -570,7 +583,7 @@ def build_action_and_trigger_fields(
                 draft["keypress"]["key"] = code
 
             def key_warn_predicate() -> bool:
-                return TRIGGER_OPTIONS[trigger_dd.get_selected()][0] != "toggle"
+                return trigger_options[trigger_dd.get_selected()][0] != "toggle"
 
             key_picker, refresh_key_warning = build_inline_key_picker(
                 draft["keypress"].get("key", "KEY_A"), on_key_changed, key_warn_predicate
@@ -781,7 +794,7 @@ def build_action_and_trigger_fields(
             return {"type": "axis", "target": draft["axis"].get("target")}
         if kind == "keypress":
             return {
-                "trigger": TRIGGER_OPTIONS[trigger_dd.get_selected()][0],
+                "trigger": trigger_options[trigger_dd.get_selected()][0],
                 "type": "keypress",
                 "key": draft["keypress"].get("key", "KEY_A"),
                 "modifiers": draft["keypress"].get("modifiers", []),
@@ -796,19 +809,19 @@ def build_action_and_trigger_fields(
             }
         if kind == "controller_button":
             return {
-                "trigger": TRIGGER_OPTIONS[trigger_dd.get_selected()][0],
+                "trigger": trigger_options[trigger_dd.get_selected()][0],
                 "type": "controller_button",
                 "button": draft["controller_button"].get("button", "BTN_SOUTH"),
             }
         if kind == "step":
             return {
-                "trigger": TRIGGER_OPTIONS[trigger_dd.get_selected()][0],
+                "trigger": trigger_options[trigger_dd.get_selected()][0],
                 "type": "step",
                 "stepper_id": draft["step"]["stepper_id"],
                 "direction": draft["step"].get("direction", "forward"),
             }
         return {
-            "trigger": TRIGGER_OPTIONS[trigger_dd.get_selected()][0],
+            "trigger": trigger_options[trigger_dd.get_selected()][0],
             "type": "macro",
             "macro_id": draft["macro"]["macro_id"],
         }

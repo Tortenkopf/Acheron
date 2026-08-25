@@ -25,9 +25,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use evdev::AbsoluteAxisCode;
+use evdev::{AbsoluteAxisCode, KeyCode};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use zbus::object_server::SignalEmitter;
 
 use crate::capture::{CaptureMode, EventState, PhysicalEvent};
@@ -38,7 +39,7 @@ use crate::config::{
     TriggerMode,
 };
 use crate::dbus::Daemon;
-use crate::executor::{self, ActiveToggle, FiringHandle};
+use crate::executor::{self, ActiveToggle, FiringHandle, MacroStep};
 use crate::injector::Injector;
 use crate::input::Input;
 
@@ -242,6 +243,248 @@ async fn reset_axis_outputs(injector: &Injector, axis_state: &mut AxisState) -> 
     Ok(())
 }
 
+/// Analog-repeat's fixed start/stop threshold (ticket 20/39) — deliberately
+/// not the key's own tunable Actuation point, so the rate curve gets the
+/// key's full physical travel to work with. Placeholder: left TBD by ticket
+/// 20's Answer, to be tuned live against the real device — no physical
+/// Tartarus Pro was available in the session that built this.
+const ANALOG_REPEAT_DEADZONE: u8 = 12;
+
+/// Analog-repeat's minimum/maximum re-fire rate (ticket 20/39), linearly
+/// interpolated across the key's full 0-255 Depth range. Placeholders, same
+/// live-tuning status as `ANALOG_REPEAT_DEADZONE`.
+const ANALOG_REPEAT_MIN_HZ: f64 = 2.0;
+const ANALOG_REPEAT_MAX_HZ: f64 = 20.0;
+
+/// Analog-repeat's fixed per-fire hold duration (ticket 20/39) — the same
+/// every tick regardless of Depth; only the tick-to-tick *rate* varies.
+/// Placeholder, same live-tuning status as `ANALOG_REPEAT_DEADZONE`.
+const ANALOG_REPEAT_PULSE_HOLD: Duration = Duration::from_millis(15);
+
+/// Analog-repeat's near-full-travel threshold (ticket 20/39) at or above
+/// which the key holds down solid instead of continuing to tap. Placeholder,
+/// same live-tuning status as `ANALOG_REPEAT_DEADZONE`.
+const ANALOG_REPEAT_HOLD_SOLID: u8 = 235;
+
+/// A running Analog-repeat background task (ticket 20/39), as tracked in
+/// dispatch's `HashMap<Input, ActiveAnalogRepeat>` — structurally closer to
+/// `ActiveToggle` than to a Fire-once/Hold-to-repeat `FiringHandle`, per
+/// ticket 20's Answer: its lifetime is driven by Depth crossing
+/// `ANALOG_REPEAT_DEADZONE` (see `update_analog_repeats`), not by a single
+/// physical press/release. Never touched from `fire()`, which swallows every
+/// Analog-sourced Down/Repeat/Up for an Analog-repeat Binding outright (see
+/// `handle_event`) — only a Digital-sourced one (no Depth at all) reaches
+/// `fire()`, which treats Analog-repeat exactly like Hold-to-repeat there
+/// (ticket 20's Digital Capture mode fallback).
+struct ActiveAnalogRepeat {
+    cancel: CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl ActiveAnalogRepeat {
+    /// Spawns the task: `steps` is compiled once, here, from the Binding's
+    /// Action as of the moment Depth first crossed the deadzone (mirrors
+    /// `fire()`'s own once-per-press `compile_action` call) — not
+    /// recompiled per tick, so a Stepper Action's cursor advances once per
+    /// "press session" rather than auto-cycling at the tick rate. `depth_rx`
+    /// is the caller's own clone of the shared live-Depth watch channel
+    /// (ticket 26), read fresh on every tick to drive the rate curve.
+    fn spawn(
+        injector: Injector,
+        input: Input,
+        steps: Vec<MacroStep>,
+        depth_rx: watch::Receiver<HashMap<Input, u8>>,
+    ) -> Self {
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(run_analog_repeat_loop(
+            injector,
+            input,
+            steps,
+            depth_rx,
+            cancel.clone(),
+        ));
+        ActiveAnalogRepeat { cancel, handle }
+    }
+
+    /// Stops the task and waits for its force-release to complete, mirroring
+    /// `ActiveToggle::stop`'s exact contract.
+    async fn stop(self) {
+        self.cancel.cancel();
+        let _ = self.handle.await;
+    }
+}
+
+/// Fires `steps`' Down phase, holds for `ANALOG_REPEAT_PULSE_HOLD`, then
+/// fires the Up phase in reverse order — matching `keypress_steps`'s own
+/// down/up nesting (modifiers released in the reverse of how they were
+/// pressed). Deliberately ignores any `MacroStep::Delay` a Macro Action
+/// might embed: Analog-repeat's whole idea (ticket 20's Answer) is a single
+/// fixed-duration pulse, not a multi-step timed sequence.
+async fn fire_analog_repeat_pulse(
+    injector: &Injector,
+    steps: &[MacroStep],
+    held: &mut HashSet<KeyCode>,
+) {
+    for step in steps {
+        if let MacroStep::KeyDown(_) = step {
+            let _ = executor::execute_step(injector, held, *step).await;
+        }
+    }
+    tokio::time::sleep(ANALOG_REPEAT_PULSE_HOLD).await;
+    for step in steps.iter().rev() {
+        if let MacroStep::KeyUp(_) = step {
+            let _ = executor::execute_step(injector, held, *step).await;
+        }
+    }
+}
+
+/// The task body `ActiveAnalogRepeat::spawn` runs. Two states, toggled by
+/// `depth_rx`'s own live snapshot on every loop iteration: below
+/// `ANALOG_REPEAT_HOLD_SOLID`, fires `fire_analog_repeat_pulse` at a rate
+/// linearly interpolated between `ANALOG_REPEAT_MIN_HZ`/`_MAX_HZ` across the
+/// full 0-255 Depth range (ticket 20's Answer: not renormalized to the key's
+/// own Actuation/Release band); at or above it, holds every Down step solid
+/// with no further tapping until Depth drops back below the threshold.
+/// Exits (force-releasing whatever it's still holding) only on external
+/// cancellation — `update_analog_repeats` is the sole owner of *when* that
+/// happens, driven by Depth crossing back down through the deadzone.
+async fn run_analog_repeat_loop(
+    injector: Injector,
+    input: Input,
+    steps: Vec<MacroStep>,
+    mut depth_rx: watch::Receiver<HashMap<Input, u8>>,
+    cancel: CancellationToken,
+) {
+    let mut held: HashSet<KeyCode> = HashSet::new();
+    let mut holding_solid = false;
+    loop {
+        let depth = *depth_rx.borrow().get(&input).unwrap_or(&0);
+        if depth >= ANALOG_REPEAT_HOLD_SOLID {
+            if !holding_solid {
+                for step in &steps {
+                    if let MacroStep::KeyDown(_) = step {
+                        let _ = executor::execute_step(&injector, &mut held, *step).await;
+                    }
+                }
+                holding_solid = true;
+            }
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                _ = depth_rx.changed() => {}
+            }
+            continue;
+        }
+        if holding_solid {
+            for step in steps.iter().rev() {
+                if let MacroStep::KeyUp(_) = step {
+                    let _ = executor::execute_step(&injector, &mut held, *step).await;
+                }
+            }
+            holding_solid = false;
+        }
+        // Below the deadzone: `update_analog_repeats` is the sole owner of
+        // *stopping* this task and is about to (or a stale wakeup is racing
+        // it) — wait rather than firing a spurious pulse at the curve's own
+        // minimum rate. Without this check, a `depth_rx.changed()` wakeup
+        // that wins its `select!` against the hold-solid branch's own
+        // `cancel.cancelled()` above (both become ready around the same
+        // depth update that crosses back below the deadzone) would
+        // otherwise fall through into the tapping branch below and fire one
+        // extra Down/Up pulse before the external stop's cancellation ever
+        // lands — reproduced by this module's own `analog_repeat_holds_
+        // solid_above_the_hold_threshold` test, intermittently, before this
+        // check existed.
+        if depth < ANALOG_REPEAT_DEADZONE {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                _ = depth_rx.changed() => {}
+            }
+            continue;
+        }
+        let rate_hz = ANALOG_REPEAT_MIN_HZ
+            + (ANALOG_REPEAT_MAX_HZ - ANALOG_REPEAT_MIN_HZ) * (f64::from(depth) / 255.0);
+        let period = Duration::from_secs_f64(1.0 / rate_hz);
+        let tick_start = Instant::now();
+        let cancelled = tokio::select! {
+            () = cancel.cancelled() => true,
+            () = fire_analog_repeat_pulse(&injector, &steps, &mut held) => false,
+        };
+        if cancelled {
+            break;
+        }
+        let elapsed = tick_start.elapsed();
+        if elapsed < period {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(period - elapsed) => {}
+            }
+        }
+    }
+    executor::force_release(&injector, held).await;
+}
+
+/// Force-stops every currently running Analog-repeat task — mirrors
+/// `stop_all_toggles`'s exact shape, called on Layer switch/Profile switch
+/// (an Analog-repeat task is tied to one specific Layer's Binding, closer to
+/// a continuous Axis output than to a Toggle's deliberately-persisted latch
+/// — same reasoning as `reset_axis_outputs`'s own call sites) and on an
+/// Analog-to-Digital capture-mode transition (the live-Depth stream driving
+/// every task's rate curve goes stale the moment that happens).
+async fn stop_all_analog_repeats(analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>) {
+    for (_, task) in analog_repeats.drain() {
+        task.stop().await;
+    }
+}
+
+/// Starts/stops every grid Input's Analog-repeat task from a fresh
+/// `depth_tx` snapshot (ticket 20/39) — the depth-driven half of
+/// Analog-repeat's firing, parallel to `handle_depth_update`'s own Axis
+/// resolution off the same snapshot. A rising edge through
+/// `ANALOG_REPEAT_DEADZONE` on an Input whose active-Layer Binding is
+/// `TriggerMode::AnalogRepeat` spawns a task (compiling its steps once, the
+/// same "once per press" precedent `fire()` already sets); a falling edge —
+/// or the Binding no longer being Analog-repeat, best-effort only, see below
+/// — stops one. A Binding changed away from Analog-repeat without an
+/// intervening depth-crossing (e.g. edited live while the key stays
+/// physically pressed) is a known, accepted residual gap: the stale task
+/// keeps running with the steps it compiled at spawn time until Depth next
+/// crosses the deadzone — the same class of gap ticket 71's Answer accepted
+/// for its own opposite-signed-halves tie-break, not engineered around here.
+#[allow(clippy::too_many_arguments)]
+async fn update_analog_repeats(
+    injector: &Injector,
+    config: &Config,
+    active_layer: Layer,
+    analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>,
+    stepper_cursors: &mut HashMap<StepperId, usize>,
+    depth_rx: &watch::Receiver<HashMap<Input, u8>>,
+    snapshot: &HashMap<Input, u8>,
+) {
+    let profile = config
+        .active_profile()
+        .expect("load_or_seed validates active_profile names a real profile");
+    let bindings = profile.layer(active_layer);
+    for (&input, &depth) in snapshot {
+        let binding = bindings.get(&input);
+        let is_analog_repeat = binding.is_some_and(|b| b.trigger == TriggerMode::AnalogRepeat);
+        if is_analog_repeat && depth >= ANALOG_REPEAT_DEADZONE {
+            analog_repeats.entry(input).or_insert_with(|| {
+                let steps = compile_action(
+                    &binding
+                        .expect("is_analog_repeat is only true for Some(binding)")
+                        .action,
+                    &config.macros,
+                    &config.steppers,
+                    stepper_cursors,
+                );
+                ActiveAnalogRepeat::spawn(injector.clone(), input, steps, depth_rx.clone())
+            });
+        } else if let Some(task) = analog_repeats.remove(&input) {
+            task.stop().await;
+        }
+    }
+}
+
 /// Returns an error once the injector channel closes, or the capture
 /// channel closes (meaning the capture task has died) — per issue 07, a
 /// genuine, fatal capture-pipeline error rather than something to swallow
@@ -335,6 +578,11 @@ pub async fn run(
     // ownership (ticket 59/71) — reset fresh on every dispatch task start,
     // same as `chord_state`.
     let mut axis_state = AxisState::default();
+    // Every currently-running Analog-repeat task (ticket 20/39), keyed by
+    // grid Input — reset fresh on every dispatch task start, same as
+    // `axis_state`; started/stopped by `update_analog_repeats` off every
+    // `rx_depth` snapshot below.
+    let mut analog_repeats: HashMap<Input, ActiveAnalogRepeat> = HashMap::new();
     let mut depth_open = true;
     loop {
         tokio::select! {
@@ -352,6 +600,7 @@ pub async fn run(
                     &actuation_tx,
                     &mut chord_state,
                     &mut axis_state,
+                    &mut analog_repeats,
                     toggle_lap_target,
                     event,
                 )
@@ -361,7 +610,17 @@ pub async fn run(
                 match changed {
                     Ok(()) => {
                         let snapshot = rx_depth.borrow_and_update().clone();
-                        handle_depth_update(&injector, &config, active_layer, &mut axis_state, snapshot).await?;
+                        handle_depth_update(&injector, &config, active_layer, &mut axis_state, snapshot.clone()).await?;
+                        update_analog_repeats(
+                            &injector,
+                            &config,
+                            active_layer,
+                            &mut analog_repeats,
+                            &mut stepper_cursors,
+                            &rx_depth,
+                            &snapshot,
+                        )
+                        .await;
                     }
                     Err(_) => depth_open = false,
                 }
@@ -379,6 +638,7 @@ pub async fn run(
                     &signal_emitter,
                     &mut chord_state,
                     &mut axis_state,
+                    &mut analog_repeats,
                     toggle_lap_target,
                 )
                 .await?;
@@ -391,13 +651,13 @@ pub async fn run(
             }
             mode = rx_capture_mode.recv(), if capture_mode_open => {
                 match mode {
-                    Some(mode) => handle_capture_mode_change(&mut capture_mode, &signal_emitter, mode).await,
+                    Some(mode) => handle_capture_mode_change(&mut capture_mode, &signal_emitter, &mut analog_repeats, mode).await,
                     None => capture_mode_open = false,
                 }
             }
             cmd = rx_commands.recv(), if commands_open => {
                 match cmd {
-                    Some(cmd) => handle_command(&injector, &mut config, &config_path, &mut toggles, &mut stepper_cursors, &mut axis_state, &active_layer, device_connected, capture_mode, &signal_emitter, &actuation_tx, &capture_control_tx, cmd).await,
+                    Some(cmd) => handle_command(&injector, &mut config, &config_path, &mut toggles, &mut stepper_cursors, &mut axis_state, &mut analog_repeats, &active_layer, device_connected, capture_mode, &signal_emitter, &actuation_tx, &capture_control_tx, cmd).await,
                     None => commands_open = false,
                 }
             }
@@ -419,6 +679,7 @@ async fn handle_event(
     actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
     chord_state: &mut ChordState,
     axis_state: &mut AxisState,
+    analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>,
     toggle_lap_target: Duration,
     event: PhysicalEvent,
 ) -> io::Result<()> {
@@ -432,6 +693,7 @@ async fn handle_event(
             active_layer,
             signal_emitter,
             axis_state,
+            analog_repeats,
             event.state,
         )
         .await?;
@@ -493,6 +755,7 @@ async fn handle_event(
             actuation_tx,
             chord_state,
             axis_state,
+            analog_repeats,
             toggle_lap_target,
             event,
         )
@@ -521,6 +784,7 @@ async fn handle_event(
                         toggles,
                         actuation_tx,
                         axis_state,
+                        analog_repeats,
                         target.clone(),
                     )
                     .await
@@ -529,6 +793,20 @@ async fn handle_event(
                         let _ = Daemon::active_profile_changed(emitter, &target).await;
                     }
                 }
+                return Ok(());
+            }
+            // Real firing for Analog-repeat while Depth is available comes
+            // entirely from `update_analog_repeats`'s own depth-driven
+            // background task (ticket 20/39) — this Analog-sourced
+            // Down/Repeat/Up (synthesized from the key's ordinary, *tunable*
+            // Actuation/Release points, a different threshold pair than
+            // Analog-repeat's own fixed deadzone) is swallowed outright
+            // rather than double-firing through `fire()`, mirroring the
+            // Axis-assignment swallow above. A Digital-sourced event (no
+            // Depth at all) falls through to `fire()`, which treats
+            // Analog-repeat exactly like Hold-to-repeat (ticket 20's
+            // Digital Capture mode fallback).
+            if binding.trigger == TriggerMode::AnalogRepeat && event.depth.is_some() {
                 return Ok(());
             }
             fire(
@@ -560,12 +838,16 @@ async fn handle_event(
 /// Also resets every Axis output (ticket 71) on an actual transition — the
 /// outgoing Layer's Axis-assignment map generally differs from the incoming
 /// one, so any live output must not be left driving a target the newly-
-/// active Layer no longer even assigns.
+/// active Layer no longer even assigns. Force-stops every Analog-repeat task
+/// for the same reason (ticket 39) — an incoming Layer's Bindings generally
+/// differ from the outgoing one's, so a task compiled against the old
+/// Layer's Action must not keep firing under the new one.
 async fn handle_layer_switch(
     injector: &Injector,
     active_layer: &mut Layer,
     signal_emitter: &Option<SignalEmitter<'static>>,
     axis_state: &mut AxisState,
+    analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>,
     state: EventState,
 ) -> io::Result<()> {
     let new_layer = match state {
@@ -578,6 +860,7 @@ async fn handle_layer_switch(
     }
     *active_layer = new_layer;
     reset_axis_outputs(injector, axis_state).await?;
+    stop_all_analog_repeats(analog_repeats).await;
     if let Some(emitter) = signal_emitter {
         let _ = Daemon::active_layer_changed(emitter, new_layer.as_str()).await;
     }
@@ -607,16 +890,25 @@ async fn handle_connection_change(
 /// (ticket 23) and emits `CaptureModeChanged` only on an actual transition —
 /// mirrors `handle_connection_change` above exactly, including skipping the
 /// push when `signal_emitter` is `None` (unit tests with no live D-Bus
-/// connection).
+/// connection). Also force-stops every Analog-repeat task on a transition to
+/// Digital (ticket 39): the live-Depth stream every task's rate curve reads
+/// goes stale the moment analog capture stops, and Digital-sourced
+/// Down/Repeat/Up events for the same Bindings are about to start reaching
+/// `fire()`'s own Hold-to-repeat-equivalent fallback instead — a still-
+/// running task would otherwise double-fire alongside it.
 async fn handle_capture_mode_change(
     capture_mode: &mut CaptureMode,
     signal_emitter: &Option<SignalEmitter<'static>>,
+    analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>,
     mode: CaptureMode,
 ) {
     if mode == *capture_mode {
         return;
     }
     *capture_mode = mode;
+    if mode == CaptureMode::Digital {
+        stop_all_analog_repeats(analog_repeats).await;
+    }
     if let Some(emitter) = signal_emitter {
         let _ = Daemon::capture_mode_changed(emitter, mode.as_str()).await;
     }
@@ -804,6 +1096,7 @@ async fn fire_individual_retroactively(
     stepper_cursors: &mut HashMap<StepperId, usize>,
     actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
     axis_state: &mut AxisState,
+    analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>,
     signal_emitter: &Option<SignalEmitter<'static>>,
     layer: Layer,
     input: Input,
@@ -823,6 +1116,7 @@ async fn fire_individual_retroactively(
                     toggles,
                     actuation_tx,
                     axis_state,
+                    analog_repeats,
                     target.clone(),
                 )
                 .await
@@ -833,6 +1127,14 @@ async fn fire_individual_retroactively(
                 }
                 return Ok(());
             }
+            // Accepted gap (ticket 39): a member's own individual Binding
+            // set to Analog-repeat fires once here through `fire()`'s
+            // ordinary one-shot path, rather than starting the depth-driven
+            // background task `update_analog_repeats` normally would — this
+            // retroactive Down is synthetic (no real live Depth to hand a
+            // task), and a grid key that's both a Chord member *and*
+            // individually Analog-repeat-triggered is a narrow combination
+            // this fast-follow doesn't specially engineer for.
             fire(
                 injector,
                 toggles,
@@ -875,6 +1177,7 @@ async fn handle_chord_event(
     actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
     chord_state: &mut ChordState,
     axis_state: &mut AxisState,
+    analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>,
     toggle_lap_target: Duration,
     event: PhysicalEvent,
 ) -> io::Result<()> {
@@ -1053,6 +1356,7 @@ async fn handle_chord_event(
                     stepper_cursors,
                     actuation_tx,
                     axis_state,
+                    analog_repeats,
                     signal_emitter,
                     active_layer,
                     event.input,
@@ -1097,6 +1401,7 @@ async fn handle_chord_timeout(
     signal_emitter: &Option<SignalEmitter<'static>>,
     chord_state: &mut ChordState,
     axis_state: &mut AxisState,
+    analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>,
     toggle_lap_target: Duration,
 ) -> io::Result<()> {
     let Some(window) = chord_state.window.take() else {
@@ -1113,6 +1418,7 @@ async fn handle_chord_timeout(
             stepper_cursors,
             actuation_tx,
             axis_state,
+            analog_repeats,
             signal_emitter,
             active_layer,
             input,
@@ -1190,6 +1496,12 @@ fn resolve_step(
 /// force-releases anything that Input's most recent firing left down (a
 /// no-op for an already-self-released, balanced Macro); Toggle's own `Up` is
 /// still a no-op, since a Toggle's stop is a second `Down`, not a release.
+/// Analog-repeat rides the exact same Down/Repeat/Up arms as Hold-to-repeat
+/// (ticket 20's Digital Capture mode fallback) — the only way this function
+/// ever sees an Analog-repeat Binding at all, since `handle_event` swallows
+/// every Analog-*sourced* Down/Repeat/Up for one outright, before `fire` is
+/// ever called (real Analog-mode firing is `update_analog_repeats`'s own
+/// depth-driven background task).
 #[allow(clippy::too_many_arguments)]
 async fn fire(
     injector: &Injector,
@@ -1205,7 +1517,10 @@ async fn fire(
 ) -> io::Result<()> {
     match (binding.trigger, state) {
         (TriggerMode::FireOnce, EventState::Down)
-        | (TriggerMode::HoldToRepeat, EventState::Down | EventState::Repeat) => {
+        | (
+            TriggerMode::HoldToRepeat | TriggerMode::AnalogRepeat,
+            EventState::Down | EventState::Repeat,
+        ) => {
             // Same-Input firings must never run concurrently — their raw
             // steps share one Injector channel, and two interleaved firings
             // could land their KeyDown/KeyUp writes out of order. A still-
@@ -1235,7 +1550,10 @@ async fn fire(
             );
             Ok(())
         }
-        (TriggerMode::FireOnce | TriggerMode::HoldToRepeat, EventState::Up) => {
+        (
+            TriggerMode::FireOnce | TriggerMode::HoldToRepeat | TriggerMode::AnalogRepeat,
+            EventState::Up,
+        ) => {
             if let Some(firing) = in_flight.get(&input) {
                 firing.force_release_stuck(injector).await;
             }
@@ -1389,6 +1707,7 @@ fn publish_actuation_snapshot(
 /// firing has no reply at all. Self-reference (`name` already active) is not
 /// special-cased — it still persists, force-stops Toggles, and republishes,
 /// an intentional no-op-except-for-Toggles per ticket 05's design.
+#[allow(clippy::too_many_arguments)]
 async fn switch_profile(
     injector: &Injector,
     config: &mut Config,
@@ -1396,6 +1715,7 @@ async fn switch_profile(
     toggles: &mut HashMap<Input, ActiveToggle>,
     actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
     axis_state: &mut AxisState,
+    analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>,
     name: String,
 ) -> Result<(), CommandError> {
     if !config.profiles.contains_key(&name) {
@@ -1413,6 +1733,10 @@ async fn switch_profile(
         // `handle_layer_switch`'s own call, just for a Profile switch
         // instead of a Layer one.
         let _ = reset_axis_outputs(injector, axis_state).await;
+        // Ticket 39: same reasoning, for the same reason, for every
+        // Analog-repeat task — the new Profile's Bindings generally differ
+        // from the old one's.
+        stop_all_analog_repeats(analog_repeats).await;
     }
     result
 }
@@ -1580,6 +1904,7 @@ async fn handle_command(
     toggles: &mut HashMap<Input, ActiveToggle>,
     stepper_cursors: &mut HashMap<StepperId, usize>,
     axis_state: &mut AxisState,
+    analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>,
     active_layer: &Layer,
     device_connected: bool,
     capture_mode: CaptureMode,
@@ -1619,6 +1944,12 @@ async fn handle_command(
         } => {
             if let Err(err) = validate_binding(&binding, config) {
                 let _ = reply.send(Err(err));
+                return;
+            }
+            if binding.trigger == TriggerMode::AnalogRepeat && !matches!(input, Input::Grid(_, _)) {
+                let _ = reply.send(Err(CommandError::InvalidRequest(
+                    "Analog-repeat is only valid on Grid Inputs".to_string(),
+                )));
                 return;
             }
             let profile = config
@@ -1826,6 +2157,7 @@ async fn handle_command(
                 toggles,
                 actuation_tx,
                 axis_state,
+                analog_repeats,
                 name.clone(),
             )
             .await;
@@ -2155,6 +2487,16 @@ async fn handle_command(
                 // `fire_individual_retroactively`).
                 let _ = reply.send(Err(CommandError::InvalidRequest(
                     "a Chord's Binding can't be a Profile Switch".to_string(),
+                )));
+                return;
+            }
+            if binding.trigger == TriggerMode::AnalogRepeat {
+                // See `ConfigError::InvalidChordAnalogRepeat` — a Chord
+                // fires on a discrete member-set completion, not a single
+                // grid key's continuous Depth, same "no coherent runtime
+                // owner" reasoning as the Profile Switch rejection above.
+                let _ = reply.send(Err(CommandError::InvalidRequest(
+                    "a Chord's Binding can't use Analog-repeat".to_string(),
                 )));
                 return;
             }
@@ -2803,6 +3145,301 @@ mod tests {
             panic!("expected a key event");
         };
         assert_eq!((code, value), (evdev::KeyCode::KEY_LEFTCTRL, 0));
+    }
+
+    #[tokio::test]
+    async fn analog_repeat_digital_sourced_behaves_like_hold_to_repeat() {
+        // Ticket 20's Digital Capture mode fallback: with no Depth at all
+        // (`event.depth: None`, exactly mirroring `hold_to_repeat_fires_on_
+        // down_and_every_repeat_but_not_up` above), Analog-repeat fires on
+        // Down/Repeat and force-releases on Up, identically to Hold-to-repeat.
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::AnalogRepeat,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: evdev::KeyCode::KEY_F1,
+                },
+            },
+        );
+
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
+        let (tx, rx) = mpsc::channel(8);
+        let (_conn_tx, conn_rx) = mpsc::channel(8);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        let dispatch_handle = tokio::spawn(run(
+            rx,
+            conn_rx,
+            cmd_rx,
+            inj.clone(),
+            config_with_bindings(bindings),
+            unused_config_path(),
+            None,
+            actuation_channel(),
+            capture_mode_channel(),
+            capture_control_channel(),
+            executor::MIN_TOGGLE_LAP,
+            depth_channel(),
+        ));
+
+        for state in [
+            EventState::Down,
+            EventState::Repeat,
+            EventState::Repeat,
+            EventState::Up,
+        ] {
+            tx.send(PhysicalEvent {
+                input: Input::Grid(1, 1),
+                state,
+                depth: None,
+            })
+            .await
+            .unwrap();
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        drop(tx);
+        dispatch_handle.await.unwrap().unwrap();
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+
+        let batches = sink.batches();
+        assert_eq!(batches.len(), 6);
+        for pair in batches.chunks(2) {
+            let evdev::EventSummary::Key(_, down_code, down_value) = pair[0][0].destructure()
+            else {
+                panic!("expected a key event");
+            };
+            let evdev::EventSummary::Key(_, up_code, up_value) = pair[1][0].destructure() else {
+                panic!("expected a key event");
+            };
+            assert_eq!((down_code, down_value), (evdev::KeyCode::KEY_F1, 1));
+            assert_eq!((up_code, up_value), (evdev::KeyCode::KEY_F1, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn analog_repeat_analog_sourced_events_are_swallowed() {
+        // The opposite case from the test above: an Analog-*sourced* Down/
+        // Repeat/Up (`event.depth: Some(_)`, synthesized from the key's
+        // ordinary Actuation/Release points) must never reach `fire()` at
+        // all for an Analog-repeat Binding — real firing is
+        // `update_analog_repeats`'s own depth-driven background task,
+        // exercised separately below. No depth-watch crossing is ever
+        // published here (`depth_channel()`'s Sender is dropped
+        // immediately), so if this Binding fell through to `fire()` instead
+        // of being swallowed, it would produce ordinary Hold-to-repeat
+        // output — this asserts zero output instead.
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::AnalogRepeat,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: evdev::KeyCode::KEY_F1,
+                },
+            },
+        );
+
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
+        let (tx, rx) = mpsc::channel(8);
+        let (_conn_tx, conn_rx) = mpsc::channel(8);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        let dispatch_handle = tokio::spawn(run(
+            rx,
+            conn_rx,
+            cmd_rx,
+            inj.clone(),
+            config_with_bindings(bindings),
+            unused_config_path(),
+            None,
+            actuation_channel(),
+            capture_mode_channel(),
+            capture_control_channel(),
+            executor::MIN_TOGGLE_LAP,
+            depth_channel(),
+        ));
+
+        for state in [EventState::Down, EventState::Repeat, EventState::Up] {
+            tx.send(PhysicalEvent {
+                input: Input::Grid(1, 1),
+                state,
+                depth: Some(200),
+            })
+            .await
+            .unwrap();
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        drop(tx);
+        dispatch_handle.await.unwrap().unwrap();
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+
+        assert!(sink.batches().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn analog_repeat_task_fires_periodically_above_the_deadzone_and_stops_below_it() {
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::AnalogRepeat,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: evdev::KeyCode::KEY_F1,
+                },
+            },
+        );
+
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
+        let (tx, rx) = mpsc::channel(8);
+        let (_conn_tx, conn_rx) = mpsc::channel(8);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (depth_tx, depth_rx) = watch::channel(HashMap::new());
+        let dispatch_handle = tokio::spawn(run(
+            rx,
+            conn_rx,
+            cmd_rx,
+            inj.clone(),
+            config_with_bindings(bindings),
+            unused_config_path(),
+            None,
+            actuation_channel(),
+            capture_mode_channel(),
+            capture_control_channel(),
+            executor::MIN_TOGGLE_LAP,
+            depth_rx,
+        ));
+
+        // A mid-travel Depth, comfortably between the deadzone and the
+        // hold-solid threshold — the rising edge spawns the task.
+        let depth: u8 = 100;
+        let rate_hz = ANALOG_REPEAT_MIN_HZ
+            + (ANALOG_REPEAT_MAX_HZ - ANALOG_REPEAT_MIN_HZ) * (f64::from(depth) / 255.0);
+        let period = Duration::from_secs_f64(1.0 / rate_hz);
+        depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), depth)]));
+        tokio::task::yield_now().await;
+
+        // Two full ticks: each is a KeyDown, a PULSE_HOLD sleep, a KeyUp,
+        // then the rest of the tick's own period.
+        for _ in 0..2 {
+            tokio::time::advance(ANALOG_REPEAT_PULSE_HOLD).await;
+            tokio::task::yield_now().await;
+            tokio::time::advance(period - ANALOG_REPEAT_PULSE_HOLD).await;
+            tokio::task::yield_now().await;
+        }
+
+        // Falling back below the deadzone stops the task — a no-op
+        // force-release here, since every pulse above already self-released.
+        depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), 0u8)]));
+        tokio::task::yield_now().await;
+        let after_stop = sink.batches().len();
+
+        // Advancing well past another tick's worth of time produces
+        // nothing further — the task is genuinely gone, not just paused
+        // between ticks.
+        tokio::time::advance(period * 3).await;
+        tokio::task::yield_now().await;
+        assert_eq!(sink.batches().len(), after_stop);
+
+        drop(tx);
+        drop(depth_tx);
+        dispatch_handle.await.unwrap().unwrap();
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+
+        let batches = sink.batches();
+        assert_eq!(batches.len(), 4);
+        for pair in batches.chunks(2) {
+            let evdev::EventSummary::Key(_, down_code, down_value) = pair[0][0].destructure()
+            else {
+                panic!("expected a key event");
+            };
+            let evdev::EventSummary::Key(_, up_code, up_value) = pair[1][0].destructure() else {
+                panic!("expected a key event");
+            };
+            assert_eq!((down_code, down_value), (evdev::KeyCode::KEY_F1, 1));
+            assert_eq!((up_code, up_value), (evdev::KeyCode::KEY_F1, 0));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn analog_repeat_holds_solid_above_the_hold_threshold() {
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::AnalogRepeat,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: evdev::KeyCode::KEY_F1,
+                },
+            },
+        );
+
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
+        let (tx, rx) = mpsc::channel(8);
+        let (_conn_tx, conn_rx) = mpsc::channel(8);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (depth_tx, depth_rx) = watch::channel(HashMap::new());
+        let dispatch_handle = tokio::spawn(run(
+            rx,
+            conn_rx,
+            cmd_rx,
+            inj.clone(),
+            config_with_bindings(bindings),
+            unused_config_path(),
+            None,
+            actuation_channel(),
+            capture_mode_channel(),
+            capture_control_channel(),
+            executor::MIN_TOGGLE_LAP,
+            depth_rx,
+        ));
+
+        depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), u8::MAX)]));
+        tokio::task::yield_now().await;
+        // Well past several ordinary ticks' worth of time — still holding
+        // solid the whole way through, not tapping.
+        tokio::time::advance(Duration::from_millis(500)).await;
+        tokio::task::yield_now().await;
+
+        let batches = sink.batches();
+        assert_eq!(batches.len(), 1, "expected exactly one KeyDown, no taps");
+        let evdev::EventSummary::Key(_, code, value) = batches[0][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_F1, 1));
+
+        // Falling back below the deadzone force-releases the held key.
+        depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), 0u8)]));
+        tokio::task::yield_now().await;
+
+        drop(tx);
+        drop(depth_tx);
+        dispatch_handle.await.unwrap().unwrap();
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+
+        let batches = sink.batches();
+        assert_eq!(batches.len(), 2);
+        let evdev::EventSummary::Key(_, code, value) = batches[1][0].destructure() else {
+            panic!("expected a key event");
+        };
+        assert_eq!((code, value), (evdev::KeyCode::KEY_F1, 0));
     }
 
     #[tokio::test(start_paused = true)]
@@ -3910,6 +4547,94 @@ mod tests {
         assert!(matches!(err, CommandError::NotFound));
 
         harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn set_chord_binding_rejects_analog_repeat() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .set_chord_binding(
+                [Input::Grid(1, 1), Input::Grid(1, 2)],
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::AnalogRepeat,
+                    action: Action::Keypress {
+                        modifiers: Modifiers::default(),
+                        key: evdev::KeyCode::KEY_A,
+                    },
+                },
+            )
+            .await
+            .expect_err("an Analog-repeat Chord Binding must be rejected");
+        assert!(matches!(err, CommandError::InvalidRequest(_)));
+
+        let key = ChordKey::new(BTreeSet::from([Input::Grid(1, 1), Input::Grid(1, 2)]));
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+        assert!(
+            !config.profiles[DEFAULT_PROFILE_NAME]
+                .chords(Layer::Base)
+                .contains_key(&key),
+            "the rejected Chord Binding must not have been applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_binding_rejects_analog_repeat_on_a_non_grid_input() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .set_binding(
+                Input::ModeKey,
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::AnalogRepeat,
+                    action: Action::Keypress {
+                        modifiers: Modifiers::default(),
+                        key: evdev::KeyCode::KEY_A,
+                    },
+                },
+            )
+            .await
+            .expect_err("an Analog-repeat Binding on a non-Grid Input must be rejected");
+        assert!(matches!(err, CommandError::InvalidRequest(_)));
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+        assert!(
+            !config.profiles[DEFAULT_PROFILE_NAME]
+                .base
+                .contains_key(&Input::ModeKey),
+            "the rejected Binding must not have been applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_binding_accepts_analog_repeat_on_a_grid_input() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::AnalogRepeat,
+                    action: Action::Keypress {
+                        modifiers: Modifiers::default(),
+                        key: evdev::KeyCode::KEY_A,
+                    },
+                },
+            )
+            .await
+            .expect("Analog-repeat on a Grid Input must be accepted");
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+        assert_eq!(
+            config.profiles[DEFAULT_PROFILE_NAME].base[&Input::Grid(1, 1)].trigger,
+            TriggerMode::AnalogRepeat
+        );
     }
 
     #[tokio::test]

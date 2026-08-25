@@ -333,6 +333,37 @@ Like the previous map, this one carries execution.
 
 - [Migrate or guard the pre-macro-library config gap](./issues/57-task-migrate-or-guard-pre-macro-library-config.md) — **guard**, decided directly with the user: the ticket's assumed rewrite-on-load precedent doesn't actually exist in `config.rs` (the real comment found says the opposite — no forced migration, sparse defaulting only), and the codebase's real precedent for an incompatible old shape is a dedicated `ConfigError` variant that refuses to start with a clear message. New `find_legacy_macro_bindings()` walks the raw TOML (ahead of the strongly-typed parse) for the pre-ticket-51 `type = "macro"` + `steps` + no-`macro_id` shape anywhere in the tree, surfacing a new `ConfigError::LegacyInlineMacroBinding` naming every affected Binding by breadcrumb instead of serde's opaque "missing field" error. Also fixed the crash-loop itself, not just this one trigger for it: `packaging/acheron-daemon.service` drops `Restart=on-failure`/`RestartSec=1`/`StartLimitIntervalSec=60`/`StartLimitBurst=5` for `Restart=no`, since *any* fatal startup exit is a permanent condition until something on disk changes — retrying only reproduces `systemd`'s own `"Start request repeated too quickly"` faster than the Daemon's real error can be read. `packaging/test_install.sh` updated to match. 330 Rust + 284 Python tests green, packaging test suite green, clippy/fmt clean. No GUI/D-Bus/CONTEXT.md changes.
 
+- [Build and tune Analog-repeat on hardware](./issues/39-task-build-analog-repeat.md) — landed
+  `TriggerMode::AnalogRepeat` end to end (config/wire/GUI/Daemon), AFK — no physical Tartarus Pro
+  available this session, so the four numeric constants (deadzone, min/max Hz, pulse-hold
+  duration, hold-solid threshold) are documented placeholders, each a single named `dispatch.rs`
+  constant, not yet live-tuned. Reuses `dispatch::run`'s existing `rx_depth` clone (from ticket 71)
+  rather than adding a second depth channel; a new `update_analog_repeats`, called from the same
+  `rx_depth.changed()` arm that already drives Axis resolution, spawns/cancels a per-Input
+  `ActiveAnalogRepeat` background task (structurally an `ActiveToggle` twin, depth-driven instead
+  of a fixed lap) on the key's Depth crossing the fixed deadzone. Analog-sourced Down/Repeat/Up is
+  swallowed in `handle_event` (mirrors the Axis-assignment swallow immediately above it); a
+  Digital-sourced one falls through to `fire()`, which now treats `AnalogRepeat` exactly like
+  `HoldToRepeat` (ticket 20's Digital Capture mode fallback). Rejected on a non-Grid Input and on
+  a Chord's own Binding, Daemon-side (`SetBinding`/`SetChordBinding`/`config::parse`) and mirrored
+  in `daemon_stub.py`; GUI's Trigger-mode dropdown excludes the option for non-grid Inputs/Chords
+  outright (not "greyed," since `Gtk.DropDown` has no per-item sensitivity — ticket 55's
+  precedent). Every task force-stops on Layer switch, Profile switch, and an Analog-to-Digital
+  capture-mode transition. Two accepted residual gaps, documented in code: a live Binding change
+  away from Analog-repeat without an intervening depth-crossing leaves a stale task running until
+  the next crossing; a grid key that's both a Chord member and individually Analog-repeat-triggered
+  fires once via the ordinary path when it resolves retroactively, rather than starting the
+  background task. One real, intermittent bug caught by the ticket's own new tests (~2-in-5 repro
+  rate): a `select!` race between the depth-watch wakeup and the external stop's cancellation
+  could let a fresh-below-deadzone tick fall through and fire one spurious pulse before
+  cancellation landed — fixed by having the loop check the deadzone itself every iteration, not
+  just hold-solid-vs-tapping. 330→339 Rust tests (two new `start_paused`-timed tests drive the
+  rate-curve/hold-solid logic directly against the real dispatch pipeline), 284→290 Python tests,
+  clippy/fmt clean. **Live-hardware verification and constant tuning not done this session** (no physical
+  device access) — spawned [Verify and tune Analog-repeat on hardware](./issues/73-task-verify-and-tune-analog-repeat-on-hardware.md),
+  matching every other build ticket's own build → verify precedent on this map. This was the
+  map's last open non-blocking fast-follow build item.
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.

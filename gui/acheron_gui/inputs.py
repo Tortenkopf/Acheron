@@ -94,8 +94,21 @@ TRIGGER_OPTIONS = [
     ("fire_once", "Fire-once"),
     ("hold_to_repeat", "Hold-to-repeat"),
     ("toggle", "Toggle"),
+    # Ticket 20/39: grid-key-only, since only a Grid Input has Depth — callers
+    # that build a Trigger-mode dropdown for a non-grid Input, or for a
+    # Chord's own Binding, must filter this entry out (mirroring
+    # `ACTION_TYPES`'s own `is_grid_input`-gated "Axis" exclusion above,
+    # ticket 60's Answer — `Gtk.DropDown` has no per-item sensitivity to
+    # merely grey a single option, per ticket 55's precedent for the same
+    # limitation).
+    ("analog_repeat", "Analog-repeat"),
 ]
-TRIGGER_SHORT = {"fire_once": "1x", "hold_to_repeat": "hold", "toggle": "toggle"}
+TRIGGER_SHORT = {
+    "fire_once": "1x",
+    "hold_to_repeat": "hold",
+    "toggle": "toggle",
+    "analog_repeat": "analog",
+}
 ACTION_TYPES = [
     ("keypress", "Keypress"),
     ("macro", "Macro"),

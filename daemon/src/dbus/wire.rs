@@ -112,6 +112,7 @@ fn trigger_mode_str(trigger: TriggerMode) -> &'static str {
         TriggerMode::FireOnce => "fire_once",
         TriggerMode::HoldToRepeat => "hold_to_repeat",
         TriggerMode::Toggle => "toggle",
+        TriggerMode::AnalogRepeat => "analog_repeat",
     }
 }
 
@@ -120,6 +121,7 @@ fn trigger_mode_from_str(s: &str) -> Result<TriggerMode, String> {
         "fire_once" => Ok(TriggerMode::FireOnce),
         "hold_to_repeat" => Ok(TriggerMode::HoldToRepeat),
         "toggle" => Ok(TriggerMode::Toggle),
+        "analog_repeat" => Ok(TriggerMode::AnalogRepeat),
         other => Err(format!("{other:?} is not a valid trigger mode")),
     }
 }
@@ -715,6 +717,7 @@ mod tests {
             TriggerMode::FireOnce,
             TriggerMode::HoldToRepeat,
             TriggerMode::Toggle,
+            TriggerMode::AnalogRepeat,
         ] {
             let s = trigger_mode_str(trigger);
             assert_eq!(trigger_mode_from_str(s).unwrap(), trigger);

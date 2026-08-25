@@ -493,6 +493,12 @@ pub enum TriggerMode {
     FireOnce,
     HoldToRepeat,
     Toggle,
+    /// A fourth mode, grid-key-only (ticket 20/39): re-fires at a rate that
+    /// varies continuously with Depth rather than at a fixed cadence — see
+    /// CONTEXT.md's Analog-repeat entry. Validated (`SetBinding`/
+    /// `SetChordBinding` and `parse`) to only ever pair with a Grid `Input`
+    /// and never with a Chord's own Binding.
+    AnalogRepeat,
 }
 
 /// CONTEXT.md: Action. `Keypress`/`Macro` compile into the shared executor's
@@ -803,6 +809,16 @@ pub enum ConfigError {
     /// serde's opaque "missing field `macro_id`" (ticket 57, spawned live
     /// from ticket 53 hitting exactly this against a real config.toml).
     LegacyInlineMacroBinding(Vec<String>),
+    /// An ordinary Binding (`base`/`held`) whose trigger is `AnalogRepeat`
+    /// but whose `Input` isn't a `Grid` variant — only grid keys have Depth
+    /// to drive a rate curve with (ticket 20/39), same reasoning as
+    /// `InvalidAxisInput`.
+    InvalidAnalogRepeatInput(String),
+    /// A Chord Binding (`chords_base`/`chords_held`) whose trigger is
+    /// `AnalogRepeat` (ticket 20/39) — refused because a Chord fires on a
+    /// discrete member-set completion, not a single grid key's continuous
+    /// Depth, mirroring `InvalidChordProfileSwitch`'s exact precedent.
+    InvalidChordAnalogRepeat,
 }
 
 impl fmt::Display for ConfigError {
@@ -868,6 +884,14 @@ impl fmt::Display for ConfigError {
                 f,
                 "config.toml contains an old-style inline Action::Macro Binding (from before named macros were introduced) at: {} — replace each one with {{ type = \"macro\", macro_id = \"...\" }} referencing an entry under [macros.*], or recreate the Binding from the GUI",
                 paths.join(", ")
+            ),
+            ConfigError::InvalidAnalogRepeatInput(input) => write!(
+                f,
+                "config.toml contains an analog_repeat trigger on {input:?}, which is not a Grid Input"
+            ),
+            ConfigError::InvalidChordAnalogRepeat => write!(
+                f,
+                "config.toml contains a Chord Binding whose trigger is analog_repeat, which is not supported on a Chord"
             ),
         }
     }
@@ -996,6 +1020,31 @@ fn parse(contents: &str) -> Result<Config, ConfigError> {
     });
     if has_invalid_step_trigger {
         return Err(ConfigError::InvalidStepTrigger);
+    }
+    let invalid_analog_repeat_input = config.profiles.values().find_map(|profile| {
+        [Layer::Base, Layer::Held].into_iter().find_map(|layer| {
+            profile
+                .layer(layer)
+                .iter()
+                .find(|(input, binding)| {
+                    binding.trigger == TriggerMode::AnalogRepeat
+                        && !matches!(input, Input::Grid(_, _))
+                })
+                .map(|(input, _)| input.to_string())
+        })
+    });
+    if let Some(input) = invalid_analog_repeat_input {
+        return Err(ConfigError::InvalidAnalogRepeatInput(input));
+    }
+    let has_chord_analog_repeat = config.profiles.values().any(|profile| {
+        profile
+            .chords_base
+            .values()
+            .chain(profile.chords_held.values())
+            .any(|binding| binding.trigger == TriggerMode::AnalogRepeat)
+    });
+    if has_chord_analog_repeat {
+        return Err(ConfigError::InvalidChordAnalogRepeat);
     }
     let has_chord_profile_switch = config.profiles.values().any(|profile| {
         profile
@@ -2113,5 +2162,45 @@ action = { type = "profile_switch", target = "Gaming" }
         let err =
             load_or_seed(&path).expect_err("a ProfileSwitch Chord Binding must refuse to start");
         assert!(matches!(err, ConfigError::InvalidChordProfileSwitch));
+    }
+
+    #[test]
+    fn refuses_to_start_when_an_analog_repeat_binding_is_on_a_non_grid_input() {
+        let (_dir, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base.mode_key]
+trigger = "analog_repeat"
+action = { type = "keypress", key = "KEY_A" }
+"#;
+        fs::write(&path, original).unwrap();
+
+        let err = load_or_seed(&path)
+            .expect_err("an Analog-repeat Binding on a non-Grid Input must refuse to start");
+        assert!(matches!(err, ConfigError::InvalidAnalogRepeatInput(input) if input == "mode_key"));
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn refuses_to_start_when_a_chord_binding_is_analog_repeat() {
+        let (_dir, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.chords_base."grid_r1c1+grid_r1c2"]
+trigger = "analog_repeat"
+action = { type = "keypress", key = "KEY_A" }
+"#;
+        fs::write(&path, original).unwrap();
+
+        let err =
+            load_or_seed(&path).expect_err("an Analog-repeat Chord Binding must refuse to start");
+        assert!(matches!(err, ConfigError::InvalidChordAnalogRepeat));
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 }

@@ -156,6 +156,8 @@ class DaemonStub:
     def set_binding(self, input_str: str, layer: str, binding: dict) -> None:
         self._reject_if_axis_assigned(input_str, layer)
         self._validate_binding_action(binding)
+        if binding.get("trigger") == "analog_repeat" and not is_grid_input(input_str):
+            raise InvalidBindingError("Analog-repeat is only valid on Grid Inputs")
         if binding.get("type") == "step":
             # Ticket 03's Answer: assigning a Stepper list to a new Input
             # silently moves it off its old one — no reject-at-save step,
@@ -231,6 +233,8 @@ class DaemonStub:
             raise InvalidBindingError("a Chord needs at least two member Inputs")
         if binding.get("type") == "profile_switch":
             raise InvalidBindingError("a Chord's Binding can't be a Profile Switch")
+        if binding.get("trigger") == "analog_repeat":
+            raise InvalidBindingError("a Chord's Binding can't use Analog-repeat")
         for input_str in inputs:
             self._reject_if_axis_assigned(input_str, layer)
         self._validate_binding_action(binding)

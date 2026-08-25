@@ -935,6 +935,63 @@ def test_axis_is_offered_only_for_grid_inputs():
     ]
 
 
+def test_analog_repeat_is_offered_only_for_grid_inputs():
+    # Ticket 20/39: mirrors `test_axis_is_offered_only_for_grid_inputs`
+    # above, but on the Trigger-mode dropdown rather than Action — only a
+    # Grid Input has Depth for the rate curve to read.
+    stub = DaemonStub()
+
+    grid_btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+    grid_popover = editor_content(grid_btn)
+    trigger_dd = _dropdown_labeled(grid_popover, "Trigger mode")
+    assert "Analog-repeat" in [
+        trigger_dd.get_model().get_string(i) for i in range(trigger_dd.get_model().get_n_items())
+    ]
+
+    non_grid_btn = make_input_button(stub, stub.get_config(), "Default", "base", "mode_key", lambda: None)
+    non_grid_popover = editor_content(non_grid_btn)
+    non_grid_trigger_dd = _dropdown_labeled(non_grid_popover, "Trigger mode")
+    assert "Analog-repeat" not in [
+        non_grid_trigger_dd.get_model().get_string(i) for i in range(non_grid_trigger_dd.get_model().get_n_items())
+    ]
+
+
+def test_chord_binding_dialog_does_not_offer_analog_repeat_as_a_trigger():
+    # A Chord fires on a discrete member-set completion, not a single grid
+    # key's continuous Depth (`SetChordBinding` always rejects it — see
+    # `ConfigError::InvalidChordAnalogRepeat`), same reasoning as the
+    # Profile Switch Action exclusion above.
+    stub = DaemonStub()
+    dialog = build_chord_binding_dialog(
+        stub, stub.get_config(), "Default", "base", ["grid_r1c1", "grid_r1c2"], None, lambda: None, None
+    )
+
+    trigger_dd = _dropdown_labeled(dialog, "Trigger mode")
+    labels = [trigger_dd.get_model().get_string(i) for i in range(trigger_dd.get_model().get_n_items())]
+    assert "Analog-repeat" not in labels
+
+
+def test_saving_an_analog_repeat_binding_on_a_grid_input_calls_set_binding():
+    stub = DaemonStub()
+
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+    popover = editor_content(btn)
+    _pick_key(popover, "Key", "F1")
+    trigger_dd = _dropdown_labeled(popover, "Trigger mode")
+    trigger_dd.set_selected([k for k, _ in TRIGGER_OPTIONS].index("analog_repeat"))
+
+    button_labeled(popover, "Save").emit("clicked")
+
+    assert stub.calls == [
+        (
+            "set_binding",
+            "grid_r1c1",
+            "base",
+            {"trigger": "analog_repeat", "type": "keypress", "key": "KEY_F1", "modifiers": []},
+        )
+    ]
+
+
 def test_selecting_axis_disables_the_trigger_dropdown():
     stub = DaemonStub()
 
