@@ -277,6 +277,22 @@ pub fn gamepad_button_codes() -> Vec<KeyCode> {
         .collect()
 }
 
+/// Whether `code` is a mouse button, per evdev's own `BTN_LEFT..=BTN_TASK`
+/// block (`0x110`-`0x117`: Left/Right/Middle/Side/Extra/Forward/Back/Task) —
+/// ticket 79/80's carve-out predicate, `dispatch::fire`/`fire_chord`'s way
+/// of telling a mouse-button `Action::Keypress` apart from a keyboard-key
+/// one so Hold-to-repeat can give it sustained-hold-for-drag instead of a
+/// repeat-tap train. Deliberately wider than the 5 codes the GUI picker
+/// (ticket 02) actually emits (Left/Right/Middle/Side-as-Back/Extra-as-
+/// Forward): `Action::Keypress.key` has zero allowlist validation (see the
+/// map's Notes), so a hand-edited `config.toml` using `BTN_FORWARD`/
+/// `BTN_BACK`/`BTN_TASK` gets the same treatment as a picker-built Binding.
+/// No overlap with `is_gamepad_button`'s range — `BTN_SOUTH` starts at
+/// `0x130`.
+pub fn is_mouse_button(code: KeyCode) -> bool {
+    (KeyCode::BTN_LEFT.code()..=KeyCode::BTN_TASK.code()).contains(&code.code())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,6 +441,32 @@ mod tests {
         assert!(!is_gamepad_button(KeyCode::new(
             KeyCode::BTN_TRIGGER_HAPPY40.code() + 1
         )));
+    }
+
+    #[test]
+    fn is_mouse_button_accepts_the_full_btn_left_to_btn_task_range() {
+        for code in [
+            KeyCode::BTN_LEFT,
+            KeyCode::BTN_RIGHT,
+            KeyCode::BTN_MIDDLE,
+            KeyCode::BTN_SIDE,
+            KeyCode::BTN_EXTRA,
+            KeyCode::BTN_FORWARD,
+            KeyCode::BTN_BACK,
+            KeyCode::BTN_TASK,
+        ] {
+            assert!(is_mouse_button(code), "{code:?} must be a mouse button");
+        }
+    }
+
+    #[test]
+    fn is_mouse_button_rejects_keyboard_gamepad_and_just_out_of_range_codes() {
+        assert!(!is_mouse_button(KeyCode::KEY_A));
+        assert!(!is_mouse_button(KeyCode::BTN_SOUTH));
+        for i in KeyCode::BTN_0.code()..=KeyCode::BTN_9.code() {
+            assert!(!is_mouse_button(KeyCode::new(i)));
+        }
+        assert!(!is_mouse_button(KeyCode::new(KeyCode::BTN_TASK.code() + 1)));
     }
 
     #[test]

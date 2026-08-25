@@ -431,6 +431,23 @@ Like the previous map, this one carries execution.
   [Build the mouse-button sustained-hold fix](./issues/80-task-build-mouse-button-sustained-hold.md)
   and [Verify the mouse-button sustained-hold fix on hardware](./issues/81-task-verify-mouse-button-sustained-hold-on-hardware.md).
 
+- [Build the mouse-button sustained-hold fix](./issues/80-task-build-mouse-button-sustained-hold.md)
+  — landed [ticket 79](./issues/79-decide-mouse-button-sustained-hold-drag.md)'s settled
+  design, AFK, no hardware needed. New `input::is_mouse_button` predicate (mirrors
+  `is_gamepad_button`) checks the `BTN_LEFT..=BTN_TASK` range; `fire()`/`fire_chord()`
+  gain a dispatch-level carve-out structurally identical to ticket 76's `ControllerButton`
+  fix but guarded on `Action::Keypress { key, .. }`'s `key` via the new predicate rather
+  than the Action variant — `Down` fires a bare unbalanced `KeyDown`, `Repeat` is a hard
+  no-op, and the pre-existing ticket-33 force-release-on-physical-`Up` path releases it
+  unchanged. Both direct Bindings and Chords get identical treatment; keyboard-key
+  Keypress/`ControllerButton`/Macro/Stepper output untouched. Replaced the now-outdated
+  `hold_to_repeat_mouse_button_still_refires_on_every_repeat` test (asserted the old
+  mash-click behavior this ticket deliberately changes) with its sustained-hold
+  replacement plus a Chord mirror, and added explicit regression coverage that an
+  ordinary keyboard-key Keypress still refires on every Repeat. 347 Rust tests green (net
+  +4), `cargo clippy --all-targets`/`cargo fmt --check` clean. Unblocks
+  [ticket 81](./issues/81-task-verify-mouse-button-sustained-hold-on-hardware.md).
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.

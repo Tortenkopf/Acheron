@@ -1055,6 +1055,38 @@ async fn fire_chord(
             chord_in_flight.insert(key, handle);
             Ok(())
         }
+        (TriggerMode::HoldToRepeat, EventState::Repeat)
+            if matches!(
+                binding.action,
+                Action::Keypress { key, .. } if crate::input::is_mouse_button(key)
+            ) =>
+        {
+            // Mirrors `fire`'s own mouse-button/HoldToRepeat Repeat arm
+            // (ticket 79/80) — the Chord's leader member's Repeat is
+            // ignored outright rather than re-firing.
+            Ok(())
+        }
+        (TriggerMode::HoldToRepeat, EventState::Down)
+            if matches!(
+                binding.action,
+                Action::Keypress { key, .. } if crate::input::is_mouse_button(key)
+            ) =>
+        {
+            if let Some(handle) = chord_in_flight.get(&key)
+                && !handle.is_finished()
+            {
+                return Ok(());
+            }
+            let Action::Keypress { key: button, .. } = binding.action else {
+                unreachable!("guarded by this arm's own match guard above")
+            };
+            // Mirrors `fire`'s own bare-KeyDown mouse-button hold —
+            // released by `release_chord_firing` on a member's physical Up.
+            let steps = vec![MacroStep::KeyDown(button)];
+            let handle = executor::spawn_fire_once(injector.clone(), steps);
+            chord_in_flight.insert(key, handle);
+            Ok(())
+        }
         (TriggerMode::FireOnce, EventState::Down)
         | (TriggerMode::HoldToRepeat, EventState::Down | EventState::Repeat) => {
             if let Some(handle) = chord_in_flight.get(&key)
@@ -1581,6 +1613,44 @@ async fn fire(
             // up" mechanism ticket 33 already relies on, rather than
             // inventing new architecture.
             let steps = vec![MacroStep::KeyDown(button)];
+            let handle = executor::spawn_fire_once(injector.clone(), steps);
+            in_flight.insert(input, handle);
+            Ok(())
+        }
+        (TriggerMode::HoldToRepeat, EventState::Repeat)
+            if matches!(
+                binding.action,
+                Action::Keypress { key, .. } if crate::input::is_mouse_button(key)
+            ) =>
+        {
+            // Ticket 79/80: a mouse-button Keypress gets the same
+            // sustained-hold treatment as ControllerButton above, so a
+            // Hold-to-repeat mouse Binding supports click-and-drag instead
+            // of a repeat-tap train — once the physical Down's own KeyDown
+            // below is holding it, every intervening kernel-autorepeat
+            // Repeat is ignored outright, no re-fire.
+            Ok(())
+        }
+        (TriggerMode::HoldToRepeat, EventState::Down)
+            if matches!(
+                binding.action,
+                Action::Keypress { key, .. } if crate::input::is_mouse_button(key)
+            ) =>
+        {
+            // Same overlap guard as the ordinary arm below.
+            if let Some(handle) = in_flight.get(&input)
+                && !handle.is_finished()
+            {
+                return Ok(());
+            }
+            let Action::Keypress { key, .. } = binding.action else {
+                unreachable!("guarded by this arm's own match guard above")
+            };
+            // Deliberately not `compile_action`'s own KeyDown/Delay/KeyUp
+            // pulse: a bare, unbalanced `KeyDown` that mirrors the physical
+            // press for as long as it's actually held, released by the
+            // physical Up's own arm below (ticket 33's force-release path).
+            let steps = vec![MacroStep::KeyDown(key)];
             let handle = executor::spawn_fire_once(injector.clone(), steps);
             in_flight.insert(input, handle);
             Ok(())
@@ -3321,11 +3391,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hold_to_repeat_mouse_button_still_refires_on_every_repeat() {
-        // Regression coverage (ticket 75/76): the ControllerButton-only
-        // carve-out must not bleed onto mouse-button output, which is
-        // `Action::Keypress` with a `BTN_*` `KeyCode` — a different Action
-        // variant entirely, so the ordinary Hold-to-repeat arm still applies.
+    async fn hold_to_repeat_mouse_button_ignores_repeat_and_releases_on_physical_up() {
+        // Ticket 79/80: unlike an ordinary Hold-to-repeat Binding (see
+        // `hold_to_repeat_fires_on_down_and_every_repeat_but_not_up` above),
+        // a mouse-button `Action::Keypress` (`BTN_LEFT`/etc.) fires exactly
+        // one KeyDown on the physical Down, ignores every kernel-autorepeat
+        // Repeat outright (no re-fire), and only releases on the physical
+        // Up — the same sustained-hold treatment ticket 75/76 gave
+        // `ControllerButton`, now supporting click-and-drag.
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
         harness
             .set_binding(
@@ -3336,6 +3409,101 @@ mod tests {
                     action: Action::Keypress {
                         modifiers: Modifiers::default(),
                         key: evdev::KeyCode::BTN_LEFT,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        harness.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..3 {
+            harness.repeat(Input::Grid(1, 1)).await;
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+        }
+        harness.release(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        let batches = harness.shut_down().await;
+
+        // Exactly one KeyDown (the physical Down) and one KeyUp (the
+        // physical Up) — the three Repeats produced nothing.
+        assert_eq!(batches.len(), 2);
+        assert_eq!(key_and_value(batches[0][0]), (evdev::KeyCode::BTN_LEFT, 1));
+        assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::BTN_LEFT, 0));
+    }
+
+    #[tokio::test]
+    async fn hold_to_repeat_chord_mouse_button_ignores_repeat_and_releases_on_member_up() {
+        // Ticket 79/80's Chord blast radius: the same treatment applies
+        // uniformly when a Chord's own Action is a mouse-button Keypress,
+        // mirrors `hold_to_repeat_chord_controller_button_ignores_repeat_
+        // and_releases_on_member_up`.
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness
+            .set_chord_binding(
+                [Input::Grid(1, 1), Input::Grid(1, 2)],
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::HoldToRepeat,
+                    action: Action::Keypress {
+                        modifiers: Modifiers::default(),
+                        key: evdev::KeyCode::BTN_LEFT,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        harness.press(Input::Grid(1, 1)).await;
+        harness.press(Input::Grid(1, 2)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        harness.repeat(Input::Grid(1, 1)).await;
+        harness.repeat(Input::Grid(1, 2)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        harness.release(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        let batches = harness.shut_down().await;
+
+        // Exactly one KeyDown (the completing Down) and one KeyUp (the
+        // first member's physical Up) — both members' Repeats produced
+        // nothing.
+        assert_eq!(batches.len(), 2);
+        assert_eq!(key_and_value(batches[0][0]), (evdev::KeyCode::BTN_LEFT, 1));
+        assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::BTN_LEFT, 0));
+    }
+
+    #[tokio::test]
+    async fn hold_to_repeat_keyboard_key_still_refires_on_every_repeat() {
+        // Regression coverage (ticket 79/80): the mouse-button-only
+        // carve-out must not bleed onto keyboard-key output — `is_mouse_
+        // button` rejects an ordinary keyboard `KeyCode`, so the ordinary
+        // Hold-to-repeat arm still applies. Mirrors ticket 76's own
+        // `hold_to_repeat_mouse_button_still_refires_on_every_repeat`
+        // negative test, but in the other direction.
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::HoldToRepeat,
+                    action: Action::Keypress {
+                        modifiers: Modifiers::default(),
+                        key: evdev::KeyCode::KEY_A,
                     },
                 },
             )
@@ -3358,12 +3526,11 @@ mod tests {
         let batches = harness.shut_down().await;
 
         // Down + one Repeat = two firings, each a KeyDown/KeyUp pair; the
-        // trailing Up produced nothing — unchanged from the ordinary
-        // Keypress case.
+        // trailing Up produced nothing — unchanged from before ticket 79/80.
         assert_eq!(batches.len(), 4);
         for pair in batches.chunks(2) {
-            assert_eq!(key_and_value(pair[0][0]), (evdev::KeyCode::BTN_LEFT, 1));
-            assert_eq!(key_and_value(pair[1][0]), (evdev::KeyCode::BTN_LEFT, 0));
+            assert_eq!(key_and_value(pair[0][0]), (evdev::KeyCode::KEY_A, 1));
+            assert_eq!(key_and_value(pair[1][0]), (evdev::KeyCode::KEY_A, 0));
         }
     }
 
