@@ -620,6 +620,7 @@ def build_action_and_trigger_fields(
         elif kind == "axis":
             def on_axis_changed(target: str) -> None:
                 draft["axis"]["target"] = target
+                save_btn.set_sensitive(target is not None)
 
             # Ticket 60's cross-key toast: which other key (if any) already
             # claims each target on this same Layer — `inp`/`layer` are

@@ -978,6 +978,27 @@ def test_save_stays_disabled_until_an_axis_target_is_picked():
     assert not button_labeled(popover, "Save").get_sensitive()
 
 
+def test_save_becomes_enabled_after_picking_an_axis_target():
+    # Regression test (ticket 72's live-hardware verification): Save stayed
+    # disabled after picking a target in the diagram picker, because only
+    # render_action_editor()'s initial pass set save_btn's sensitivity —
+    # on_axis_changed updated the draft but never re-armed Save, so a real
+    # click on a target button did nothing until the Action dropdown was
+    # rebuilt some other way.
+    stub = DaemonStub()
+
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+    popover = editor_content(btn)
+
+    action_dd = _dropdown_labeled(popover, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("axis"))
+    assert not button_labeled(popover, "Save").get_sensitive()
+
+    _click_axis_target(popover, "Left Trigger")
+
+    assert button_labeled(popover, "Save").get_sensitive()
+
+
 def test_opening_an_axis_assigned_key_defaults_to_axis_with_the_current_target():
     stub = DaemonStub()
     stub.set_axis_assignment("grid_r1c1", "base", "right_trigger")
