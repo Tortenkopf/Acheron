@@ -54,6 +54,18 @@ fn modifier_codes(modifiers: Modifiers) -> Vec<KeyCode> {
     codes
 }
 
+/// Fire-once's dwell floor for `Action::ControllerButton` output only
+/// (ticket 74/75/76): a bare zero-artificial-dwell `KeyDown`/`KeyUp` pair
+/// can land both edges inside the same input-poll frame on the receiving
+/// game, so the whole press is silently swallowed. Deliberately *not*
+/// shared with `dispatch::ANALOG_REPEAT_PULSE_HOLD` — the two dwells are
+/// tuned for unrelated jobs (15ms was tuned against Analog-repeat's own
+/// rate-curve/cadence on real hardware; 35ms targets true phase-independent
+/// single-poll coverage against a 60fps frame interval, per ticket 74's
+/// research §6) — sharing the constant would silently couple two unrelated
+/// tuning knobs. Not final-tuned against a real game yet.
+pub(crate) const CONTROLLER_BUTTON_FIRE_ONCE_PULSE_HOLD: Duration = Duration::from_millis(35);
+
 /// `pub(crate)` (rather than private) so `dispatch::resolve_step` can reuse
 /// the same canned mods-down/key/mods-up sequence for a Stepper item's
 /// modifier combination (ticket 63) — the two callers share the exact
@@ -104,12 +116,24 @@ pub fn compile(action: &Action, macros: &HashMap<MacroId, MacroDef>) -> Vec<Macr
                 "Action::Step's steps depend on Daemon-owned runtime cursor state, resolved by dispatch::compile_action before this generic compile is ever reached for it"
             )
         }
-        // Same shape as a plain, unmodified Keypress (ticket 14's Answer: "a
-        // controller-button press is the same shape as a Keypress: compile a
-        // down/up pair, inject it") — only the target uinput device differs,
-        // which the injector alone decides (`input::is_gamepad_button`).
+        // Almost the same shape as a plain, unmodified Keypress (ticket 14's
+        // Answer: "a controller-button press is the same shape as a
+        // Keypress: compile a down/up pair, inject it") — only the target
+        // uinput device differs, which the injector alone decides
+        // (`input::is_gamepad_button`) — plus a genuine dwell between the
+        // two (ticket 75/76): a bare zero-artificial-dwell pair can land
+        // both edges inside the same input-poll frame on the receiving
+        // game, silently swallowing the press. This applies to every caller
+        // of `compile()` for this Action, not only Fire-once — Hold-to-
+        // repeat never reaches this arm at all (`fire`/`fire_chord` in
+        // dispatch.rs compile its own bare `KeyDown`-only steps instead, per
+        // ticket 75's Answer).
         Action::ControllerButton { button } => {
-            vec![MacroStep::KeyDown(*button), MacroStep::KeyUp(*button)]
+            vec![
+                MacroStep::KeyDown(*button),
+                MacroStep::Delay(CONTROLLER_BUTTON_FIRE_ONCE_PULSE_HOLD),
+                MacroStep::KeyUp(*button),
+            ]
         }
     }
 }
@@ -463,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn compile_controller_button_is_a_bare_down_up_pair() {
+    fn compile_controller_button_is_a_down_up_pair_with_a_dwell() {
         let action = Action::ControllerButton {
             button: KeyCode::BTN_SOUTH,
         };
@@ -474,9 +498,51 @@ mod tests {
             steps,
             vec![
                 MacroStep::KeyDown(KeyCode::BTN_SOUTH),
+                MacroStep::Delay(CONTROLLER_BUTTON_FIRE_ONCE_PULSE_HOLD),
                 MacroStep::KeyUp(KeyCode::BTN_SOUTH),
             ]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fire_once_controller_button_dwell_actually_elapses_before_the_up_write() {
+        // Ticket 75/76: the dwell must be a genuine blocking sleep, not just
+        // a step present in the compiled sequence — the Up write must not
+        // reach the sink until the full dwell has actually elapsed.
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
+
+        let steps = compile(
+            &Action::ControllerButton {
+                button: KeyCode::BTN_SOUTH,
+            },
+            &empty_macros(),
+        );
+        tokio::task::yield_now().await;
+        spawn_fire_once(inj.clone(), steps);
+        tokio::task::yield_now().await;
+
+        assert_eq!(sink.batches().len(), 1, "the Down must fire immediately");
+
+        tokio::time::advance(CONTROLLER_BUTTON_FIRE_ONCE_PULSE_HOLD - Duration::from_millis(1))
+            .await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            sink.batches().len(),
+            1,
+            "the Up must not fire before the dwell elapses"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+
+        let batches = sink.batches();
+        assert_eq!(batches.len(), 2, "the Up must fire once the dwell elapses");
+        assert_eq!(key_and_value(batches[0][0]), (KeyCode::BTN_SOUTH, 1));
+        assert_eq!(key_and_value(batches[1][0]), (KeyCode::BTN_SOUTH, 0));
     }
 
     #[tokio::test]

@@ -1029,6 +1029,32 @@ async fn fire_chord(
     toggle_lap_target: Duration,
 ) -> io::Result<()> {
     match (binding.trigger, state) {
+        (TriggerMode::HoldToRepeat, EventState::Repeat)
+            if matches!(binding.action, Action::ControllerButton { .. }) =>
+        {
+            // Mirrors `fire`'s own ControllerButton/HoldToRepeat Repeat
+            // arm (ticket 75/76) — the Chord's leader member's Repeat is
+            // ignored outright rather than re-firing.
+            Ok(())
+        }
+        (TriggerMode::HoldToRepeat, EventState::Down)
+            if matches!(binding.action, Action::ControllerButton { .. }) =>
+        {
+            if let Some(handle) = chord_in_flight.get(&key)
+                && !handle.is_finished()
+            {
+                return Ok(());
+            }
+            let Action::ControllerButton { button } = binding.action else {
+                unreachable!("guarded by this arm's own match guard above")
+            };
+            // Mirrors `fire`'s own bare-KeyDown ControllerButton hold —
+            // released by `release_chord_firing` on a member's physical Up.
+            let steps = vec![MacroStep::KeyDown(button)];
+            let handle = executor::spawn_fire_once(injector.clone(), steps);
+            chord_in_flight.insert(key, handle);
+            Ok(())
+        }
         (TriggerMode::FireOnce, EventState::Down)
         | (TriggerMode::HoldToRepeat, EventState::Down | EventState::Repeat) => {
             if let Some(handle) = chord_in_flight.get(&key)
@@ -1502,6 +1528,15 @@ fn resolve_step(
 /// every Analog-*sourced* Down/Repeat/Up for one outright, before `fire` is
 /// ever called (real Analog-mode firing is `update_analog_repeats`'s own
 /// depth-driven background task).
+///
+/// `Action::ControllerButton` + Hold-to-repeat is a carved-out exception
+/// (ticket 75/76): a real gamepad button doesn't autorepeat in hardware, so
+/// `Down` fires a bare, unbalanced `KeyDown` (not `compile_action`'s own
+/// pulse) that mirrors the physical hold, every `Repeat` is ignored outright
+/// (no re-fire), and the existing `Up` arm below force-releases it — the
+/// same "held until the physical Up force-releases it" shape ticket 33
+/// already relies on for an unbalanced Macro, reused rather than invented
+/// fresh.
 #[allow(clippy::too_many_arguments)]
 async fn fire(
     injector: &Injector,
@@ -1516,6 +1551,40 @@ async fn fire(
     toggle_lap_target: Duration,
 ) -> io::Result<()> {
     match (binding.trigger, state) {
+        (TriggerMode::HoldToRepeat, EventState::Repeat)
+            if matches!(binding.action, Action::ControllerButton { .. }) =>
+        {
+            // Ticket 75/76: a real gamepad button doesn't autorepeat in
+            // hardware — held down, it just stays down — so once the
+            // physical Down's own KeyDown below is holding it, every
+            // intervening kernel-autorepeat Repeat is ignored outright, no
+            // re-fire.
+            Ok(())
+        }
+        (TriggerMode::HoldToRepeat, EventState::Down)
+            if matches!(binding.action, Action::ControllerButton { .. }) =>
+        {
+            // Same overlap guard as the ordinary arm below.
+            if let Some(handle) = in_flight.get(&input)
+                && !handle.is_finished()
+            {
+                return Ok(());
+            }
+            let Action::ControllerButton { button } = binding.action else {
+                unreachable!("guarded by this arm's own match guard above")
+            };
+            // Deliberately not `compile_action`'s own KeyDown/Delay/KeyUp
+            // pulse (that's Fire-once's shape): a bare, unbalanced `KeyDown`
+            // that mirrors the physical press for as long as it's actually
+            // held, released by the physical Up's own arm below — reusing
+            // the same "leaves a key held, a later force-release cleans it
+            // up" mechanism ticket 33 already relies on, rather than
+            // inventing new architecture.
+            let steps = vec![MacroStep::KeyDown(button)];
+            let handle = executor::spawn_fire_once(injector.clone(), steps);
+            in_flight.insert(input, handle);
+            Ok(())
+        }
         (TriggerMode::FireOnce, EventState::Down)
         | (
             TriggerMode::HoldToRepeat | TriggerMode::AnalogRepeat,
@@ -2718,6 +2787,17 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::oneshot;
 
+    /// Same helper as `executor`'s own test module — used by the newer,
+    /// terser ControllerButton Hold-to-repeat tests (ticket 75/76) rather
+    /// than this file's older, more verbose `destructure()`/`else { panic!
+    /// }` inline pattern.
+    fn key_and_value(event: evdev::InputEvent) -> (evdev::KeyCode, i32) {
+        match event.destructure() {
+            evdev::EventSummary::Key(_, code, value) => (code, value),
+            other => panic!("expected a key event, got {other:?}"),
+        }
+    }
+
     fn config_with_bindings(bindings: HashMap<Input, Binding>) -> Config {
         config_with_profile(Profile {
             base: bindings,
@@ -3145,6 +3225,146 @@ mod tests {
             panic!("expected a key event");
         };
         assert_eq!((code, value), (evdev::KeyCode::KEY_LEFTCTRL, 0));
+    }
+
+    #[tokio::test]
+    async fn hold_to_repeat_controller_button_ignores_repeat_and_releases_on_physical_up() {
+        // Ticket 75/76: unlike an ordinary Hold-to-repeat Binding (see
+        // `hold_to_repeat_fires_on_down_and_every_repeat_but_not_up` above),
+        // `Action::ControllerButton` fires exactly one KeyDown on the
+        // physical Down, ignores every kernel-autorepeat Repeat outright
+        // (no re-fire), and only releases on the physical Up.
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::HoldToRepeat,
+                    action: Action::ControllerButton {
+                        button: evdev::KeyCode::BTN_SOUTH,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        harness.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..3 {
+            harness.repeat(Input::Grid(1, 1)).await;
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+        }
+        harness.release(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        let batches = harness.gamepad_batches();
+        harness.shut_down().await;
+
+        // Exactly one KeyDown (the physical Down) and one KeyUp (the
+        // physical Up) — the three Repeats produced nothing.
+        assert_eq!(batches.len(), 2);
+        assert_eq!(key_and_value(batches[0][0]), (evdev::KeyCode::BTN_SOUTH, 1));
+        assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::BTN_SOUTH, 0));
+    }
+
+    #[tokio::test]
+    async fn hold_to_repeat_chord_controller_button_ignores_repeat_and_releases_on_member_up() {
+        // Ticket 75/76's Chord blast radius: the same treatment applies
+        // uniformly when a Chord's own Action is `ControllerButton`, mirrors
+        // `hold_to_repeat_chord_refires_only_on_the_leader_members_repeat`.
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness
+            .set_chord_binding(
+                [Input::Grid(1, 1), Input::Grid(1, 2)],
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::HoldToRepeat,
+                    action: Action::ControllerButton {
+                        button: evdev::KeyCode::BTN_SOUTH,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        harness.press(Input::Grid(1, 1)).await;
+        harness.press(Input::Grid(1, 2)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        harness.repeat(Input::Grid(1, 1)).await;
+        harness.repeat(Input::Grid(1, 2)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        harness.release(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        let batches = harness.gamepad_batches();
+        harness.shut_down().await;
+
+        // Exactly one KeyDown (the completing Down) and one KeyUp (the
+        // first member's physical Up) — both members' Repeats produced
+        // nothing.
+        assert_eq!(batches.len(), 2);
+        assert_eq!(key_and_value(batches[0][0]), (evdev::KeyCode::BTN_SOUTH, 1));
+        assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::BTN_SOUTH, 0));
+    }
+
+    #[tokio::test]
+    async fn hold_to_repeat_mouse_button_still_refires_on_every_repeat() {
+        // Regression coverage (ticket 75/76): the ControllerButton-only
+        // carve-out must not bleed onto mouse-button output, which is
+        // `Action::Keypress` with a `BTN_*` `KeyCode` — a different Action
+        // variant entirely, so the ordinary Hold-to-repeat arm still applies.
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::HoldToRepeat,
+                    action: Action::Keypress {
+                        modifiers: Modifiers::default(),
+                        key: evdev::KeyCode::BTN_LEFT,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        harness.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        harness.repeat(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        harness.release(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        let batches = harness.shut_down().await;
+
+        // Down + one Repeat = two firings, each a KeyDown/KeyUp pair; the
+        // trailing Up produced nothing — unchanged from the ordinary
+        // Keypress case.
+        assert_eq!(batches.len(), 4);
+        for pair in batches.chunks(2) {
+            assert_eq!(key_and_value(pair[0][0]), (evdev::KeyCode::BTN_LEFT, 1));
+            assert_eq!(key_and_value(pair[1][0]), (evdev::KeyCode::BTN_LEFT, 0));
+        }
     }
 
     #[tokio::test]

@@ -389,6 +389,18 @@ Like the previous map, this one carries execution.
 
 - [Decide the fix for Fire-once/Hold-to-repeat Controller-button registration](./issues/75-decide-controller-button-pulse-fix.md) — two structurally different fixes, both scoped to `Action::ControllerButton` only (mouse-button/Keypress/Macro output untouched). **Fire-once** gets a genuine invented dwell — a `MacroStep::Delay` auto-inserted in `compile()`'s output, blocking (not queued), a new **35ms** constant (`CONTROLLER_BUTTON_FIRE_ONCE_PULSE_HOLD`, deliberately not shared with `ANALOG_REPEAT_PULSE_HOLD` — two unrelated tuning knobs) — since Fire-once's pulse is decoupled from physical hold duration by design, so there's no real duration to mirror. **Hold-to-repeat** gets no dwell at all: a real gamepad button doesn't autorepeat in hardware, so the dispatch-level fix instead fires `KeyDown` once on physical Down, ignores kernel-autorepeat `Repeat` events, and fires `KeyUp` once on physical Up — a genuine sustained hold spanning the real (always-many-frames-long) physical press, reusing the existing `ActiveToggle`-style held-state mechanism rather than inventing a timer. Both fixes cover Chord's use of `Action::ControllerButton` for free; Stepper can't reach it. Deliberately deferred, no urgency pre-release: whether Fire-once/Analog-repeat should remain *allowed* for `Action::ControllerButton` at all, and whether a new Auto-fire/Turbo mode is wanted — spawned [Decide Trigger-mode applicability for Action::ControllerButton](./issues/78-decide-controller-button-trigger-mode-applicability.md). Also spawned, per the user's own follow-up question: [Decide sustained-hold Hold-to-repeat for mouse-button output (dragging)](./issues/79-decide-mouse-button-sustained-hold-drag.md), asking the same "should this become a real held button" question for mouse-button Keypress output. Build spawned as [ticket 76](./issues/76-task-build-controller-button-pulse-fix.md), hardware-and-real-game verification as [ticket 77](./issues/77-task-verify-controller-button-pulse-fix-on-hardware.md).
 
+- [Build the Controller-button pulse fix](./issues/76-task-build-controller-button-pulse-fix.md)
+  — landed [ticket 75](./issues/75-decide-controller-button-pulse-fix.md)'s settled
+  design, AFK, no hardware needed. `executor::compile()` now inserts a 35ms
+  `CONTROLLER_BUTTON_FIRE_ONCE_PULSE_HOLD` dwell between `Action::ControllerButton`'s
+  compiled `KeyDown`/`KeyUp` (Fire-once's fix); Hold-to-repeat gets a dispatch-level
+  carve-out in `fire()`/`fire_chord()` instead — `Down` fires a bare unbalanced
+  `KeyDown` via the existing `spawn_fire_once`/`in_flight` machinery, `Repeat` is a
+  hard no-op, and the pre-existing ticket-33 force-release-on-physical-`Up` path
+  releases it with no changes needed. Both direct Bindings and Chords get identical
+  treatment. 343 Rust tests green (5 new), `cargo clippy`/`cargo fmt --check` clean.
+  Unblocks [ticket 77](./issues/77-task-verify-controller-button-pulse-fix-on-hardware.md).
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.
