@@ -482,6 +482,15 @@ Like the previous map, this one carries execution.
   mouse-button sustained-hold Toggle fix on
   hardware](./issues/84-task-verify-mouse-button-sustained-hold-toggle-on-hardware.md).
 
+- [Build the mouse-button sustained-hold Toggle fix](./issues/83-task-build-mouse-button-sustained-hold-toggle.md)
+  — landed [ticket 82](./issues/82-decide-mouse-button-sustained-hold-toggle.md)'s settled
+  design, AFK, no hardware needed. New `ActiveToggle::spawn_held` constructor (backed by a new
+  `run_toggle_held` task) alongside the existing loop `spawn`; `fire()`/`fire_chord()`'s Toggle
+  arms each gain a carve-out structurally identical to the existing `HoldToRepeat` mouse-button
+  one, guarded on `is_mouse_button`. `ActiveToggle::stop()` and every existing caller of it
+  needed zero changes. 351 Rust tests green (net +4), `cargo clippy --all-targets`/`cargo fmt
+  --check` clean. Unblocks [ticket 84](./issues/84-task-verify-mouse-button-sustained-hold-toggle-on-hardware.md).
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.

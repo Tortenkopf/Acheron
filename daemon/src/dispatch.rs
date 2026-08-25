@@ -1099,6 +1099,21 @@ async fn fire_chord(
             chord_in_flight.insert(key, handle);
             Ok(())
         }
+        (TriggerMode::Toggle, EventState::Down)
+            if matches!(
+                binding.action,
+                Action::Keypress { key, .. } if crate::input::is_mouse_button(key)
+            ) =>
+        {
+            let Action::Keypress { key: button, .. } = binding.action else {
+                unreachable!("guarded by this arm's own match guard above")
+            };
+            // Ticket 82: a mouse-button Chord Toggle gets the same
+            // sustained-hold treatment as a plain Input's own Toggle below
+            // — a single held KeyDown rather than a repeat-tap loop.
+            chord_toggles.insert(key, ActiveToggle::spawn_held(injector.clone(), button));
+            Ok(())
+        }
         (TriggerMode::Toggle, EventState::Down) => {
             let steps = compile_action(&binding.action, macros, steppers, stepper_cursors);
             chord_toggles.insert(
@@ -1679,6 +1694,21 @@ async fn fire(
             let steps = compile_action(&binding.action, macros, steppers, stepper_cursors);
             let handle = executor::spawn_fire_once(injector.clone(), steps);
             in_flight.insert(input, handle);
+            Ok(())
+        }
+        (TriggerMode::Toggle, EventState::Down)
+            if matches!(
+                binding.action,
+                Action::Keypress { key, .. } if crate::input::is_mouse_button(key)
+            ) =>
+        {
+            let Action::Keypress { key, .. } = binding.action else {
+                unreachable!("guarded by this arm's own match guard above")
+            };
+            // Ticket 82: a mouse-button Toggle gets the same sustained-hold
+            // treatment as HoldToRepeat's own mouse-button carve-out above —
+            // a single held KeyDown rather than a repeat-tap loop.
+            toggles.insert(input, ActiveToggle::spawn_held(injector.clone(), key));
             Ok(())
         }
         (TriggerMode::Toggle, EventState::Down) => {
@@ -3534,6 +3564,105 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn toggle_mouse_button_holds_a_single_keydown_and_the_same_key_stops_it() {
+        // Ticket 82/83: a mouse-button Keypress under Toggle gets a real
+        // sustained hold instead of the ordinary repeat-tap loop — one
+        // KeyDown while toggled on, no matter how long, released by exactly
+        // one KeyUp when the same key stops it.
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::Toggle,
+                    action: Action::Keypress {
+                        modifiers: Modifiers::default(),
+                        key: evdev::KeyCode::BTN_LEFT,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        harness.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        // Advance well past several ordinary Toggle laps' worth of time —
+        // a looping Toggle would have re-pressed several times by now.
+        for _ in 0..7 {
+            tokio::time::advance(executor::MIN_TOGGLE_LAP).await;
+            tokio::task::yield_now().await;
+        }
+
+        let state = harness.get_state().await;
+        assert_eq!(state.active_toggles, vec![Input::Grid(1, 1)]);
+
+        // Same physical key, still toggled on: stops it rather than
+        // starting a second one.
+        harness.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        let batches = harness.shut_down().await;
+
+        assert_eq!(
+            batches.len(),
+            2,
+            "exactly one KeyDown, one KeyUp — no re-fires in between"
+        );
+        assert_eq!(key_and_value(batches[0][0]), (evdev::KeyCode::BTN_LEFT, 1));
+        assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::BTN_LEFT, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn toggle_keyboard_key_still_loops_at_dispatch_level() {
+        // Regression coverage (ticket 82/83): the mouse-button-only
+        // carve-out must not bleed onto keyboard-key output — `is_mouse_
+        // button` rejects an ordinary keyboard `KeyCode`, so the ordinary
+        // looping Toggle arm still applies.
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::Toggle,
+                    action: Action::Keypress {
+                        modifiers: Modifiers::default(),
+                        key: evdev::KeyCode::KEY_A,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        harness.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..7 {
+            tokio::time::advance(executor::MIN_TOGGLE_LAP).await;
+            tokio::task::yield_now().await;
+        }
+
+        harness.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        let batches = harness.shut_down().await;
+
+        assert!(
+            batches.len() > 2,
+            "a keyboard-key Toggle must still loop (mash), unlike the mouse-button held variant: got {batches:?}"
+        );
+    }
+
     #[tokio::test]
     async fn analog_repeat_digital_sourced_behaves_like_hold_to_repeat() {
         // Ticket 20's Digital Capture mode fallback: with no Depth at all
@@ -4890,6 +5019,54 @@ mod tests {
             panic!("expected a key event");
         };
         assert_eq!((code, value), (evdev::KeyCode::KEY_LEFTCTRL, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn toggle_chord_mouse_button_holds_a_single_keydown_and_full_completion_stops_it() {
+        // Ticket 82/83's Chord blast radius: the same sustained-hold
+        // treatment applies when a Chord's own Action is a mouse-button
+        // Keypress under Toggle, mirroring a single Input's own Toggle
+        // above.
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness
+            .set_chord_binding(
+                [Input::Grid(1, 1), Input::Grid(1, 2)],
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::Toggle,
+                    action: Action::Keypress {
+                        modifiers: Modifiers::default(),
+                        key: evdev::KeyCode::BTN_LEFT,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        harness.press(Input::Grid(1, 1)).await;
+        harness.press(Input::Grid(1, 2)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        for _ in 0..7 {
+            tokio::time::advance(executor::MIN_TOGGLE_LAP).await;
+            tokio::task::yield_now().await;
+        }
+
+        // A fresh completion of the full member set stops it, mirroring a
+        // single Input's own Toggle.
+        harness.press(Input::Grid(1, 1)).await;
+        harness.press(Input::Grid(1, 2)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        let batches = harness.shut_down().await;
+
+        assert_eq!(batches.len(), 2, "no re-fires between the two completions");
+        assert_eq!(key_and_value(batches[0][0]), (evdev::KeyCode::BTN_LEFT, 1));
+        assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::BTN_LEFT, 0));
     }
 
     #[tokio::test]

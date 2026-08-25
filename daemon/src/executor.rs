@@ -261,6 +261,19 @@ impl ActiveToggle {
         ActiveToggle { cancel, handle }
     }
 
+    /// Ticket 82's mouse-button Toggle fix: a single sustained hold rather
+    /// than `spawn`'s repeat-tap loop — one `KeyDown` on start, released by
+    /// one `KeyUp` on `stop()`, nothing in between. Same `{cancel, handle}`
+    /// shape as the loop variant, so `stop()` and every one of its existing
+    /// callers (`StopAllToggles`, profile switch, the Mode key, a Toggle
+    /// Chord's own "full member set again" stop, a plain Input's second
+    /// `Down`) work unchanged for both variants.
+    pub fn spawn_held(injector: Injector, key: KeyCode) -> Self {
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(run_toggle_held(injector, key, cancel.clone()));
+        ActiveToggle { cancel, handle }
+    }
+
     /// Stops the Toggle and waits for its force-release to complete, so a
     /// caller that awaits this knows every held key is already released
     /// before doing anything else (e.g. resuming normal evaluation of the
@@ -352,6 +365,26 @@ async fn run_toggle_loop(
             }
         }
     }
+    force_release(&injector, held).await;
+}
+
+/// Ticket 82's held (non-looping) Toggle body: a single `KeyDown`, then wait
+/// for the stop signal, then release — the mouse-button counterpart to
+/// `run_toggle_loop`'s repeat-tap shape. A write suppressed at the injector
+/// (nothing actually went down) leaves `held` empty, so the eventual
+/// `force_release` below is correctly a no-op, same discipline as
+/// `execute_step`'s own suppression handling.
+async fn run_toggle_held(injector: Injector, key: KeyCode, cancel: CancellationToken) {
+    let mut held: HashSet<KeyCode> = HashSet::new();
+    if execute_step(&injector, &mut held, MacroStep::KeyDown(key))
+        .await
+        .is_err()
+    {
+        // The injector task has died — the whole Daemon is going down, so
+        // there's no one left to force-release to.
+        return;
+    }
+    cancel.cancelled().await;
     force_release(&injector, held).await;
 }
 
@@ -604,6 +637,40 @@ mod tests {
             let expected_value = if i % 2 == 0 { 1 } else { 0 };
             assert_eq!(key_and_value(batch[0]), (KeyCode::KEY_A, expected_value));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn spawn_held_holds_a_single_keydown_until_stopped() {
+        // Ticket 82: the mouse-button Toggle fix — one KeyDown, nothing
+        // else, no matter how long it's left running, until `stop()`
+        // releases it with exactly one KeyUp.
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
+
+        tokio::task::yield_now().await;
+        let toggle = ActiveToggle::spawn_held(inj.clone(), KeyCode::BTN_LEFT);
+        tokio::task::yield_now().await;
+
+        // Advance well past several ordinary Toggle laps' worth of time —
+        // a looping Toggle would have re-pressed several times by now.
+        for _ in 0..7 {
+            tokio::time::advance(MIN_TOGGLE_LAP).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sink.batches().len(),
+            1,
+            "a held Toggle must never re-fire, unlike the looping variant"
+        );
+        assert_eq!(key_and_value(sink.batches()[0][0]), (KeyCode::BTN_LEFT, 1));
+
+        toggle.stop().await;
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+
+        let batches = sink.batches();
+        assert_eq!(batches.len(), 2, "exactly one KeyDown, one KeyUp");
+        assert_eq!(key_and_value(batches[1][0]), (KeyCode::BTN_LEFT, 0));
     }
 
     #[tokio::test(start_paused = true)]
