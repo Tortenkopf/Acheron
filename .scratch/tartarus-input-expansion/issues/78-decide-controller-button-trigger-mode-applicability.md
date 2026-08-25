@@ -16,3 +16,7 @@ Open questions for this session:
 - If any modes end up disallowed for `ControllerButton`, does that need a config.toml migration/guard for anyone who already hand-authored a now-invalid combination (mirrors [ticket 57](./57-task-migrate-or-guard-pre-macro-library-config.md)'s precedent) — likely moot pre-release, but worth a one-line confirmation.
 
 Record the settled design as this ticket's Answer; spawn build/verify tasks per this map's standing precedent if it changes shipped behavior.
+
+## Comments
+
+**From [ticket 79](./79-decide-mouse-button-sustained-hold-drag.md)'s resolution**: while deciding the mouse-button mirror of this ticket's sibling ([ticket 75](./75-decide-controller-button-pulse-fix.md)), the user pointed out that `MacroStep::KeyDown`/`KeyUp` already carries a bare, unrestricted `KeyCode` (confirmed in code — `executor.rs:500` already uses `MacroStep::KeyDown(KeyCode::BTN_SOUTH)` for ticket 76's own dwell fix), so a Macro under Toggle is already a fully general, arbitrarily-timed turbo-fire for `Action::ControllerButton` too, not just for Keypress/mouse-button output. Worth weighing directly against this ticket's own open "is a new Auto-fire/Turbo mode actually wanted" question — ticket 79 concluded no dedicated Turbo mode was needed for mouse buttons on that basis. Not resolved here; left for whoever picks up this ticket.

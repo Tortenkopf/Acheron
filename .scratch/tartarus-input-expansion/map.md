@@ -413,6 +413,24 @@ Like the previous map, this one carries execution.
   buttons (A/B/X/Y) — pick buttons the target game actually binds. Closes the map's
   entire Controller-button pulse-fix strand (decide → build → verify, tickets 75-77).
 
+- [Decide sustained-hold Hold-to-repeat for mouse-button output (dragging)](./issues/79-decide-mouse-button-sustained-hold-drag.md)
+  — mirrors [ticket 75](./issues/75-decide-controller-button-pulse-fix.md)'s `ControllerButton`
+  fix onto mouse-button `Action::Keypress` output, unconditionally: Hold-to-repeat becomes
+  sustained-hold (`KeyDown` once on Down, `Repeat` ignored, `KeyUp` once on Up), no mode
+  split, mash-click not preserved — click-and-drag strictly dominates it. New
+  `input::is_mouse_button` predicate (mirrors `is_gamepad_button`) matches evdev's real
+  `BTN_LEFT..=BTN_TASK` range (8 codes), deliberately wider than the picker's 5, since
+  `Keypress.key` has no allowlist. Carve-out lives in `fire()`/`fire_chord()` keyed on the
+  predicate rather than the Action variant (mouse buttons share `Action::Keypress` with
+  keyboard keys), covering Chord for free; Macro steps unaffected. **No Turbo/Auto-fire
+  mode needed** — the user pointed out a Macro under Toggle already carries a bare,
+  unrestricted `KeyCode` per step, making it a strictly more flexible arbitrarily-timed
+  turbo-fire than any fixed-rate mode could be; left as a comment on
+  [ticket 78](./issues/78-decide-controller-button-trigger-mode-applicability.md) as a data
+  point for its own still-open Turbo-mode question, not resolved there. Spawned
+  [Build the mouse-button sustained-hold fix](./issues/80-task-build-mouse-button-sustained-hold.md)
+  and [Verify the mouse-button sustained-hold fix on hardware](./issues/81-task-verify-mouse-button-sustained-hold-on-hardware.md).
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.
