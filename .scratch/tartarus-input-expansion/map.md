@@ -504,6 +504,24 @@ Like the previous map, this one carries execution.
   changes needed. Closes the map's mouse-button sustained-hold Toggle strand (decide → build →
   verify, tickets 82-84), mirroring the Hold-to-repeat strand's tickets 79-81.
 
+- [Decide Trigger-mode applicability for Action::ControllerButton](./issues/78-decide-controller-button-trigger-mode-applicability.md)
+  — Fire-once disallowed for `ControllerButton` (a new `ConfigError::InvalidControllerButtonTrigger`,
+  same shape as `InvalidProfileSwitchTrigger`/`InvalidStepTrigger`), Hold-to-repeat's sustained-hold
+  behavior already covers a quick tap; ticket 76's now-dead Fire-once dwell code gets deleted, not
+  kept as a no-op. Analog-repeat stays allowed unchanged (real turbo-trigger precedent, still
+  grid-key-scoped not Action-scoped) but gains a gamepad-specific 35ms dwell floor
+  (`ANALOG_REPEAT_CONTROLLER_PULSE_HOLD`, reusing ticket 76's vetted constant) alongside the
+  existing 15ms Keypress/mouse-button dwell — `MAX_HZ`'s 50ms tightest period already clears it, so
+  the rate curve itself is untouched. Toggle unchanged. No new Auto-fire/Turbo mode, same
+  conclusion as [ticket 79](./issues/79-decide-mouse-button-sustained-hold-drag.md) and for the
+  same reason (a Macro-under-Toggle is already a strictly more general turbo-fire). Migration
+  turned out not moot: the user's own live `config.toml` (Testing profile) has three Fire-once +
+  `ControllerButton` bindings that will now refuse to start — no auto-migration, per this
+  project's refuse-to-start precedent, hand-fixed instead during the verify pass. CONTEXT.md's
+  Trigger mode entry updated. Spawned [Build the Controller-button Trigger-mode
+  restriction](./issues/85-task-build-controller-button-trigger-mode-restriction.md) and
+  [Verify it on hardware](./issues/86-task-verify-controller-button-trigger-mode-restriction-on-hardware.md).
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.

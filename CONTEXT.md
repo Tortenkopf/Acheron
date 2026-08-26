@@ -55,7 +55,7 @@ A per-Input, per-Layer assignment, structurally independent of Binding/Action, t
 _Avoid_: Action (Axis assignment is a parallel concept, not an Action variant — see Action), Controller (reserved for the discrete-button Action)
 
 **Trigger mode**:
-Governs how a Binding fires once its Input is pressed. One of Fire-once, Hold-to-repeat, Toggle, or Analog-repeat. Applies to every Binding, regardless of whether its Action is a Keypress or a Macro — except a Stepper's forward/backward Bindings, which disallow Toggle: there is no coherent continuously-running state for a cursor advance the way there is for a held Keypress or a looping Macro. Analog-repeat is further restricted to grid-key Bindings only, since it requires Depth.
+Governs how a Binding fires once its Input is pressed. One of Fire-once, Hold-to-repeat, Toggle, or Analog-repeat. Applies to every Binding, regardless of whether its Action is a Keypress or a Macro — except a Stepper's forward/backward Bindings, which disallow Toggle (there is no coherent continuously-running state for a cursor advance the way there is for a held Keypress or a looping Macro), and a Controller button Binding, which disallows Fire-once (ticket 78's Answer: Hold-to-repeat's sustained-hold behavior already covers a quick tap, and no real gamepad button press is decoupled from physical hold duration the way Fire-once's invented pulse is by design). Analog-repeat is further restricted to grid-key Bindings only, since it requires Depth.
 _Avoid_: trigger type, activation mode
 
 **Fire-once**:
