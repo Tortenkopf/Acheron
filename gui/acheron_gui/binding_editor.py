@@ -492,12 +492,17 @@ def build_action_and_trigger_fields(
     # types`'s own `is_grid_input`-gated "Axis" exclusion above it. The
     # Daemon's own `parse`/`SetBinding`/`SetChordBinding` validation
     # (ticket 39) makes it structurally impossible for `starting["trigger"]`
-    # to be "analog_repeat" here when this filters it out.
-    trigger_options = (
+    # to be "analog_repeat" here when this filters it out. Fixed for the
+    # popover's whole lifetime (an Input's grid-ness never changes), unlike
+    # `trigger_options` below, which `render_action_editor` also narrows for
+    # Controller Button and rebuilds live as the Action-kind changes (ticket
+    # 78).
+    base_trigger_options = (
         TRIGGER_OPTIONS
         if inp is not None and is_grid_input(inp)
         else [(k, lbl) for k, lbl in TRIGGER_OPTIONS if k != "analog_repeat"]
     )
+    trigger_options = base_trigger_options
     trigger_keys = [k for k, _ in trigger_options]
     trigger_dd = Gtk.DropDown(model=Gtk.StringList.new([lbl for _, lbl in trigger_options]))
     trigger_dd.set_selected(trigger_keys.index(starting["trigger"]))
@@ -555,6 +560,7 @@ def build_action_and_trigger_fields(
     _trigger_handler: dict = {"id": None}
 
     def render_action_editor():
+        nonlocal trigger_options, trigger_keys
         clear_children(editor_slot)
         if _trigger_handler["id"] is not None:
             trigger_dd.disconnect(_trigger_handler["id"])
@@ -565,6 +571,39 @@ def build_action_and_trigger_fields(
         # disables it (no picker yet to assign a fresh macro_id), and every
         # other kind must not stay disabled from a previous render.
         save_btn.set_sensitive(True)
+
+        # Ticket 78: Fire-once is locked out for Controller Button (Hold-to-
+        # repeat's sustained-hold behavior already covers a quick tap; no
+        # real gamepad button press works like Fire-once's decoupled pulse)
+        # — unlike Analog-repeat's exclusion above (fixed for the popover's
+        # whole lifetime, since an Input's grid-ness never changes), this
+        # depends on `kind`, which the user can flip live via `action_dd`, so
+        # the model is rebuilt here rather than computed once. Mirrors the
+        # non-grid-Input/Chord Analog-repeat exclusion's own reasoning
+        # (`Gtk.DropDown` has no per-item sensitivity — ticket 39's
+        # precedent), applied a second time for a second kind-gated entry.
+        new_trigger_options = (
+            [(k, lbl) for k, lbl in base_trigger_options if k != "fire_once"]
+            if kind == "controller_button"
+            else base_trigger_options
+        )
+        new_trigger_keys = [k for k, _ in new_trigger_options]
+        if new_trigger_keys != trigger_keys:
+            previous_key = (
+                trigger_keys[trigger_dd.get_selected()]
+                if trigger_dd.get_selected() < len(trigger_keys)
+                else None
+            )
+            trigger_dd.set_model(Gtk.StringList.new([lbl for _, lbl in new_trigger_options]))
+            trigger_options, trigger_keys = new_trigger_options, new_trigger_keys
+            trigger_dd.set_selected(
+                trigger_keys.index(previous_key)
+                if previous_key in trigger_keys
+                # Fire-once just got excluded (kind became controller_button)
+                # — Hold-to-repeat is the closest real-gamepad equivalent.
+                else trigger_keys.index("hold_to_repeat")
+            )
+
         # Profile Switch has no coherent held/toggled meaning (ticket 05) —
         # locked to Fire-once here and again, defensively, in on_save. Axis
         # output has no Trigger mode at all (ticket 60's Answer) — same

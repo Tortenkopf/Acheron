@@ -258,8 +258,23 @@ const ANALOG_REPEAT_MAX_HZ: f64 = 20.0;
 
 /// Analog-repeat's fixed per-fire hold duration (ticket 20/39) — the same
 /// every tick regardless of Depth; only the tick-to-tick *rate* varies.
-/// Placeholder, same live-tuning status as `ANALOG_REPEAT_DEADZONE`.
+/// Placeholder, same live-tuning status as `ANALOG_REPEAT_DEADZONE`. Used for
+/// every output Action except `Action::ControllerButton`, which selects
+/// `ANALOG_REPEAT_CONTROLLER_PULSE_HOLD` instead (ticket 78) — Keypress/
+/// mouse-button output is interrupt-driven on the receiving side, not subject
+/// to the per-frame-polling risk a gamepad read has.
 const ANALOG_REPEAT_PULSE_HOLD: Duration = Duration::from_millis(15);
+
+/// `Action::ControllerButton`'s own Analog-repeat pulse-hold floor (ticket
+/// 78): `ANALOG_REPEAT_MAX_HZ`'s 20Hz already yields a 50ms period at the
+/// fastest end of the rate curve, comfortably above this 35ms dwell — the
+/// same frame-safe floor ticket 76 already vetted for `Action::
+/// ControllerButton` output against a polled 60fps game read (the class of
+/// problem ticket 74 flagged as unaddressed for Analog-repeat's own
+/// pre-existing 15ms dwell). Deliberately its own constant, not shared with
+/// `ANALOG_REPEAT_PULSE_HOLD` or `executor::CONTROLLER_BUTTON_DIGITAL_PULSE_
+/// HOLD` — three dwells tuned for unrelated jobs.
+const ANALOG_REPEAT_CONTROLLER_PULSE_HOLD: Duration = Duration::from_millis(35);
 
 /// Analog-repeat's near-full-travel threshold (ticket 20/39) at or above
 /// which the key holds down solid instead of continuing to tap. Placeholder,
@@ -293,6 +308,7 @@ impl ActiveAnalogRepeat {
         injector: Injector,
         input: Input,
         steps: Vec<MacroStep>,
+        pulse_hold: Duration,
         depth_rx: watch::Receiver<HashMap<Input, u8>>,
     ) -> Self {
         let cancel = CancellationToken::new();
@@ -300,6 +316,7 @@ impl ActiveAnalogRepeat {
             injector,
             input,
             steps,
+            pulse_hold,
             depth_rx,
             cancel.clone(),
         ));
@@ -314,15 +331,18 @@ impl ActiveAnalogRepeat {
     }
 }
 
-/// Fires `steps`' Down phase, holds for `ANALOG_REPEAT_PULSE_HOLD`, then
-/// fires the Up phase in reverse order — matching `keypress_steps`'s own
-/// down/up nesting (modifiers released in the reverse of how they were
-/// pressed). Deliberately ignores any `MacroStep::Delay` a Macro Action
-/// might embed: Analog-repeat's whole idea (ticket 20's Answer) is a single
-/// fixed-duration pulse, not a multi-step timed sequence.
+/// Fires `steps`' Down phase, holds for `pulse_hold` (`ANALOG_REPEAT_PULSE_
+/// HOLD`, or `ANALOG_REPEAT_CONTROLLER_PULSE_HOLD` for `Action::
+/// ControllerButton` output, per ticket 78), then fires the Up phase in
+/// reverse order — matching `keypress_steps`'s own down/up nesting (modifiers
+/// released in the reverse of how they were pressed). Deliberately ignores
+/// any `MacroStep::Delay` a Macro Action might embed: Analog-repeat's whole
+/// idea (ticket 20's Answer) is a single fixed-duration pulse, not a
+/// multi-step timed sequence.
 async fn fire_analog_repeat_pulse(
     injector: &Injector,
     steps: &[MacroStep],
+    pulse_hold: Duration,
     held: &mut HashSet<KeyCode>,
 ) {
     for step in steps {
@@ -330,7 +350,7 @@ async fn fire_analog_repeat_pulse(
             let _ = executor::execute_step(injector, held, *step).await;
         }
     }
-    tokio::time::sleep(ANALOG_REPEAT_PULSE_HOLD).await;
+    tokio::time::sleep(pulse_hold).await;
     for step in steps.iter().rev() {
         if let MacroStep::KeyUp(_) = step {
             let _ = executor::execute_step(injector, held, *step).await;
@@ -352,6 +372,7 @@ async fn run_analog_repeat_loop(
     injector: Injector,
     input: Input,
     steps: Vec<MacroStep>,
+    pulse_hold: Duration,
     mut depth_rx: watch::Receiver<HashMap<Input, u8>>,
     cancel: CancellationToken,
 ) {
@@ -407,7 +428,7 @@ async fn run_analog_repeat_loop(
         let tick_start = Instant::now();
         let cancelled = tokio::select! {
             () = cancel.cancelled() => true,
-            () = fire_analog_repeat_pulse(&injector, &steps, &mut held) => false,
+            () = fire_analog_repeat_pulse(&injector, &steps, pulse_hold, &mut held) => false,
         };
         if cancelled {
             break;
@@ -469,15 +490,25 @@ async fn update_analog_repeats(
         let is_analog_repeat = binding.is_some_and(|b| b.trigger == TriggerMode::AnalogRepeat);
         if is_analog_repeat && depth >= ANALOG_REPEAT_DEADZONE {
             analog_repeats.entry(input).or_insert_with(|| {
-                let steps = compile_action(
-                    &binding
-                        .expect("is_analog_repeat is only true for Some(binding)")
-                        .action,
-                    &config.macros,
-                    &config.steppers,
-                    stepper_cursors,
-                );
-                ActiveAnalogRepeat::spawn(injector.clone(), input, steps, depth_rx.clone())
+                let action = &binding
+                    .expect("is_analog_repeat is only true for Some(binding)")
+                    .action;
+                let steps =
+                    compile_action(action, &config.macros, &config.steppers, stepper_cursors);
+                // Ticket 78: a gamepad button gets the 35ms frame-safe floor;
+                // every other output Action keeps the original 15ms dwell.
+                let pulse_hold = if matches!(action, Action::ControllerButton { .. }) {
+                    ANALOG_REPEAT_CONTROLLER_PULSE_HOLD
+                } else {
+                    ANALOG_REPEAT_PULSE_HOLD
+                };
+                ActiveAnalogRepeat::spawn(
+                    injector.clone(),
+                    input,
+                    steps,
+                    pulse_hold,
+                    depth_rx.clone(),
+                )
             });
         } else if let Some(task) = analog_repeats.remove(&input) {
             task.stop().await;
@@ -1114,6 +1145,19 @@ async fn fire_chord(
             chord_toggles.insert(key, ActiveToggle::spawn_held(injector.clone(), button));
             Ok(())
         }
+        (TriggerMode::Toggle, EventState::Down)
+            if matches!(binding.action, Action::ControllerButton { .. }) =>
+        {
+            let Action::ControllerButton { button } = binding.action else {
+                unreachable!("guarded by this arm's own match guard above")
+            };
+            // Ticket 78: a gamepad button Chord Toggle gets the same
+            // sustained-hold treatment as a plain Input's own ControllerButton
+            // Toggle above, and as the mouse-button Chord Toggle carve-out
+            // above it.
+            chord_toggles.insert(key, ActiveToggle::spawn_held(injector.clone(), button));
+            Ok(())
+        }
         (TriggerMode::Toggle, EventState::Down) => {
             let steps = compile_action(&binding.action, macros, steppers, stepper_cursors);
             chord_toggles.insert(
@@ -1583,7 +1627,13 @@ fn resolve_step(
 /// (no re-fire), and the existing `Up` arm below force-releases it — the
 /// same "held until the physical Up force-releases it" shape ticket 33
 /// already relies on for an unbalanced Macro, reused rather than invented
-/// fresh.
+/// fresh. `Action::ControllerButton` + Toggle gets the analogous carve-out
+/// (ticket 78): `spawn_held`'s single sustained KeyDown rather than
+/// `compile_action`'s repeat-tap loop, mirroring the mouse-button Toggle fix
+/// (ticket 82/83) below — a real gamepad button doesn't have a "turbo" Toggle
+/// mode any more than it autorepeats, so a latched Toggle should just hold it
+/// down. Fire-once is disallowed for `Action::ControllerButton` entirely
+/// (ticket 78, enforced at config-load/write time, not here).
 #[allow(clippy::too_many_arguments)]
 async fn fire(
     injector: &Injector,
@@ -1711,6 +1761,20 @@ async fn fire(
             toggles.insert(input, ActiveToggle::spawn_held(injector.clone(), key));
             Ok(())
         }
+        (TriggerMode::Toggle, EventState::Down)
+            if matches!(binding.action, Action::ControllerButton { .. }) =>
+        {
+            let Action::ControllerButton { button } = binding.action else {
+                unreachable!("guarded by this arm's own match guard above")
+            };
+            // Ticket 78: a gamepad button Toggle gets the same sustained-hold
+            // treatment as the mouse-button carve-out above (and as
+            // ControllerButton's own Hold-to-repeat carve-out, ticket 75/76)
+            // — a single held KeyDown rather than a repeat-tap loop, matching
+            // a real held gamepad button (e.g. a latched sprint/aim).
+            toggles.insert(input, ActiveToggle::spawn_held(injector.clone(), button));
+            Ok(())
+        }
         (TriggerMode::Toggle, EventState::Down) => {
             let steps = compile_action(&binding.action, macros, steppers, stepper_cursors);
             toggles.insert(
@@ -1784,12 +1848,17 @@ fn validate_binding(binding: &Binding, config: &Config) -> Result<(), CommandErr
             "a Profile Switch Binding must use Fire-once".to_string(),
         ));
     }
-    if let Action::ControllerButton { button } = binding.action
-        && !crate::input::is_gamepad_button(button)
-    {
-        return Err(CommandError::InvalidRequest(format!(
-            "{button:?} is not a valid gamepad button"
-        )));
+    if let Action::ControllerButton { button } = binding.action {
+        if !crate::input::is_gamepad_button(button) {
+            return Err(CommandError::InvalidRequest(format!(
+                "{button:?} is not a valid gamepad button"
+            )));
+        }
+        if binding.trigger == TriggerMode::FireOnce {
+            return Err(CommandError::InvalidRequest(
+                "Fire-once is not allowed for a Controller Button Binding".to_string(),
+            ));
+        }
     }
     if let Action::Macro { macro_id } = &binding.action
         && !config.macros.contains_key(macro_id)
@@ -3620,6 +3689,64 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn toggle_controller_button_holds_a_single_keydown_and_the_same_key_stops_it() {
+        // Ticket 78: a gamepad button under Toggle gets the same
+        // sustained-hold treatment as a mouse-button Toggle (ticket 82/83)
+        // above, and as ControllerButton's own Hold-to-repeat carve-out
+        // (ticket 75/76) — one KeyDown while toggled on, no matter how long,
+        // released by exactly one KeyUp when the same key stops it. Before
+        // this ticket, this fell through to the ordinary looping Toggle arm
+        // instead.
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::Toggle,
+                    action: Action::ControllerButton {
+                        button: evdev::KeyCode::BTN_SOUTH,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        harness.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        // Advance well past several ordinary Toggle laps' worth of time —
+        // a looping Toggle would have re-pressed several times by now.
+        for _ in 0..7 {
+            tokio::time::advance(executor::MIN_TOGGLE_LAP).await;
+            tokio::task::yield_now().await;
+        }
+
+        let state = harness.get_state().await;
+        assert_eq!(state.active_toggles, vec![Input::Grid(1, 1)]);
+
+        // Same physical key, still toggled on: stops it rather than
+        // starting a second one.
+        harness.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        let batches = harness.gamepad_batches();
+        harness.shut_down().await;
+
+        assert_eq!(
+            batches.len(),
+            2,
+            "exactly one KeyDown, one KeyUp — no re-fires in between"
+        );
+        assert_eq!(key_and_value(batches[0][0]), (evdev::KeyCode::BTN_SOUTH, 1));
+        assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::BTN_SOUTH, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn toggle_keyboard_key_still_loops_at_dispatch_level() {
         // Regression coverage (ticket 82/83): the mouse-button-only
         // carve-out must not bleed onto keyboard-key output — `is_mouse_
@@ -3889,6 +4016,86 @@ mod tests {
             assert_eq!((down_code, down_value), (evdev::KeyCode::KEY_F1, 1));
             assert_eq!((up_code, up_value), (evdev::KeyCode::KEY_F1, 0));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn analog_repeat_controller_button_uses_the_controller_pulse_hold_floor() {
+        // Ticket 78: Analog-repeat on a Binding whose Action is
+        // `ControllerButton` holds each pulse for `ANALOG_REPEAT_CONTROLLER_
+        // PULSE_HOLD` (35ms), not the ordinary `ANALOG_REPEAT_PULSE_HOLD`
+        // (15ms) every other output Action uses.
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::AnalogRepeat,
+                action: Action::ControllerButton {
+                    button: evdev::KeyCode::BTN_SOUTH,
+                },
+            },
+        );
+
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
+        let (tx, rx) = mpsc::channel(8);
+        let (_conn_tx, conn_rx) = mpsc::channel(8);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (depth_tx, depth_rx) = watch::channel(HashMap::new());
+        let dispatch_handle = tokio::spawn(run(
+            rx,
+            conn_rx,
+            cmd_rx,
+            inj.clone(),
+            config_with_bindings(bindings),
+            unused_config_path(),
+            None,
+            actuation_channel(),
+            capture_mode_channel(),
+            capture_control_channel(),
+            executor::MIN_TOGGLE_LAP,
+            depth_rx,
+        ));
+
+        let depth: u8 = 100;
+        depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), depth)]));
+        tokio::task::yield_now().await;
+
+        assert_eq!(sink.batches().len(), 1, "the Down must fire immediately");
+
+        tokio::time::advance(ANALOG_REPEAT_PULSE_HOLD).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            sink.batches().len(),
+            1,
+            "the ordinary 15ms dwell must not release a ControllerButton pulse"
+        );
+
+        tokio::time::advance(ANALOG_REPEAT_CONTROLLER_PULSE_HOLD - ANALOG_REPEAT_PULSE_HOLD).await;
+        tokio::task::yield_now().await;
+
+        // Fall back below the deadzone to let `update_analog_repeats` stop
+        // the task (dropping its own `Injector` clone) before shutdown —
+        // otherwise the still-running task's clone keeps the injector's own
+        // channel open forever, hanging `inj_handle.await` below (mirrors
+        // `analog_repeat_task_fires_periodically_above_the_deadzone_and_
+        // stops_below_it`'s own shutdown sequence).
+        depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), 0u8)]));
+        tokio::task::yield_now().await;
+
+        drop(tx);
+        drop(depth_tx);
+        dispatch_handle.await.unwrap().unwrap();
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+
+        let batches = sink.batches();
+        assert_eq!(
+            batches.len(),
+            2,
+            "the Up must fire once the 35ms controller floor elapses"
+        );
+        assert_eq!(key_and_value(batches[0][0]), (evdev::KeyCode::BTN_SOUTH, 1));
+        assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::BTN_SOUTH, 0));
     }
 
     #[tokio::test(start_paused = true)]
@@ -5069,6 +5276,54 @@ mod tests {
         assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::BTN_LEFT, 0));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn toggle_chord_controller_button_holds_a_single_keydown_and_full_completion_stops_it() {
+        // Ticket 78's Chord blast radius: the same sustained-hold treatment
+        // applies when a Chord's own Action is `ControllerButton` under
+        // Toggle, mirroring a single Input's own ControllerButton Toggle
+        // above and the mouse-button Chord Toggle carve-out above it.
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        harness
+            .set_chord_binding(
+                [Input::Grid(1, 1), Input::Grid(1, 2)],
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::Toggle,
+                    action: Action::ControllerButton {
+                        button: evdev::KeyCode::BTN_SOUTH,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        harness.press(Input::Grid(1, 1)).await;
+        harness.press(Input::Grid(1, 2)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        for _ in 0..7 {
+            tokio::time::advance(executor::MIN_TOGGLE_LAP).await;
+            tokio::task::yield_now().await;
+        }
+
+        // A fresh completion of the full member set stops it, mirroring a
+        // single Input's own Toggle.
+        harness.press(Input::Grid(1, 1)).await;
+        harness.press(Input::Grid(1, 2)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        let batches = harness.gamepad_batches();
+        harness.shut_down().await;
+
+        assert_eq!(batches.len(), 2, "no re-fires between the two completions");
+        assert_eq!(key_and_value(batches[0][0]), (evdev::KeyCode::BTN_SOUTH, 1));
+        assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::BTN_SOUTH, 0));
+    }
+
     #[tokio::test]
     async fn set_chord_binding_command_persists_and_clear_chord_binding_removes_it() {
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
@@ -5682,7 +5937,7 @@ mod tests {
                 Input::Grid(1, 1),
                 Layer::Base,
                 Binding {
-                    trigger: TriggerMode::FireOnce,
+                    trigger: TriggerMode::HoldToRepeat,
                     action: Action::ControllerButton {
                         button: evdev::KeyCode::BTN_SOUTH,
                     },
@@ -5698,6 +5953,37 @@ mod tests {
             Action::ControllerButton {
                 button: evdev::KeyCode::BTN_SOUTH,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn set_binding_rejects_a_fire_once_controller_button_binding() {
+        // Ticket 78: Fire-once is locked out for `Action::ControllerButton`
+        // at the live-write path too, mirroring `config::parse`'s own check.
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                Binding {
+                    trigger: TriggerMode::FireOnce,
+                    action: Action::ControllerButton {
+                        button: evdev::KeyCode::BTN_SOUTH,
+                    },
+                },
+            )
+            .await
+            .expect_err("a Fire-once ControllerButton Binding must be rejected");
+        assert!(matches!(err, CommandError::InvalidRequest(_)));
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+        assert!(
+            !config.profiles[DEFAULT_PROFILE_NAME]
+                .base
+                .contains_key(&Input::Grid(1, 1)),
+            "the rejected Binding must not have been applied"
         );
     }
 

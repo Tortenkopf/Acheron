@@ -65,7 +65,7 @@ The Trigger mode where the Action fires exactly once per physical press.
 The Trigger mode where the Action re-fires continuously for as long as the Input is physically held.
 
 **Toggle**:
-The Trigger mode where a single press starts the Action running continuously (looping, for a Macro; held down, for a Keypress) until the same Input is pressed again.
+The Trigger mode where a single press starts the Action running continuously (looping, for a Macro; held down, for a Keypress or a Controller button — ticket 78 gave Controller button the same sustained-hold treatment already given a mouse-button Keypress, ticket 82, and Controller button's own Hold-to-repeat, ticket 75/76: no real gamepad button has a "turbo" Toggle mode any more than it autorepeats) until the same Input is pressed again.
 
 **Analog-repeat**:
 The Trigger mode, grid-key-only, where the Action re-fires at a rate that varies continuously with Depth — slower near the deadzone, faster near full travel — rather than at Hold-to-repeat's fixed cadence. Starts once Depth crosses a small fixed deadzone (deliberately *not* the key's own Actuation point, so the rate curve gets the key's full travel range) and holds the key down solid, without further tapping, above a fixed near-full-travel threshold. Falls back to plain Hold-to-repeat when the Daemon is in Digital Capture mode (no Depth available). User-facing feature name: "Simulated Analog Key-Interlacing," for keyboard-driven driving sims and similar games where a player would otherwise hand-interlace keypresses to steer or accelerate.

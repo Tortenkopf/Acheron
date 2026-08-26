@@ -522,6 +522,27 @@ Like the previous map, this one carries execution.
   restriction](./issues/85-task-build-controller-button-trigger-mode-restriction.md) and
   [Verify it on hardware](./issues/86-task-verify-controller-button-trigger-mode-restriction-on-hardware.md).
 
+- [Build the Controller-button Trigger-mode restriction](./issues/85-task-build-controller-button-trigger-mode-restriction.md)
+  — landed ticket 78's design, AFK, no hardware needed, with two corrections to its scope
+  text found while building (both grilled live before implementing): (1) `compile()`'s
+  `Action::ControllerButton` dwell-insertion is *not* dead code — it's still reached by the
+  Digital-Capture-mode Analog-repeat fallback (ticket 20), so it was kept and its constant
+  renamed `CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD` rather than deleted; (2) Toggle for
+  `Action::ControllerButton` was never actually a "latched held button" as ticket 78 assumed
+  — it had no sustained-hold carve-out (only Hold-to-repeat did, ticket 75/76) and fell
+  through to a repeat-tap pulse-train loop. Fixed by giving Toggle the same
+  `ActiveToggle::spawn_held` carve-out as Hold-to-repeat and the mouse-button Toggle fix
+  (ticket 82/83), in both `fire()`/`fire_chord()` — a real, hardware-verifiable behavior
+  change now folded into [ticket 86](./issues/86-task-verify-controller-button-trigger-mode-restriction-on-hardware.md)'s
+  checklist. Otherwise landed exactly as scoped: `ConfigError::InvalidControllerButtonTrigger`
+  (config.rs `parse()` + the live `SetBinding`/`SetChordBinding` path), new
+  `ANALOG_REPEAT_CONTROLLER_PULSE_HOLD = 35ms` selected over the existing 15ms dwell when
+  the firing Action is `ControllerButton`, the GUI Trigger-mode dropdown excluding Fire-once
+  live for Controller Button (rebuilt on every Action-kind change, since — unlike
+  Analog-repeat's grid-only exclusion — it isn't fixed for the popover's lifetime),
+  `daemon_stub.py` mirroring the same rejection, and CONTEXT.md's Toggle entry corrected.
+  356 Rust tests / 291 GUI tests pass, `cargo fmt`/`clippy` clean.
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.

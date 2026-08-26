@@ -54,17 +54,23 @@ fn modifier_codes(modifiers: Modifiers) -> Vec<KeyCode> {
     codes
 }
 
-/// Fire-once's dwell floor for `Action::ControllerButton` output only
-/// (ticket 74/75/76): a bare zero-artificial-dwell `KeyDown`/`KeyUp` pair
-/// can land both edges inside the same input-poll frame on the receiving
-/// game, so the whole press is silently swallowed. Deliberately *not*
-/// shared with `dispatch::ANALOG_REPEAT_PULSE_HOLD` — the two dwells are
-/// tuned for unrelated jobs (15ms was tuned against Analog-repeat's own
-/// rate-curve/cadence on real hardware; 35ms targets true phase-independent
-/// single-poll coverage against a 60fps frame interval, per ticket 74's
-/// research §6) — sharing the constant would silently couple two unrelated
-/// tuning knobs. Not final-tuned against a real game yet.
-pub(crate) const CONTROLLER_BUTTON_FIRE_ONCE_PULSE_HOLD: Duration = Duration::from_millis(35);
+/// `compile()`'s dwell floor for `Action::ControllerButton` output (ticket
+/// 74/75/76): a bare zero-artificial-dwell `KeyDown`/`KeyUp` pair can land
+/// both edges inside the same input-poll frame on the receiving game, so the
+/// whole press is silently swallowed. Originally tuned for Fire-once, but
+/// ticket 78 locked Fire-once out for `Action::ControllerButton` entirely —
+/// this now only fires via `dispatch::compile_action`'s Digital-Capture-mode
+/// Analog-repeat fallback (a Digital-sourced Analog-repeat Binding reaches
+/// `fire`'s generic arm, which still calls straight through to `compile()`,
+/// per ticket 20's Answer), so the same single-poll-swallow risk still
+/// applies there. Deliberately *not* shared with
+/// `dispatch::ANALOG_REPEAT_PULSE_HOLD`/`ANALOG_REPEAT_CONTROLLER_PULSE_HOLD`
+/// — the dwells are tuned for unrelated jobs (15ms was tuned against
+/// Analog-repeat's own rate-curve/cadence on real hardware; 35ms targets true
+/// phase-independent single-poll coverage against a 60fps frame interval, per
+/// ticket 74's research §6) — sharing the constant would silently couple
+/// unrelated tuning knobs. Not final-tuned against a real game yet.
+pub(crate) const CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD: Duration = Duration::from_millis(35);
 
 /// `pub(crate)` (rather than private) so `dispatch::resolve_step` can reuse
 /// the same canned mods-down/key/mods-up sequence for a Stepper item's
@@ -123,15 +129,16 @@ pub fn compile(action: &Action, macros: &HashMap<MacroId, MacroDef>) -> Vec<Macr
         // (`input::is_gamepad_button`) — plus a genuine dwell between the
         // two (ticket 75/76): a bare zero-artificial-dwell pair can land
         // both edges inside the same input-poll frame on the receiving
-        // game, silently swallowing the press. This applies to every caller
-        // of `compile()` for this Action, not only Fire-once — Hold-to-
-        // repeat never reaches this arm at all (`fire`/`fire_chord` in
-        // dispatch.rs compile its own bare `KeyDown`-only steps instead, per
-        // ticket 75's Answer).
+        // game, silently swallowing the press. Fire-once is locked out for
+        // this Action (ticket 78), and both Hold-to-repeat and Toggle are
+        // carved out ahead of `compile_action` in `fire`/`fire_chord`
+        // (ticket 75/76's bare-KeyDown hold, ticket 78's Toggle mirror of
+        // it) — the only caller still reaching this arm is the
+        // Digital-Capture-mode Analog-repeat fallback (ticket 20).
         Action::ControllerButton { button } => {
             vec![
                 MacroStep::KeyDown(*button),
-                MacroStep::Delay(CONTROLLER_BUTTON_FIRE_ONCE_PULSE_HOLD),
+                MacroStep::Delay(CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD),
                 MacroStep::KeyUp(*button),
             ]
         }
@@ -531,7 +538,7 @@ mod tests {
             steps,
             vec![
                 MacroStep::KeyDown(KeyCode::BTN_SOUTH),
-                MacroStep::Delay(CONTROLLER_BUTTON_FIRE_ONCE_PULSE_HOLD),
+                MacroStep::Delay(CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD),
                 MacroStep::KeyUp(KeyCode::BTN_SOUTH),
             ]
         );
@@ -557,8 +564,7 @@ mod tests {
 
         assert_eq!(sink.batches().len(), 1, "the Down must fire immediately");
 
-        tokio::time::advance(CONTROLLER_BUTTON_FIRE_ONCE_PULSE_HOLD - Duration::from_millis(1))
-            .await;
+        tokio::time::advance(CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD - Duration::from_millis(1)).await;
         tokio::task::yield_now().await;
         assert_eq!(
             sink.batches().len(),

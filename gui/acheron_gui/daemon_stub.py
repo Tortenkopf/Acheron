@@ -142,6 +142,12 @@ class DaemonStub:
                 raise InvalidBindingError(f"{stepper_id!r} does not name a Stepper in the library")
             if binding.get("trigger") == "toggle":
                 raise InvalidBindingError("Toggle is not allowed for a Stepper Binding")
+        if binding.get("type") == "controller_button" and binding.get("trigger") == "fire_once":
+            # Ticket 78: Fire-once is locked out for Controller Button —
+            # Hold-to-repeat's sustained-hold behavior already covers a
+            # quick tap, so there's nothing left for Fire-once's decoupled
+            # pulse to uniquely serve.
+            raise InvalidBindingError("Fire-once is not allowed for a Controller Button Binding")
 
     def _reject_if_axis_assigned(self, input_str: str, layer: str) -> None:
         # Ticket 59 §2's mutual exclusion: `SetBinding`/`SetChordBinding`

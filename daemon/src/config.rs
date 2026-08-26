@@ -773,6 +773,13 @@ pub enum ConfigError {
     InvalidActiveProfile(String),
     InvalidProfileSwitchTrigger,
     InvalidControllerButton(String),
+    /// A Fire-once `Action::ControllerButton` Binding (ticket 78's Answer):
+    /// Hold-to-repeat already covers a quick tap (a quick physical Down+Up
+    /// naturally produces a quick output Down+Up), leaving nothing for
+    /// Fire-once's decoupled-from-hold-duration pulse to uniquely serve — no
+    /// real gamepad button press works that way. Same shape as
+    /// `InvalidProfileSwitchTrigger`/`InvalidStepTrigger`.
+    InvalidControllerButtonTrigger,
     UnknownMacro(String),
     UnknownStepper(String),
     InvalidStepTrigger,
@@ -851,6 +858,10 @@ impl fmt::Display for ConfigError {
             ConfigError::InvalidControllerButton(button) => write!(
                 f,
                 "config.toml contains an Action::ControllerButton Binding whose button {button:?} is not a valid gamepad button"
+            ),
+            ConfigError::InvalidControllerButtonTrigger => write!(
+                f,
+                "config.toml contains an Action::ControllerButton Binding whose trigger is fire_once"
             ),
             ConfigError::UnknownMacro(macro_id) => write!(
                 f,
@@ -990,6 +1001,15 @@ fn parse(contents: &str) -> Result<Config, ConfigError> {
     });
     if let Some(button) = invalid_controller_button {
         return Err(ConfigError::InvalidControllerButton(format!("{button:?}")));
+    }
+    let has_invalid_controller_button_trigger = config.profiles.values().any(|profile| {
+        profile_all_bindings(profile).any(|binding| {
+            matches!(binding.action, Action::ControllerButton { .. })
+                && binding.trigger == TriggerMode::FireOnce
+        })
+    });
+    if has_invalid_controller_button_trigger {
+        return Err(ConfigError::InvalidControllerButtonTrigger);
     }
     let dangling_macro_id = config.profiles.values().find_map(|profile| {
         profile_all_bindings(profile).find_map(|binding| match &binding.action {
@@ -1478,6 +1498,26 @@ action = { type = "controller_button", button = "KEY_A" }
         let err =
             load_or_seed(&path).expect_err("a non-gamepad ControllerButton must refuse to start");
         assert!(matches!(err, ConfigError::InvalidControllerButton(_)));
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn refuses_to_start_when_a_controller_button_binding_is_fire_once() {
+        let (_dir, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base.grid_r1c1]
+trigger = "fire_once"
+action = { type = "controller_button", button = "BTN_SOUTH" }
+"#;
+        fs::write(&path, original).unwrap();
+
+        let err = load_or_seed(&path)
+            .expect_err("a Fire-once ControllerButton Binding must refuse to start");
+        assert!(matches!(err, ConfigError::InvalidControllerButtonTrigger));
 
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }

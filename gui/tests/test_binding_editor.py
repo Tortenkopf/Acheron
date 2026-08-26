@@ -246,7 +246,11 @@ def test_saving_a_controller_button_binding_calls_set_binding_with_the_chosen_bu
             "set_binding",
             "grid_r1c1",
             "base",
-            {"trigger": "fire_once", "type": "controller_button", "button": "BTN_EAST"},
+            # Ticket 78: Fire-once is excluded once the Action-kind becomes
+            # Controller Button, so switching to it from the default
+            # fire_once Keypress falls back to Hold-to-repeat rather than
+            # keeping an option no longer offered.
+            {"trigger": "hold_to_repeat", "type": "controller_button", "button": "BTN_EAST"},
         )
     ]
     assert changed == [1]
@@ -279,7 +283,7 @@ def test_controller_button_action_summary_shows_the_button_and_trigger():
 def test_bound_controller_button_shows_the_button_in_the_grid_button_label():
     stub = DaemonStub()
     stub.set_binding(
-        "grid_r1c1", "base", {"trigger": "fire_once", "type": "controller_button", "button": "BTN_START"}
+        "grid_r1c1", "base", {"trigger": "hold_to_repeat", "type": "controller_button", "button": "BTN_START"}
     )
 
     btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
@@ -953,6 +957,33 @@ def test_analog_repeat_is_offered_only_for_grid_inputs():
     non_grid_trigger_dd = _dropdown_labeled(non_grid_popover, "Trigger mode")
     assert "Analog-repeat" not in [
         non_grid_trigger_dd.get_model().get_string(i) for i in range(non_grid_trigger_dd.get_model().get_n_items())
+    ]
+
+
+def test_fire_once_is_offered_only_when_action_kind_is_not_controller_button():
+    # Ticket 78: Fire-once is locked out for Controller Button (Hold-to-
+    # repeat's sustained-hold behavior already covers a quick tap) — unlike
+    # Analog-repeat's exclusion above (fixed for an Input's whole grid-ness),
+    # this is kind-gated and must react live as the Action dropdown changes.
+    stub = DaemonStub()
+
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+    popover = editor_content(btn)
+    trigger_dd = _dropdown_labeled(popover, "Trigger mode")
+    assert "Fire-once" in [
+        trigger_dd.get_model().get_string(i) for i in range(trigger_dd.get_model().get_n_items())
+    ]
+
+    action_dd = _dropdown_labeled(popover, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("controller_button"))
+    assert "Fire-once" not in [
+        trigger_dd.get_model().get_string(i) for i in range(trigger_dd.get_model().get_n_items())
+    ]
+
+    # Switching back away from Controller Button restores it.
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("keypress"))
+    assert "Fire-once" in [
+        trigger_dd.get_model().get_string(i) for i in range(trigger_dd.get_model().get_n_items())
     ]
 
 
