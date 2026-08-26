@@ -543,6 +543,24 @@ Like the previous map, this one carries execution.
   `daemon_stub.py` mirroring the same rejection, and CONTEXT.md's Toggle entry corrected.
   356 Rust tests / 291 GUI tests pass, `cargo fmt`/`clippy` clean.
 
+- [Verify the Controller-button Trigger-mode restriction on hardware](./issues/86-task-verify-controller-button-trigger-mode-restriction-on-hardware.md) —
+  confirmed on the real Daemon/Tartarus Pro/GUI, no regressions. The user chose to clear the
+  live config's three offending Fire-once + `ControllerButton` bindings outright rather than
+  hand-converting their Trigger mode; Daemon starts cleanly after. Fresh Fire-once +
+  `ControllerButton` confirmed rejected both live (hand-edited `config.toml`, isolated
+  `XDG_CONFIG_HOME`) and in the GUI (Fire-once absent from the dropdown) — the rejection
+  message is generic/non-Binding-naming, matching `InvalidProfileSwitchTrigger`/
+  `InvalidStepTrigger`'s existing precedent despite ticket 78/85's "naming the offending
+  Binding(s)" phrasing. Hold-to-repeat `ControllerButton`: no regression (single sustained
+  DOWN/UP, ~3.17s hold). Toggle `ControllerButton`: confirmed the real fix — one KeyDown on
+  first press, one KeyUp ~2.68s later on second, not the old pulse-train. Analog-repeat
+  `ControllerButton`: fires correctly, measured pulse width 36.0ms against the new 35ms floor
+  (real-game cross-check offered, declined as unnecessary). Keypress Analog-repeat: unaffected,
+  ~16.2ms pulse width against the original 15ms dwell — same capture incidentally confirmed
+  `ANALOG_REPEAT_HOLD_SOLID`'s continuous-hold behavior at depth is unaffected too. Temporary
+  test bindings and the profile switch (MnM → Testing) used for verification were reverted
+  afterward.
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.
