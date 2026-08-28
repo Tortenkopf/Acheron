@@ -561,6 +561,18 @@ Like the previous map, this one carries execution.
   test bindings and the profile switch (MnM → Testing) used for verification were reverted
   afterward.
 
+- [Prototype fixed-size Device Overview buttons](./issues/87-prototype-fixed-size-device-overview-buttons.md)
+  — surfaced directly by the user via `/wayfinder`, revisiting ticket 06's "floor, not cap"
+  decision. Variant A (tight ellipsis + tooltip) won outright over auto-shrink-font and
+  wrap-then-ellipsize hybrid — the missing half of ticket 06's own rejected `max-width-chars`
+  attempt (pairing the width cap with `set_lines()` + `set_ellipsize()`, not wrap alone).
+  Two live refinements: the Input's own label renders bold, separating "which Input" from
+  "what it does"; the Mode key grows to the same 100×100 as every other button, which — as a
+  side effect — finally gives its `.mode-key` CSS a true circle instead of the oval ticket 06
+  flagged but didn't fix. Settled sizes: grid/wheel/diamond/Mode-key buttons 100×100, key 20
+  150×100 (wider, matching the hardware). Prototype on `prototype/87-fixed-size-device-overview-buttons`.
+  Spawned [Build the fixed-size Device Overview buttons for real](./issues/88-task-build-fixed-size-device-overview-buttons.md).
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.
