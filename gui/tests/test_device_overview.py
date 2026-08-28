@@ -1,4 +1,4 @@
-from gi.repository import Gtk
+from gi.repository import Gtk, Pango
 
 from acheron_gui.daemon_client import AlreadyExistsError, DaemonError, NotFoundError
 from acheron_gui.daemon_stub import DaemonStub
@@ -121,6 +121,78 @@ def _grid_button(root, label, profile="Default", layer="base"):
         and getattr(w, "binding_editor_window", None) is not None
         and w.binding_editor_window.get_title() == title,
     )
+
+
+def test_device_buttons_are_a_fixed_size_cap_not_a_growing_floor():
+    # Ticket 87/88: every device button is capped at a fixed size regardless
+    # of label content — a 4-modifier chord is exactly the pathological case
+    # the old "floor, not cap" sizing let grow the button and its grid column.
+    stub = DaemonStub()
+    stub.set_binding(
+        "grid_r1c1",
+        "base",
+        {
+            "trigger": "fire_once",
+            "type": "keypress",
+            "key": "KEY_F12",
+            "modifiers": ["ctrl", "shift", "alt", "super"],
+        },
+    )
+    root = _build(stub, {})
+
+    grid_btn = _grid_button(root, "1")
+    assert grid_btn.get_size_request() == (100, 100)
+    label = grid_btn.get_child()
+    assert label.get_lines() == 3
+    assert label.get_ellipsize() == Pango.EllipsizeMode.END
+    # width_chars == max_width_chars: a fixed width request, no float.
+    assert label.get_max_width_chars() == 8
+    assert label.get_width_chars() == 8
+
+    # Key 20 (the wider hardware paddle) and the Mode key.
+    key20 = _grid_button(root, "20")
+    assert key20.get_size_request() == (150, 100)
+    assert key20.get_child().get_max_width_chars() == 14
+
+    mode = _grid_button(root, "Mode")
+    assert mode.get_size_request() == (100, 100)
+    assert "mode-key" in mode.get_css_classes()
+
+
+def test_device_button_label_is_bold_input_line_with_full_text_tooltip():
+    stub = DaemonStub()
+    stub.set_binding(
+        "grid_r1c1",
+        "base",
+        {"trigger": "fire_once", "type": "keypress", "key": "KEY_A", "modifiers": ["ctrl"]},
+    )
+    root = _build(stub, {})
+
+    btn = _grid_button(root, "1")
+    markup = btn.get_child().get_label()
+    assert markup.startswith("<b>1</b>\n")
+    assert "Ctrl+A" in markup
+    # The tooltip is the full untruncated text, newline flattened to two
+    # spaces — set unconditionally, not gated on whether the label truncated.
+    assert btn.get_tooltip_text() == "1  Ctrl+A  [1x]"
+
+
+def test_device_button_summary_line_is_markup_escaped():
+    stub = DaemonStub()
+    stub.create_profile("A & <b>B</b>")
+    stub.set_binding(
+        "grid_r1c1",
+        "base",
+        {"trigger": "fire_once", "type": "profile_switch", "target": "A & <b>B</b>"},
+    )
+    root = _build(stub, {})
+
+    btn = _grid_button(root, "1")
+    markup = btn.get_child().get_label()
+    assert "&amp;" in markup
+    assert "&lt;b&gt;" in markup
+    # The tooltip is plain text, so it carries the raw unescaped summary.
+    assert btn.get_tooltip_text() == "1  → A & <b>B</b>"
 
 
 def test_grid_destination_shows_the_real_chords_section_with_a_selecting_toggle():

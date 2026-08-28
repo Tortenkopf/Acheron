@@ -70,7 +70,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from gi.repository import Gtk, Pango
+from gi.repository import GLib, Gtk, Pango
 
 from .binding_editor import action_summary, build_binding_editor, build_chord_binding_dialog
 from .daemon_client import DaemonError
@@ -340,8 +340,8 @@ def make_input_button(
     layer: str,
     inp: str,
     on_change: Callable[[], None],
-    w=76,
-    h=99,
+    w=100,
+    h=100,
     sensitive: bool = True,
     insensitive_reason: str | None = None,
     capture_mode: str = "digital",
@@ -351,37 +351,56 @@ def make_input_button(
 ) -> Gtk.Button:
     binding = config["profiles"][profile][layer].get(inp)
     axis_target = config["profiles"][profile][f"axis_{layer}"].get(inp)
-    inner = Gtk.Label(
-        label=f"{input_label(inp)}\n"
-        f"{action_summary(binding, inp, config.get('macros', {}), config.get('steppers', {}), axis_target)}",
-        justify=Gtk.Justification.CENTER,
+    label_line = input_label(inp)
+    summary_line = action_summary(
+        binding, inp, config.get("macros", {}), config.get("steppers", {}), axis_target
+    )
+    inner = Gtk.Label(justify=Gtk.Justification.CENTER)
+    # Ticket 87/88: the Input's own label — its grid number, "Mode", or an
+    # arrow glyph, i.e. *which* Input this is — renders bold; the binding
+    # summary below it — *what it does* — stays regular weight.
+    # `GLib.markup_escape_text` on both lines: the summary line carries
+    # user-influenced content (Chord member text, Macro/Stepper display
+    # names) that could contain markup-special characters.
+    inner.set_markup(
+        f"<b>{GLib.markup_escape_text(label_line)}</b>\n"
+        f"{GLib.markup_escape_text(summary_line)}"
     )
     inner.set_wrap(True)
-    # Plain `wrap=True` alone only breaks at whitespace (`Pango.WrapMode.WORD`,
-    # the Gtk.Label default). Every summary string does have at least one
-    # legal break (the space before "[trigger]"/"(default)"), so ordinary
-    # content ("passthrough (Q)", "Ctrl+A  [1x]") already wraps cleanly on
-    # that alone — WORD_CHAR is only the fallback for the one run that has
-    # none: a multi-modifier chord like "Ctrl+Shift+Alt+Super+F12" is one
-    # unbroken token, live-verified to force the button (and its Grid cell)
-    # to ~300px wide under plain WORD wrap instead of wrapping at all. Not
-    # paired with `max-width-chars`: that caps the label's *natural* width
-    # request globally, which sounded right for the chord case but live
-    # verification (a real screenshot) showed it also forces ordinary
-    # "passthrough" into an ugly mid-word "passthr/ough" split, since 7-8
-    # chars isn't enough room for an 11-letter word. Leaving natural width
-    # uncapped means ordinary content wraps at its own word boundaries as
-    # before, and only the rare no-space chord run falls back to a character
-    # split inside a button that's already `w`-wide — the same "floor, not
-    # ceiling" tradeoff already accepted for `h` below, not a new one.
+    # WORD_CHAR still runs first — ordinary content ("Ctrl+A  [1x]") wraps at
+    # its own whitespace, and only a no-space run (a multi-modifier chord
+    # like "Ctrl+Shift+Alt+Super+F12") falls back to a character split.
     inner.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+    # Ticket 87's settled variant A: both dimensions are a genuine cap now,
+    # not ticket 06's "floor, not ceiling". `max_width_chars` + `set_lines` +
+    # `set_ellipsize` apply *after* the wrap above and bound the label's
+    # requested size, so the button never has to grow past `w`/`h` — the
+    # missing half of ticket 06's own rejected `max-width-chars` attempt,
+    # which paired a width cap with wrapping alone and mid-word-split
+    # "passthrough" for lack of a line limit + ellipsis fallback. The char
+    # cap is deliberately snug (tuned live in ticket 88 against the real
+    # font/theme), so ordinary content sometimes ellipsizes too — every
+    # button always carries a full-text tooltip regardless (below), cheaper
+    # than tracking per-button truncation state.
+    chars = 8 if w <= 100 else 14
+    # `width_chars == max_width_chars` pins the label's requested width to a
+    # fixed value instead of letting it float between a tiny wrap-minimum and
+    # the max — without this, `wrap=True` + `ellipsize` intermittently report
+    # a natural width below the minimum during transient allocation, which
+    # GTK clamps but also warns about ("natural size must be >= min size").
+    # A fixed request is also exactly the predictability this ticket is for;
+    # the button's own `w` still bounds it.
+    inner.set_width_chars(chars)
+    inner.set_max_width_chars(chars)
+    inner.set_lines(3)
+    inner.set_ellipsize(Pango.EllipsizeMode.END)
     btn = Gtk.Button()
     btn.set_child(inner)
     btn.set_size_request(w, h)
     # A MenuButton's default halign is FILL: inside a plain Gtk.Box (the Mode
     # key and key-20's paddle, both appended straight to `stick_col` rather
     # than gridded), that stretches it to the box's full cross-width — the
-    # diamond's ~160px, not this button's own 52px — live-verified via a
+    # diamond's own width, not this button's own 100px — live-verified via a
     # real screenshot as the actual cause of the oversized Mode-key oval,
     # not missing wrapping. A Gtk.Grid cell (every other caller) already
     # sizes to its own column, so this is a no-op there. (Still relevant
@@ -403,6 +422,12 @@ def make_input_button(
     for cls in chord_classes or []:
         btn.add_css_class(cls)
     btn.set_sensitive(sensitive)
+    # Ticket 88: every button carries a tooltip with its full untruncated
+    # two-line text (label + summary, newline flattened to two spaces), set
+    # unconditionally — not gated on whether the label actually ellipsized.
+    # A more specific tooltip (the disabled-Mode-key reason, or Chord
+    # membership) still overrides it when there is one.
+    btn.set_tooltip_text(f"{label_line}  {summary_line}")
     if not sensitive and insensitive_reason:
         btn.set_tooltip_text(insensitive_reason)
     elif chord_tooltip:
@@ -725,7 +750,7 @@ def build_main_view(
             chord_ui["recorded"].append(inp)
         on_change()
 
-    def input_btn(inp: str, w=76, h=99, sensitive=True, insensitive_reason=None) -> Gtk.Button:
+    def input_btn(inp: str, w=100, h=100, sensitive=True, insensitive_reason=None) -> Gtk.Button:
         chord_classes, chord_tooltip = _chord_button_style(chords_on_layer, config, chord_ui, inp)
         return make_input_button(
             client,
@@ -813,8 +838,8 @@ def build_main_view(
         # it's intercepted before any Binding lookup ever runs (ticket 18).
         mode_btn = input_btn(
             "mode_key",
-            52,
-            40,
+            100,
+            100,
             sensitive=mode_key_bindable,
             insensitive_reason="Layer-shift Mode key: switch it to Bound above to give it its own Binding",
         )
@@ -826,13 +851,15 @@ def build_main_view(
         # them on the desk (per layout.md) fires Left at top, Down at left,
         # Up at right, Right at bottom — not the naive Up-at-top mapping.
         diamond = Gtk.Grid(row_spacing=2, column_spacing=2)
-        diamond.attach(input_btn("thumbstick_left", 52, 40), 1, 0, 1, 1)
-        diamond.attach(input_btn("thumbstick_down", 52, 40), 0, 1, 1, 1)
-        diamond.attach(input_btn("thumbstick_up", 52, 40), 2, 1, 1, 1)
-        diamond.attach(input_btn("thumbstick_right", 52, 40), 1, 2, 1, 1)
+        diamond.attach(input_btn("thumbstick_left", 100, 100), 1, 0, 1, 1)
+        diamond.attach(input_btn("thumbstick_down", 100, 100), 0, 1, 1, 1)
+        diamond.attach(input_btn("thumbstick_up", 100, 100), 2, 1, 1, 1)
+        diamond.attach(input_btn("thumbstick_right", 100, 100), 1, 2, 1, 1)
         stick_col.append(diamond)
 
-        stick_col.append(input_btn(grid_input(4, 5), 52, 40))
+        # Key 20 (the paddle below the diamond) is physically wider on the
+        # hardware — 150×100, per ticket 87's settled sizing.
+        stick_col.append(input_btn(grid_input(4, 5), 150, 100))
         device.append(stick_col)
 
         device_row.append(device)

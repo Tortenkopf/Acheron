@@ -573,6 +573,24 @@ Like the previous map, this one carries execution.
   150×100 (wider, matching the hardware). Prototype on `prototype/87-fixed-size-device-overview-buttons`.
   Spawned [Build the fixed-size Device Overview buttons for real](./issues/88-task-build-fixed-size-device-overview-buttons.md).
 
+- [Build the fixed-size Device Overview buttons for real](./issues/88-task-build-fixed-size-device-overview-buttons.md)
+  — landed ticket 87's variant A in `device_overview.py`/`app.py` and live-verified against
+  the real Daemon + Tartarus Pro (all five checklist items — fixed size holds under a
+  pathological 4-modifier binding, full-text tooltip on hover, Mode key a true circle,
+  bold/regular label split, 920×680 → **1400×860** window fits everything). `make_input_button`
+  now caps both dimensions: bold-Input-line `set_markup()` (both lines
+  `GLib.markup_escape_text`'d) + `set_lines(3)` + `set_ellipsize(END)` + **`width_chars ==
+  max_width_chars`** (8 for 100px, 14 for 150px) — the width-pinning is a live-forced
+  deviation from the prototype's `max_width_chars`-only sketch, which threw an intermittent
+  GTK `natural size must be >= min size` warning. Tooltip set unconditionally on the button
+  then overridden by the existing `insensitive_reason`/`chord_tooltip` branches. Sizes:
+  grid/wheel/diamond/Mode-key 100×100, key 20 150×100; positions untouched. 294 GUI tests
+  green (+3), no daemon changes. **The fixed-size-button strand (tickets 87–88) is closed** —
+  no verify-on-hardware ticket, per ticket 88's own instruction. Two accepted non-defects: the
+  thumbstick diamond now reads as a loose plus (empty 100px centre cell) — a consequence of
+  the "sizing-only, don't restructure" constraint; a pathological binding shows 4 text lines
+  (label + `set_lines(3)` summary), matching the prototype.
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.

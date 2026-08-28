@@ -340,7 +340,12 @@ class AcheronApplication(Gtk.Application):
         )
 
         win = Gtk.ApplicationWindow(application=self, title="Acheron")
-        win.set_default_size(920, 680)
+        # Ticket 88: grown from 920×680 so the larger fixed-size Device
+        # Overview row (100×100 grid/wheel/diamond/Mode key, 150×100 key 20 —
+        # ticket 87) plus the 220px Profile sidebar and 220px Chords section
+        # all fit at first launch without GTK shrinking any button below its
+        # new fixed size. Measured live against the real running window.
+        win.set_default_size(1400, 860)
         _wire_window_close_to_hide(win)
 
         # Ticket 36: the real system tray icon — a standalone D-Bus service
