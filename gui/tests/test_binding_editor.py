@@ -45,7 +45,7 @@ def _has_warning(root) -> bool:
     return find_all(root, lambda w: "warning" in w.get_css_classes()) != []
 
 
-def test_clicking_an_unbound_key_opens_editor_defaulted_to_fire_once_keypress():
+def test_clicking_an_unbound_key_opens_editor_defaulted_to_hold_to_repeat_keypress():
     stub = DaemonStub()
     changed = []
 
@@ -55,6 +55,22 @@ def test_clicking_an_unbound_key_opens_editor_defaulted_to_fire_once_keypress():
     popover = editor_content(btn)
     heading = find_one(popover, lambda w: "heading" in w.get_css_classes())
     assert heading.get_label() == "Default / base / 1"
+
+    # Ticket 89: a freshly-created Binding starts on Hold-to-repeat, not Fire-once.
+    trigger_dd = _dropdown_labeled(popover, "Trigger mode")
+    assert TRIGGER_OPTIONS[trigger_dd.get_selected()][0] == "hold_to_repeat"
+
+
+def test_clicking_an_unbound_scroll_wheel_direction_defaults_to_fire_once():
+    # Ticket 89: the scroll wheel's two directions are the carve-out — the
+    # wheel fires once per physical detent, so Hold-to-repeat would machine-gun.
+    stub = DaemonStub()
+
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "wheel_scroll_up", lambda: None)
+    popover = editor_content(btn)
+
+    trigger_dd = _dropdown_labeled(popover, "Trigger mode")
+    assert TRIGGER_OPTIONS[trigger_dd.get_selected()][0] == "fire_once"
 
 
 def test_saving_a_keypress_binding_calls_set_binding_and_closes_popover():
@@ -73,7 +89,8 @@ def test_saving_a_keypress_binding_calls_set_binding_and_closes_popover():
             "set_binding",
             "grid_r1c1",
             "base",
-            {"trigger": "fire_once", "type": "keypress", "key": "KEY_F1", "modifiers": []},
+            # Ticket 89: new-binding default is Hold-to-repeat.
+            {"trigger": "hold_to_repeat", "type": "keypress", "key": "KEY_F1", "modifiers": []},
         )
     ]
     assert changed == [1]
@@ -89,7 +106,7 @@ def test_clearing_an_existing_binding_calls_clear_binding():
     btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
     popover = editor_content(btn)
 
-    button_labeled(popover, "Clear (passthrough)").emit("clicked")
+    button_labeled(popover, "Clear Binding").emit("clicked")
 
     assert stub.calls[-1] == ("clear_binding", "grid_r1c1", "base")
     assert changed == [1]
@@ -102,7 +119,7 @@ def test_clearing_an_already_passthrough_input_is_a_noop_but_still_closes():
     btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
     popover = editor_content(btn)
 
-    button_labeled(popover, "Clear (passthrough)").emit("clicked")
+    button_labeled(popover, "Clear Binding").emit("clicked")
 
     assert stub.calls == []
     assert changed == [1]
@@ -148,7 +165,7 @@ def test_editing_targets_the_held_layer_independently_of_base():
             "set_binding",
             "grid_r1c1",
             "held",
-            {"trigger": "fire_once", "type": "keypress", "key": "KEY_F1", "modifiers": []},
+            {"trigger": "hold_to_repeat", "type": "keypress", "key": "KEY_F1", "modifiers": []},
         )
     ]
     assert "grid_r1c1" not in stub.get_config()["profiles"]["Default"]["base"]
@@ -499,7 +516,7 @@ def test_saving_a_mouse_button_binding_round_trips_the_btn_code():
             "set_binding",
             "grid_r1c1",
             "base",
-            {"trigger": "fire_once", "type": "keypress", "key": "BTN_LEFT", "modifiers": []},
+            {"trigger": "hold_to_repeat", "type": "keypress", "key": "BTN_LEFT", "modifiers": []},
         )
     ]
 
@@ -574,7 +591,8 @@ def test_selecting_macro_with_existing_entries_defaults_to_the_first_and_save_re
         "set_binding",
         "grid_r1c1",
         "base",
-        {"trigger": "fire_once", "type": "macro", "macro_id": macro_id},
+        # Ticket 89: fresh editor → Hold-to-repeat default.
+        {"trigger": "hold_to_repeat", "type": "macro", "macro_id": macro_id},
     )
 
 
@@ -627,7 +645,8 @@ def test_creating_a_macro_inline_via_new_macro_assigns_it_and_enables_save():
         "set_binding",
         "grid_r1c1",
         "base",
-        {"trigger": "fire_once", "type": "macro", "macro_id": macro_id},
+        # Ticket 89: fresh editor → Hold-to-repeat default.
+        {"trigger": "hold_to_repeat", "type": "macro", "macro_id": macro_id},
     )
 
 
@@ -693,7 +712,7 @@ def test_opening_an_existing_binding_with_an_unknown_action_kind_does_not_crash_
     assert not save_btn.get_sensitive()
 
     # Clear must still work normally, as an escape hatch.
-    button_labeled(editor, "Clear (passthrough)").emit("clicked")
+    button_labeled(editor, "Clear Binding").emit("clicked")
     assert stub.calls[-1] == ("clear_binding", "grid_r1c1", "base")
 
 
@@ -744,7 +763,8 @@ def test_selecting_stepper_with_existing_entries_defaults_to_the_first_and_forwa
         "set_binding",
         "grid_r1c1",
         "base",
-        {"trigger": "fire_once", "type": "step", "stepper_id": stepper_id, "direction": "forward"},
+        # Ticket 89: fresh editor → Hold-to-repeat default.
+        {"trigger": "hold_to_repeat", "type": "step", "stepper_id": stepper_id, "direction": "forward"},
     )
 
 
@@ -765,7 +785,8 @@ def test_changing_direction_for_a_step_binding_updates_the_saved_binding():
         "set_binding",
         "grid_r1c1",
         "base",
-        {"trigger": "fire_once", "type": "step", "stepper_id": stepper_id, "direction": "backward"},
+        # Ticket 89: fresh editor → Hold-to-repeat default.
+        {"trigger": "hold_to_repeat", "type": "step", "stepper_id": stepper_id, "direction": "backward"},
     )
 
 
@@ -822,7 +843,8 @@ def test_creating_a_stepper_inline_via_new_stepper_assigns_it_and_enables_save()
         "set_binding",
         "grid_r1c1",
         "base",
-        {"trigger": "fire_once", "type": "step", "stepper_id": stepper_id, "direction": "forward"},
+        # Ticket 89: fresh editor → Hold-to-repeat default.
+        {"trigger": "hold_to_repeat", "type": "step", "stepper_id": stepper_id, "direction": "forward"},
     )
 
 
@@ -858,7 +880,7 @@ def test_chord_binding_dialog_does_not_offer_profile_switch_as_an_action():
 
     action_dd = _dropdown_labeled(dialog, "Action")
     labels = [action_dd.get_model().get_string(i) for i in range(action_dd.get_model().get_n_items())]
-    assert "Profile Switch" not in labels
+    assert "Switch Profile" not in labels  # ticket 89: display label
 
 
 def test_saving_an_edited_chords_grown_membership_clears_the_old_key_first():
@@ -1109,7 +1131,7 @@ def test_clearing_an_axis_assigned_key_calls_clear_axis_assignment():
     btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
     popover = editor_content(btn)
 
-    button_labeled(popover, "Clear (passthrough)").emit("clicked")
+    button_labeled(popover, "Clear Binding").emit("clicked")
 
     assert stub.calls == [("clear_axis_assignment", "grid_r1c1", "base")]
     assert changed == [1]

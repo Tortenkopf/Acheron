@@ -21,7 +21,15 @@ from gi.repository import Gtk, GLib
 
 from .daemon_client import DaemonError
 from .gtk_utils import build_name_prompt_popover, clear_children
-from .inputs import ACTION_TYPES, INPUT_DEFAULT_LABEL, TRIGGER_OPTIONS, TRIGGER_SHORT, input_label, is_grid_input
+from .inputs import (
+    ACTION_TYPES,
+    INPUT_DEFAULT_LABEL,
+    TRIGGER_OPTIONS,
+    TRIGGER_SHORT,
+    default_trigger_for,
+    input_label,
+    is_grid_input,
+)
 from .axis_picker import AXIS_LABEL_BY_TARGET, build_inline_axis_picker
 from .controller_picker import LABEL_BY_CODE as CONTROLLER_LABEL_BY_CODE
 from .controller_picker import build_inline_controller_picker
@@ -885,9 +893,19 @@ def build_binding_editor(
     # rather than falling through to `existing`'s always-`None` value here.
     current_axis_target = config["profiles"][profile][f"axis_{layer}"].get(inp)
     if current_axis_target is not None:
+        # Axis output has no Trigger mode at all (ticket 60) — this "trigger"
+        # is inert, never read by the "axis" branch, left as-is.
         starting = {"trigger": "fire_once", "type": "axis", "target": current_axis_target}
     else:
-        starting = existing or {"trigger": "fire_once", "type": "keypress", "key": "KEY_A", "modifiers": []}
+        # Ticket 89: a freshly-created Binding defaults to Hold-to-repeat
+        # (Fire-once for the scroll wheel — see `default_trigger_for`), not
+        # Fire-once everywhere.
+        starting = existing or {
+            "trigger": default_trigger_for(inp),
+            "type": "keypress",
+            "key": "KEY_A",
+            "modifiers": [],
+        }
     # "Axis" is offered only for grid keys (ticket 60's Answer) — non-grid
     # Inputs (Mode key, thumbstick, wheel) never see the option at all,
     # rather than seeing it disabled.
@@ -936,7 +954,7 @@ def build_binding_editor(
     save_btn.connect("clicked", on_save)
     btn_row.append(save_btn)
 
-    clear_btn = Gtk.Button(label="Clear (passthrough)")
+    clear_btn = Gtk.Button(label="Clear Binding")
 
     def on_clear(b):
         if current_axis_target is not None:
@@ -948,7 +966,7 @@ def build_binding_editor(
             on_saved()
             return
         if existing is None:
-            # Already passthrough — nothing to clear, no D-Bus call needed.
+            # Already unbound — nothing to clear, no D-Bus call needed.
             on_saved()
             return
         try:
@@ -1019,7 +1037,14 @@ def build_chord_binding_dialog(
     `SetChordBinding`'s subset/superset check runs before any old entry is
     removed).
     """
-    starting = existing or {"trigger": "fire_once", "type": "keypress", "key": "KEY_A", "modifiers": []}
+    # Ticket 89: a Chord's own Binding has no single Input, so it takes the
+    # plain Hold-to-repeat default (`default_trigger_for(None)`).
+    starting = existing or {
+        "trigger": default_trigger_for(None),
+        "type": "keypress",
+        "key": "KEY_A",
+        "modifiers": [],
+    }
     # Neither Profile Switch nor Axis has anywhere coherent to run from a
     # Chord's own Binding — Profile Switch because `fire_chord` has no
     # `&mut Config` to run a switch through, Axis because it isn't a Binding

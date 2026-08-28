@@ -91,9 +91,12 @@ def is_grid_input(inp: str) -> bool:
 
 
 TRIGGER_OPTIONS = [
-    ("fire_once", "Fire-once"),
+    # Ticket 89: Hold-to-repeat leads (and is the new-binding default — see
+    # `default_trigger_for`), since it's the mode most bindings actually want;
+    # Fire-once drops to third.
     ("hold_to_repeat", "Hold-to-repeat"),
     ("toggle", "Toggle"),
+    ("fire_once", "Fire-once"),
     # Ticket 20/39: grid-key-only, since only a Grid Input has Depth — callers
     # that build a Trigger-mode dropdown for a non-grid Input, or for a
     # Chord's own Binding, must filter this entry out (mirroring
@@ -109,11 +112,27 @@ TRIGGER_SHORT = {
     "toggle": "toggle",
     "analog_repeat": "analog",
 }
+
+
+def default_trigger_for(inp: str | None) -> str:
+    """The Trigger mode a freshly-created Binding starts on (ticket 89):
+    Hold-to-repeat everywhere except the scroll wheel's two directions, which
+    stay Fire-once — the wheel fires once per physical detent, so Hold-to-
+    repeat there would machine-gun. `inp is None` (a Chord's own Binding, which
+    has no single Input) also gets Hold-to-repeat. This is GUI-authoring-only;
+    the Daemon's own `Binding.trigger` serde default is unconditionally
+    Hold-to-repeat (it has no "this Input is the wheel" notion at parse time).
+    """
+    if inp in ("wheel_scroll_up", "wheel_scroll_down"):
+        return "fire_once"
+    return "hold_to_repeat"
+
+
 ACTION_TYPES = [
+    # Ticket 89: menu order — Keypress / Controller Button / Axis first (the
+    # three "emit a device event" kinds), then Macro / Stepper (the library
+    # kinds), then Switch Profile last.
     ("keypress", "Keypress"),
-    ("macro", "Macro"),
-    ("step", "Stepper"),
-    ("profile_switch", "Profile Switch"),
     ("controller_button", "Controller Button"),
     # Ticket 71: offered only when `is_grid_input(inp)` — non-grid Inputs
     # (Mode key, thumbstick, wheel) never see this option at all, rather
@@ -124,4 +143,10 @@ ACTION_TYPES = [
     # out, mirroring `binding_editor.build_chord_binding_dialog`'s existing
     # `profile_switch` exclusion.
     ("axis", "Axis"),
+    ("macro", "Macro"),
+    ("step", "Stepper"),
+    # Ticket 89: display label "Switch Profile" (imperative, reads like the
+    # menu action it is); the internal key stays "profile_switch", as do
+    # `Action::ProfileSwitch`, every D-Bus method, and the config.toml tag.
+    ("profile_switch", "Switch Profile"),
 ]

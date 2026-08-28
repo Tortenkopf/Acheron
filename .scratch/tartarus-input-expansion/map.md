@@ -591,6 +591,27 @@ Like the previous map, this one carries execution.
   the "sizing-only, don't restructure" constraint; a pathological binding shows 4 text lines
   (label + `set_lines(3)` summary), matching the prototype.
 
+- [Keybinding-dialog polish batch](./issues/89-task-keybinding-dialog-polish.md) — four small
+  Q2/Q3/Q4/Q8 cleanups landed together: the per-key editor's clear button is now "Clear Binding"
+  (not "Clear (passthrough)"); the Action menu reads Keypress / Controller Button / Axis / Macro
+  / Stepper / **Switch Profile** (display-label rename only — `"profile_switch"` and every
+  Rust/D-Bus/config identifier untouched); the Trigger-mode menu reads Hold-to-repeat / Toggle /
+  Fire-once / Analog-repeat, and a freshly-created Binding now **defaults to Hold-to-repeat**
+  (Fire-once only for the two scroll-wheel directions, via a new `inputs.default_trigger_for`;
+  existing Bindings unaffected); `daemon/src/config.rs` gained `impl Default for TriggerMode` →
+  `HoldToRepeat` + `#[serde(default)]` on `Binding.trigger` so a hand-edited `config.toml` that
+  omits `trigger` parses instead of erroring (still always written back out — byte-identical
+  round-trip); the key picker's F13–F24 row is now always inline (the "Show F13-F24" collapse,
+  which never saved space, is gone; "Show Numpad" kept). CONTEXT.md's Action + Chord prose swept
+  "Profile Switch" → "Switch Profile" (no dedicated glossary entry existed). 357 Rust / 295
+  Python tests green, `fmt`/`clippy` clean. **Not folded in**: the Daemon's own rejection strings
+  still say "Profile Switch" (scoped out — the ticket allowed only one `config.rs` serde change,
+  and `daemon_stub.py` must stay message-identical to the real Daemon) — flagged for the user as
+  a small optional end-to-end sweep. Live verification (screenshots, real key-press round-trips,
+  hand-edited-config restart) deferred to
+  [ticket 95](./issues/95-task-verify-keybinding-dialog-polish-on-hardware.md) — Daemon was
+  stopped and no screenshot tooling here, per the 42→44 / 48→49 / 85→86 precedent.
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.

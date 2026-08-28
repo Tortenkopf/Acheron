@@ -16,7 +16,7 @@ fail to find room. This picker skips straight to that fix — always-inline,
 like `key_picker.build_inline_key_picker` — rather than reproducing the same
 bug in a second picker mounted in the identical container. The "Extra
 buttons" section keeps its own *nested* show/hide toggle (mirrors
-`key_picker`'s "Show F13-F24 ▸" sub-toggle): that only grows an
+`key_picker`'s "Show Numpad ▸" sub-toggle): that only grows an
 already-visible panel, not the outer collapse-to-nothing shape that broke.
 """
 
@@ -164,7 +164,7 @@ def _pad_diagram(on_pick: Callable[[str], None], current: str) -> Gtk.Widget:
 def _extra_grid(on_pick: Callable[[str], None], current: str) -> Gtk.Widget:
     """The Trigger-Happy 1-40 range, kept out of the diagram (per ticket 38's
     own steer) behind a nested show/hide toggle — the same shape as
-    `key_picker`'s "Show F13-F24 ▸" sub-toggle, safe because it only grows an
+    `key_picker`'s "Show Numpad ▸" sub-toggle, safe because it only grows an
     already-inline, already-visible panel."""
     state = {"shown": False}
     section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)

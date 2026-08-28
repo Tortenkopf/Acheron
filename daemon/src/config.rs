@@ -335,6 +335,13 @@ impl<'de> Deserialize<'de> for ChordKey {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Binding {
+    /// `#[serde(default)]` (→ `TriggerMode::HoldToRepeat`, matching the GUI's
+    /// own new-binding default, ticket 89) so a hand-edited `config.toml`
+    /// binding that omits `trigger` parses instead of failing with serde's
+    /// opaque "missing field `trigger`". Backward-compatible: every config
+    /// that spells `trigger` out still parses identically, and the field is
+    /// still always written back out (no `skip_serializing_if`).
+    #[serde(default)]
     pub trigger: TriggerMode,
     pub action: Action,
 }
@@ -499,6 +506,15 @@ pub enum TriggerMode {
     /// `SetChordBinding` and `parse`) to only ever pair with a Grid `Input`
     /// and never with a Chord's own Binding.
     AnalogRepeat,
+}
+
+/// Hold-to-repeat is the default a `config.toml` binding takes when it omits
+/// `trigger` entirely (`Binding.trigger`'s `#[serde(default)]`), matching the
+/// GUI's own new-binding default (ticket 89).
+impl Default for TriggerMode {
+    fn default() -> Self {
+        TriggerMode::HoldToRepeat
+    }
 }
 
 /// CONTEXT.md: Action. `Keypress`/`Macro` compile into the shared executor's
@@ -1254,6 +1270,24 @@ action = { type = "keypress", key = "KEY_F1" }
                 key: KeyCode::KEY_F1,
             }
         );
+    }
+
+    #[test]
+    fn a_binding_that_omits_trigger_parses_as_hold_to_repeat() {
+        // Ticket 89: `Binding.trigger` is `#[serde(default)]`, so a
+        // hand-edited config.toml binding with no `trigger` line parses
+        // (as Hold-to-repeat, matching the GUI's new-binding default)
+        // instead of failing with serde's "missing field `trigger`".
+        let toml = r#"
+schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base.grid_r1c1]
+action = { type = "keypress", key = "KEY_F1" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let binding = &config.profiles["Default"].base[&Input::Grid(1, 1)];
+        assert_eq!(binding.trigger, TriggerMode::HoldToRepeat);
     }
 
     #[test]

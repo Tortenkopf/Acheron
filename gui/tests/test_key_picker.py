@@ -69,15 +69,14 @@ def test_every_qwerty_home_and_bottom_row_letter_reports_an_uppercase_code():
             assert picked == [f"KEY_{letter.upper()}"]
 
 
-def test_f13_through_f24_are_hidden_behind_a_show_toggle():
+def test_f13_through_f24_are_shown_inline_with_no_toggle():
+    # Ticket 89: F13-F24 render unconditionally, directly under F1-F12 — the
+    # old "Show F13-F24 ▸" collapse is gone (it never saved vertical space).
     widget, _refresh = build_inline_key_picker("KEY_A", lambda code: None)
-
-    assert find_all(widget, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "F13") == []
-
-    button_labeled(widget, "Show F13-F24 ▸").emit("clicked")
 
     assert button_labeled(widget, "F13") is not None
     assert button_labeled(widget, "F24") is not None
+    assert find_all(widget, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Show F13-F24 ▸") == []
 
 
 def test_numpad_keys_are_hidden_behind_a_show_toggle():
@@ -96,14 +95,18 @@ def test_numpad_keys_are_hidden_behind_a_show_toggle():
     assert find_all(widget, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Num 7") == []
 
 
-def test_numpad_toggle_is_independent_of_the_f13_f24_toggle():
+def test_numpad_toggle_leaves_the_always_visible_f13_f24_row_alone():
+    # Ticket 89: F13-F24 are always inline now; the numpad keeps its own
+    # independent collapse.
     widget, _refresh = build_inline_key_picker("KEY_A", lambda code: None)
-
-    button_labeled(widget, "Show F13-F24 ▸").emit("clicked")
 
     assert button_labeled(widget, "F13") is not None
     assert find_all(widget, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Num 7") == []
     assert button_labeled(widget, "Show Numpad ▸") is not None
+
+    button_labeled(widget, "Show Numpad ▸").emit("clicked")
+    assert button_labeled(widget, "F13") is not None
+    assert button_labeled(widget, "Num 7") is not None
 
 
 def test_picking_a_numpad_key_reports_its_kp_code():

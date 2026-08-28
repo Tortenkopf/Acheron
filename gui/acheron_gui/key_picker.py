@@ -256,23 +256,12 @@ def _numpad_block(on_pick, current: str) -> Gtk.Widget:
 def _keyboard_grid(on_pick, current: str) -> Gtk.Widget:
     grid = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
     grid.append(_keycap_row(_FN_ROW, on_pick, current))
-
-    fn_hi_state = {"shown": False}
-    fn_hi_row_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-    show_hi_btn = Gtk.Button(label="Show F13-F24 ▸", halign=Gtk.Align.START)
-
-    def toggle_hi(b):
-        fn_hi_state["shown"] = not fn_hi_state["shown"]
-        clear_children(fn_hi_row_slot)
-        if fn_hi_state["shown"]:
-            fn_hi_row_slot.append(_keycap_row(_FN_ROW_HI, on_pick, current))
-            show_hi_btn.set_label("Hide F13-F24 ▾")
-        else:
-            show_hi_btn.set_label("Show F13-F24 ▸")
-
-    show_hi_btn.connect("clicked", toggle_hi)
-    grid.append(show_hi_btn)
-    grid.append(fn_hi_row_slot)
+    # Ticket 89: F13-F24 render unconditionally, directly under F1-F12 — the
+    # old "Show F13-F24 ▸" collapse never actually saved vertical space (the
+    # button was about as tall as the one row it hid). The "Show Numpad"
+    # toggle below stays: the numpad is a genuine 4x4 block whose collapse
+    # does earn its space.
+    grid.append(_keycap_row(_FN_ROW_HI, on_pick, current))
 
     grid.append(Gtk.Box(height_request=6))
     grid.append(_keycap_row(_NUM_ROW, on_pick, current))
