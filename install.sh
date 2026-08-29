@@ -33,6 +33,14 @@ gui_lib_dir="$HOME/.local/lib/acheron"
 apps_dir="$HOME/.local/share/applications"
 icons_dir="$HOME/.local/share/icons/hicolor"
 
+# Ticket 97: the tray indicator's three status-dot SVGs live here, NOT in
+# the GUI package dir — the SNI host keeps a live file-watch on this path
+# and overwriting an SVG in a git checkout while the GUI runs has crashed
+# the desktop session. The GUI also self-heals this dir on launch; this
+# step just puts them in place before the first launch.
+tray_icons_src="$script_dir/gui/acheron_gui/icons"
+tray_icons_dir="$HOME/.local/share/acheron/tray-icons"
+
 echo "==> Building acheron-daemon (release)"
 cargo build --release --manifest-path "$daemon_dir/Cargo.toml"
 
@@ -86,6 +94,10 @@ install -m 644 "$desktop_src" "$apps_dir/acheron.desktop"
 echo "==> Installing app icons to $icons_dir"
 mkdir -p "$icons_dir"
 cp -r "$icons_src/." "$icons_dir/"
+
+echo "==> Installing tray status icons to $tray_icons_dir"
+mkdir -p "$tray_icons_dir"
+cp "$tray_icons_src"/*.svg "$tray_icons_dir/"
 
 echo "==> Refreshing desktop database and icon cache (best-effort)"
 # Both are pure caches: GNOME/KDE read the loose files above directly, so a

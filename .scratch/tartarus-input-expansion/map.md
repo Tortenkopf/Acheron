@@ -724,6 +724,19 @@ Like the previous map, this one carries execution.
   GUI-polish cluster's build side (tickets 89–93); only ticket 94's hardware
   verification remains.
 
+- [Get the tray icons out of the git checkout](./issues/97-task-tray-icons-out-of-git-checkout.md)
+  — the SNI host (`ubuntu-appindicators`) was reading the three status-dot SVGs straight
+  out of the running GUI's package dir, which *is* the working tree under `python3
+  gui/main.py`; the user overwrote one while the GUI ran and the desktop session crashed
+  (same environmental NVIDIA-Optimus/Wayland fragility as ticket 50's freeze, but the
+  in-place-overwrite-of-a-watched-file trigger is real and now removed). `tray.py` resolves
+  `IconThemePath` to a stable per-user data dir (`$ACHERON_TRAY_ICON_DIR` →
+  `$XDG_DATA_HOME/acheron/tray-icons` → `~/.local/share/acheron/tray-icons`), never the
+  package dir; `TrayIcon` construction syncs the bundled SVGs there (only when missing/
+  changed, temp-file + `os.replace`, best-effort). `install.sh` also populates that path
+  up front — new installed path for ticket 35's docs/uninstall list. GUI suite 317 green,
+  `test_install.sh` green. Not hardware-verified (no runtime behaviour change).
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.

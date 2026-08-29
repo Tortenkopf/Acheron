@@ -50,6 +50,20 @@ MENU_OBJECT_PATH = "/MenuBar"
 WATCHER_BUS_NAME = "org.kde.StatusNotifierWatcher"
 WATCHER_OBJECT_PATH = "/StatusNotifierWatcher"
 
+# The three status-dot SVGs the SNI host renders in the panel. They ship in
+# this package's own `icons/` dir as read-only *source* only — at runtime
+# `TrayIcon` syncs them out to a stable per-user data dir
+# (`_resolve_icon_theme_path`) and the host is only ever pointed there.
+#
+# Why not just point `IconThemePath` at this package's `icons/` dir: when
+# the GUI runs from a git checkout (`python3 gui/main.py`, the normal dev
+# path) that dir *is* the working tree, and the GNOME Shell panel keeps a
+# live file-watch on `IconThemePath` — overwriting an SVG in place there
+# while the GUI runs hard-crashed the whole session (ticket 97). The
+# installed launch path (`~/.local/lib/acheron/`) wouldn't hit that, but
+# resolving to one stable location regardless keeps the two paths identical.
+BUNDLED_ICON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
+
 # The direct equivalent of `AppIndicator3.set_icon_theme_path` — one flat
 # directory of `<name>.svg` files, live-verified against the real GNOME
 # Shell panel as the layout that actually resolves. Ticket 36's own build
@@ -66,8 +80,7 @@ WATCHER_OBJECT_PATH = "/StatusNotifierWatcher"
 # generic "icon not found" fallback for it — only dropping the SVGs flat
 # directly into this one directory made the real green/orange/red circle
 # actually render live. A later commissioned icon replaces these same flat
-# `icons/<name>.svg` files, not a freedesktop-theme-shaped path.
-ICON_THEME_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
+# `<name>.svg` files, not a freedesktop-theme-shaped path.
 
 # Mirrors `STATUS_STATES`' three reachable states exactly — placeholder
 # filled-circle SVGs at its own hex values (ticket 11's resolution).
@@ -76,6 +89,53 @@ ICON_NAMES = {
     "running_disconnected": "acheron-running-disconnected",
     "not_running": "acheron-not-running",
 }
+
+
+def _resolve_icon_theme_path() -> str:
+    """The flat directory the SNI host reads the status-dot SVGs from —
+    always a stable per-user data dir, NEVER this package's own `icons/`
+    (see the note above and ticket 97). Honors `$ACHERON_TRAY_ICON_DIR`
+    (mirrors the launcher's `$ACHERON_GUI_LIB`), then `$XDG_DATA_HOME`,
+    then the `~/.local/share` default. `install.sh` populates the same
+    default path up front."""
+    override = os.environ.get("ACHERON_TRAY_ICON_DIR")
+    if override:
+        return override
+    data_home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(data_home, "acheron", "tray-icons")
+
+
+def _sync_bundled_icons(dest_dir: str) -> None:
+    """Copies the bundled status-dot SVGs into `dest_dir`, but only the ones
+    that are missing or whose bytes differ from the bundled copy — a
+    steady-state launch writes nothing. Each write is a temp file +
+    `os.replace`, so a host watching the directory never sees a partial
+    file and never the truncate-in-place that crashed the session
+    (ticket 97). Best-effort: a failure here is logged, not raised — the
+    host just falls back to its generic "no icon" rendering, exactly as it
+    would have before this sync existed."""
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        for name in ICON_NAMES.values():
+            filename = f"{name}.svg"
+            src = os.path.join(BUNDLED_ICON_DIR, filename)
+            if not os.path.isfile(src):
+                continue
+            with open(src, "rb") as handle:
+                wanted = handle.read()
+            dest = os.path.join(dest_dir, filename)
+            try:
+                with open(dest, "rb") as handle:
+                    if handle.read() == wanted:
+                        continue
+            except FileNotFoundError:
+                pass
+            tmp = f"{dest}.{os.getpid()}.tmp"
+            with open(tmp, "wb") as handle:
+                handle.write(wanted)
+            os.replace(tmp, dest)
+    except OSError as err:
+        print(f"acheron-gui: could not sync tray icons to {dest_dir}: {err}", file=sys.stderr)
 
 _Layout = Tuple[Int32, Structure, List[Variant]]
 
@@ -214,7 +274,7 @@ class _StatusNotifierItemService:
 
     @property
     def IconThemePath(self) -> Str:
-        return ICON_THEME_PATH
+        return self._tray_icon.icon_theme_path
 
     @property
     def Menu(self) -> ObjPath:
@@ -271,6 +331,13 @@ class TrayIcon:
         self._status = "not_running"
         self._menu_model = MenuModel()
 
+        # Ticket 97: the SNI host reads the status-dot SVGs from a stable
+        # per-user data dir, never this package's `icons/` (which may be a
+        # live git checkout). Sync the bundled copies out on every launch,
+        # cheaply (a no-op once they're current).
+        self._icon_theme_path = _resolve_icon_theme_path()
+        _sync_bundled_icons(self._icon_theme_path)
+
         self._item_service = _StatusNotifierItemService(self)
         self._menu_service = _DBusMenuService(self._menu_model)
 
@@ -284,6 +351,10 @@ class TrayIcon:
     @property
     def icon_name(self) -> str:
         return ICON_NAMES[self._status]
+
+    @property
+    def icon_theme_path(self) -> str:
+        return self._icon_theme_path
 
     def update(self, config: dict, profile: str, status: str) -> None:
         """Rebuilds the menu tree from scratch and bumps its revision

@@ -17,6 +17,10 @@ install/usage docs and any uninstall section) and two things worth folding in he
 `Text file busy` if `acheron-daemon` is already running — the clean-checkout end-to-end
 check should either stop the unit first or this should be fixed to `install`.
 
+Ticket 97 adds one more installed path: `install.sh` now also copies the three tray
+status-dot SVGs to `~/.local/share/acheron/tray-icons/` (the GUI reads them only from
+there, never the checkout). Add it to the installed-path / uninstall list.
+
 ## Question
 
 Write the release documentation a stranger needs to build, install, and use Acheron from a clean

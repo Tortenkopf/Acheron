@@ -151,6 +151,19 @@ for size in 16 24 32 48 64 128 256 512; do
   [[ -f "$installed" ]] || fail "icon not installed at hicolor/${size}x${size}/apps/acheron.png"
 done
 
+# --- tray status icons (ticket 97) --------------------------------------
+# The SNI host reads these from a stable per-user dir, never the git
+# checkout — install.sh must place them at ~/.local/share/acheron/tray-icons.
+tray_icons_dir="$fake_home/.local/share/acheron/tray-icons"
+for name in acheron-running-connected acheron-running-disconnected acheron-not-running; do
+  src="$repo_root/gui/acheron_gui/icons/$name.svg"
+  dest="$tray_icons_dir/$name.svg"
+  [[ -f "$dest" ]] || fail "tray status icon not installed at acheron/tray-icons/$name.svg"
+  diff -q "$src" "$dest" >/dev/null \
+    || fail "installed tray status icon $name.svg differs from gui/acheron_gui/icons/$name.svg"
+done
+echo "PASS: install.sh installs the three tray status icons outside the checkout"
+
 if command -v desktop-file-validate >/dev/null 2>&1; then
   desktop-file-validate "$desktop" || fail "desktop-file-validate rejected the installed entry"
   echo "PASS: desktop entry validates"

@@ -1,6 +1,10 @@
+import os
+
 from acheron_gui.daemon_client import NotFoundError
 from acheron_gui.daemon_stub import DaemonStub
 from acheron_gui.tray import (
+    BUNDLED_ICON_DIR,
+    ICON_NAMES,
     ITEM_OBJECT_PATH,
     MENU_OBJECT_PATH,
     WATCHER_BUS_NAME,
@@ -99,6 +103,57 @@ def test_icon_name_reflects_the_three_status_states():
 
     tray.update(config, "Default", "not_running")
     assert tray.icon_name == "acheron-not-running"
+
+
+def _bundled_bytes(icon_name):
+    with open(os.path.join(BUNDLED_ICON_DIR, f"{icon_name}.svg"), "rb") as handle:
+        return handle.read()
+
+
+def test_icon_theme_path_is_the_configured_dir_and_never_the_package():
+    target = os.environ["ACHERON_TRAY_ICON_DIR"]
+    tray, bus, _show, _quit = _make_tray()
+
+    assert tray.icon_theme_path == target
+    assert bus.published[ITEM_OBJECT_PATH].IconThemePath == target
+    # The whole point of ticket 97: it must not resolve into the (possibly
+    # git-checkout) package dir.
+    assert os.path.abspath(tray.icon_theme_path) != os.path.abspath(BUNDLED_ICON_DIR)
+
+
+def test_construction_syncs_the_three_bundled_status_icons():
+    tray, _bus, _show, _quit = _make_tray()
+
+    for icon_name in ICON_NAMES.values():
+        synced = os.path.join(tray.icon_theme_path, f"{icon_name}.svg")
+        assert os.path.isfile(synced)
+        with open(synced, "rb") as handle:
+            assert handle.read() == _bundled_bytes(icon_name)
+
+
+def test_a_stale_synced_icon_is_refreshed_on_construction():
+    target_dir = os.environ["ACHERON_TRAY_ICON_DIR"]
+    os.makedirs(target_dir, exist_ok=True)
+    stale = os.path.join(target_dir, "acheron-not-running.svg")
+    with open(stale, "wb") as handle:
+        handle.write(b"<svg>stale</svg>")
+
+    _tray, _bus, _show, _quit = _make_tray()
+
+    with open(stale, "rb") as handle:
+        assert handle.read() == _bundled_bytes("acheron-not-running")
+
+
+def test_an_unwritable_icon_dir_does_not_raise(tmp_path, monkeypatch, capsys):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    monkeypatch.setenv("ACHERON_TRAY_ICON_DIR", str(blocker / "tray-icons"))
+
+    tray, _bus, _show, _quit = _make_tray()  # must not raise
+
+    assert "could not sync tray icons" in capsys.readouterr().err
+    # The path is still reported (the host just renders no icon).
+    assert tray.icon_theme_path == str(blocker / "tray-icons")
 
 
 def test_item_properties_are_spec_correct():
