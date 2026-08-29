@@ -87,6 +87,18 @@ echo "sudo $*" >> "$CALL_LOG"
 EOF
 chmod +x "$fake_bin/sudo"
 
+# Stub the two cache-refresh tools (ticket 90): record the call, do nothing.
+# The real ones are pure caches and already guarded in install.sh, but
+# stubbing keeps this test hermetic and independent of whether they're
+# installed on the machine running it.
+for tool in update-desktop-database gtk-update-icon-cache; do
+  cat > "$fake_bin/$tool" <<EOF
+#!/usr/bin/env bash
+echo "$tool \$*" >> "\$CALL_LOG"
+EOF
+  chmod +x "$fake_bin/$tool"
+done
+
 run_install() {
   HOME="$fake_home" CALL_LOG="$call_log" PATH="$fake_bin:$PATH" bash "$repo_root/install.sh"
 }
@@ -115,3 +127,36 @@ trigger_count="$(grep -c '^sudo udevadm trigger$' "$call_log" || true)"
 [[ "$trigger_count" -eq 2 ]] || fail "expected udevadm trigger once per run (2 total), got $trigger_count"
 
 echo "PASS: install.sh installs the udev rule and reloads udev on every run"
+
+# --- GUI desktop-app launch path (ticket 90) ----------------------------
+gui_lib="$fake_home/.local/lib/acheron/acheron_gui"
+[[ -f "$gui_lib/__main__.py" ]] || fail "GUI package not installed to ~/.local/lib/acheron (missing __main__.py)"
+[[ -f "$gui_lib/app.py" ]] || fail "GUI package not installed to ~/.local/lib/acheron (missing app.py)"
+[[ -d "$gui_lib/__pycache__" ]] && fail "__pycache__ leaked into the installed GUI package"
+
+launcher="$fake_home/.local/bin/acheron-gui"
+[[ -x "$launcher" ]] || fail "launcher not installed to ~/.local/bin/acheron-gui"
+diff -q "$repo_root/packaging/acheron-gui" "$launcher" >/dev/null \
+  || fail "installed launcher content differs from packaging/acheron-gui"
+
+desktop="$fake_home/.local/share/applications/acheron.desktop"
+[[ -f "$desktop" ]] || fail "desktop entry not installed to ~/.local/share/applications/acheron.desktop"
+diff -q "$repo_root/packaging/acheron.desktop" "$desktop" >/dev/null \
+  || fail "installed desktop entry differs from packaging/acheron.desktop"
+grep -qxF "Exec=acheron-gui" "$desktop" || fail "desktop entry missing Exec=acheron-gui"
+grep -qxF "Icon=acheron" "$desktop" || fail "desktop entry missing Icon=acheron"
+
+for size in 16 24 32 48 64 128 256 512; do
+  installed="$fake_home/.local/share/icons/hicolor/${size}x${size}/apps/acheron.png"
+  [[ -f "$installed" ]] || fail "icon not installed at hicolor/${size}x${size}/apps/acheron.png"
+done
+
+if command -v desktop-file-validate >/dev/null 2>&1; then
+  desktop-file-validate "$desktop" || fail "desktop-file-validate rejected the installed entry"
+  echo "PASS: desktop entry validates"
+fi
+
+ddb_count="$(grep -c "^update-desktop-database .*/applications\$" "$call_log" || true)"
+[[ "$ddb_count" -eq 2 ]] || fail "expected update-desktop-database once per run (2 total), got $ddb_count"
+
+echo "PASS: install.sh installs the GUI launcher, desktop entry, and icons on every run"

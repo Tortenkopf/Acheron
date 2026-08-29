@@ -612,6 +612,23 @@ Like the previous map, this one carries execution.
   [ticket 95](./issues/95-task-verify-keybinding-dialog-polish-on-hardware.md) — Daemon was
   stopped and no screenshot tooling here, per the 42→44 / 48→49 / 85→86 precedent.
 
+- [Give the GUI a desktop-app launch path](./issues/90-task-desktop-app-launcher.md) — built
+  and live-verified in-session (cold start, app-grid launch, user's own visual pass on the
+  window icon + grid entry — no re-login needed). New `gui/acheron_gui/__main__.py` (runs as
+  `python3 -m acheron_gui`); `packaging/acheron-gui` launcher (`python3 -P -m acheron_gui`,
+  `PYTHONPATH` at the installed copy, never a checkout); `packaging/acheron.desktop`
+  (`Exec=acheron-gui`, `Icon=acheron`, `StartupWMClass=com.acheron.gui`); PNG app icons
+  16–512px under `packaging/icons/hicolor/`. `install.sh` gained an all-`$HOME`, no-sudo
+  section: GUI package → `~/.local/lib/acheron/`, launcher → `~/.local/bin`, `.desktop` →
+  `~/.local/share/applications`, icons → `~/.local/share/icons/hicolor`, best-effort
+  `update-desktop-database`/`gtk-update-icon-cache`. `test_install.sh` extended; 295 Python
+  tests green (no daemon change). **The supplied `Acheron.svg` was a 1254px PNG wrapped in
+  `<svg><image>`, not a real vector** — per the user, `scalable/` is skipped and rasters
+  (through 512px = 2× HiDPI) cover it; drop in a genuine vector later if wanted. Two things
+  handed to [ticket 35](./issues/35-task-write-release-documentation.md): the installed-path
+  table (also the uninstall list), and that `install.sh`'s daemon-binary `cp` fails
+  `Text file busy` against a running daemon (should be `install`, not `cp`).
+
 - [Homogenize the Stepper and Macro library editors](./issues/91-task-homogenize-stepper-macro-library-editors.md)
   — GUI-only (`library_view.py`), built and live-verified against the running GUI this
   session (self-screenshot harness, see below — the "no screenshot tooling here" claims on

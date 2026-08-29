@@ -5,6 +5,18 @@ While this Ticket is not technically blocked by anything, it should still deferr
 of 1.0 development, as we cannot say for certain what else will need to go into this documentation,
 that might still surface while the full feature set is being implemented.
 
+Run this ticket's final pass *after* [ticket 90](./90-task-desktop-app-launcher.md) lands — it
+adds a GUI launcher (`acheron-gui`), a `.desktop` entry, an app icon, and new `install.sh`
+steps + installed paths that the install/usage docs must cover (the GUI has no documented
+launch path today beyond `python3 gui/main.py` from a checkout).
+
+Ticket 90 is now **resolved** — its Answer carries the full installed-path table (for the
+install/usage docs and any uninstall section) and two things worth folding in here:
+(1) the app-grid `Exec=acheron-gui` needs `~/.local/bin` on `PATH` — worth a doc line;
+(2) `install.sh` uses `cp` (not `install`) for the daemon binary, so it fails
+`Text file busy` if `acheron-daemon` is already running — the clean-checkout end-to-end
+check should either stop the unit first or this should be fixed to `install`.
+
 ## Question
 
 Write the release documentation a stranger needs to build, install, and use Acheron from a clean

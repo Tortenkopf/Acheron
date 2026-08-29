@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Acheron GUI launcher. Installed to ~/.local/bin/acheron-gui by install.sh
+# (ticket 90). Runs the copy of the `acheron_gui` package that install.sh
+# lays down at ~/.local/lib/acheron/ — it does NOT point back at a git
+# checkout, so the app grid entry and this script keep working after the
+# checkout is moved or deleted.
+#
+# Deliberately thin: no venv, no `pip install`, no Python packaging. It
+# just puts the installed package dir on PYTHONPATH and hands off to the
+# system python3 (which must have PyGObject / GTK 4 available — the same
+# requirement as `python3 gui/main.py` from a checkout; documented for the
+# user in the install docs, ticket 35).
+set -euo pipefail
+
+acheron_lib="${ACHERON_GUI_LIB:-$HOME/.local/lib/acheron}"
+
+if [[ ! -d "$acheron_lib/acheron_gui" ]]; then
+    echo "acheron-gui: GUI package not found at $acheron_lib/acheron_gui" >&2
+    echo "acheron-gui: run install.sh from the Acheron source tree first." >&2
+    exit 1
+fi
+
+export PYTHONPATH="$acheron_lib${PYTHONPATH:+:$PYTHONPATH}"
+# -P keeps the current directory off sys.path, so `acheron-gui` run from
+# inside a git checkout's gui/ dir still imports the *installed* package,
+# not ./acheron_gui.
+exec python3 -P -m acheron_gui "$@"

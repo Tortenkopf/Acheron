@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Acheron
+GenericName=Tartarus Pro Configurator
+Comment=Remap keys and build macros, layers and profiles for the Razer Tartarus Pro
+Exec=acheron-gui
+Icon=acheron
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=razer;tartarus;keypad;macro;remap;layers;gaming;
+StartupNotify=true
+StartupWMClass=com.acheron.gui

@@ -21,8 +21,17 @@ unit_src="$script_dir/packaging/acheron-daemon.service"
 udev_rule_src="$script_dir/packaging/60-acheron-tartarus-pro.rules"
 udev_rule_dest="/etc/udev/rules.d/60-acheron-tartarus-pro.rules"
 
+# Ticket 90: the GUI's desktop-app launch path — a launcher script, a
+# freedesktop .desktop entry, and the app icon, all installed under $HOME.
+launcher_src="$script_dir/packaging/acheron-gui"
+desktop_src="$script_dir/packaging/acheron.desktop"
+icons_src="$script_dir/packaging/icons/hicolor"
+
 bin_dir="$HOME/.local/bin"
 unit_dir="$HOME/.config/systemd/user"
+gui_lib_dir="$HOME/.local/lib/acheron"
+apps_dir="$HOME/.local/share/applications"
+icons_dir="$HOME/.local/share/icons/hicolor"
 
 echo "==> Building acheron-daemon (release)"
 cargo build --release --manifest-path "$daemon_dir/Cargo.toml"
@@ -54,4 +63,48 @@ echo "==> Reloading systemd --user and enabling acheron-daemon"
 systemctl --user daemon-reload
 systemctl --user enable --now acheron-daemon
 
-echo "==> Done. Check status with: systemctl --user status acheron-daemon"
+# --- GUI desktop-app launch path (ticket 90) ----------------------------
+# All under $HOME, no sudo. The GUI source is copied to a fixed installed
+# location ($gui_lib_dir) so the launcher and .desktop entry never point
+# back into this git checkout — moving or deleting the checkout afterward
+# doesn't break the app grid entry. No venv / pip / Python packaging: the
+# launcher runs the system python3 with $gui_lib_dir on PYTHONPATH, same
+# GTK4 / PyGObject requirement as `python3 gui/main.py` from a checkout.
+echo "==> Installing GUI package to $gui_lib_dir/acheron_gui"
+rm -rf "$gui_lib_dir/acheron_gui"
+mkdir -p "$gui_lib_dir"
+cp -r "$script_dir/gui/acheron_gui" "$gui_lib_dir/acheron_gui"
+find "$gui_lib_dir/acheron_gui" -name '__pycache__' -type d -prune -exec rm -rf {} +
+
+echo "==> Installing GUI launcher to $bin_dir/acheron-gui"
+install -m 755 "$launcher_src" "$bin_dir/acheron-gui"
+
+echo "==> Installing desktop entry to $apps_dir/acheron.desktop"
+mkdir -p "$apps_dir"
+install -m 644 "$desktop_src" "$apps_dir/acheron.desktop"
+
+echo "==> Installing app icons to $icons_dir"
+mkdir -p "$icons_dir"
+cp -r "$icons_src/." "$icons_dir/"
+
+echo "==> Refreshing desktop database and icon cache (best-effort)"
+# Both are pure caches: GNOME/KDE read the loose files above directly, so a
+# failure here just means the entry/icon may not appear until the next
+# login. Guarded like the udev step — a note, not an abort.
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$apps_dir" 2>/dev/null \
+        || echo "    update-desktop-database failed — the entry still works; re-login if it's missing."
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    # gtk-update-icon-cache needs an index.theme in the target dir. Seed it
+    # from the system hicolor theme if the user's own copy doesn't have one.
+    if [[ ! -f "$icons_dir/index.theme" && -f /usr/share/icons/hicolor/index.theme ]]; then
+        cp /usr/share/icons/hicolor/index.theme "$icons_dir/index.theme"
+    fi
+    gtk-update-icon-cache -f -t "$icons_dir" 2>/dev/null \
+        || echo "    gtk-update-icon-cache failed — the icon still resolves from loose files; re-login if it's missing."
+fi
+
+echo "==> Done."
+echo "    Daemon:  systemctl --user status acheron-daemon"
+echo "    GUI:     acheron-gui   (or launch \"Acheron\" from your app grid)"
