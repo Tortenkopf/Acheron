@@ -702,6 +702,17 @@ pub enum StepperItem {
         #[serde(default)]
         modifiers: Modifiers,
     },
+    /// A gamepad-button press (ticket 92's Answer) — the joystick/controller
+    /// extension CONTEXT.md's Stepper entry always anticipated. Compiled by
+    /// `dispatch::resolve_step` to the same down/dwell/up triple as
+    /// `Action::ControllerButton` (`executor::controller_button_steps`),
+    /// routed to the gamepad `uinput` device by `input::is_gamepad_button`.
+    /// `button` is validated against `input::gamepad_button_codes()`'s
+    /// 57-entry allowlist at the `CreateStepper`/`SetStepperItems` D-Bus
+    /// paths and by `parse`'s `InvalidControllerButtonStepperItem` check,
+    /// mirroring `Action::ControllerButton`'s two-place enforcement. **No
+    /// `modifiers` field** — a gamepad button takes no modifier combination.
+    ControllerButton { button: KeyCode },
 }
 
 /// A library entry in `Config.steppers` (ticket 03/54 — CONTEXT.md:
@@ -796,6 +807,12 @@ pub enum ConfigError {
     /// real gamepad button press works that way. Same shape as
     /// `InvalidProfileSwitchTrigger`/`InvalidStepTrigger`.
     InvalidControllerButtonTrigger,
+    /// A `StepperItem::ControllerButton` list item whose `button` is not in
+    /// `input::gamepad_button_codes()`'s 57-entry allowlist (ticket 92) —
+    /// the Stepper-item parallel of `InvalidControllerButton`, so a
+    /// hand-edited `config.toml` with a `controller_button` item naming
+    /// `KEY_A` refuses to start with a clear error.
+    InvalidControllerButtonStepperItem(String),
     UnknownMacro(String),
     UnknownStepper(String),
     InvalidStepTrigger,
@@ -878,6 +895,10 @@ impl fmt::Display for ConfigError {
             ConfigError::InvalidControllerButtonTrigger => write!(
                 f,
                 "config.toml contains an Action::ControllerButton Binding whose trigger is fire_once"
+            ),
+            ConfigError::InvalidControllerButtonStepperItem(button) => write!(
+                f,
+                "config.toml contains a Stepper list item whose controller button {button:?} is not a valid gamepad button"
             ),
             ConfigError::UnknownMacro(macro_id) => write!(
                 f,
@@ -1056,6 +1077,21 @@ fn parse(contents: &str) -> Result<Config, ConfigError> {
     });
     if has_invalid_step_trigger {
         return Err(ConfigError::InvalidStepTrigger);
+    }
+    let invalid_stepper_controller_button = config.steppers.values().find_map(|def| {
+        def.items.iter().find_map(|item| match item {
+            StepperItem::ControllerButton { button }
+                if !crate::input::is_gamepad_button(*button) =>
+            {
+                Some(*button)
+            }
+            _ => None,
+        })
+    });
+    if let Some(button) = invalid_stepper_controller_button {
+        return Err(ConfigError::InvalidControllerButtonStepperItem(format!(
+            "{button:?}"
+        )));
     }
     let invalid_analog_repeat_input = config.profiles.values().find_map(|profile| {
         [Layer::Base, Layer::Held].into_iter().find_map(|layer| {
@@ -1900,6 +1936,62 @@ action = { type = "step", stepper = "weapon-wheel", direction = "forward" }
 
         let err = load_or_seed(&path).expect_err("a Toggle Step Binding must refuse to start");
         assert!(matches!(err, ConfigError::InvalidStepTrigger));
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn parses_a_controller_button_stepper_item() {
+        let toml = r#"
+schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base]
+
+[steppers.weapon-wheel]
+name = "Weapon Wheel"
+items = [
+  { type = "key", key = "KEY_1" },
+  { type = "controller_button", button = "BTN_SOUTH" },
+]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let def = &config.steppers[&StepperId::from("weapon-wheel")];
+        assert_eq!(
+            def.items,
+            vec![
+                StepperItem::Key {
+                    key: KeyCode::KEY_1,
+                    modifiers: Modifiers::default(),
+                },
+                StepperItem::ControllerButton {
+                    button: KeyCode::BTN_SOUTH,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn refuses_to_start_when_a_controller_button_stepper_item_is_not_a_gamepad_code() {
+        let (_dir, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base]
+
+[steppers.weapon-wheel]
+name = "Weapon Wheel"
+items = [{ type = "controller_button", button = "KEY_A" }]
+"#;
+        fs::write(&path, original).unwrap();
+
+        let err = load_or_seed(&path)
+            .expect_err("a non-gamepad controller_button Stepper item must refuse to start");
+        assert!(matches!(
+            err,
+            ConfigError::InvalidControllerButtonStepperItem(_)
+        ));
 
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }

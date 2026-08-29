@@ -403,6 +403,21 @@ def test_set_stepper_items_on_an_unknown_stepper_id_raises_not_found():
         stub.set_stepper_items("nonexistent", [])
 
 
+def test_stepper_items_accept_a_valid_controller_button_and_reject_a_non_gamepad_code():
+    stub = DaemonStub()
+    stepper_id = stub.create_stepper("Weapon Wheel", [])
+
+    stub.set_stepper_items(stepper_id, [{"type": "controller_button", "button": "BTN_SOUTH"}])
+    assert stub.get_config()["steppers"][stepper_id]["items"] == [
+        {"type": "controller_button", "button": "BTN_SOUTH"}
+    ]
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_stepper_items(stepper_id, [{"type": "controller_button", "button": "KEY_A"}])
+    with pytest.raises(InvalidBindingError):
+        stub.create_stepper("Bad", [{"type": "controller_button", "button": "KEY_A"}])
+
+
 def test_set_binding_with_an_unknown_stepper_id_raises_invalid_binding():
     stub = DaemonStub()
 

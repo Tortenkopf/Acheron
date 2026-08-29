@@ -432,8 +432,10 @@ fn macros_to_dict(macros: &HashMap<MacroId, MacroDef>) -> Dict {
 }
 
 /// A `StepperItem` marshals the same `"type"`-tagged shape as an `Action` —
-/// today's sole `Key` variant carries `"key"`, mirroring `MacroStepDto`'s
-/// `key_down`/`key_up` fields (ticket 03/54 — CONTEXT.md: Stepper).
+/// the `Key` variant carries `"key"` (mirroring `MacroStepDto`'s
+/// `key_down`/`key_up` fields), the `ControllerButton` variant carries
+/// `"button"` (mirroring `Action::ControllerButton`'s own field, ticket 92)
+/// — CONTEXT.md: Stepper.
 pub fn stepper_item_to_dict(item: &StepperItem) -> Dict {
     let mut dict = Dict::new();
     match item {
@@ -444,6 +446,10 @@ pub fn stepper_item_to_dict(item: &StepperItem) -> Dict {
             if !modifiers.is_empty() {
                 dict.insert("modifiers".to_string(), scalar(modifiers));
             }
+        }
+        StepperItem::ControllerButton { button } => {
+            dict.insert("type".to_string(), scalar("controller_button".to_string()));
+            dict.insert("button".to_string(), scalar(key_to_string(*button)));
         }
     }
     dict
@@ -463,6 +469,10 @@ pub fn stepper_item_from_dict(dict: &Dict) -> Result<StepperItem, String> {
                 None => Modifiers::default(),
             };
             Ok(StepperItem::Key { key, modifiers })
+        }
+        "controller_button" => {
+            let button = key_from_str(get_str(dict, "button")?)?;
+            Ok(StepperItem::ControllerButton { button })
         }
         other => Err(format!("{other:?} is not a valid StepperItem type")),
     }
@@ -638,6 +648,21 @@ mod tests {
         let dict = stepper_item_to_dict(&item);
         assert_eq!(dict_get_string(&dict, "type"), "key");
         assert_eq!(dict_get_string(&dict, "key"), "BTN_LEFT");
+
+        let round_tripped = stepper_item_from_dict(&dict).unwrap();
+        assert_eq!(round_tripped, item);
+    }
+
+    #[test]
+    fn controller_button_stepper_item_round_trips_through_a_dict() {
+        let item = StepperItem::ControllerButton {
+            button: KeyCode::BTN_SOUTH,
+        };
+
+        let dict = stepper_item_to_dict(&item);
+        assert_eq!(dict_get_string(&dict, "type"), "controller_button");
+        assert_eq!(dict_get_string(&dict, "button"), "BTN_SOUTH");
+        assert!(dict.get("modifiers").is_none());
 
         let round_tripped = stepper_item_from_dict(&dict).unwrap();
         assert_eq!(round_tripped, item);

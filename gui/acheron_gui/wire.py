@@ -36,11 +36,13 @@ def macro_step_to_variant(step: dict) -> dict[str, GLib.Variant]:
 
 
 def stepper_item_to_variant(item: dict) -> dict[str, GLib.Variant]:
-    """`item` is `{"type": "key", "key": "KEY_A", "modifiers": [...]}`,
-    matching `StepperItem`'s wire tag — today's sole `Key` variant, mirroring
-    `macro_step_to_variant`'s shape. `modifiers` (ticket 62/63's Answer)
-    follows `action_to_variant`'s own convention: an empty list is omitted
-    entirely rather than sent as `[]`."""
+    """`item` is `{"type": "key", "key": "KEY_A", "modifiers": [...]}` or
+    `{"type": "controller_button", "button": "BTN_SOUTH"}` (ticket 92),
+    matching `StepperItem`'s wire tags — mirroring `macro_step_to_variant`'s
+    shape. `modifiers` (ticket 62/63's Answer) follows `action_to_variant`'s
+    own convention: an empty list is omitted entirely rather than sent as
+    `[]`. The `controller_button` variant has no `modifiers` field at all —
+    a gamepad button takes no modifier combination."""
     kind = item["type"]
     if kind == "key":
         result = {"type": GLib.Variant("s", "key"), "key": GLib.Variant("s", item["key"])}
@@ -48,6 +50,11 @@ def stepper_item_to_variant(item: dict) -> dict[str, GLib.Variant]:
         if modifiers:
             result["modifiers"] = GLib.Variant("as", modifiers)
         return result
+    if kind == "controller_button":
+        return {
+            "type": GLib.Variant("s", "controller_button"),
+            "button": GLib.Variant("s", item["button"]),
+        }
     raise ValueError(f"{kind!r} is not a valid StepperItem type")
 
 

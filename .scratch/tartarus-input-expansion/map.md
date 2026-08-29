@@ -695,6 +695,35 @@ Like the previous map, this one carries execution.
   sentence with the dwell caveat. Ticket 93 carries the build; ticket 94 the
   hardware verification.
 
+- [Build the library controller-button picker for real](./issues/93-task-build-library-controller-button-picker.md)
+  — built to 92's Answer exactly, daemon + GUI + tests (365 Rust + 313 Python
+  green, clippy/fmt clean); live-hardware verification stays
+  [ticket 94](./issues/94-task-verify-library-controller-button-picker-on-hardware.md)
+  (now unblocked). Daemon: `StepperItem::ControllerButton { button }` (no
+  `modifiers`, `snake_case` tag → `controller_button`), `executor::controller_button_steps`
+  extracted and shared by `compile` + `resolve_step`, `validate_stepper_items` at
+  `CreateStepper`/`SetStepperItems` + a `parse()` scan +
+  `ConfigError::InvalidControllerButtonStepperItem`, `wire.rs` +
+  `stepper_item_to_variant` marshal `button` from the start. Macro steps: route (c)
+  unchanged — a gamepad `KeyDown`/`KeyUp` is an ordinary `MacroStepDto`, no new
+  variant/validation. GUI: `build_library_picker_switch` + a **shared**
+  `_mount_picker_mode_switch` orchestration for both editors (a `/code-review`
+  finding — the two editors' switcher closures had diverged); `describe_step`
+  renders `↓ Btn: …` for gamepad codes; `build_macro_editor_columns` now takes
+  `ui_state`; the Macro switcher greys on `Delay` and shows the polled-input hint
+  in controller mode, the Stepper hides its Modifiers row. `daemon_stub` mirrors
+  the allowlist for both stepper items *and* (a pre-existing gap this closed)
+  controller-button bindings. Screenshot-verified against the running GUI: the
+  switcher row aligns pixel-lockstep across tabs in keyboard mode. `/code-review`
+  (high) findings triaged — acted on the in-scope ones (shared switcher
+  orchestration, stub binding gap, stale comments); the rest belong to other
+  tickets (90/88), predate this diff, or relitigate 92 §1's settled route (c).
+  One accepted deviation (per 92 §3): flipping keyboard↔controller in place, and
+  across tabs *in controller mode*, shifts column-3 width / body-y — the switcher
+  row itself stays lockstep, which is what 92 §3 protects. Closes the map's
+  GUI-polish cluster's build side (tickets 89–93); only ticket 94's hardware
+  verification remains.
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.

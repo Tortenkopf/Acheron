@@ -23,8 +23,24 @@ from gi.repository import GLib, Gtk, Graphene  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import acheron_gui.app as _app_mod  # noqa: E402
 from acheron_gui.app import AcheronApplication  # noqa: E402
 from acheron_gui.daemon_stub import DaemonStub  # noqa: E402
+
+
+class _NoTray:
+    """The real `TrayIcon` needs an `org.kde.StatusNotifierWatcher` on the
+    session bus, which a headless screenshot run has no reason to provide —
+    stub it out so the window still builds."""
+
+    def __init__(self, *_a, **_kw) -> None:
+        pass
+
+    def update(self, *_a, **_kw) -> None:
+        pass
+
+
+_app_mod.TrayIcon = _NoTray
 
 
 class _FakeSystemd:
@@ -128,6 +144,11 @@ def main() -> None:
         lambda: shot("macros_delay"),
         lambda: click("Steppers"),
         lambda: shot("steppers"),
+        # Ticket 92/93: the keyboard↔controller switcher on both editors.
+        lambda: click("Controller"),
+        lambda: shot("steppers_controller"),
+        lambda: click("Macros"),
+        lambda: shot("macros_controller"),
         lambda: app.quit(),
     ]
 

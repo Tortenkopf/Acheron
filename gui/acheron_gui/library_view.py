@@ -77,10 +77,29 @@ from typing import Callable
 from gi.repository import Gtk, Pango
 
 from .binding_editor import describe_step, labeled_row
+from .controller_picker import LABEL_BY_CODE as CONTROLLER_LABEL_BY_CODE
+from .controller_picker import build_inline_controller_picker
 from .daemon_client import DaemonError
 from .gtk_utils import build_name_prompt_popover, build_pinned_sidebar_box, clear_children
 from .inputs import ALL_INPUTS, input_label
 from .key_picker import LABEL_BY_CODE, build_inline_key_picker
+
+# Ticket 92: the keyboard↔controller picker switcher's session-only mode,
+# shared across both library editors (so working in controller mode "stays
+# put" when moving between Steppers and Macros) via this single `ui_state`
+# key. Resets to "keyboard" on GUI restart — not persisted to the daemon,
+# matching `ui_state["dest"]`.
+_PICKER_MODE_KEY = "library_picker_mode"
+_DEFAULT_CONTROLLER_CODE = "BTN_SOUTH"
+
+# Shown in the Macro step editor when a KeyDown/KeyUp step targets a
+# controller button (ticket 92's Answer) — the polled-input dwell caveat
+# the user must manage by hand in an authored sequence.
+_CONTROLLER_MACRO_HINT = (
+    "Controller buttons are polled by most games once per frame — add a Delay step of at "
+    "least 35 ms between a button's Down and Up (and before pressing it again) or the "
+    "press may not register."
+)
 
 _UNASSIGNED_LABEL = "— Unassigned —"
 
@@ -318,7 +337,7 @@ def _header_middle_reserve() -> Gtk.Widget:
 
 
 def build_macro_editor_columns(
-    client, config: dict, macro_id: str, on_change: Callable[[], None]
+    client, config: dict, macro_id: str, ui_state: dict, on_change: Callable[[], None]
 ) -> tuple[Gtk.Widget, Gtk.Widget]:
     """Columns 2+3 for the selected Macro (ticket 70): column 2 is the name
     heading plus the steps list; column 3 is the error label and
@@ -340,7 +359,7 @@ def build_macro_editor_columns(
     # it out of view — the error label, the button, and (Stepper's own)
     # toast message are exactly what the user asked to stay visible
     # regardless of scroll position). Structured in lockstep with
-    # `build_stepper_editor_columns` (ticket 91) — see `_HEADER_MIDDLE_H`.
+    # `build_stepper_editor_columns` (ticket 91) — see `_header_middle_reserve`.
     col3 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_EDITOR_COL_SPACING)
 
     error_label = Gtk.Label(xalign=0, wrap=True, css_classes=["error"])
@@ -420,19 +439,24 @@ def build_macro_editor_columns(
     # assigned below but only read here at click time (Python's
     # late-binding closures), so construction order doesn't need to match
     # visual order.
-    new_step_value = {"key": "KEY_A", "ms_text": "0"}
+    # Ticket 92 §3: each picker mode keeps its own independent draft —
+    # `controller_key` alongside the existing keyboard `key` — so flipping
+    # the switcher back and forth never clobbers either. Only the active
+    # mode's value is what "+ Add step" commits.
+    new_step_value = {"key": "KEY_A", "ms_text": "0", "controller_key": _DEFAULT_CONTROLLER_CODE}
 
     add_btn = Gtk.Button(label="+ Add step")
 
     def on_add(_b):
         kind_i = step_kind_dd.get_selected()
-        if kind_i == 0:
-            step = {"type": "key_down", "key": new_step_value["key"]}
-        elif kind_i == 1:
-            step = {"type": "key_up", "key": new_step_value["key"]}
-        else:
+        if kind_i == 2:
             val = new_step_value["ms_text"]
             step = {"type": "delay_ms", "ms": int(val) if val.isdigit() else 0}
+        else:
+            kind = "key_down" if kind_i == 0 else "key_up"
+            in_controller = ui_state.get(_PICKER_MODE_KEY, "keyboard") == "controller"
+            code = new_step_value["controller_key"] if in_controller else new_step_value["key"]
+            step = {"type": kind, "key": code}
         persist(list(steps) + [step])
 
     add_btn.connect("clicked", on_add)
@@ -446,14 +470,28 @@ def build_macro_editor_columns(
     col3.append(Gtk.Separator())
 
     add_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_EDITOR_COL_SPACING)
+
+    # Ticket 92 §3: the keyboard↔controller switcher, its own row directly
+    # below the hint and above the step-kind dropdown — on *both* editors
+    # (ticket 91 lockstep). It's greyed when the step-kind is Delay (no
+    # value picker to switch between) and is orthogonal to the step-kind
+    # dropdown: "controller button" is *not* a fourth step-kind, it just
+    # changes which picker fills the value slot for a KeyDown/KeyUp step.
+    switch_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    add_box.append(switch_slot)
+
     step_kind_dd = Gtk.DropDown(model=Gtk.StringList.new(["KeyDown", "KeyUp", "Delay (ms)"]))
-    # One ~one-row control between the hint and the picker row, matching the
-    # Stepper editor's modifier-checkbox row (ticket 91) so the picker lands
-    # at the same y.
     add_box.append(labeled_row("New step", step_kind_dd))
 
     value_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
     add_box.append(value_slot)
+
+    current_mode, rerender_switch = _mount_picker_mode_switch(
+        switch_slot,
+        ui_state,
+        on_mode_changed=lambda _mode: render_value_slot(),
+        sensitive=lambda: step_kind_dd.get_selected() != 2,
+    )
 
     def render_value_slot():
         clear_children(value_slot)
@@ -463,6 +501,17 @@ def build_macro_editor_columns(
             # Ticket 91 #2: this field genuinely isn't a key (the step-kind
             # dropdown selects KeyDown / KeyUp / Delay).
             value_slot.append(labeled_row("Delay (ms)", ms_entry))
+        elif current_mode() == "controller":
+            def on_controller_changed(code: str) -> None:
+                new_step_value["controller_key"] = code
+
+            picker = build_inline_controller_picker(
+                new_step_value["controller_key"], on_controller_changed
+            )
+            value_slot.append(labeled_row("Button", picker))
+            value_slot.append(
+                Gtk.Label(label=_CONTROLLER_MACRO_HINT, xalign=0, wrap=True, css_classes=["dim"])
+            )
         else:
             def on_value_key_changed(code: str) -> None:
                 new_step_value["key"] = code
@@ -477,7 +526,12 @@ def build_macro_editor_columns(
             # label and the Stepper item editor's.
             value_slot.append(labeled_row("Key", value_picker))
 
-    step_kind_dd.connect("notify::selected", lambda *_: render_value_slot())
+    def on_kind_changed(*_):
+        rerender_switch()  # re-evaluate the greyed-when-Delay state
+        render_value_slot()
+
+    step_kind_dd.connect("notify::selected", on_kind_changed)
+    rerender_switch()
     render_value_slot()
 
     body.append(add_box)
@@ -491,10 +545,77 @@ def _sorted_stepper_ids(steppers: dict) -> list[str]:
 
 
 def describe_stepper_item(item: dict) -> str:
+    if item.get("type") == "controller_button":
+        # Ticket 92: reuse the gamepad picker's catalog label, e.g.
+        # "Btn: A / South". No modifier combination on this variant.
+        raw = item["button"]
+        return f"Btn: {CONTROLLER_LABEL_BY_CODE.get(raw, raw)}"
     raw_key = item["key"]
     key = LABEL_BY_CODE.get(raw_key, raw_key)
     mods = "+".join(m.capitalize() for m in item.get("modifiers", []))
     return f"{mods}+{key}" if mods else key
+
+
+def build_library_picker_switch(selected_mode: str, on_select: Callable[[str], None]) -> Gtk.Box:
+    """The keyboard↔controller picker switcher for the library editors
+    (ticket 92's Answer §3) — a plain-text two-button segmented control, the
+    same shape as `device_overview.build_destination_switch` (the Grid/
+    Library switcher the user named as the reference), each button floored
+    at `_dropdown_row_height()` so it reads a little shorter than the
+    Grid/Library switcher's own buttons (the user's explicit request).
+    Carries no state of its own: `on_select` writes the pick into
+    `ui_state[_PICKER_MODE_KEY]` and re-renders, matching every other
+    tab/destination switch in this GUI."""
+    row = Gtk.Box(spacing=6)
+    for mode_key, label in (("keyboard", "Keyboard / mouse"), ("controller", "Controller")):
+        btn = Gtk.Button(label=label)
+        btn.set_size_request(-1, _dropdown_row_height())
+        if mode_key == selected_mode:
+            btn.add_css_class("suggested-action")
+
+        def on_clicked(_b, mode_key=mode_key):
+            on_select(mode_key)
+
+        btn.connect("clicked", on_clicked)
+        row.append(btn)
+    return row
+
+
+def _mount_picker_mode_switch(
+    switch_slot: Gtk.Box,
+    ui_state: dict,
+    *,
+    on_mode_changed: Callable[[str], None],
+    sensitive: Callable[[], bool] = lambda: True,
+) -> tuple[Callable[[], str], Callable[[], None]]:
+    """Ticket 92 §3: the shared keyboard↔controller switcher orchestration
+    for both library editors — kept in one place so the two editors can't
+    drift on the `ui_state[_PICKER_MODE_KEY]` contract. Renders the switcher
+    row into `switch_slot` and returns `(current_mode, rerender)`:
+
+    - `current_mode()` reads the shared session mode (default `"keyboard"`).
+    - `rerender()` rebuilds the switcher row — call it when `sensitive()`'s
+      inputs change (the Macro editor greys the switch on a Delay step).
+    - Clicking a switch button writes the mode and calls `on_mode_changed`,
+      the editor-specific reaction (re-render the value slot; the Stepper
+      editor also toggles its Modifiers row).
+    """
+
+    def current_mode() -> str:
+        return ui_state.get(_PICKER_MODE_KEY, "keyboard")
+
+    def set_mode(mode: str) -> None:
+        ui_state[_PICKER_MODE_KEY] = mode
+        rerender()
+        on_mode_changed(mode)
+
+    def rerender() -> None:
+        clear_children(switch_slot)
+        switch = build_library_picker_switch(current_mode(), set_mode)
+        switch.set_sensitive(sensitive())
+        switch_slot.append(labeled_row("Picker", switch))
+
+    return current_mode, rerender
 
 
 def _stepper_pair_inputs(bindings: dict, stepper_id: str) -> dict[str, str | None]:
@@ -838,41 +959,53 @@ def build_stepper_editor_columns(
     # over `new_item_value`, assigned below but only read here at click
     # time (Python's late-binding closures), so construction order doesn't
     # need to match visual order.
-    new_item_value = {"key": "KEY_A", "modifiers": []}
+    # Ticket 92 §3: each picker mode keeps its own independent draft —
+    # `controller_key` alongside the keyboard `key`/`modifiers` — so
+    # flipping the switcher never clobbers either. Only the active mode's
+    # value is what "+ Add item" commits.
+    new_item_value = {"key": "KEY_A", "modifiers": [], "controller_key": _DEFAULT_CONTROLLER_CODE}
 
     add_btn = Gtk.Button(label="+ Add item")
 
     def on_add(_b):
-        persist(
-            list(items)
-            + [
-                {
-                    "type": "key",
-                    "key": new_item_value["key"],
-                    "modifiers": sorted(new_item_value["modifiers"]),
-                }
-            ]
-        )
+        if ui_state.get(_PICKER_MODE_KEY, "keyboard") == "controller":
+            item = {"type": "controller_button", "button": new_item_value["controller_key"]}
+        else:
+            item = {
+                "type": "key",
+                "key": new_item_value["key"],
+                "modifiers": sorted(new_item_value["modifiers"]),
+            }
+        persist(list(items) + [item])
 
     add_btn.connect("clicked", on_add)
     col3.append(add_btn)
 
     # Ticket 91 #1: the Forward/Backward assignment row + separator here is
-    # what the Macro editor reserves `_HEADER_MIDDLE_H` of blank space for,
-    # so both editors' scrollable bodies start at the same y.
+    # what the Macro editor reserves the same blank space for (via
+    # `_header_middle_reserve`), so both editors' scrollable bodies start at
+    # the same y.
     col3.append(
         build_stepper_assignment_row(client, config, profile, layer, stepper_id, ui_state, on_change, show_error)
     )
     col3.append(Gtk.Separator())
 
-    # No kind selector here (unlike Macro's step editor) — `StepperItem` has
-    # exactly one wire variant (`Key`), and `key_picker`'s inline picker
-    # already covers both keyboard keys and mouse buttons in one widget, so
-    # there is nothing left for a dropdown to choose between.
     add_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_EDITOR_COL_SPACING)
 
-    def on_value_key_changed(code: str) -> None:
-        new_item_value["key"] = code
+    # Ticket 92 §3: the keyboard↔controller switcher, its own row directly
+    # below the hint and above the Modifiers row — on *both* editors so the
+    # cross-tab lockstep (ticket 91) holds. Always functional here (a
+    # Stepper item is either a keyboard/mouse key or a controller button).
+    switch_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    add_box.append(switch_slot)
+
+    def on_mode_changed(mode: str) -> None:
+        mod_row.set_visible(mode != "controller")
+        render_value_slot()
+
+    current_mode, rerender_switch = _mount_picker_mode_switch(
+        switch_slot, ui_state, on_mode_changed=on_mode_changed
+    )
 
     # The same Ctrl/Shift/Alt/Super checkbox block `binding_editor.py`
     # renders for Keypress (ticket 62's Answer) — a Stepper item's modifier
@@ -887,6 +1020,9 @@ def build_stepper_editor_columns(
     # structurally the same one-row control as the Macro editor's step-kind
     # `labeled_row`, keeping the "Key" picker row at the same y on both tabs
     # without a hardcoded row height.
+    #
+    # Ticket 92 §3: hidden (not greyed) in controller mode — a gamepad
+    # button has no modifier concept, so a greyed row would be pure clutter.
     mod_box = Gtk.Box(spacing=8)
     mod_box.set_valign(Gtk.Align.CENTER)
     # Floor this row at a real dropdown row's height so the "Key" picker row
@@ -908,22 +1044,42 @@ def build_stepper_editor_columns(
 
         cb.connect("toggled", on_mod)
         mod_box.append(cb)
-    add_box.append(labeled_row("Modifiers", mod_box))
+    mod_row = labeled_row("Modifiers", mod_box)
+    add_box.append(mod_row)
 
-    # Suppressed for a different reason than the Macro editor's own
-    # KeyDown-only step above: there the warning's suggested workaround
-    # (Toggle + a KeyDown-only Macro step) *is* what a KeyDown-only step
-    # already is. Here it's simply unreachable — a Stepper item always
-    # compiles to a bare KeyDown/KeyUp pair (ticket 03/54's firing
-    # semantics) and Toggle is disallowed outright for a Stepper Binding —
-    # so showing the warning would point the user at a workflow this
-    # construct structurally cannot support.
-    value_picker, _refresh = build_inline_key_picker(
-        new_item_value["key"], on_value_key_changed, warn_predicate=lambda: False
-    )
-    # Ticket 91 #2: "Key", matching the grid-view key-picker's own label and
-    # the Macro step editor's KeyDown/KeyUp value row.
-    add_box.append(labeled_row("Key", value_picker))
+    value_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    add_box.append(value_slot)
+
+    def render_value_slot() -> None:
+        clear_children(value_slot)
+        if current_mode() == "controller":
+            def on_controller_changed(code: str) -> None:
+                new_item_value["controller_key"] = code
+
+            picker = build_inline_controller_picker(
+                new_item_value["controller_key"], on_controller_changed
+            )
+            value_slot.append(labeled_row("Button", picker))
+        else:
+            def on_value_key_changed(code: str) -> None:
+                new_item_value["key"] = code
+
+            # The modifier warning is suppressed for a different reason than
+            # the Macro editor's own KeyDown-only step: there the workaround
+            # (Toggle + a KeyDown-only Macro step) *is* a KeyDown-only step;
+            # here it's simply unreachable — a Stepper item always compiles
+            # to a bare KeyDown/KeyUp pair (ticket 03/54) and Toggle is
+            # disallowed for a Stepper Binding.
+            value_picker, _refresh = build_inline_key_picker(
+                new_item_value["key"], on_value_key_changed, warn_predicate=lambda: False
+            )
+            # Ticket 91 #2: "Key", matching the grid-view key-picker's own
+            # label and the Macro step editor's KeyDown/KeyUp value row.
+            value_slot.append(labeled_row("Key", value_picker))
+
+    rerender_switch()
+    mod_row.set_visible(current_mode() != "controller")
+    render_value_slot()
 
     body.append(add_box)
     col3.append(_vscrollable(body))
@@ -1003,7 +1159,10 @@ def build_library_content(
             root.append(_empty_library_label("No Macros yet — use “+ New” to create one."))
         else:
             _mount_editor_columns(
-                root, *build_macro_editor_columns(client, config, selected_macro_id, on_change)
+                root,
+                *build_macro_editor_columns(
+                    client, config, selected_macro_id, ui_state, on_change
+                ),
             )
 
     return root

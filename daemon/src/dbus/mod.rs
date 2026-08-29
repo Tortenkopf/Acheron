@@ -2059,6 +2059,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_stepper_items_over_real_dbus_round_trips_a_controller_button() {
+        // Ticket 92/93: the same SetStepperItems -> GetConfig round trip as
+        // above, for the new `ControllerButton` variant — plans the `button`
+        // field into the wire from the start (ticket 63's `modifiers`
+        // retrofit is the lesson).
+        let server = TestServer::start().await;
+        let stepper_id = server.create_stepper("Test stepper", vec![]).await;
+
+        let new_items: Vec<wire::Dict> = vec![wire::stepper_item_to_dict(
+            &crate::config::StepperItem::ControllerButton {
+                button: evdev::KeyCode::BTN_SOUTH,
+            },
+        )];
+        server
+            .proxy
+            .set_stepper_items(&stepper_id, new_items)
+            .await
+            .expect("SetStepperItems must succeed");
+
+        let config = server.proxy.get_config().await.unwrap();
+        server.shut_down().await;
+
+        let steppers: wire::Dict = config.get("steppers").unwrap().clone().try_into().unwrap();
+        let def: wire::Dict = steppers
+            .get(&stepper_id)
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let items: Vec<wire::Dict> = def.get("items").unwrap().clone().try_into().unwrap();
+        assert_eq!(items.len(), 1);
+        let item_type: String = items[0].get("type").unwrap().clone().try_into().unwrap();
+        assert_eq!(item_type, "controller_button");
+        let button: String = items[0].get("button").unwrap().clone().try_into().unwrap();
+        assert_eq!(button, "BTN_SOUTH");
+    }
+
+    #[tokio::test]
     async fn set_stepper_items_over_real_dbus_on_an_unknown_stepper_id_returns_not_found() {
         let server = TestServer::start().await;
 

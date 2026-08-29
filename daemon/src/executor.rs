@@ -86,6 +86,22 @@ pub(crate) fn keypress_steps(modifiers: Modifiers, key: KeyCode) -> Vec<MacroSte
     steps
 }
 
+/// The down/dwell/up triple a single atomic controller-button press
+/// compiles to (ticket 75/76's `CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD`
+/// dwell between the edges, so a same-poll-frame game doesn't swallow the
+/// press). Shared by `compile`'s `Action::ControllerButton` arm and
+/// `dispatch::resolve_step`'s `StepperItem::ControllerButton` arm (ticket
+/// 92) — a Stepper item is always an atomic one-shot press, so it hits the
+/// same polled-input risk and reuses the same constant rather than
+/// hand-inlining the triple in `dispatch`.
+pub(crate) fn controller_button_steps(button: KeyCode) -> Vec<MacroStep> {
+    vec![
+        MacroStep::KeyDown(button),
+        MacroStep::Delay(CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD),
+        MacroStep::KeyUp(button),
+    ]
+}
+
 /// Compiles a Binding's `Action` into the flat step sequence the shared
 /// executor runs (spec.md: "both Action kinds compile ... into one steps:
 /// Vec<MacroStep> ... run by one shared executor"). `macros` resolves a
@@ -135,13 +151,7 @@ pub fn compile(action: &Action, macros: &HashMap<MacroId, MacroDef>) -> Vec<Macr
         // (ticket 75/76's bare-KeyDown hold, ticket 78's Toggle mirror of
         // it) — the only caller still reaching this arm is the
         // Digital-Capture-mode Analog-repeat fallback (ticket 20).
-        Action::ControllerButton { button } => {
-            vec![
-                MacroStep::KeyDown(*button),
-                MacroStep::Delay(CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD),
-                MacroStep::KeyUp(*button),
-            ]
-        }
+        Action::ControllerButton { button } => controller_button_steps(*button),
     }
 }
 
@@ -541,6 +551,22 @@ mod tests {
                 MacroStep::Delay(CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD),
                 MacroStep::KeyUp(KeyCode::BTN_SOUTH),
             ]
+        );
+    }
+
+    #[test]
+    fn controller_button_steps_helper_matches_the_compile_arm() {
+        // Ticket 92: `dispatch::resolve_step` reuses this helper for a
+        // `StepperItem::ControllerButton`, so it must stay identical to
+        // what `compile(Action::ControllerButton)` produces.
+        assert_eq!(
+            controller_button_steps(KeyCode::BTN_TL),
+            compile(
+                &Action::ControllerButton {
+                    button: KeyCode::BTN_TL,
+                },
+                &empty_macros(),
+            )
         );
     }
 

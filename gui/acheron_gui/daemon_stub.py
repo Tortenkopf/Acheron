@@ -35,6 +35,7 @@ import re
 from typing import Callable
 
 from .axis_picker import AXIS_LABEL_BY_TARGET
+from .controller_picker import LABEL_BY_CODE as _GAMEPAD_CODES
 from .daemon_client import AlreadyExistsError, InvalidBindingError, NotFoundError
 from .inputs import is_grid_input
 
@@ -142,12 +143,34 @@ class DaemonStub:
                 raise InvalidBindingError(f"{stepper_id!r} does not name a Stepper in the library")
             if binding.get("trigger") == "toggle":
                 raise InvalidBindingError("Toggle is not allowed for a Stepper Binding")
-        if binding.get("type") == "controller_button" and binding.get("trigger") == "fire_once":
-            # Ticket 78: Fire-once is locked out for Controller Button —
-            # Hold-to-repeat's sustained-hold behavior already covers a
-            # quick tap, so there's nothing left for Fire-once's decoupled
-            # pulse to uniquely serve.
-            raise InvalidBindingError("Fire-once is not allowed for a Controller Button Binding")
+        if binding.get("type") == "controller_button":
+            if binding.get("button") not in _GAMEPAD_CODES:
+                # Ticket 43: `dispatch::validate_binding` rejects a
+                # ControllerButton binding whose button isn't in the
+                # 57-entry gamepad allowlist — same guard the stepper-item
+                # path now mirrors (ticket 92).
+                raise InvalidBindingError(
+                    f"{binding.get('button')!r} is not a valid gamepad button"
+                )
+            if binding.get("trigger") == "fire_once":
+                # Ticket 78: Fire-once is locked out for Controller Button —
+                # Hold-to-repeat's sustained-hold behavior already covers a
+                # quick tap, so there's nothing left for Fire-once's
+                # decoupled pulse to uniquely serve.
+                raise InvalidBindingError(
+                    "Fire-once is not allowed for a Controller Button Binding"
+                )
+
+    def _validate_stepper_items(self, items: list[dict]) -> None:
+        # Ticket 92: mirrors the real Daemon's `validate_stepper_items` —
+        # a `controller_button` list item whose `button` is not in the
+        # 57-entry gamepad allowlist is rejected outright, the same guard
+        # `Action::ControllerButton` already has.
+        for item in items:
+            if item.get("type") == "controller_button" and item.get("button") not in _GAMEPAD_CODES:
+                raise InvalidBindingError(
+                    f"{item.get('button')!r} is not a valid gamepad button"
+                )
 
     def _reject_if_axis_assigned(self, input_str: str, layer: str) -> None:
         # Ticket 59 §2's mutual exclusion: `SetBinding`/`SetChordBinding`
@@ -405,6 +428,7 @@ class DaemonStub:
     def create_stepper(self, name: str, items: list[dict]) -> str:
         if not name.strip():
             raise InvalidBindingError("Stepper name can't be empty")
+        self._validate_stepper_items(items)
         stepper_id = self._unique_stepper_id(name)
         self._steppers[stepper_id] = {"name": name, "items": copy.deepcopy(items)}
         self.calls.append(("create_stepper", name, copy.deepcopy(items)))
@@ -430,6 +454,7 @@ class DaemonStub:
     def set_stepper_items(self, stepper_id: str, items: list[dict]) -> None:
         if stepper_id not in self._steppers:
             raise NotFoundError(f"no Stepper with id {stepper_id!r}")
+        self._validate_stepper_items(items)
         self._steppers[stepper_id]["items"] = copy.deepcopy(items)
         self.calls.append(("set_stepper_items", stepper_id, copy.deepcopy(items)))
 

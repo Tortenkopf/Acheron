@@ -1,5 +1,6 @@
 from gi.repository import Gtk
 
+from acheron_gui.binding_editor import describe_step
 from acheron_gui.daemon_client import DaemonError
 from acheron_gui.daemon_stub import DaemonStub
 from acheron_gui.inputs import ALL_INPUTS
@@ -11,7 +12,7 @@ from acheron_gui.library_view import (
     stepper_used_by_count,
 )
 
-from .widget_tree import button_labeled, find_all, find_one
+from .widget_tree import button_labeled, find_all, find_one, walk
 
 _PROFILE = "Default"
 _LAYER = "base"
@@ -450,6 +451,185 @@ def test_describe_stepper_item_with_no_modifiers_shows_a_bare_key_label():
     assert describe_stepper_item({"key": "KEY_3"}) == "3"
 
 
+# --- Controller-button items / steps (ticket 92/93) ---
+
+
+def test_describe_stepper_item_renders_a_controller_button_label():
+    assert (
+        describe_stepper_item({"type": "controller_button", "button": "BTN_SOUTH"})
+        == "Btn: A / South"
+    )
+
+
+def test_describe_step_renders_a_gamepad_keydown_with_the_button_label():
+    assert describe_step({"type": "key_down", "key": "BTN_SOUTH"}) == "↓ Btn: A / South"
+    assert describe_step({"type": "key_up", "key": "BTN_TL"}) == "↑ Btn: LB (Left bumper)"
+    # A mouse button is also `BTN_*` but isn't in the gamepad catalog — it
+    # keeps the plain form.
+    assert describe_step({"type": "key_down", "key": "BTN_LEFT"}) == "KeyDown BTN_LEFT"
+    assert describe_step({"type": "key_down", "key": "KEY_A"}) == "KeyDown KEY_A"
+
+
+def _picker_switch_buttons(root):
+    return find_all(
+        root,
+        lambda w: isinstance(w, Gtk.Button)
+        and w.get_label() in ("Keyboard / mouse", "Controller"),
+    )
+
+
+def test_both_library_editors_carry_the_picker_switcher():
+    stub = DaemonStub()
+    stub.create_macro("M", [])
+    stub.create_stepper("S", [])
+
+    macro_root = _build(stub, {"library_tab": "macros"})
+    stepper_root = _build(stub, {"library_tab": "steppers"})
+
+    assert {b.get_label() for b in _picker_switch_buttons(macro_root)} == {
+        "Keyboard / mouse",
+        "Controller",
+    }
+    assert {b.get_label() for b in _picker_switch_buttons(stepper_root)} == {
+        "Keyboard / mouse",
+        "Controller",
+    }
+
+
+def test_clicking_controller_on_the_switcher_records_the_shared_mode():
+    stub = DaemonStub()
+    stub.create_stepper("Weapon Wheel", [])
+    ui_state = {"library_tab": "steppers"}
+
+    root = _build(stub, ui_state)
+    button_labeled(root, "Controller").emit("clicked")
+
+    assert ui_state["library_picker_mode"] == "controller"
+
+
+def test_adding_a_controller_button_stepper_item_persists_the_controller_button_shape():
+    stub = DaemonStub()
+    stepper_id = stub.create_stepper("Weapon Wheel", [])
+    ui_state = {"library_tab": "steppers"}
+
+    root = _build(stub, ui_state)
+    button_labeled(root, "Controller").emit("clicked")
+
+    rebuilt = _build(stub, ui_state)
+    button_row = _row_labeled(rebuilt, "Button")
+    button_labeled(button_row, "B").emit("clicked")
+    button_labeled(rebuilt, "+ Add item").emit("clicked")
+
+    assert stub.get_config()["steppers"][stepper_id]["items"] == [
+        {"type": "controller_button", "button": "BTN_EAST"}
+    ]
+
+    final = _build(stub, ui_state)
+    assert find_one(final, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "Btn: B / East")
+
+
+def test_stepper_modifiers_row_is_hidden_in_controller_mode():
+    stub = DaemonStub()
+    stub.create_stepper("Weapon Wheel", [])
+
+    keyboard_root = _build(stub, {"library_tab": "steppers"})
+    assert _row_labeled(keyboard_root, "Modifiers").get_visible()
+
+    controller_root = _build(
+        stub, {"library_tab": "steppers", "library_picker_mode": "controller"}
+    )
+    assert not _row_labeled(controller_root, "Modifiers").get_visible()
+    assert _row_labeled(controller_root, "Button") is not None
+    assert find_all(
+        controller_root, lambda w: isinstance(w, Gtk.Box) and _row_label_text(w) == "Key"
+    ) == []
+
+
+def test_adding_a_controller_keydown_macro_step_stores_the_gamepad_code():
+    stub = DaemonStub()
+    macro_id = stub.create_macro("Combo", [])
+    ui_state = {"library_tab": "macros", "library_picker_mode": "controller"}
+
+    root = _build(stub, ui_state)
+    button_row = _row_labeled(root, "Button")
+    button_labeled(button_row, "A").emit("clicked")
+    button_labeled(root, "+ Add step").emit("clicked")
+
+    assert stub.get_config()["macros"][macro_id]["steps"] == [
+        {"type": "key_down", "key": "BTN_SOUTH"}
+    ]
+
+
+def test_macro_switcher_is_insensitive_when_the_step_kind_is_delay():
+    stub = DaemonStub()
+    stub.create_macro("Combo", [])
+
+    root = _build(stub, {"library_tab": "macros"})
+    step_kind_dd = _dropdown_labeled(root, "New step")
+
+    def switch_box():
+        row = _row_labeled(root, "Picker")
+        child = row.get_first_child().get_next_sibling()  # past the "Picker" label
+        return child
+
+    assert switch_box().get_sensitive()
+
+    step_kind_dd.set_selected(2)  # Delay (ms)
+    assert not switch_box().get_sensitive()
+
+    step_kind_dd.set_selected(0)  # back to KeyDown
+    assert switch_box().get_sensitive()
+
+
+def test_macro_delay_step_still_round_trips_with_the_switcher_present():
+    stub = DaemonStub()
+    macro_id = stub.create_macro("Combo", [])
+
+    root = _build(stub, {"library_tab": "macros"})
+    _dropdown_labeled(root, "New step").set_selected(2)
+    delay_entry = find_one(_row_labeled(root, "Delay (ms)"), lambda w: isinstance(w, Gtk.Entry))
+    delay_entry.set_text("120")
+    button_labeled(root, "+ Add step").emit("clicked")
+
+    assert stub.get_config()["macros"][macro_id]["steps"] == [{"type": "delay_ms", "ms": 120}]
+
+
+def test_switching_modes_back_and_forth_preserves_the_keyboard_draft():
+    stub = DaemonStub()
+    stepper_id = stub.create_stepper("Weapon Wheel", [])
+    ui_state = {"library_tab": "steppers"}
+
+    root = _build(stub, ui_state)
+    button_labeled(_row_labeled(root, "Key"), "F1").emit("clicked")
+    # Flip to controller (in place, no rebuild), touch its picker, flip back.
+    button_labeled(root, "Controller").emit("clicked")
+    button_labeled(_row_labeled(root, "Button"), "B").emit("clicked")
+    button_labeled(root, "Keyboard / mouse").emit("clicked")
+    button_labeled(root, "+ Add item").emit("clicked")
+
+    assert stub.get_config()["steppers"][stepper_id]["items"] == [
+        {"type": "key", "key": "KEY_F1", "modifiers": []}
+    ]
+
+
+def test_switching_modes_back_and_forth_preserves_the_controller_draft():
+    stub = DaemonStub()
+    stepper_id = stub.create_stepper("Weapon Wheel", [])
+    ui_state = {"library_tab": "steppers"}
+
+    root = _build(stub, ui_state)
+    button_labeled(root, "Controller").emit("clicked")
+    button_labeled(_row_labeled(root, "Button"), "B").emit("clicked")
+    button_labeled(root, "Keyboard / mouse").emit("clicked")
+    button_labeled(_row_labeled(root, "Key"), "F1").emit("clicked")
+    button_labeled(root, "Controller").emit("clicked")
+    button_labeled(root, "+ Add item").emit("clicked")
+
+    assert stub.get_config()["steppers"][stepper_id]["items"] == [
+        {"type": "controller_button", "button": "BTN_EAST"}
+    ]
+
+
 def test_picking_a_bare_modifier_for_a_new_item_shows_no_modifier_warning():
     # A Stepper item always fires as a bare KeyDown/KeyUp pair (never a
     # Macro step) and Toggle is disallowed outright for a Stepper Binding,
@@ -707,18 +887,19 @@ def test_stepper_item_picker_row_is_labeled_key():
 def test_stepper_modifier_checkboxes_render_above_the_key_picker_row():
     # Ticket 91 #3: the key picker owns a tall on-screen grid that used to
     # push the modifier checkboxes past the default window height — they now
-    # sit directly above the "Key" row.
+    # sit above the "Key" row (with ticket 92's switcher row above them
+    # again).
     stub = DaemonStub()
     stub.create_stepper("Weapon Wheel", [])
 
     root = _build_steppers(stub)
+    ordered = list(walk(root))
+    mod_row = _row_labeled(root, "Modifiers")
     key_row = _row_labeled(root, "Key")
-    add_box = key_row.get_parent()
-
-    first_child = add_box.get_first_child()
-    assert first_child is not key_row
+    assert mod_row is not None and key_row is not None
+    assert ordered.index(mod_row) < ordered.index(key_row)
     assert find_one(
-        first_child, lambda w: isinstance(w, Gtk.CheckButton) and w.get_label() == "ctrl"
+        mod_row, lambda w: isinstance(w, Gtk.CheckButton) and w.get_label() == "ctrl"
     ) is not None
 
 

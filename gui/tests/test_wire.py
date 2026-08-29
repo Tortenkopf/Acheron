@@ -91,3 +91,13 @@ def test_stepper_item_with_no_modifiers_omits_the_modifiers_field():
     variant_dict = wire.stepper_item_to_variant(item)
 
     assert "modifiers" not in variant_dict
+
+
+def test_controller_button_stepper_item_round_trips_through_a_variant():
+    item = {"type": "controller_button", "button": "BTN_SOUTH"}
+
+    variant_dict = wire.stepper_item_to_variant(item)
+    unpacked = {k: v.unpack() for k, v in variant_dict.items()}
+
+    assert unpacked == item
+    assert "modifiers" not in variant_dict

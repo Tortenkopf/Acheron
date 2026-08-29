@@ -1566,11 +1566,12 @@ fn compile_action(
 
 /// Advances/retreats a Stepper's per-list cursor (Daemon-side-only runtime
 /// state, ticket 03/54 — CONTEXT.md: Stepper) and compiles the
-/// newly-selected item through `executor::keypress_steps` — "one motion
-/// moves the cursor and fires," ticket 03's Answer's firing semantics, now
-/// carrying the item's own modifier combination if it has one (ticket 62's
-/// Answer: a Stepper item's fire sequence reuses `Action::Keypress`'s
-/// mods-down/key/mods-up compile path, atomically). A missing cursor entry
+/// newly-selected item — "one motion moves the cursor and fires," ticket
+/// 03's Answer's firing semantics. A `Key` item reuses `Action::Keypress`'s
+/// mods-down/key/mods-up compile path, carrying its own modifier
+/// combination if it has one (ticket 62); a `ControllerButton` item (ticket
+/// 92) reuses `Action::ControllerButton`'s down/dwell/up triple. A missing
+/// cursor entry
 /// means "at the list's first item" (index 0), matching `stepper_cursors`'s
 /// own always-resets-to-first-item-on-restart convention. Wraps at either
 /// end. A `stepper` with zero items compiles to no steps at all — nothing to
@@ -1598,8 +1599,16 @@ fn resolve_step(
         StepDirection::Backward => (current + len - 1) % len,
     };
     stepper_cursors.insert(stepper.clone(), next);
-    let StepperItem::Key { key, modifiers } = def.items[next];
-    executor::keypress_steps(modifiers, key)
+    match def.items[next] {
+        // A keyboard/mouse item: the item's own modifier combination
+        // (ticket 62) through `Action::Keypress`'s canned compile path.
+        StepperItem::Key { key, modifiers } => executor::keypress_steps(modifiers, key),
+        // A gamepad-button item (ticket 92): the same atomic down/dwell/up
+        // triple as `Action::ControllerButton`'s digital path, routed to
+        // the gamepad `uinput` device by the injector's own
+        // `input::is_gamepad_button` check.
+        StepperItem::ControllerButton { button } => executor::controller_button_steps(button),
+    }
 }
 
 /// Branches on `TriggerMode` x event state, per ticket 17: Fire-once fires
@@ -1877,6 +1886,27 @@ fn validate_binding(binding: &Binding, config: &Config) -> Result<(), CommandErr
             return Err(CommandError::InvalidRequest(
                 "Toggle is not allowed for a Stepper Binding".to_string(),
             ));
+        }
+    }
+    Ok(())
+}
+
+/// Rejects a `StepperItem::ControllerButton` list item naming a non-gamepad
+/// code (ticket 92) — the `CreateStepper`/`SetStepperItems` counterpart of
+/// `validate_binding`'s `Action::ControllerButton` allowlist guard, and of
+/// `config::parse`'s `InvalidControllerButtonStepperItem` check for a
+/// hand-edited `config.toml`. A GUI-emitted item is always valid (the
+/// picker only ever produces allowlist codes); this catches a hand-crafted
+/// D-Bus call, mirroring the two-place enforcement `Action::ControllerButton`
+/// already has (ticket 43).
+fn validate_stepper_items(items: &[StepperItem]) -> Result<(), CommandError> {
+    for item in items {
+        if let StepperItem::ControllerButton { button } = item
+            && !crate::input::is_gamepad_button(*button)
+        {
+            return Err(CommandError::InvalidRequest(format!(
+                "{button:?} is not a valid gamepad button"
+            )));
         }
     }
     Ok(())
@@ -2606,6 +2636,10 @@ async fn handle_command(
                 )));
                 return;
             }
+            if let Err(err) = validate_stepper_items(&items) {
+                let _ = reply.send(Err(err));
+                return;
+            }
             let stepper_id = config::unique_stepper_id(config, &name);
             config
                 .steppers
@@ -2673,6 +2707,10 @@ async fn handle_command(
             items,
             reply,
         } => {
+            if let Err(err) = validate_stepper_items(&items) {
+                let _ = reply.send(Err(err));
+                return;
+            }
             let Some(def) = config.steppers.get_mut(&stepper_id) else {
                 let _ = reply.send(Err(CommandError::NotFound));
                 return;
@@ -6987,6 +7025,76 @@ mod tests {
                 executor::MacroStep::KeyUp(evdev::KeyCode::KEY_LEFTCTRL),
             ]
         );
+    }
+
+    /// Ticket 92: a `StepperItem::ControllerButton` compiles to the same
+    /// down/dwell/up triple as `Action::ControllerButton`'s digital path.
+    #[test]
+    fn resolve_step_compiles_a_controller_button_item_to_the_dwell_triple() {
+        let stepper_id = StepperId::from("weapon-wheel");
+        let mut steppers = HashMap::new();
+        steppers.insert(
+            stepper_id.clone(),
+            StepperDef {
+                name: "Weapon Wheel".to_string(),
+                items: vec![crate::config::StepperItem::ControllerButton {
+                    button: evdev::KeyCode::BTN_SOUTH,
+                }],
+            },
+        );
+        let mut cursors = HashMap::new();
+
+        let steps = resolve_step(&steppers, &mut cursors, &stepper_id, StepDirection::Forward);
+
+        assert_eq!(
+            steps,
+            vec![
+                executor::MacroStep::KeyDown(evdev::KeyCode::BTN_SOUTH),
+                executor::MacroStep::Delay(executor::CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD),
+                executor::MacroStep::KeyUp(evdev::KeyCode::BTN_SOUTH),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn set_stepper_items_rejects_a_controller_button_item_naming_a_non_gamepad_code() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        let stepper_id = harness
+            .create_stepper("Weapon Wheel", vec![])
+            .await
+            .expect("CreateStepper must succeed");
+
+        let err = harness
+            .set_stepper_items(
+                stepper_id.clone(),
+                vec![crate::config::StepperItem::ControllerButton {
+                    button: evdev::KeyCode::KEY_A,
+                }],
+            )
+            .await
+            .expect_err("a non-gamepad controller button item must be rejected");
+        assert!(matches!(err, CommandError::InvalidRequest(_)));
+
+        // The rejected write never lands.
+        let config = harness.get_config().await;
+        assert!(config.steppers[&stepper_id].items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_stepper_rejects_a_controller_button_item_naming_a_non_gamepad_code() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let err = harness
+            .create_stepper(
+                "Weapon Wheel",
+                vec![crate::config::StepperItem::ControllerButton {
+                    button: evdev::KeyCode::KEY_A,
+                }],
+            )
+            .await
+            .expect_err("a non-gamepad controller button item must be rejected");
+        assert!(matches!(err, CommandError::InvalidRequest(_)));
+        assert!(harness.get_config().await.steppers.is_empty());
     }
 
     #[tokio::test]

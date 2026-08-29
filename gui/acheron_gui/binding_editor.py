@@ -100,10 +100,16 @@ def action_summary(
 
 def describe_step(step: dict) -> str:
     kind = step["type"]
-    if kind == "key_down":
-        return f"KeyDown {step['key']}"
-    if kind == "key_up":
-        return f"KeyUp {step['key']}"
+    if kind in ("key_down", "key_up"):
+        raw = step["key"]
+        # Ticket 92: a KeyDown/KeyUp step may target a controller button
+        # (routed to the gamepad device by the injector). Render it with the
+        # gamepad catalog's label and a ↓/↑ prefix, e.g. "↓ Btn: A / South".
+        # Mouse buttons (also `BTN_*`) aren't in the gamepad catalog, so
+        # they keep the plain "KeyDown BTN_SIDE" form.
+        if raw in CONTROLLER_LABEL_BY_CODE:
+            return f"{'↓' if kind == 'key_down' else '↑'} Btn: {CONTROLLER_LABEL_BY_CODE[raw]}"
+        return f"{'KeyDown' if kind == 'key_down' else 'KeyUp'} {raw}"
     if kind == "delay_ms":
         return f"Delay {step['ms']}ms"
     return str(step)
