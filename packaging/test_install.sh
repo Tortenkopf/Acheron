@@ -52,11 +52,29 @@ call_log="$work/calls.log"
 mkdir -p "$fake_home" "$fake_bin"
 : > "$call_log"
 
+# Run install.sh from a throwaway copy of the repo, never the checkout this
+# test lives in. The fake `cargo` below writes its stub binary to
+# `<script_dir>/daemon/target/release/acheron-daemon`, where `<script_dir>`
+# is wherever the install.sh it runs is located — point that at the real
+# checkout and the stub silently overwrites a real release binary, which a
+# later `install.sh` then copies straight into ~/.local/bin (observed:
+# a daemon that "starts" and immediately exits 0 printing "fake-acheron-daemon").
+# The sandbox copy carries only what install.sh actually reads.
+sandbox_repo="$work/repo"
+mkdir -p "$sandbox_repo/daemon" "$sandbox_repo/gui"
+cp "$repo_root/install.sh" "$sandbox_repo/"
+cp "$repo_root/daemon/Cargo.toml" "$sandbox_repo/daemon/"
+cp -r "$repo_root/packaging" "$sandbox_repo/"
+cp -r "$repo_root/gui/acheron_gui" "$sandbox_repo/gui/"
+
 # Stub cargo: records its invocation, then drops a fake release binary where
 # install.sh expects to find one, so the rest of the script has something
-# real to `cp` without an actual Rust build.
+# real to `cp` without an actual Rust build. Guarded so it can only ever
+# write inside $work — a regression that runs it against a real checkout
+# fails loudly instead of clobbering a real binary.
 cat > "$fake_bin/cargo" <<'EOF'
 #!/usr/bin/env bash
+set -u
 echo "cargo $*" >> "$CALL_LOG"
 manifest=""
 prev=""
@@ -66,7 +84,11 @@ for arg in "$@"; do
   fi
   prev="$arg"
 done
-daemon_dir="$(dirname "$manifest")"
+daemon_dir="$(cd "$(dirname "$manifest")" && pwd)"
+if [[ -z "${SANDBOX_ROOT:-}" || "$daemon_dir/" != "$SANDBOX_ROOT"/* ]]; then
+  echo "fake cargo: refusing to write outside the test sandbox: $daemon_dir" >&2
+  exit 1
+fi
 mkdir -p "$daemon_dir/target/release"
 printf '#!/usr/bin/env bash\necho fake-acheron-daemon\n' > "$daemon_dir/target/release/acheron-daemon"
 chmod +x "$daemon_dir/target/release/acheron-daemon"
@@ -100,7 +122,8 @@ EOF
 done
 
 run_install() {
-  HOME="$fake_home" CALL_LOG="$call_log" PATH="$fake_bin:$PATH" bash "$repo_root/install.sh"
+  HOME="$fake_home" CALL_LOG="$call_log" SANDBOX_ROOT="$work" PATH="$fake_bin:$PATH" \
+    bash "$sandbox_repo/install.sh"
 }
 
 run_install
