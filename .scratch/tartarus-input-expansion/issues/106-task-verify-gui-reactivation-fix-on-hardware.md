@@ -1,5 +1,5 @@
 Type: task
-Status: open
+Status: resolved
 Blocked by: 105
 
 ## Question
@@ -37,3 +37,24 @@ Capture the stderr of the primary across a few re-invocations (should be silent)
 Daemon suites green. This closes the ticket 104 finding.
 
 ## Answer
+
+**All checklist items passed live on the real GNOME panel** — ticket 105's fix confirmed,
+the ticket 104 finding closed.
+
+Setup: GUI package synced GUI-only into `~/.local/lib/acheron/` (the `install.sh` lines
+81–88 operation — no sudo, daemon binary untouched), `acheron-daemon` started.
+
+- **Cold start** (`acheron-gui` from a terminal, kept as the primary so its stderr stayed
+  visible): window opened, one tray icon, no traceback.
+- **CLI re-invocation** (`acheron-gui` from a second terminal — the path ticket 104 crashed
+  on): existing window raised/focused, **primary's stderr stayed silent** (no
+  `g-io-error-quark … StatusNotifierItem`), one tray icon, one window.
+- **`gtk-launch acheron.desktop` re-invocation** while running: same, stderr silent.
+- **Re-activation while hidden to tray**: closed to tray, `acheron-gui` again → window came
+  back visible and focused, not raised-while-invisible.
+- **Tray "Show"** while hidden: restored the window (the `_present_window` re-route holds).
+- **GNOME app-grid click**: focuses the running window cleanly, refactor didn't disturb it.
+
+Terminal 1 (the primary) stayed silent across every re-invocation — the bug's observable
+symptom (a traceback per secondary launch) is gone. 336 Python + 369 Rust green. No
+`config.toml` touched. Closes the ticket 105 → 106 build→verify pair.

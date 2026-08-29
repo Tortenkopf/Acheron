@@ -889,6 +889,15 @@ Like the previous map, this one carries execution.
   snapshot and a real second `Gio` activation through GNOME Shell is HITL. Spawned
   [Verify the GUI re-activation fix on hardware](./issues/106-task-verify-gui-reactivation-fix-on-hardware.md).
 
+- [Verify the GUI re-activation fix on hardware](./issues/106-task-verify-gui-reactivation-fix-on-hardware.md)
+  — every checklist item passed live on the user's real GNOME panel. Cold start, `acheron-gui`
+  CLI re-invoke (the path ticket 104 crashed on), `gtk-launch` re-invoke, re-activation while
+  hidden to tray, tray "Show", and the app-grid click all raise/focus the one window with the
+  primary's stderr **silent** throughout — the `g-io-error-quark … StatusNotifierItem`
+  traceback per secondary launch is gone, one tray icon and one window at all times. GUI-only
+  package sync into `~/.local/lib/acheron/` (no daemon rebuild, no sudo). 336 Python + 369
+  Rust green. Closes the ticket 104 finding and the 105→106 pair.
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.
