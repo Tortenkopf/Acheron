@@ -1,4 +1,5 @@
 Type: task
+Status: resolved
 
 ## Question
 
@@ -89,3 +90,129 @@ Also flagged in the same review, lower confidence — fold in if cheap:
   membership are reachable (face or hover). Regression-check a Chord-only member (no
   individual binding) and an individual-binding-only key still read correctly.
 - Full Rust + Python suites green; `config.toml` restored byte-identical.
+
+## Answer
+
+Both defects fixed, GUI-only (no daemon change), tests green throughout. Defect 2
+(the tooltip) is **fully verified in this session** via the screenshot harness
+(ticket 91/95 precedent — drives the real `AcheronApplication` against `DaemonStub`,
+no daemon, no hardware). Defect 1 (the launcher) is verified as far as this machine
+allows: its sys.path sanitization works under the system `python3` (3.14) and the
+packaging suite now executes the installed launcher — but the actual failure mode
+(a `python3` **older than 3.11**) can't be reproduced here (no docker/podman/pyenv/uv,
+and the system `python3` is 3.14), and re-running `install.sh` to check the real
+app-grid `.desktop` launch would rebuild the daemon and restart the user's live
+service. Those two remain, spawned as
+[Verify the ticket-88/90 code-review fixes](./104-task-verify-ticket-88-90-code-review-fixes.md).
+
+### 1. Launcher `python3 -P` → portable sys.path sanitization (ticket 90)
+
+`packaging/acheron-gui` — replaced `exec python3 -P -m acheron_gui "$@"` with:
+
+```bash
+cd "$acheron_lib"
+exec python3 -m acheron_gui "$@"
+```
+
+`python3 -m` prepends the process cwd (`""`) to `sys.path` *ahead of* `PYTHONPATH`, so
+the original reason for `-P` (a checkout's `./acheron_gui` shadowing the installed copy
+when `acheron-gui` is run from inside `gui/`) is handled by `cd`ing into the installed
+package dir first — then the implicit `""` entry resolves to `$acheron_lib`, which
+holds the installed package, and nothing a checkout provides is on the path at all.
+No version-specific interpreter flags remain, so Ubuntu 22.04 (3.10), Debian 11 (3.9)
+and RHEL/Alma/Rocky 9 (3.9) are unblocked.
+
+Verified live on this machine (system `python3` is 3.14): built a throwaway installed
+layout, `cd`'d into a fake checkout's `gui/` containing a decoy `acheron_gui/__init__.py`
+that `raise SystemExit`s if imported, ran the real `packaging/acheron-gui --version` from
+there → printed `acheron-gui 1.0.0` (the *installed* package), decoy never touched.
+
+**`packaging/test_install.sh`** — the finding was that it only diffed the launcher's
+text, never ran it. Added:
+- a regression guard that the installed launcher contains no `python3 -P` and still
+  `cd`s into `$acheron_lib`;
+- a real smoke step that **executes** the installed launcher under the system `python3`
+  (`acheron-gui --version` and `--help`, asserting exit 0 + output shape) — a launcher
+  that can't start Python now fails the packaging suite.
+
+**`gui/acheron_gui/app.py`** — `main()` grew a tiny pre-`Gtk.Application` arg surface
+(`--version` / `-V`, `--help` / `-h`) so that smoke step has something to run that needs
+no display and acquires no bus name. `--version` prints `acheron-gui <__version__>`
+(reuses ticket 99's `__version__`); anything else launches the GUI exactly as before
+(`app.run([sys.argv[0]])` still drops argv, unchanged). This is the "or equivalent" the
+ticket's own verification line allowed for `acheron-gui --help`.
+
+No Python floor was hard-stated in code or a `main.py` version gate — the launcher no
+longer needs one, and stating a supported-`python3` range is left to
+[ticket 35](./35-task-write-release-documentation.md)'s install docs (a forward note is
+already there). `install.sh` unchanged (it already `install -m 755`s the launcher).
+
+### 2. Chord-member tooltip loses the individual binding (ticket 88)
+
+`gui/acheron_gui/device_overview.py`, `make_input_button` — the old override chain
+(`full text` → `insensitive_reason` → `chord_tooltip`, last wins) meant a grid key that
+is **both** a Chord member **and** individually bound showed only the Chord's
+membership+action on hover, and (post-ticket-88) its own summary was ellipsized on the
+face — so the individual binding was readable nowhere. Rewritten to stack rather than
+override:
+
+- disabled key (`not sensitive` + reason) → still just the reason, nothing else is
+  actionable;
+- Chord member **with** its own Binding → `"{full_text}\n\n{chord_tooltip}"` — face text
+  first, Chord membership below;
+- Chord-only member (no individual Binding) → `chord_tooltip` alone, unchanged from
+  before;
+- otherwise → `full_text`, unchanged.
+
+The lower-confidence `chars = 8 if w <= 100 else 14` item: added the requested comment
+explaining the two width buckets (100px buttons → 8, key 20's 150px paddle → 14) and
+that they're ticket 88's eyeball-tuned values against the real Yaru font, not derived
+from `w`/metrics — a wider button added later needs its own bucket. Not deriving from
+font metrics: out of proportion to the payoff for a fixed 2-width layout, and ticket 88
+already rejected the floaty-width approach for a real GTK warning.
+
+New regression test `test_chord_member_with_its_own_binding_shows_both_in_the_tooltip`
+in `test_device_overview.py`: a key that is in a `{1,2}` Chord *and* bound to
+`Ctrl+Shift+Alt+F9 [1x]` → tooltip `"1  Ctrl+Shift+Alt+F9  [1x]\n\nPart of Chord:\n1 + 2 → C  [1x]"`;
+the Chord-only sibling key still reads `"Part of Chord:\n1 + 2 → C  [1x]"`.
+
+**Live-verified via the screenshot harness.** New
+`gui/tools/shot_device_overview.py` (sibling of `shot_library.py` /
+`shot_binding_editor.py`) seeds grid key 1 as both a `{1,2}`-Chord member and a
+`Ctrl+Shift+Alt+F9 [1x]` individual Keypress, key 3 as an individual-only binding,
+renders the real Device Overview against `DaemonStub`, screenshots it, and dumps
+every grid button's `get_tooltip_text()`. Assets in
+[`assets/96-tooltip-shot/`](../assets/96-tooltip-shot/) — `tooltips.txt`:
+
+| key | tooltip |
+|---|---|
+| 1 (Chord + own binding) | `1  Ctrl+Shift+Alt+F9  [1x]` ⏎⏎ `Part of Chord:` ⏎ `1 + 2 → C  [1x]` |
+| 2 (Chord-only) | `Part of Chord:` ⏎ `1 + 2 → C  [1x]` |
+| 3 (individual-only) | `3  Super+K  [hold]` |
+| Mode (insensitive) | `Layer-shift Mode key: switch it to Bound above …` |
+
+`device_overview.png` shows the grid rendering cleanly with the fix in place (no
+crash, the Chords panel reads `1 + 2 → C  [1x]`). Note: in the harness's default
+Adwaita theme key 1's face wraps rather than ellipsizes, so the "readable nowhere"
+symptom is font/theme-dependent — but the tooltip **content loss** the finding
+describes was unconditional (the old override dropped the individual summary for
+*every* Chord-member-with-a-binding regardless of theme), and that is what's fixed.
+
+### Suites
+
+- **Python (GUI)**: `332 passed` (was 331; +1 new test). `.venv/bin/pytest`.
+- **Rust (daemon)**: `369 passed` — unchanged, no daemon code touched, run as a baseline.
+- **`packaging/test_install.sh`**: green, including the two new launcher checks.
+- New file `gui/tools/shot_device_overview.py` (screenshot harness, not test-run in CI —
+  matches `shot_library.py`/`shot_binding_editor.py`).
+- `config.toml` never touched this session (no daemon run, no GUI run).
+
+### For ticket 104 (what this session couldn't reach)
+
+- The launcher run under a real `python3` **≤ 3.10** (a container) — the exact
+  regression the `-P` removal targets, unreproducible on this box.
+- `install.sh` re-run + the real app-grid `.desktop` click on this machine (ticket 90's
+  `gtk-launch acheron.desktop` check), since only the launcher's internals changed and
+  the `.desktop` file itself is untouched.
+
+The tooltip fix needs no further verification — done above.

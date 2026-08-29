@@ -1,0 +1,56 @@
+Default / base / 1
+    tooltip: '1  Ctrl+Shift+Alt+F9  [1x]\n\nPart of Chord:\n1 + 2 → C  [1x]'
+Default / base / 10
+    tooltip: '10  R'
+Default / base / 11
+    tooltip: '11  Caps Lock'
+Default / base / 12
+    tooltip: '12  A'
+Default / base / 13
+    tooltip: '13  S'
+Default / base / 14
+    tooltip: '14  D'
+Default / base / 15
+    tooltip: '15  F'
+Default / base / 16
+    tooltip: '16  Shift'
+Default / base / 17
+    tooltip: '17  Z'
+Default / base / 18
+    tooltip: '18  X'
+Default / base / 19
+    tooltip: '19  C'
+Default / base / 2
+    tooltip: 'Part of Chord:\n1 + 2 → C  [1x]'
+Default / base / 20
+    tooltip: '20  Space'
+Default / base / 3
+    tooltip: '3  Super+K  [hold]'
+Default / base / 4
+    tooltip: '4  4'
+Default / base / 5
+    tooltip: '5  5'
+Default / base / 6
+    tooltip: '6  Tab'
+Default / base / 7
+    tooltip: '7  Q'
+Default / base / 8
+    tooltip: '8  W'
+Default / base / 9
+    tooltip: '9  E'
+Default / base / Mode
+    tooltip: 'Layer-shift Mode key: switch it to Bound above to give it its own Binding'
+Default / base / Wheel •
+    tooltip: 'Wheel •  Middle Click'
+Default / base / Wheel ▲
+    tooltip: 'Wheel ▲  Scroll'
+Default / base / Wheel ▼
+    tooltip: 'Wheel ▼  Scroll'
+Default / base / ←
+    tooltip: '←  ←'
+Default / base / ↑
+    tooltip: '↑  ↑'
+Default / base / →
+    tooltip: '→  →'
+Default / base / ↓
+    tooltip: '↓  ↓'

@@ -162,6 +162,28 @@ launcher="$fake_home/.local/bin/acheron-gui"
 diff -q "$repo_root/packaging/acheron-gui" "$launcher" >/dev/null \
   || fail "installed launcher content differs from packaging/acheron-gui"
 
+# Ticket 96: the launcher must not use `python3 -P` — that flag is CPython
+# 3.11+ only and aborts with "Unknown option: -P" on the 3.9/3.10 that the
+# common LTS targets ship, so the GUI never opens. It sanitizes sys.path by
+# cd'ing into the installed package dir instead.
+grep -qE '(^|[[:space:]])python3[[:space:]]+-P' "$launcher" \
+  && fail "launcher uses 'python3 -P' — 3.11+ only, breaks on Ubuntu 22.04 / Debian 11 / RHEL 9"
+grep -qxF 'cd "$acheron_lib"' "$launcher" \
+  || fail "launcher no longer cd's into \$acheron_lib to sanitize sys.path"
+echo "PASS: launcher avoids the 3.11-only python3 -P flag"
+
+# Smoke check: actually *run* the installed launcher under the system
+# python3 (the finding: nothing here ever executed it, only diffed its
+# text). `--version` is handled before Gtk.Application, so it needs no
+# display and no bus name — a launcher that can't start Python fails here.
+launcher_out="$(HOME="$fake_home" "$launcher" --version)" \
+  || fail "installed launcher exited non-zero on 'acheron-gui --version'"
+[[ "$launcher_out" == acheron-gui\ * ]] \
+  || fail "launcher --version printed unexpected output: $launcher_out"
+HOME="$fake_home" "$launcher" --help >/dev/null \
+  || fail "installed launcher exited non-zero on 'acheron-gui --help'"
+echo "PASS: installed launcher runs under the system python3 (--version / --help)"
+
 desktop="$fake_home/.local/share/applications/acheron.desktop"
 [[ -f "$desktop" ]] || fail "desktop entry not installed to ~/.local/share/applications/acheron.desktop"
 diff -q "$repo_root/packaging/acheron.desktop" "$desktop" >/dev/null \

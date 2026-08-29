@@ -21,7 +21,15 @@ if [[ ! -d "$acheron_lib/acheron_gui" ]]; then
 fi
 
 export PYTHONPATH="$acheron_lib${PYTHONPATH:+:$PYTHONPATH}"
-# -P keeps the current directory off sys.path, so `acheron-gui` run from
-# inside a git checkout's gui/ dir still imports the *installed* package,
-# not ./acheron_gui.
-exec python3 -P -m acheron_gui "$@"
+# Run from the installed package dir. `python3 -m` prepends the current
+# directory ("") to sys.path ahead of PYTHONPATH, so launching from inside
+# a git checkout's gui/ dir would otherwise import ./acheron_gui instead of
+# the installed copy. cd'ing into $acheron_lib makes that implicit ""
+# entry resolve to the installed package too, so nothing can shadow it.
+#
+# This replaces the old `python3 -P` (ticket 90), whose -P flag exists only
+# on CPython 3.11+: on an older system python3 it aborts with
+# "Unknown option: -P" (exit 2) and the GUI never opens — Ubuntu 22.04 LTS
+# ships 3.10, Debian 11 and RHEL/Alma/Rocky 9 ship 3.9 (ticket 96).
+cd "$acheron_lib"
+exec python3 -m acheron_gui "$@"

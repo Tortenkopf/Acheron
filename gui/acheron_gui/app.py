@@ -456,7 +456,28 @@ class AcheronApplication(Gtk.Application):
         win.present()
 
 
+_USAGE = (
+    "Usage: acheron-gui [--version] [--help]\n"
+    "\n"
+    "Launches the Acheron GTK GUI, which talks to acheron-daemon over D-Bus.\n"
+    "There are no options that change how it runs."
+)
+
+
 def main() -> None:
+    # A tiny arg surface, deliberately handled before Gtk.Application so it
+    # works with no display and without acquiring the bus name — this is what
+    # `packaging/test_install.sh` runs as its launcher smoke check (ticket
+    # 96), so a launcher that can't even start Python fails CI.
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    if arg in ("--version", "-V"):
+        from acheron_gui import __version__
+
+        print(f"acheron-gui {__version__}")
+        return
+    if arg in ("--help", "-h"):
+        print(_USAGE)
+        return
     app = AcheronApplication()
     app.run([sys.argv[0]])
 

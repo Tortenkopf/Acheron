@@ -382,6 +382,12 @@ def make_input_button(
     # font/theme), so ordinary content sometimes ellipsizes too — every
     # button always carries a full-text tooltip regardless (below), cheaper
     # than tracking per-button truncation state.
+    # Two buckets keyed off the button's own width: 8 chars for the 100px
+    # buttons (the grid, wheel, thumbstick lobes, Mode key), 14 for key 20's
+    # 150px paddle — the only wider footprint. Not derived from `w` or font
+    # metrics: these are the snug values tuned by eye in ticket 88 against the
+    # real Yaru theme font, where the label still fills the button without
+    # forcing it to grow. A wider button added later needs its own bucket.
     chars = 8 if w <= 100 else 14
     # `width_chars == max_width_chars` pins the label's requested width to a
     # fixed value instead of letting it float between a tiny wrap-minimum and
@@ -425,13 +431,24 @@ def make_input_button(
     # Ticket 88: every button carries a tooltip with its full untruncated
     # two-line text (label + summary, newline flattened to two spaces), set
     # unconditionally — not gated on whether the label actually ellipsized.
-    # A more specific tooltip (the disabled-Mode-key reason, or Chord
-    # membership) still overrides it when there is one.
-    btn.set_tooltip_text(f"{label_line}  {summary_line}")
+    full_text = f"{label_line}  {summary_line}"
     if not sensitive and insensitive_reason:
+        # A disabled key (only the Mode key, ticket 11) has nothing
+        # actionable to describe — its reason is the whole tooltip.
         btn.set_tooltip_text(insensitive_reason)
+    elif chord_tooltip and binding is not None:
+        # Ticket 96: a grid key can be *both* a Chord member *and* carry its
+        # own individual Binding. The old override showed only `chord_tooltip`
+        # (the Chord's members + action), so once the face ellipsized to ~8
+        # chars this key's own binding summary was readable nowhere. Stack
+        # both — full face text first, Chord membership below.
+        btn.set_tooltip_text(f"{full_text}\n\n{chord_tooltip}")
     elif chord_tooltip:
+        # Chord-only member (no individual Binding): the membership tooltip
+        # says everything, same as before ticket 96.
         btn.set_tooltip_text(chord_tooltip)
+    else:
+        btn.set_tooltip_text(full_text)
 
     # Ticket 44 (live-verified on real hardware): a real top-level Gtk.Window
     # instead of a Gtk.Popover anchored to `btn`. The Binding editor's

@@ -195,6 +195,30 @@ def test_device_button_summary_line_is_markup_escaped():
     assert btn.get_tooltip_text() == "1  → A & <b>B</b>"
 
 
+def test_chord_member_with_its_own_binding_shows_both_in_the_tooltip():
+    # Ticket 96: a grid key that is both a Chord member *and* carries its own
+    # individual Binding used to get only the Chord membership tooltip — its
+    # own binding summary appeared nowhere once the face ellipsized.
+    stub = DaemonStub()
+    stub.set_chord_binding(
+        ["grid_r1c1", "grid_r1c2"], "base", {"trigger": "fire_once", "type": "keypress", "key": "KEY_C"}
+    )
+    stub.set_binding(
+        "grid_r1c1",
+        "base",
+        {"trigger": "fire_once", "type": "keypress", "key": "KEY_F9", "modifiers": ["ctrl", "shift", "alt"]},
+    )
+    root = _build(stub, {})
+
+    btn = _grid_button(root, "1")
+    assert btn.get_tooltip_text() == "1  Ctrl+Shift+Alt+F9  [1x]\n\nPart of Chord:\n1 + 2 → C  [1x]"
+
+    # A Chord-only member (no individual Binding) is unchanged — just the
+    # membership tooltip.
+    other = _grid_button(root, "2")
+    assert other.get_tooltip_text() == "Part of Chord:\n1 + 2 → C  [1x]"
+
+
 def test_grid_destination_shows_the_real_chords_section_with_a_selecting_toggle():
     stub = DaemonStub()
 
