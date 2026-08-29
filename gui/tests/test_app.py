@@ -1,7 +1,9 @@
 from gi.repository import GLib
 
 from acheron_gui.app import (
+    _activate_window,
     _ensure_daemon_started_on_launch,
+    _present_window,
     _wire_focus_tracking,
     _wire_status_tracking,
     _wire_window_close_to_hide,
@@ -300,3 +302,78 @@ def test_close_request_handler_returns_true_to_stop_the_default_close():
     results = window.simulate_close_request()
 
     assert results == [True]
+
+
+class _FakePresentableWindow:
+    """Stands in for the main `Gtk.ApplicationWindow` on the presentation
+    side — a headless test has no window manager to map or raise a real
+    one. Mirrors `_FakeFocusWindow`/`_FakeCloseableWindow` above; driving
+    the real `do_activate` would additionally need a registered
+    `Gtk.Application` and a live session bus for the tray."""
+
+    def __init__(self, visible: bool = True):
+        self.visible = visible
+        self.present_calls = 0
+
+    def set_visible(self, visible: bool) -> None:
+        self.visible = visible
+
+    def present(self) -> None:
+        self.present_calls += 1
+
+
+def test_present_window_shows_a_tray_hidden_window_before_presenting_it():
+    # `_wire_window_close_to_hide` hides rather than destroys the window, so
+    # re-surfacing it has to make it visible again, not just present() an
+    # invisible window.
+    win = _FakePresentableWindow(visible=False)
+
+    _present_window(win)
+
+    assert win.visible is True
+    assert win.present_calls == 1
+
+
+def test_first_activation_builds_the_window_and_presents_it():
+    win = _FakePresentableWindow()
+    builds = []
+
+    result = _activate_window(None, lambda: builds.append(None) or win, _present_window)
+
+    assert builds == [None]
+    assert result is win
+    assert win.present_calls == 1
+
+
+def test_second_activation_reuses_the_window_without_rebuilding():
+    # Ticket 105: `Gio.Application` re-emits `activate` when a second
+    # `acheron-gui` / `gtk-launch acheron.desktop` hands off to the running
+    # primary. The one-time setup (window, tray icon, CSS, D-Bus
+    # subscriptions) must not run again — re-running it rebuilt the tray's
+    # SNI object and crashed on the already-exported path, aborting before
+    # the real window was raised and leaking a zombie second window.
+    win = _FakePresentableWindow()
+    builds = []
+
+    def build():
+        builds.append(None)
+        return win
+
+    first = _activate_window(None, build, _present_window)
+    second = _activate_window(first, build, _present_window)
+
+    assert builds == [None]  # built once, not once per activation
+    assert second is win
+    assert win.present_calls == 2  # but re-presented every time
+
+
+def test_reactivation_reshows_the_window_when_it_was_hidden_to_the_tray():
+    win = _FakePresentableWindow(visible=False)
+
+    def build():
+        raise AssertionError("must not rebuild on a later activation")
+
+    _activate_window(win, build, _present_window)
+
+    assert win.visible is True
+    assert win.present_calls == 1

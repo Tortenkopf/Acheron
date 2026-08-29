@@ -874,6 +874,21 @@ Like the previous map, this one carries execution.
   latent because the GNOME app-grid *click* is shell-serviced and never calls D-Bus
   `activate`. Spawned [Fix the GUI re-activation crash](./issues/105-task-fix-gui-reactivation-crash.md).
 
+- [Fix the GUI re-activation crash](./issues/105-task-fix-gui-reactivation-crash.md) — the
+  whole build moved out of `do_activate` (which `Gio` re-emits on every secondary launch)
+  into a one-time `AcheronApplication._build_main_window()`, gated by a `self._main_window`
+  create-once guard in a new `_activate_window()` helper; `do_activate` now only re-presents
+  that one window, via `_present_window()` which shows it first (the ticket's "re-show when
+  hidden-to-tray" decision). Chose the instance-attr guard over `get_active_window()` because
+  a tray-hidden window isn't reliably "active". Side effects fixed for free: duplicate CSS
+  provider + duplicate D-Bus subscriptions on re-activation. Tray "Show" now routes through
+  `_present_window` too; `AcheronApplication.__init__` gained an injectable `tray_bus=None`
+  so the seam is headless-testable. 4 new `test_app.py` tests against the seam (suite's
+  established pattern — the live `do_activate` needs a registered app + session bus + mapped
+  window); 336 Python green. **Live GNOME check deferred** — installed launcher is a pre-fix
+  snapshot and a real second `Gio` activation through GNOME Shell is HITL. Spawned
+  [Verify the GUI re-activation fix on hardware](./issues/106-task-verify-gui-reactivation-fix-on-hardware.md).
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.

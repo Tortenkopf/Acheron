@@ -51,12 +51,22 @@ is harmless.
 
 Ticket 21: `_ensure_daemon_started_on_launch` is the GUI's half of the
 login-autostart-plus-safety-net design (spec.md "Packaging and lifecycle") —
-called once, synchronously, right at the start of `do_activate`, before the
-status/focus wiring above even subscribes. `systemd --user`'s own
+called once, synchronously, at the start of the one-time `_build_main_window`
+(ticket 105 moved the whole build out of `do_activate`, which `Gio` re-emits
+on every secondary launch), before the status/focus wiring even subscribes. `systemd --user`'s own
 `WantedBy=default.target` is the primary autostart trigger; this call only
 exists to recover a Daemon that's crashed into `failed` (systemd's own
 `StartLimitBurst` guard latches it there, per install.sh's unit) or that
 somehow isn't running yet, without the user ever touching a terminal.
+
+Ticket 105: `Gio.Application` emits `activate` on *every* invocation, not
+just the first — a second `acheron-gui` process, or `gtk-launch
+acheron.desktop`, hands the running primary an `activate` (only a GNOME
+app-grid *click* is shell-serviced and skips D-Bus entirely). So the whole
+build lives in `_build_main_window`, run once via the `self._main_window`
+guard in `_activate_window`; `do_activate` itself now only re-presents that
+one window — shown first, since `_wire_window_close_to_hide` may have
+hidden it to the tray.
 """
 
 from __future__ import annotations
@@ -320,17 +330,71 @@ def _ensure_daemon_started_on_launch(systemd_client: SystemdClient) -> None:
         print(f"acheron-gui: could not ensure the Daemon is started: {err}", file=sys.stderr)
 
 
+def _present_window(win) -> None:
+    """Re-surface the main window. It may be hidden to the tray rather than
+    destroyed (`_wire_window_close_to_hide` keeps it added to the app but
+    invisible), so it's explicitly shown before being presented — not just
+    `present()`'d, which is what ticket 90's launcher check expected on a
+    second launch and ticket 105 found it wasn't getting.
+
+    `win` is duck-typed (`set_visible()` + `present()`) so tests can drive
+    it with a plain fake, same reasoning as `_wire_focus_tracking`'s own
+    `window` parameter.
+    """
+    win.set_visible(True)
+    win.present()
+
+
+def _activate_window(existing, build, present):
+    """`Gio.Application` emits `activate` on *every* invocation — the first
+    launch, but also a second `acheron-gui` process or `gtk-launch
+    acheron.desktop` handing off to the already-running primary (ticket
+    105). Only the first activation builds anything: `build()` creates the
+    window and, on the way, the tray icon, CSS provider, D-Bus
+    subscriptions and daemon-start safety net — all genuinely
+    once-per-process (re-running it re-exported the tray's SNI object and
+    raised `g-io-error-quark`, aborting before the window was ever raised
+    and leaking a zombie second `ApplicationWindow`). Every later
+    activation just re-surfaces the window that already exists.
+
+    Split out as a plain function, tested with fakes, for the same reason
+    `_wire_focus_tracking` and friends are: driving the real `do_activate`
+    would need a registered `Gtk.Application`, a live session bus for the
+    tray, and a mapped top-level window — none of which a headless test
+    has.
+    """
+    win = existing if existing is not None else build()
+    present(win)
+    return win
+
+
 class AcheronApplication(Gtk.Application):
     def __init__(
         self,
         client: DaemonClient | None = None,
         systemd_client: SystemdClient | None = None,
+        tray_bus=None,
     ):
         super().__init__(application_id="com.acheron.gui")
         self._client = client or DBusDaemonClient()
         self._systemd_client = systemd_client or DBusSystemdClient()
+        # Injectable session bus for the tray icon (mirrors `client`/
+        # `systemd_client` above) — only set by tests, which must never
+        # register a throwaway SNI on the developer's real panel.
+        self._tray_bus = tray_bus
+        # The one main window, created lazily on the first `do_activate`
+        # and reused by every later one (ticket 105).
+        self._main_window = None
 
     def do_activate(self):
+        self._main_window = _activate_window(
+            self._main_window, self._build_main_window, _present_window
+        )
+
+    def _build_main_window(self):
+        """The one-time setup: window, tray icon, CSS, D-Bus subscriptions
+        and the daemon-start safety net. Run exactly once per process — see
+        `_activate_window`."""
         _ensure_daemon_started_on_launch(self._systemd_client)
 
         provider = Gtk.CssProvider()
@@ -354,7 +418,13 @@ class AcheronApplication(Gtk.Application):
         # `do_activate` (nothing else keeps it referenced otherwise); kept
         # in sync by `rebuild()`'s own `update()` call below rather than any
         # D-Bus subscriptions of its own, per ticket 36's design.
-        self._tray_icon = TrayIcon(self._client, self._systemd_client, win.present, self.quit)
+        self._tray_icon = TrayIcon(
+            self._client,
+            self._systemd_client,
+            lambda: _present_window(win),
+            self.quit,
+            bus=self._tray_bus,
+        )
 
         content_box = Gtk.Box()
         # GUI-only view state (not Daemon state) that must survive a
@@ -453,7 +523,7 @@ class AcheronApplication(Gtk.Application):
 
         rebuild()
         win.set_child(content_box)
-        win.present()
+        return win
 
 
 _USAGE = (

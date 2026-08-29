@@ -1,5 +1,5 @@
 Type: task
-Status: open
+Status: resolved
 
 ## Question
 
@@ -57,3 +57,63 @@ CLI / `gtk-launch` re-invocation, which is exactly what ticket 90's own
 
 - The tray icon's own design / menu behaviour (tickets 36, 98) — untouched.
 - The launcher and `.desktop` file (tickets 90, 96, 104) — verified good.
+
+## Answer
+
+Fixed with a create-once guard, not `do_startup`. `Gio.Application` re-emits
+`activate` on every secondary launch, so the entire build was moved out of
+`do_activate` into a new one-time `AcheronApplication._build_main_window()`;
+`do_activate` now only calls a dispatch helper.
+
+**`gui/acheron_gui/app.py`:**
+
+- **`_activate_window(existing, build, present)`** (module function) — `win =
+  existing if existing is not None else build(); present(win); return win`.
+  `do_activate` is now just
+  `self._main_window = _activate_window(self._main_window, self._build_main_window, _present_window)`.
+  The `self._main_window` instance attr (init `None`) is the guard — chosen
+  over `get_active_window()` because a window hidden to the tray
+  (`_wire_window_close_to_hide`) isn't reliably "active", which would let a
+  second activation build a second window anyway.
+- **`_present_window(win)`** (module function) — `win.set_visible(True);
+  win.present()`. The explicit show is the ticket's "re-show it when
+  hidden-to-tray" decision: re-activation while the window is tray-hidden
+  makes it visible again, not just raised-while-invisible.
+- **`_build_main_window(self)`** — the old `do_activate` body verbatim
+  (CSS provider, `Gtk.ApplicationWindow`, `TrayIcon`, all D-Bus
+  subscriptions, `_ensure_daemon_started_on_launch`, the idle-drain, first
+  `rebuild()`), ending `return win` instead of `win.present()`. Now runs
+  exactly once per process, so the duplicate CSS-provider registration and
+  duplicate subscriptions on re-activation are gone too, not just the SNI
+  crash.
+- `TrayIcon(...)` construction: `on_show_window` callback changed from
+  `win.present` to `lambda: _present_window(win)` so the tray "Show" item
+  also un-hides a tray-hidden window through the one helper. `__init__`
+  gained an injectable `tray_bus=None` (mirrors `client`/`systemd_client`)
+  so a test can hand `TrayIcon` a fake bus — the tray's real
+  `SessionMessageBus` was the main thing blocking a headless `do_activate`
+  test.
+- Module + `_ensure_daemon_started_on_launch` docstrings updated for the
+  `do_activate` → `_build_main_window` move.
+
+**`gui/tests/test_app.py`:** four new tests against the seam (the suite's
+established pattern — every `_wire_*` helper is tested this way, never the
+live `do_activate`, which needs a registered `Gtk.Application` + live
+session bus + a mapped top-level):
+
+- `test_present_window_shows_a_tray_hidden_window_before_presenting_it`
+- `test_first_activation_builds_the_window_and_presents_it`
+- `test_second_activation_reuses_the_window_without_rebuilding` — the core
+  regression: `build()` runs once across two activations, `present()` runs
+  twice.
+- `test_reactivation_reshows_the_window_when_it_was_hidden_to_the_tray`
+
+336 Python tests green (was 332). Daemon suite untouched.
+
+**Live GNOME check not done this session** — the installed
+`~/.local/bin/acheron-gui` is a pre-fix snapshot (needs `install.sh` re-run)
+and exercising a real second `Gio` activation through GNOME Shell is
+inherently HITL. Spawned
+[Verify the GUI re-activation fix on hardware](./106-task-verify-gui-reactivation-fix-on-hardware.md)
+(blocked on this ticket) for the cold-start / `acheron-gui` re-invoke /
+`gtk-launch` re-invoke / hidden-to-tray checklist on the user's panel.
