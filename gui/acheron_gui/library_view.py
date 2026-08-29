@@ -74,7 +74,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from gi.repository import Gtk
+from gi.repository import Gtk, Pango
 
 from .binding_editor import describe_step, labeled_row
 from .daemon_client import DaemonError
@@ -83,6 +83,29 @@ from .inputs import ALL_INPUTS, input_label
 from .key_picker import LABEL_BY_CODE, build_inline_key_picker
 
 _UNASSIGNED_LABEL = "— Unassigned —"
+
+# Ticket 91: the Macro and Stepper editors are built to identical
+# measurements so nothing visibly shifts when the user flips between the two
+# library tabs. `build_macro_editor_columns` / `build_stepper_editor_columns`
+# are structured in lockstep:
+#
+#   column 2 : name heading + vexpanding list scroller          (`_build_editor_col2`)
+#   column 3 : error label + "+ Add …" button                  (pinned, shared)
+#              + editor-specific middle (Stepper: the Forward/Backward
+#                assignment row; Macro: `_header_middle_reserve()`, an inert
+#                copy of that same widget stack so it occupies the identical
+#                height on any theme) + a separator
+#              + `_vscrollable` body: "Changes save automatically." hint,
+#                then exactly one `labeled_row` (Macro: the step-kind
+#                dropdown; Stepper: `labeled_row("Modifiers", …)`), then the
+#                "Key"/"Delay (ms)" picker row — so the picker lands at the
+#                same y on both tabs.
+#
+# No hardcoded pixel constants: every "reserve the same space" is done by
+# building the same widget stack rather than a magic height (a shared
+# `Gtk.SizeGroup` can't span the two, since only one editor is realized at a
+# time).
+_EDITOR_COL_SPACING = 6
 
 
 def build_library_tabs(selected_tab: str, on_select: Callable[[str], None]) -> Gtk.Box:
@@ -245,6 +268,55 @@ def build_macros_browse_list(client, config: dict, ui_state: dict, on_change: Ca
     return box
 
 
+def _build_editor_col2(name: str, list_scroller: Gtk.Widget) -> Gtk.Box:
+    """Column 2, built identically for both editors (ticket 91): the selected
+    entry's name heading above its vexpanding steps/items list scroller. The
+    heading ellipsizes rather than growing the column to fit a long
+    Macro/Stepper name — otherwise the column-2/column-3 split would depend
+    on the name and shift when flipping tabs."""
+    col2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_EDITOR_COL_SPACING)
+    heading = Gtk.Label(label=name, xalign=0, css_classes=["heading"])
+    heading.set_ellipsize(Pango.EllipsizeMode.END)
+    col2.append(heading)
+    col2.append(list_scroller)
+    return col2
+
+
+def _vexpanding_list_scroller(rows: Gtk.Widget) -> Gtk.ScrolledWindow:
+    """The steps/items list container — same treatment for both editors
+    (ticket 70 follow-up, kept identical by ticket 91): fills column 2's full
+    height and scrolls past it, never an `hscrollbar`."""
+    scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+    scroller.set_vexpand(True)
+    scroller.set_child(rows)
+    return scroller
+
+
+def _dropdown_row_height() -> int:
+    """The rendered height of a `labeled_row` wrapping a `Gtk.DropDown` on
+    the current theme, measured from a throwaway probe rather than
+    hardcoded (ticket 91). Both editors' single "row before the picker" is
+    sized to this — the Macro editor's step-kind selector already is one —
+    and the Macro editor reserves two of them (plus one inter-row gap) to
+    match the Stepper editor's Forward/Backward assignment row."""
+    probe = labeled_row("", Gtk.DropDown(model=Gtk.StringList.new([""])))
+    _minimum, natural, _bl, _nbl = probe.measure(Gtk.Orientation.VERTICAL, -1)
+    return natural
+
+
+def _header_middle_reserve() -> Gtk.Widget:
+    """The Macro editor's stand-in for the Stepper editor's Forward/Backward
+    assignment row (ticket 91 #1): a blank box sized to that row's rendered
+    height (`build_stepper_assignment_row` is a `_EDITOR_COL_SPACING` VBox
+    of two dropdown `labeled_row`s), so the separator, the middle
+    `labeled_row`, and the whole scrollable body land at the same y as
+    their Stepper counterparts. Sized from `_dropdown_row_height()`, not a
+    hardcoded pixel reserve."""
+    spacer = Gtk.Box()
+    spacer.set_size_request(-1, 2 * _dropdown_row_height() + _EDITOR_COL_SPACING)
+    return spacer
+
+
 def build_macro_editor_columns(
     client, config: dict, macro_id: str, on_change: Callable[[], None]
 ) -> tuple[Gtk.Widget, Gtk.Widget]:
@@ -260,9 +332,6 @@ def build_macro_editor_columns(
     macro = config["macros"][macro_id]
     steps = macro["steps"]
 
-    col2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-    col2.append(Gtk.Label(label=macro["name"], xalign=0, css_classes=["heading"]))
-
     # col3 is an unscrolled outer container: the error label and
     # "+ Add step" (appended below) stay pinned at the top, with the hint
     # and the kind selector/key-value picker inside a `_vscrollable` body
@@ -270,14 +339,15 @@ def build_macro_editor_columns(
     # expandable content can grow tall enough to scroll everything below
     # it out of view — the error label, the button, and (Stepper's own)
     # toast message are exactly what the user asked to stay visible
-    # regardless of scroll position).
-    col3 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    # regardless of scroll position). Structured in lockstep with
+    # `build_stepper_editor_columns` (ticket 91) — see `_HEADER_MIDDLE_H`.
+    col3 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_EDITOR_COL_SPACING)
 
     error_label = Gtk.Label(xalign=0, wrap=True, css_classes=["error"])
     error_label.set_visible(False)
     col3.append(error_label)
 
-    body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_EDITOR_COL_SPACING)
     body.append(
         Gtk.Label(
             label="Changes save automatically.",
@@ -339,14 +409,10 @@ def build_macro_editor_columns(
 
         steps_list.append(row_box)
 
-    steps_scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
-    # Ticket 70 follow-up, same fix/reasoning as the browse list (see
-    # build_macros_browse_list) — column 2 now has the same full column
-    # height column 1's old list used to occupy, so the old 240px cap left
-    # dead space beneath a short step list.
-    steps_scroller.set_vexpand(True)
-    steps_scroller.set_child(steps_list)
-    col2.append(steps_scroller)
+    # Ticket 70 follow-up (kept in lockstep by ticket 91's `_build_editor_col2`
+    # / `_vexpanding_list_scroller`): column 2 fills the full column height
+    # column 1's old list used to occupy, so a short list leaves no dead space.
+    col2 = _build_editor_col2(macro["name"], _vexpanding_list_scroller(steps_list))
 
     # "+ Add step" is appended straight into col3 (not body), pinning it
     # above the scrolled area entirely rather than merely above add_box
@@ -372,8 +438,18 @@ def build_macro_editor_columns(
     add_btn.connect("clicked", on_add)
     col3.append(add_btn)
 
-    add_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    # Ticket 91 #1: the Stepper editor's column 3 carries a Forward/Backward
+    # assignment row + separator here; the Macro editor reserves the same
+    # vertical space (blank) + its own separator, so the scrollable body
+    # below starts at the same y on both tabs.
+    col3.append(_header_middle_reserve())
+    col3.append(Gtk.Separator())
+
+    add_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_EDITOR_COL_SPACING)
     step_kind_dd = Gtk.DropDown(model=Gtk.StringList.new(["KeyDown", "KeyUp", "Delay (ms)"]))
+    # One ~one-row control between the hint and the picker row, matching the
+    # Stepper editor's modifier-checkbox row (ticket 91) so the picker lands
+    # at the same y.
     add_box.append(labeled_row("New step", step_kind_dd))
 
     value_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -384,7 +460,9 @@ def build_macro_editor_columns(
         if step_kind_dd.get_selected() == 2:
             ms_entry = Gtk.Entry(text=new_step_value["ms_text"], width_chars=10)
             ms_entry.connect("changed", lambda e: new_step_value.__setitem__("ms_text", e.get_text()))
-            value_slot.append(labeled_row("Value", ms_entry))
+            # Ticket 91 #2: this field genuinely isn't a key (the step-kind
+            # dropdown selects KeyDown / KeyUp / Delay).
+            value_slot.append(labeled_row("Delay (ms)", ms_entry))
         else:
             def on_value_key_changed(code: str) -> None:
                 new_step_value["key"] = code
@@ -395,7 +473,9 @@ def build_macro_editor_columns(
             value_picker, _refresh = build_inline_key_picker(
                 new_step_value["key"], on_value_key_changed, warn_predicate=lambda: False
             )
-            value_slot.append(labeled_row("Value", value_picker))
+            # Ticket 91 #2: "Key", matching the grid-view key-picker's own
+            # label and the Stepper item editor's.
+            value_slot.append(labeled_row("Key", value_picker))
 
     step_kind_dd.connect("notify::selected", lambda *_: render_value_slot())
     render_value_slot()
@@ -666,16 +746,14 @@ def build_stepper_editor_columns(
     stepper = config["steppers"][stepper_id]
     items = stepper["items"]
 
-    col2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-    col2.append(Gtk.Label(label=stepper["name"], xalign=0, css_classes=["heading"]))
-
     # col3 is an unscrolled outer container: the toast/error-label/
     # "+ Add item"/assignment-row header (appended below) stays pinned at
     # the top, with the hint and the "New item" key picker inside a
     # `_vscrollable` body beneath it. The buttons, the error label, and the
     # toast are exactly what the user asked to stay visible regardless of
-    # scroll position (ticket 70 follow-up, live-verified).
-    col3 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    # scroll position (ticket 70 follow-up, live-verified). Structured in
+    # lockstep with `build_macro_editor_columns` (ticket 91).
+    col3 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_EDITOR_COL_SPACING)
 
     toast = ui_state.pop("stepper_toast", None)
     if toast is not None:
@@ -685,7 +763,7 @@ def build_stepper_editor_columns(
     error_label.set_visible(False)
     col3.append(error_label)
 
-    body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_EDITOR_COL_SPACING)
     body.append(
         Gtk.Label(
             label="Changes save automatically.",
@@ -750,12 +828,9 @@ def build_stepper_editor_columns(
 
         items_list.append(row_box)
 
-    items_scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
-    # See build_macro_editor_columns's matching comment — same fix, same
-    # reasoning, for the Stepper item list.
-    items_scroller.set_vexpand(True)
-    items_scroller.set_child(items_list)
-    col2.append(items_scroller)
+    # Same `_build_editor_col2` / `_vexpanding_list_scroller` as the Macro
+    # editor (ticket 70 follow-up, kept in lockstep by ticket 91).
+    col2 = _build_editor_col2(stepper["name"], _vexpanding_list_scroller(items_list))
 
     # "+ Add item" and the Forward/Backward assignment row are appended
     # straight into col3 (not body), pinning them above the scrolled area
@@ -782,6 +857,9 @@ def build_stepper_editor_columns(
     add_btn.connect("clicked", on_add)
     col3.append(add_btn)
 
+    # Ticket 91 #1: the Forward/Backward assignment row + separator here is
+    # what the Macro editor reserves `_HEADER_MIDDLE_H` of blank space for,
+    # so both editors' scrollable bodies start at the same y.
     col3.append(
         build_stepper_assignment_row(client, config, profile, layer, stepper_id, ui_state, on_change, show_error)
     )
@@ -791,29 +869,31 @@ def build_stepper_editor_columns(
     # exactly one wire variant (`Key`), and `key_picker`'s inline picker
     # already covers both keyboard keys and mouse buttons in one widget, so
     # there is nothing left for a dropdown to choose between.
-    add_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    add_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_EDITOR_COL_SPACING)
 
     def on_value_key_changed(code: str) -> None:
         new_item_value["key"] = code
-
-    # Suppressed for a different reason than the Macro editor's own
-    # KeyDown-only step above: there the warning's suggested workaround
-    # (Toggle + a KeyDown-only Macro step) *is* what a KeyDown-only step
-    # already is. Here it's simply unreachable — a Stepper item always
-    # compiles to a bare KeyDown/KeyUp pair (ticket 03/54's firing
-    # semantics) and Toggle is disallowed outright for a Stepper Binding —
-    # so showing the warning would point the user at a workflow this
-    # construct structurally cannot support.
-    value_picker, _refresh = build_inline_key_picker(
-        new_item_value["key"], on_value_key_changed, warn_predicate=lambda: False
-    )
-    add_box.append(labeled_row("New item", value_picker))
 
     # The same Ctrl/Shift/Alt/Super checkbox block `binding_editor.py`
     # renders for Keypress (ticket 62's Answer) — a Stepper item's modifier
     # combination compiles through the same canned mods-down/key/mods-up
     # sequence as Keypress (ticket 63).
+    #
+    # Ticket 91 #3: rendered *above* the "Key" picker row rather than below
+    # it. The picker owns a tall on-screen keyboard grid that otherwise
+    # pushed these checkboxes past the default window height (the user had
+    # to scroll "a tiny bit" to see them); above the grid they're always
+    # visible on first glance. Wrapped in a `labeled_row` (below) so it's
+    # structurally the same one-row control as the Macro editor's step-kind
+    # `labeled_row`, keeping the "Key" picker row at the same y on both tabs
+    # without a hardcoded row height.
     mod_box = Gtk.Box(spacing=8)
+    mod_box.set_valign(Gtk.Align.CENTER)
+    # Floor this row at a real dropdown row's height so the "Key" picker row
+    # lands at the same y as it does on the Macro tab, whose step-kind
+    # `labeled_row` is exactly that shape (ticket 91). Measured, not
+    # hardcoded — see `_dropdown_row_height`.
+    mod_box.set_size_request(-1, _dropdown_row_height())
     for m in ("ctrl", "shift", "alt", "super"):
         cb = Gtk.CheckButton(label=m)
         cb.set_active(m in new_item_value["modifiers"])
@@ -828,7 +908,22 @@ def build_stepper_editor_columns(
 
         cb.connect("toggled", on_mod)
         mod_box.append(cb)
-    add_box.append(mod_box)
+    add_box.append(labeled_row("Modifiers", mod_box))
+
+    # Suppressed for a different reason than the Macro editor's own
+    # KeyDown-only step above: there the warning's suggested workaround
+    # (Toggle + a KeyDown-only Macro step) *is* what a KeyDown-only step
+    # already is. Here it's simply unreachable — a Stepper item always
+    # compiles to a bare KeyDown/KeyUp pair (ticket 03/54's firing
+    # semantics) and Toggle is disallowed outright for a Stepper Binding —
+    # so showing the warning would point the user at a workflow this
+    # construct structurally cannot support.
+    value_picker, _refresh = build_inline_key_picker(
+        new_item_value["key"], on_value_key_changed, warn_predicate=lambda: False
+    )
+    # Ticket 91 #2: "Key", matching the grid-view key-picker's own label and
+    # the Macro step editor's KeyDown/KeyUp value row.
+    add_box.append(labeled_row("Key", value_picker))
 
     body.append(add_box)
     col3.append(_vscrollable(body))
@@ -894,38 +989,39 @@ def build_library_content(
     if selected_tab == "steppers":
         selected_stepper_id = _selected_stepper_id(config, ui_state)
         if selected_stepper_id is None:
-            root.append(
-                Gtk.Label(
-                    label="No Steppers yet — use “+ New” to create one.",
-                    xalign=0,
-                    wrap=True,
-                    css_classes=["dim"],
-                )
-            )
+            root.append(_empty_library_label("No Steppers yet — use “+ New” to create one."))
         else:
-            col2, col3 = build_stepper_editor_columns(
-                client, config, profile, layer, selected_stepper_id, ui_state, on_change
+            _mount_editor_columns(
+                root,
+                *build_stepper_editor_columns(
+                    client, config, profile, layer, selected_stepper_id, ui_state, on_change
+                ),
             )
-            col2.set_hexpand(True)
-            col3.set_hexpand(True)
-            root.append(col2)
-            root.append(col3)
     else:
         selected_macro_id = _selected_macro_id(config, ui_state)
         if selected_macro_id is None:
-            root.append(
-                Gtk.Label(
-                    label="No Macros yet — use “+ New” to create one.",
-                    xalign=0,
-                    wrap=True,
-                    css_classes=["dim"],
-                )
-            )
+            root.append(_empty_library_label("No Macros yet — use “+ New” to create one."))
         else:
-            col2, col3 = build_macro_editor_columns(client, config, selected_macro_id, on_change)
-            col2.set_hexpand(True)
-            col3.set_hexpand(True)
-            root.append(col2)
-            root.append(col3)
+            _mount_editor_columns(
+                root, *build_macro_editor_columns(client, config, selected_macro_id, on_change)
+            )
 
     return root
+
+
+def _empty_library_label(text: str) -> Gtk.Widget:
+    return Gtk.Label(label=text, xalign=0, wrap=True, css_classes=["dim"])
+
+
+def _mount_editor_columns(root: Gtk.Box, col2: Gtk.Widget, col3: Gtk.Widget) -> None:
+    """Places the two editor columns identically for both tabs (ticket 91).
+    Column 3 holds its natural width — which is the same on both tabs, since
+    both editors' column 3 is built in lockstep and its width is driven by
+    the shared inline key picker — so it never shifts when flipping tabs.
+    Column 2 (the name + list, whose own natural width *does* vary with the
+    step/item text) expands into whatever is left, absorbing that variation
+    instead of passing it on as a visible jump."""
+    col2.set_hexpand(True)
+    col3.set_hexpand(False)
+    root.append(col2)
+    root.append(col3)

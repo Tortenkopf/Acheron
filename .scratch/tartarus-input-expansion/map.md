@@ -612,6 +612,37 @@ Like the previous map, this one carries execution.
   [ticket 95](./issues/95-task-verify-keybinding-dialog-polish-on-hardware.md) — Daemon was
   stopped and no screenshot tooling here, per the 42→44 / 48→49 / 85→86 precedent.
 
+- [Homogenize the Stepper and Macro library editors](./issues/91-task-homogenize-stepper-macro-library-editors.md)
+  — GUI-only (`library_view.py`), built and live-verified against the running GUI this
+  session (self-screenshot harness, see below — the "no screenshot tooling here" claims on
+  tickets 61/89→95 etc. were mistaken). The two editor-column builders are now structured
+  in lockstep via shared helpers (`_build_editor_col2`, `_vexpanding_list_scroller`,
+  `_header_middle_reserve`, `_mount_editor_columns`) and **no hardcoded pixel dimensions** —
+  cross-tab alignment is done by building the same widget stack or by measuring a real
+  dropdown row's height on the running theme (`_dropdown_row_height()`). Flipping
+  Steppers↔Macros: the name heading, "+ Add step"/"+ Add item", the "Changes save
+  automatically" hint, and the key-picker summary + keyboard grid are now pixel-aligned
+  (measured y=37/42/164/228 on both), and column 3 (the editor + picker) holds the same
+  natural width and left edge on both tabs (`hexpand=False`, column 2 absorbs the
+  step/item-text width variation). The Macro editor reserves blank space matching the
+  Stepper editor's Forward/Backward assignment row + separator. **Q6 relabels**: Stepper
+  item "New item"→"Key", Macro step key branch "Value"→"Key", Macro delay branch
+  "Value"→"Delay (ms)". **#9**: the Stepper Ctrl/Shift/Alt/Super checkboxes moved above the
+  key picker (as `labeled_row("Modifiers", …)`) so they're visible at the default 1400×860
+  window without scrolling — `app.py`'s window size untouched. `/code-review` flagged the
+  first pass's magic pixel constants as theme-fragile; fixed by the measured-height
+  approach above. 300 Python tests green (+5), no Rust changes. New reusable screenshot
+  harness `gui/tools/shot_library.py` (drives the real app against `DaemonStub`,
+  self-screenshots via the toplevel's GSK renderer — no external tool/portal). Two findings
+  handed forward: (a) ticket 92/93's key↔controller switcher should go in the same
+  single-`labeled_row` slot as the step-kind dropdown / modifier row and be added to *both*
+  editors to keep the lockstep; (b) `gtk_utils.build_pinned_sidebar_box`'s 220px is a floor
+  not a clamp — a long Macro/Stepper name in the column-1 browse list can widen column 1
+  by ~30px (≈2px with realistic names), shifting column 2 with it, though column 3 is
+  pinned regardless; a real clamp needs a GTK-version floor or a test-breaking row-button
+  rework, so left as a possible small follow-up (also affects the Grid↔Library Profile
+  sidebar, ticket 69/70's turf).
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.

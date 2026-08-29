@@ -215,7 +215,7 @@ def test_adding_a_step_calls_set_macro_steps_and_appends():
     root = _build(stub, {})
     dd = find_one(root, lambda w: isinstance(w, Gtk.DropDown))
     dd.set_selected(2)  # "Delay (ms)"
-    ms_entry = find_one(_row_labeled(root, "Value"), lambda w: isinstance(w, Gtk.Entry))
+    ms_entry = find_one(_row_labeled(root, "Delay (ms)"), lambda w: isinstance(w, Gtk.Entry))
     ms_entry.set_text("40")
     button_labeled(root, "+ Add step").emit("clicked")
 
@@ -410,7 +410,7 @@ def test_adding_an_item_calls_set_stepper_items_and_appends():
     stepper_id = stub.create_stepper("Weapon Wheel", [])
 
     root = _build_steppers(stub)
-    picker_row = _row_labeled(root, "New item")
+    picker_row = _row_labeled(root, "Key")
     button_labeled(picker_row, "F1").emit("clicked")
     button_labeled(root, "+ Add item").emit("clicked")
 
@@ -420,7 +420,7 @@ def test_adding_an_item_calls_set_stepper_items_and_appends():
 
 
 def test_adding_an_item_with_a_modifier_checked_round_trips_through_on_add_and_the_list_row():
-    # Ticket 62/63: the "New item" row gains the same Ctrl/Shift/Alt/Super
+    # Ticket 62/63: the "Key" row gains the same Ctrl/Shift/Alt/Super
     # mod_box binding_editor.py renders for Keypress — checking one must
     # reach on_add's persisted item and then describe_stepper_item's label
     # on the next render.
@@ -428,7 +428,7 @@ def test_adding_an_item_with_a_modifier_checked_round_trips_through_on_add_and_t
     stepper_id = stub.create_stepper("Weapon Wheel", [])
 
     root = _build_steppers(stub)
-    picker_row = _row_labeled(root, "New item")
+    picker_row = _row_labeled(root, "Key")
     button_labeled(picker_row, "F1").emit("clicked")
     find_one(root, lambda w: isinstance(w, Gtk.CheckButton) and w.get_label() == "ctrl").set_active(True)
     button_labeled(root, "+ Add item").emit("clicked")
@@ -461,7 +461,7 @@ def test_picking_a_bare_modifier_for_a_new_item_shows_no_modifier_warning():
     stub.create_stepper("Weapon Wheel", [])
 
     root = _build_steppers(stub)
-    picker_row = _row_labeled(root, "New item")
+    picker_row = _row_labeled(root, "Key")
     # "Ctrl" appears twice in the grid (Left/Right) — click whichever comes
     # first, same approach test_binding_editor.py's own `_pick_first_modifier`
     # uses for the identical ambiguity.
@@ -667,4 +667,72 @@ def test_unassigning_an_input_clears_the_binding():
     forward_dd.set_selected(0)  # "— Unassigned —"
 
     assert ("clear_binding", "wheel_scroll_up", "base") in stub.calls
+
+
+# --- Ticket 91: the Stepper and Macro library editors are built to
+# identical measurements, and their key fields all read "Key" ---
+
+
+def test_macro_keydown_step_value_row_is_labeled_key():
+    stub = DaemonStub()
+    stub.create_macro("M", [])
+
+    root = _build(stub, {})  # macros tab, default step kind is KeyDown
+
+    assert _row_labeled(root, "Key") is not None
+    assert find_all(root, lambda w: isinstance(w, Gtk.Box) and _row_label_text(w) == "Value") == []
+
+
+def test_macro_delay_step_value_row_is_labeled_delay_ms():
+    stub = DaemonStub()
+    stub.create_macro("M", [])
+
+    root = _build(stub, {})
+    find_one(root, lambda w: isinstance(w, Gtk.DropDown)).set_selected(2)  # Delay
+
+    assert _row_labeled(root, "Delay (ms)") is not None
+    assert find_all(root, lambda w: isinstance(w, Gtk.Box) and _row_label_text(w) == "Value") == []
+
+
+def test_stepper_item_picker_row_is_labeled_key():
+    stub = DaemonStub()
+    stub.create_stepper("Weapon Wheel", [])
+
+    root = _build_steppers(stub)
+
+    assert _row_labeled(root, "Key") is not None
+    assert find_all(root, lambda w: isinstance(w, Gtk.Box) and _row_label_text(w) == "New item") == []
+
+
+def test_stepper_modifier_checkboxes_render_above_the_key_picker_row():
+    # Ticket 91 #3: the key picker owns a tall on-screen grid that used to
+    # push the modifier checkboxes past the default window height — they now
+    # sit directly above the "Key" row.
+    stub = DaemonStub()
+    stub.create_stepper("Weapon Wheel", [])
+
+    root = _build_steppers(stub)
+    key_row = _row_labeled(root, "Key")
+    add_box = key_row.get_parent()
+
+    first_child = add_box.get_first_child()
+    assert first_child is not key_row
+    assert find_one(
+        first_child, lambda w: isinstance(w, Gtk.CheckButton) and w.get_label() == "ctrl"
+    ) is not None
+
+
+def test_editor_columns_mount_with_col3_at_its_natural_width_on_both_tabs():
+    # Column 3 (the add-controls + picker) holds the same natural width on
+    # both tabs; column 2 (name + list) absorbs the slack, so nothing shifts
+    # horizontally when flipping tabs.
+    stub = DaemonStub()
+    stub.create_macro("M", [{"type": "key_down", "key": "KEY_A"}])
+    stub.create_stepper("S", [{"type": "key", "key": "KEY_A"}])
+
+    for tab in ("macros", "steppers"):
+        content = build_library_content(stub, stub.get_config(), _PROFILE, _LAYER, {"library_tab": tab}, lambda: None)
+        col2, col3 = content.get_first_child(), content.get_first_child().get_next_sibling()
+        assert col2.get_hexpand() is True
+        assert col3.get_hexpand() is False
     assert "wheel_scroll_up" not in stub.get_config()["profiles"]["Default"]["base"]
