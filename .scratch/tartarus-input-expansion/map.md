@@ -761,6 +761,32 @@ Like the previous map, this one carries execution.
   `MnM`. **This resolves the last ticket in the `/wayfinder` GUI-polish cluster (89–94)** and
   completes the controller-button-in-library strand (92 → 93 → 94).
 
+- [Verify the Keybinding-dialog polish on hardware](./issues/95-task-verify-keybinding-dialog-polish-on-hardware.md)
+  — ticket 89's four cleanups all hardware-verified against the byte-identical-to-HEAD daily-driver
+  daemon + real Tartarus Pro (Analog mode). Screenshots + dropdown-model dumps confirm the Action
+  menu (`Keypress · Controller Button · Axis · Macro · Stepper · Switch Profile`, "Switch Profile"
+  label) and Trigger menu (`Hold-to-repeat · Toggle · Fire-once · Analog-repeat`) orders, with
+  Axis/Analog-repeat gone for non-grid Inputs & Chords, Switch Profile also gone for Chords,
+  Fire-once gone for Controller Button; the button reads **"Clear Binding"**; F13–F24 renders
+  inline with no toggle ("Show Numpad" kept). Picker fits: the per-key modal window is 599×1015 on
+  a 1920×1080 screen with the whole picker above Save/Clear and only the internally-capped
+  Actuation section below; the library-editor mounts were already covered by ticket 91's
+  screenshots (89 landed before 91). Real round-trips with the user pressing physical keys: a fresh
+  grid-key binding persists `hold_to_repeat` and re-fires at the ~33 ms kernel-autorepeat cadence
+  while held; a fresh `wheel_scroll_up` persists `fire_once` and fires once per detent (no
+  machine-gun); a fresh Controller Button persists `hold_to_repeat` and sustains BTN_SOUTH on the
+  gamepad node only; a fresh Switch Profile persists locked `fire_once` and switches on a tap.
+  Serde default confirmed live: deleting the `trigger` line from a binding and restarting the
+  daemon starts clean (no "missing field" error), parses as Hold-to-repeat, and behaves as such on
+  the device; bindings that spell `trigger` out are unaffected. Existing bindings still preselect
+  their saved Trigger/Action after the reorder (5 cases). 365 Rust / 317 Python green, fmt/clippy
+  clean; no daemon or GUI change needed. `config.toml` restored byte-identical (`sha256
+  78b16096…`), daemon back on `Default`. New reusable harness `gui/tools/shot_binding_editor.py`
+  (NON_UNIQUE app id — solves ticket 94's flagged blocker for 95+). **Closes the `/wayfinder`
+  GUI-polish cluster (89–95).** Still open from ticket 89: the Daemon's own "Profile Switch"
+  rejection strings (`dispatch.rs` ×3 + stub) — a small optional term sweep, deliberately out of
+  both 89's and 95's scope.
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.
