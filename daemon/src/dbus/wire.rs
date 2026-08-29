@@ -662,7 +662,7 @@ mod tests {
         let dict = stepper_item_to_dict(&item);
         assert_eq!(dict_get_string(&dict, "type"), "controller_button");
         assert_eq!(dict_get_string(&dict, "button"), "BTN_SOUTH");
-        assert!(dict.get("modifiers").is_none());
+        assert!(!dict.contains_key("modifiers"));
 
         let round_tripped = stepper_item_from_dict(&dict).unwrap();
         assert_eq!(round_tripped, item);

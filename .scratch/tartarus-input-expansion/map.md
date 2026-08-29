@@ -737,6 +737,30 @@ Like the previous map, this one carries execution.
   up front — new installed path for ticket 35's docs/uninstall list. GUI suite 317 green,
   `test_install.sh` green. Not hardware-verified (no runtime behaviour change).
 
+- [Verify the library controller-button picker on hardware](./issues/94-task-verify-library-controller-button-picker-on-hardware.md)
+  — every checklist item live-verified against the real Tartarus Pro + daily-driver daemon +
+  the "Acheron Virtual Controller" (`event27`/`js0`); ticket 93's build needed **no** daemon
+  or GUI behaviour change. Drove Stepper/Macro/Binding creation over D-Bus in a throwaway
+  `Wf94` profile while the user pressed physical grid keys and `evtest` captured both the
+  virtual gamepad and virtual keyboard nodes. Confirmed: the switcher row stays y-lockstep
+  across all four editor/mode states with the gamepad diagram unclipped (Stepper Modifiers
+  row hidden in controller mode); a Stepper stepping a `[BTN_SOUTH, BTN_EAST, KEY_A]` mix
+  fires each item on the correct node with the 35 ms `CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD`
+  dwell on gamepad items only and **zero cross-node leakage**, forward/backward/wrap all
+  correct; a route-(c) gamepad `KeyDown`/`KeyUp` macro step fires correctly and an
+  *unbalanced* one is force-released the instant the physical key is released (ticket 33 path
+  covers gamepad codes); a mixed keyboard+controller+delay macro fires all parts in order on
+  the right nodes; allowlist rejection works at both the D-Bus path (`"KEY_A" is not a valid
+  gamepad button`) and config parse (`refusing to start …`), while macro steps stay
+  deliberately unguarded per 92 §1; `Btn: A / South` / `↓ Btn: X / West` labels render on the
+  real library rows; and the grid-view `Action::ControllerButton` (ticket 43) still works
+  after 93's shared-helper refactor. Suites: **365 Rust / 317 Python green**, `fmt` clean.
+  Fixed one `unnecessary_get_then_check` clippy warning that ticket 93's own diff introduced
+  in a `wire.rs` test assertion (default-warn on toolchain 1.97.1; 93 had claimed
+  clippy-clean). `config.toml` restored byte-identical (`sha256 f0c66d3d…`); daemon back on
+  `MnM`. **This resolves the last ticket in the `/wayfinder` GUI-polish cluster (89–94)** and
+  completes the controller-button-in-library strand (92 → 93 → 94).
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.
