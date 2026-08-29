@@ -102,4 +102,15 @@ re-run, but not gated on it.
   resolves outside the tree; first `_sync_bundled_icons` writes all three, second call
   rewrites nothing (mtimes unchanged).
 
+### Follow-up (post-resolve)
+
+Running `packaging/test_install.sh` from the checkout to verify the new tray-icon
+assertion exposed a **pre-existing** footgun: the test's fake `cargo` wrote its stub
+binary into the real `daemon/target/release/`, and because cargo's fingerprints stayed
+fresh, a subsequent real `install.sh` copied that stub into `~/.local/bin/acheron-daemon`
+(daemon "started" then exited 0 printing `fake-acheron-daemon`). Fixed in a separate
+commit: `test_install.sh` now runs `install.sh` from a throwaway repo copy under `$work`,
+and the fake cargo refuses to write outside `$SANDBOX_ROOT`. Real binary rebuilt and
+reinstalled; daemon confirmed active and answering D-Bus.
+
 Status: resolved
