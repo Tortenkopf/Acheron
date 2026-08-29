@@ -36,6 +36,14 @@ Like the previous map, this one carries execution.
 
 **Settled during the analog charting pass, not to be re-litigated in a ticket**: the digital (evdev) capture path **survives** as an automatic *degradation path*, never as a user preference — the Daemon attempts driver mode and silently falls back to evdev capture if the udev rule is missing, the `hidraw` open fails, or the unlock is rejected, reporting which mode it landed in. Separately there is an explicit user-facing **override that forces digital**, for debugging GUI behavior and as a safety valve for future users; the user never selects "analog" as a normal path, they only ever switch it off. The Daemon also re-locks the device to mode `0x00` on clean shutdown. Rationale: driver mode silences the grid keys' ordinary keycodes on every node, so an analog-only design hands anyone whose udev step failed a keypad whose 20 grid keys do nothing — and a dead Daemon currently still leaves a working keypad, a property worth not losing. [Ticket 16](./issues/16-task-analog-mode-hardware-facts.md) has since bounded the damage: only the grid is silenced, so the stranded state is a crippled keypad rather than a dead one, and an unclean death does leave the user in it.
 
+**About-dialog cluster charted 2026-08-29** (tickets 99–103, a required-floor release item — an "About Acheron" screen with the program blurb, versions, the connected device's firmware/serial, acknowledgements, and the GPLv3 legal notice). Settled in the charting grilling, not to be re-litigated per ticket:
+- **Independent per-component SemVer** — Daemon version in `daemon/Cargo.toml`, GUI version in a new `gui/acheron_gui/__init__.py` `__version__`, both `1.0.0` at release but free to diverge (they install as separate units with D-Bus between them). The Daemon reports its version as a new `GetState()` key; the dialog shows the GUI version prominently and the Daemon's as a detail line. Dev-checkout builds show `1.0.0-dev+<short-hash>`. (Ticket 99.)
+- **Firmware + serial** are read by the Daemon once at device-connect over the Interface-2 control channel it already opens for the analog unlock (Razer standard report, `command_id 0x81`/`0x82`), cached, and surfaced as two *optional* `GetState()` keys — absent when disconnected/failed, mirroring `device_connected`. No dedicated D-Bus method. (Ticket 100 research → ticket 101 build.)
+- **Entry point**: a new `Gtk.HeaderBar` titlebar on the main window with a right-aligned primary menu button (`Gio.Menu`, one item "About Acheron"), the intended home for future global actions.
+- **Dialog implementation**: hand-built plain `Gtk.Window`, modal, `transient-for` the main window. **libadwaita was explicitly ruled out** — `Adw.AboutDialog` needs libadwaita initialised, which applies the Adwaita stylesheet app-wide and would silently restyle the whole hardware-verified GUI; not worth it for one dialog. Revisit adopting libadwaita later as a deliberate, separately-verified change if ever wanted.
+- **GPL notice**: GPLv3 §5(d) "Appropriate Legal Notices" — copyright line + no-warranty + redistribution-under-GPLv3 statement + a "View Licence" button showing the bundled full `LICENSE` text + a gnu.org link. `Copyright © 2026 Justin Milatz` (releasing under the GPL does not waive copyright — the notice is required). Per-file GPL headers stay with [ticket 35](./issues/35-task-write-release-documentation.md).
+- Placeholder rows (email / website / repo) are shown with visible "TBD" text, not omitted. The Acheron-river blurb is reproduced verbatim including its `...` ellipses, with a Wikipedia link since it's a quote.
+
 **Standing discipline — keep the door open for other Tartarus variants**: this map's destination stays scoped to the Tartarus Pro only (no other hardware to test against), but avoid casually adding new hardcoded Tartarus-Pro-only assumptions while building the remaining features where a small amount of care would keep the door open for someone else to fork/adapt for other Tartarus variants later (V1/Chroma). Mirrors the previous map's "keep the capture layer swappable" discipline for analog input — a light habit to hold, not a reason to build or audit anything now. No ticket exists for this and none is expected before v1.0.
 
 ## Decisions so far
@@ -801,6 +809,23 @@ Like the previous map, this one carries execution.
   bookkeeping survives a rebuild. Structural changes (Profile add/remove) still ride the
   rebuild + `LayoutUpdated`. 325 GUI tests green (+8 new); user live-verified both
   symptoms fixed on the real GNOME panel.
+
+- [Confirm the Tartarus Pro firmware/serial read protocol](./issues/100-research-firmware-serial-read-protocol.md)
+  — implementation-ready, see [the write-up](./research/tartarus-pro-device-info-protocol.md).
+  Both reads reuse `analog.rs::build_razer_cmd` unchanged on the Interface-2 `hidraw` node:
+  firmware = `command_class 0x00`/`command_id 0x81`/`data_size 0x02` (CRC `0x83`), serial =
+  `0x00`/`0x82`/`0x16` (CRC `0x94`). New for Acheron is the readback — `HIDIOCGFEATURE(91) =
+  0xC05B4807` with `buf[0]=0x00`; the kernel's report-number-0 offset means the 90-byte
+  response lands at `buf[1..91]`, args from `buf[9]` (symmetric with the SET buffer). Render
+  firmware `v{buf[9]}.{buf[10]}` (→ `v1.2`), serial ASCII `buf[9..31]` NUL-trimmed (→
+  `PM2443F36300141`). `transaction_id`: primary **`0xFF`** (OpenRazer hardcodes it for these
+  two reads with no per-device switch, and it already reads our unit's real serial/firmware
+  via sysfs), fallback `0x1F`; ticket 101 must confirm on hardware since the `HIDIOCGFEATURE`
+  path itself has never run against this device. Safest ordering: read once at device-connect
+  on a short-lived Interface-2 fd (the `relock()` pattern), before any analog unlock, on a
+  path that runs regardless of capture mode. Reset risk negligible — these are reads,
+  PR #2710's concern is `set_device_mode` only, and OpenRazer reads the serial on every
+  connect for every Razer keyboard. Unblocks [ticket 101](./issues/101-task-daemon-device-firmware-serial.md).
 
 ## Not yet specified
 
