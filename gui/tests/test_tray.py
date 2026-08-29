@@ -286,6 +286,65 @@ def test_update_bumps_the_menu_revision_and_signals_layout_updated():
     assert received == [(1, 0), (2, 0)]
 
 
+def _unwrap(props):
+    return {name: value.unpack() for name, value in props.items()}
+
+
+def test_update_emits_items_properties_updated_for_a_changed_label():
+    tray, bus, _show, _quit = _make_tray()
+    menu = bus.published[MENU_OBJECT_PATH]
+    received = []
+    menu.ItemsPropertiesUpdated.connect(
+        lambda changed, removed: received.append((changed, removed))
+    )
+
+    config = {"profiles": {"Default": {}}}
+    tray.update(config, "Default", "running_connected")
+    # First build populates every item fresh — nothing to patch yet.
+    assert received == []
+
+    tray.update(config, "Default", "not_running")
+
+    assert len(received) == 1
+    changed, removed = received[0]
+    assert removed == []
+    patched = {item_id: _unwrap(props) for item_id, props in changed}
+    # The Pause/Resume row flipped its label; the status line changed too.
+    assert "Resume Daemon" in [p["label"] for p in patched.values()]
+
+
+def test_update_emits_items_properties_updated_for_the_active_profile_greying():
+    stub = DaemonStub()
+    stub.create_profile("Gaming")
+    tray, bus, _show, _quit = _make_tray(client=stub)
+    menu = bus.published[MENU_OBJECT_PATH]
+    received = []
+    menu.ItemsPropertiesUpdated.connect(
+        lambda changed, removed: received.append((changed, removed))
+    )
+
+    tray.update(stub.get_config(), "Default", "running_connected")
+    tray.update(stub.get_config(), "Gaming", "running_connected")
+
+    changed, _removed = received[-1]
+    patched = {_unwrap(props)["label"]: _unwrap(props) for _id, props in changed}
+    assert patched["Default"]["enabled"] is True
+    assert patched["Gaming"]["enabled"] is False
+
+
+def test_update_does_not_emit_items_properties_updated_when_nothing_changed():
+    tray, bus, _show, _quit = _make_tray()
+    menu = bus.published[MENU_OBJECT_PATH]
+    received = []
+    menu.ItemsPropertiesUpdated.connect(lambda *a: received.append(a))
+
+    config = {"profiles": {"Default": {}}}
+    tray.update(config, "Default", "running_connected")
+    tray.update(config, "Default", "running_connected")
+
+    assert received == []
+
+
 def test_update_emits_new_icon_new_title_and_new_status():
     tray, bus, _show, _quit = _make_tray()
     item = bus.published[ITEM_OBJECT_PATH]

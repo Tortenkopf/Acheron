@@ -787,6 +787,21 @@ Like the previous map, this one carries execution.
   rejection strings (`dispatch.rs` ×3 + stub) — a small optional term sweep, deliberately out of
   both 89's and 95's scope.
 
+- [Fix the tray menu going stale after a rebuild](./issues/98-task-fix-tray-menu-stale-after-rebuild.md)
+  — user-reported: the tray menu's active-Profile greying and its Pause/Resume Daemon
+  label both froze at whatever was true when the GUI launched. Ticket 36's "full
+  rebuild + `LayoutUpdated`, never per-item property patches" convention doesn't match
+  GNOME's `ubuntu-appindicators` host, whose `dbusMenu.js` re-reads only
+  `type`/`children-display` off a post-`LayoutUpdated` `GetLayout` and fetches full
+  properties for *new* item ids only — a known item's changed `label`/`enabled` reaches
+  it via `ItemsPropertiesUpdated` or not at all, and `tray.py` never emitted that. Fix:
+  `MenuModel.rebuild()` now returns the `(changed, removed)` property delta and
+  `TrayIcon.update()` emits `ItemsPropertiesUpdated` for it after `LayoutUpdated`; menu
+  item ids are now role-assigned (fixed rows 1-5, Profiles 6+) so the host's id-keyed
+  bookkeeping survives a rebuild. Structural changes (Profile add/remove) still ride the
+  rebuild + `LayoutUpdated`. 325 GUI tests green (+8 new); user live-verified both
+  symptoms fixed on the real GNOME panel.
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.

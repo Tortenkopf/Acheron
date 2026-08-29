@@ -139,6 +139,68 @@ def test_rebuild_replaces_items_and_bumps_revision_each_time():
     assert model.revision == 2
 
 
+def test_fixed_rows_keep_stable_ids_regardless_of_profile_count():
+    one, _ = _build(profile="Default", profiles=["Default"])
+    many, _ = _build(profile="Default", profiles=["Default", "Gaming", "Work"])
+
+    def ids_by_label(items):
+        return {
+            items[cid].properties["label"]: cid for cid in items[ROOT_ID].children
+        }
+
+    assert ids_by_label(one) == ids_by_label(many)
+
+
+def test_rebuild_delta_reports_the_pause_resume_label_flip():
+    model = MenuModel()
+    model.rebuild(_build(daemon_running=True)[0])
+
+    changed, removed = model.rebuild(_build(daemon_running=False)[0])
+
+    assert removed == []
+    assert dict(changed)  # id -> new props
+    pause_id = _child(model.items, ROOT_ID, "Resume Daemon")
+    assert (pause_id, {"label": "Resume Daemon"}) in changed
+
+
+def test_rebuild_delta_reports_the_active_profile_greying_on_a_switch():
+    model = MenuModel()
+    model.rebuild(_build(profile="Default", profiles=["Default", "Gaming"])[0])
+
+    changed, _removed = model.rebuild(
+        _build(profile="Gaming", profiles=["Default", "Gaming"])[0]
+    )
+
+    switch_id = _child(model.items, ROOT_ID, "Switch Profile")
+    default_id = _child(model.items, switch_id, "Default")
+    gaming_id = _child(model.items, switch_id, "Gaming")
+    delta = dict(changed)
+    assert delta[default_id]["enabled"] is True
+    assert delta[gaming_id]["enabled"] is False
+
+
+def test_rebuild_delta_is_empty_when_nothing_changed():
+    model = MenuModel()
+    model.rebuild(_build()[0])
+
+    changed, removed = model.rebuild(_build()[0])
+
+    assert (changed, removed) == ([], [])
+
+
+def test_rebuild_delta_omits_a_newly_added_profile():
+    model = MenuModel()
+    model.rebuild(_build(profile="Default", profiles=["Default"])[0])
+
+    changed, removed = model.rebuild(
+        _build(profile="Default", profiles=["Default", "Gaming"])[0]
+    )
+
+    # The new "Gaming" entry is a fresh id — the host fetches its properties
+    # itself off the LayoutUpdated re-scan, so it must not be in the delta.
+    assert (changed, removed) == ([], [])
+
+
 def test_get_layout_unlimited_depth_returns_the_whole_tree():
     model = MenuModel()
     items, _ = _build(profile="Default", profiles=["Default", "Gaming"])

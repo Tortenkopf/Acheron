@@ -6,11 +6,22 @@ split `wire.py` draws between "what the wire needs" and "what the GUI edits").
 Ticket 36: on any relevant change (Profile created/renamed/deleted, Daemon
 pause/resume, status transition) the whole item tree is rebuilt from scratch
 and `MenuModel.revision` bumped — mirrors this codebase's existing
-full-rebuild convention (`app.py`'s own `rebuild()`) rather than incremental
-per-item `ItemsPropertiesUpdated` patches. Item ids are therefore only
-stable for the lifetime of one tree — freely reassigned on every rebuild —
-since `LayoutUpdated`'s revision bump is what tells the host to re-fetch the
-whole thing rather than trust its old ids.
+full-rebuild convention (`app.py`'s own `rebuild()`).
+
+Ticket 98: the rebuild + `LayoutUpdated` is not enough on its own. GNOME's
+`ubuntu-appindicators` host, after a `LayoutUpdated`, re-reads only `type`
+and `children-display` from `GetLayout` and pulls a full property set for
+*new* item ids only — an already-known item's changed `label`/`enabled`
+(the Pause↔Resume flip, the active-Profile greying) reaches it through an
+`ItemsPropertiesUpdated` signal or not at all. So `rebuild()` also diffs
+the previous tree against the new one and hands `tray.py` the per-item
+property delta to emit. For that diff to line up across rebuilds, item ids
+are assigned by *role*, not allocation order: the five fixed rows (status,
+Show Window, Switch Profile, Pause/Resume, Quit) keep ids 1-5 for the life
+of the process and the Profile entries take 6, 7, 8, … in order — so a
+Profile switch or a Daemon pause leaves every id exactly where the host
+last saw it, and only a genuine Profile add/remove shifts anything (which
+`LayoutUpdated`'s revision bump already covers).
 """
 
 from __future__ import annotations
@@ -27,6 +38,16 @@ ROOT_ID = 0
 # `get_group_properties` fall back to these rather than requiring every
 # item to spell them out.
 _DEFAULT_PROPERTIES = {"visible": True, "enabled": True, "label": ""}
+
+# Role-assigned item ids (ticket 98): the five fixed rows keep these ids for
+# the whole process so the SNI host's id-keyed property bookkeeping survives
+# a rebuild; Profile entries take `FIRST_PROFILE_ID`, +1, +2, … in order.
+STATUS_ID = 1
+SHOW_WINDOW_ID = 2
+SWITCH_PROFILE_ID = 3
+PAUSE_RESUME_ID = 4
+QUIT_ID = 5
+FIRST_PROFILE_ID = 6
 
 
 @dataclass
@@ -56,60 +77,85 @@ def build_menu_items(
     delete button and the old `build_tray_mock`'s quick-switch already used,
     rather than sending a redundant `SwitchProfile` that would force-stop
     every running Toggle for no actual switch (ticket 19).
+
+    Item ids are role-assigned, not allocation-ordered (ticket 98 — see the
+    module docstring): fixed rows hold `STATUS_ID`..`QUIT_ID`, Profile
+    entries `FIRST_PROFILE_ID` upward in `profiles` order.
     """
     items: dict[int, MenuItem] = {}
-    next_id = [1]
-
-    def add(properties: dict, children: list[int] | None = None, on_activate=None) -> int:
-        item_id = next_id[0]
-        next_id[0] += 1
-        items[item_id] = MenuItem(item_id, properties, children or [], on_activate)
-        return item_id
 
     status_label, _colour, _glyph = STATUS_STATES[status]
-    status_id = add({"label": status_label, "enabled": False})
-    show_window_id = add({"label": "Show Window"}, on_activate=on_show_window)
+    items[STATUS_ID] = MenuItem(STATUS_ID, {"label": status_label, "enabled": False})
+    items[SHOW_WINDOW_ID] = MenuItem(
+        SHOW_WINDOW_ID, {"label": "Show Window"}, on_activate=on_show_window
+    )
 
-    profile_ids = [
-        add(
+    profile_ids: list[int] = []
+    for offset, name in enumerate(profiles):
+        profile_id = FIRST_PROFILE_ID + offset
+        profile_ids.append(profile_id)
+        items[profile_id] = MenuItem(
+            profile_id,
             {"label": name, "enabled": name != profile},
             on_activate=lambda name=name: on_switch_profile(name),
         )
-        for name in profiles
-    ]
-    switch_profile_id = add(
-        {"label": "Switch Profile", "children-display": "submenu"}, children=profile_ids
-    )
 
-    pause_resume_id = add(
+    items[SWITCH_PROFILE_ID] = MenuItem(
+        SWITCH_PROFILE_ID,
+        {"label": "Switch Profile", "children-display": "submenu"},
+        children=profile_ids,
+    )
+    items[PAUSE_RESUME_ID] = MenuItem(
+        PAUSE_RESUME_ID,
         {"label": "Pause Daemon" if daemon_running else "Resume Daemon"},
         on_activate=on_toggle_daemon,
     )
-    quit_id = add({"label": "Quit"}, on_activate=on_quit)
+    items[QUIT_ID] = MenuItem(QUIT_ID, {"label": "Quit"}, on_activate=on_quit)
 
     items[ROOT_ID] = MenuItem(
         ROOT_ID,
         {},
-        [status_id, show_window_id, switch_profile_id, pause_resume_id, quit_id],
+        [STATUS_ID, SHOW_WINDOW_ID, SWITCH_PROFILE_ID, PAUSE_RESUME_ID, QUIT_ID],
     )
     return items
 
 
 class MenuModel:
     """Holds the current item tree plus a monotonic revision counter
-    (`LayoutUpdated`'s own argument) — bumped on every `rebuild()`, never
-    patched incrementally (see module docstring). Starts as an empty root
-    with no children, since the real tree only exists once `TrayIcon`'s
-    first `update()` call rebuilds it (mirrors `app.py`'s own
+    (`LayoutUpdated`'s own argument) — bumped on every `rebuild()`. Starts
+    as an empty root with no children, since the real tree only exists once
+    `TrayIcon`'s first `update()` call rebuilds it (mirrors `app.py`'s own
     `PLACEHOLDER_CONFIG` gap-before-first-fetch pattern)."""
 
     def __init__(self) -> None:
         self.revision = 0
         self.items: dict[int, MenuItem] = {ROOT_ID: MenuItem(ROOT_ID, {}, [])}
 
-    def rebuild(self, items: dict[int, MenuItem]) -> None:
+    def rebuild(
+        self, items: dict[int, MenuItem]
+    ) -> tuple[list[tuple[int, dict]], list[tuple[int, list[str]]]]:
+        """Swaps in a fresh item tree and bumps `revision`. Returns the
+        `ItemsPropertiesUpdated` delta `(changed, removed)` for `tray.py`
+        to emit (ticket 98 — see module docstring): every item id present
+        in *both* the previous and new tree whose properties differ, as
+        `(id, new_properties)` in `changed` plus `(id, [dropped_names])` in
+        `removed`. A genuinely new id is left out — `LayoutUpdated` makes
+        the host fetch that one's properties itself."""
+        previous = self.items
         self.items = items
         self.revision += 1
+
+        changed: list[tuple[int, dict]] = []
+        removed: list[tuple[int, list[str]]] = []
+        for item_id, item in items.items():
+            was = previous.get(item_id)
+            if was is None or was.properties == item.properties:
+                continue
+            changed.append((item_id, dict(item.properties)))
+            dropped = [name for name in was.properties if name not in item.properties]
+            if dropped:
+                removed.append((item_id, dropped))
+        return changed, removed
 
     def get_layout(self, parent_id: int, recursion_depth: int, property_names: list[str]):
         """Returns `(revision, layout)`, `layout` a plain native

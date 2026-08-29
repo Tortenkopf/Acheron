@@ -24,7 +24,8 @@ The menu tree itself (`tray_menu.MenuModel`) is plain Python, decoupled from
 the `GLib.Variant`/dasbus marshaling this module does at the D-Bus boundary
 — the same split `wire.py` draws between "what the wire needs" and "what
 the GUI edits" (`tray_menu.py`'s own module docstring has the rest of that
-story, including why item ids are freely reassigned on every rebuild).
+story, including why item ids are role-assigned and how a rebuild's
+property delta reaches the host).
 """
 
 import os
@@ -230,9 +231,13 @@ class _DBusMenuService:
         updatedProps: List[Tuple[Int32, Structure]],
         removedProps: List[Tuple[Int32, List[Str]]],
     ):
-        # Ticket 36: never actually emitted — every relevant change does a
-        # full rebuild + LayoutUpdated instead (see tray_menu.py's module
-        # docstring). Declared anyway for a spec-correct introspection.
+        # Ticket 98: emitted after a rebuild for every already-known item
+        # whose properties changed (Pause↔Resume, the active-Profile
+        # greying) — GNOME's host re-reads only `type`/`children-display`
+        # from a post-`LayoutUpdated` `GetLayout`, so a property-only change
+        # on an item it already has reaches it through this signal or not at
+        # all. A Profile added/removed still rides the full rebuild +
+        # `LayoutUpdated` (see tray_menu.py's module docstring).
         pass
 
 
@@ -387,8 +392,15 @@ class TrayIcon:
             toggle_daemon,
             self._on_quit,
         )
-        self._menu_model.rebuild(items)
+        changed, removed = self._menu_model.rebuild(items)
         self._menu_service.LayoutUpdated(self._menu_model.revision, ROOT_ID)
+        if changed or removed:
+            # Ticket 98: the host won't re-read a known item's label/enabled
+            # off the post-LayoutUpdated GetLayout — push the delta explicitly.
+            self._menu_service.ItemsPropertiesUpdated(
+                [(item_id, _properties_variant(props)) for item_id, props in changed],
+                removed,
+            )
 
         self._item_service.NewIcon()
         self._item_service.NewTitle()
