@@ -843,6 +843,37 @@ Like the previous map, this one carries execution.
   Unblocks [ticket 102](./issues/102-task-build-about-dialog.md) (still blocked on
   [ticket 101](./issues/101-task-daemon-device-firmware-serial.md)).
 
+- [Fix the code-review findings from tickets 88 and 90](./issues/96-task-fix-code-review-findings-tickets-88-90.md)
+  — two defects a `/code-review` pass surfaced in already-resolved GUI tickets, batched
+  here. **Launcher (ticket 90)**: `packaging/acheron-gui` dropped `python3 -P` (CPython
+  3.11+ only — aborts `Unknown option: -P` on the 3.9/3.10 that Ubuntu 22.04 / Debian 11
+  / RHEL 9 ship, GUI never opens) for `cd "$acheron_lib"; exec python3 -m acheron_gui`,
+  which sanitizes `sys.path` the same way with no version-specific flag; `main()` gained
+  `--version`/`--help` handled before `Gtk.Application` and `packaging/test_install.sh`
+  now actually *runs* the installed launcher (was text-diff only). **Tooltip (ticket
+  88)**: `device_overview.make_input_button`'s tooltip override chain hid a Chord
+  member's own individual Binding summary — now stacks `"{face text}\n\n{chord_tooltip}"`
+  when a key is both; magic `chars = 8/14` bucket got its explanatory comment. 332 Python
+  + 369 Rust green; tooltip live-verified via new `gui/tools/shot_device_overview.py`
+  (assets in `assets/96-tooltip-shot/`). Spawned
+  [Verify the ticket-88/90 code-review fixes](./issues/104-task-verify-ticket-88-90-code-review-fixes.md)
+  for the two checks needing a pre-3.11 container / the user's live desktop.
+
+- [Verify the ticket-88/90 code-review fixes](./issues/104-task-verify-ticket-88-90-code-review-fixes.md)
+  — both ticket 96 fixes confirmed sound. **Launcher (ticket 90)**: tested against real
+  **CPython 3.10.21** (via user-local `uv`, no container available) — the old `python3 -P`
+  reproduces `Unknown option: -P` exit 2, the new `cd "$acheron_lib"; python3 -m acheron_gui`
+  parses clean under 3.10, and shadowing resistance holds (a decoy `./acheron_gui/` in the
+  cwd is never imported). After the user re-ran `install.sh`: `gtk-launch acheron.desktop`
+  cold-starts clean, `acheron-gui` reaches one shared instance, the app-grid click focuses
+  the existing window with no second window / no error (user HITL), `test_install.sh` green.
+  **Tooltip (ticket 88)**: user confirmed the combined Chord-member tooltip on the real Yaru
+  theme. Found one **pre-existing** bug (not a 88/90 regression) — a second `acheron-gui` /
+  `gtk-launch` re-enters `do_activate`, which rebuilds the `TrayIcon` and crashes on the
+  already-exported SNI object without raising the running window; dates to ticket 36, held
+  latent because the GNOME app-grid *click* is shell-serviced and never calls D-Bus
+  `activate`. Spawned [Fix the GUI re-activation crash](./issues/105-task-fix-gui-reactivation-crash.md).
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.
