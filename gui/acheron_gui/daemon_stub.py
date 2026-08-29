@@ -80,6 +80,9 @@ class DaemonStub:
         # Hardcoded, mirroring the real Daemon's ticket 21 stand-in — there
         # is no analog CaptureSource yet for either side to report on.
         self._capture_mode = "digital"
+        # Ticket 99: the real Daemon reports its compile-time `crate::VERSION`
+        # here; the stub stands in with a bare release string.
+        self._daemon_version = "1.0.0"
         self._force_digital = False
         self._daemon_running = True
         self._device_connected = True
@@ -118,6 +121,7 @@ class DaemonStub:
             "active_toggles": list(self._active_toggles),
             "device_connected": self._device_connected,
             "capture_mode": self._capture_mode,
+            "daemon_version": self._daemon_version,
             # Every library entry gets a reported cursor, defaulting to `0`
             # ("the list's first item") for one never yet stepped — mirrors
             # the real Daemon's `GetState()` shape (ticket 03/54).

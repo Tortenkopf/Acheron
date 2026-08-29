@@ -21,6 +21,18 @@ Ticket 97 adds one more installed path: `install.sh` now also copies the three t
 status-dot SVGs to `~/.local/share/acheron/tray-icons/` (the GUI reads them only from
 there, never the checkout). Add it to the installed-path / uninstall list.
 
+Ticket 99 (component version strings) hands two things here:
+(1) Document where each component's canonical version lives — `daemon/Cargo.toml`'s
+`version` and `gui/acheron_gui/__init__.py`'s `_BASE_VERSION` — so a release cut bumps
+both. Both are `1.0.0` at v1.0.
+(2) Both versions render as bare `1.0.0` only from a checkout of the `v1.0.0` git tag (or
+a no-git tarball); any other checkout shows `1.0.0-dev+<short-hash>`. So the release
+process must **tag `v1.0.0` before building** the artifacts users install, and the
+README's build instructions should mention that a plain `main` checkout will self-label
+`-dev`. `daemon/build.rs` also honours an explicit `ACHERON_VERSION` env override if a
+packager ever needs to pin the string. `install.sh` did **not** gain a version-stamping
+step — the git-tag/tarball detection made one unnecessary.
+
 ## Question
 
 Write the release documentation a stranger needs to build, install, and use Acheron from a clean

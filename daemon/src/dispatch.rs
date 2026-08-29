@@ -2201,6 +2201,7 @@ async fn handle_command(
                 active_toggles: toggles.keys().copied().collect(),
                 device_connected,
                 capture_mode: capture_mode.as_str(),
+                daemon_version: crate::VERSION,
                 stepper_cursors,
             });
         }

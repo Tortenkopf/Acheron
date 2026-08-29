@@ -252,7 +252,8 @@ impl Daemon {
     /// reflects the dispatch task's real active Layer as of ticket 18.
     /// `device_connected` reflects the `CaptureSource`'s poll loop's current
     /// view as of ticket 20. `capture_mode` (`"analog"`/`"digital"`) is real
-    /// as of ticket 23 — see `command::State`'s doc comment.
+    /// as of ticket 23. `daemon_version` is the compile-time `crate::VERSION`
+    /// string (ticket 99) — see `command::State`'s doc comment.
     async fn get_state(&self) -> Result<HashMap<String, OwnedValue>, DaemonError> {
         let (reply, rx) = oneshot::channel();
         self.commands
@@ -1466,12 +1467,19 @@ mod tests {
             .clone()
             .try_into()
             .unwrap();
+        let daemon_version: String = state
+            .get("daemon_version")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
 
         assert_eq!(profile, DEFAULT_PROFILE_NAME);
         assert_eq!(layer, "base");
         assert!(active_toggles.is_empty());
         assert!(device_connected);
         assert_eq!(capture_mode, "digital");
+        assert_eq!(daemon_version, crate::VERSION);
     }
 
     /// Ticket 20's end-to-end live demo, exercised without real hardware: a

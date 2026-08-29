@@ -20,7 +20,9 @@ use crate::input::Input;
 /// 17; `device_connected` is real as of ticket 20, reflecting the
 /// `CaptureSource`'s poll loop's current view. `capture_mode` (`"analog"`/
 /// `"digital"`) is real as of ticket 23, reflecting the supervisor's actual
-/// current `CaptureSource`.
+/// current `CaptureSource`. `daemon_version` (ticket 99) is the compile-time
+/// `crate::VERSION` string, reported here so the GUI's About dialog can show
+/// it alongside its own `__version__`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct State {
     pub profile: String,
@@ -28,6 +30,7 @@ pub struct State {
     pub active_toggles: Vec<Input>,
     pub device_connected: bool,
     pub capture_mode: &'static str,
+    pub daemon_version: &'static str,
     /// Every Stepper library entry's Daemon-side-only runtime cursor (ticket
     /// 03/54 — CONTEXT.md: Stepper), keyed by `StepperId`, one entry per
     /// entry in `Config.steppers` (defaulting to `0`, "the list's first

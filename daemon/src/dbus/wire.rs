@@ -551,6 +551,10 @@ pub fn state_to_dict(state: &State) -> Dict {
         scalar(state.capture_mode.to_string()),
     );
     dict.insert(
+        "daemon_version".to_string(),
+        scalar(state.daemon_version.to_string()),
+    );
+    dict.insert(
         "stepper_cursors".to_string(),
         scalar(stepper_cursors_to_dict(&state.stepper_cursors)),
     );
@@ -1167,12 +1171,17 @@ mod tests {
             active_toggles: vec![Input::Grid(1, 1)],
             device_connected: true,
             capture_mode: "analog",
+            daemon_version: "1.0.0-dev+abc1234",
             stepper_cursors,
         };
 
         let dict = state_to_dict(&state);
         assert_eq!(dict_get_string(&dict, "profile"), "Gaming");
         assert_eq!(dict_get_string(&dict, "layer"), "held");
+        assert_eq!(
+            dict_get_string(&dict, "daemon_version"),
+            "1.0.0-dev+abc1234"
+        );
         assert_eq!(
             Vec::<String>::try_from(get(&dict, "active_toggles").unwrap().clone()).unwrap(),
             vec!["grid_r1c1".to_string()]

@@ -35,6 +35,7 @@ def test_fresh_stub_matches_the_seed_configs_shape():
         "active_toggles": [],
         "device_connected": True,
         "capture_mode": "digital",
+        "daemon_version": "1.0.0",
         "stepper_cursors": {},
     }
 

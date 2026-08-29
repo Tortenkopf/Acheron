@@ -827,6 +827,22 @@ Like the previous map, this one carries execution.
   PR #2710's concern is `set_device_mode` only, and OpenRazer reads the serial on every
   connect for every Razer keyboard. Unblocks [ticket 101](./issues/101-task-daemon-device-firmware-serial.md).
 
+- [Establish real component version strings](./issues/99-task-component-version-strings.md)
+  — both components carry `1.0.0` (`daemon/Cargo.toml` bumped from `0.1.0`;
+  `gui/acheron_gui/__init__.py` gains `_BASE_VERSION`/`__version__`). **One derivation rule
+  for both**: a checkout on the `v<version>` tag or a no-git tarball → bare `1.0.0`; any
+  other checkout → `1.0.0-dev+<short-hash>` — stricter than "git present = dev" because the
+  primary install path is `git clone`, so the release must `git tag v1.0.0` before building
+  (handed to [ticket 35](./issues/35-task-write-release-documentation.md)). Daemon: new
+  `build.rs` shells git at compile time → `ACHERON_VERSION` env (overridable) →
+  `acheron_daemon::VERSION`; pure `-dev` logic factored to `build_version.rs` for test
+  coverage. GUI: computed at import, degrades to bare on any git failure. Daemon reports it
+  as a new additive `GetState()` `daemon_version` key (no `SCHEMA_VERSION` bump — ticket
+  25's keyed dict makes it free); `daemon_client` passes it through untouched, `app.py`
+  untouched (the sole consumer is the About dialog). 369 Rust + 331 Python tests green.
+  Unblocks [ticket 102](./issues/102-task-build-about-dialog.md) (still blocked on
+  [ticket 101](./issues/101-task-daemon-device-firmware-serial.md)).
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.
