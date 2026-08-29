@@ -660,6 +660,41 @@ Like the previous map, this one carries execution.
   rework, so left as a possible small follow-up (also affects the Grid↔Library Profile
   sidebar, ticket 69/70's turf).
 
+- [Decide controller-button items in the Stepper/Macro library editors](./issues/92-decide-controller-button-items-in-stepper-macro.md)
+  — settled over two grilling rounds, no prototype needed (ticket 93 stays
+  `Blocked by: 91, 92`, no new child). **Macro: route (c) — no new `MacroStepDto`
+  variant.** A gamepad code already flows through `KeyDown`/`KeyUp` and routes to
+  the gamepad `uinput` device (`injector::sink_for` by `is_gamepad_button`);
+  `CreateMacro`/`SetMacroSteps` do no per-code validation today and the injector
+  can't crash on any code (the keyboard device advertises all of `0..=0x2ff`), so
+  the picker is pure discoverability. The Macro step editor keeps its
+  `KeyDown/KeyUp/Delay` step-kind dropdown; a keyboard↔controller switcher picks
+  which picker fills the value slot. A gamepad button held via `KeyDown` stays
+  held across `Delay` steps until `KeyUp` — full flexibility for free, no new
+  daemon/wire code, no macro-step validation. **Stepper: new
+  `StepperItem::ControllerButton { button }`** (no `modifiers` field — doesn't
+  exist), `resolve_step` compiles it to `KeyDown / Delay(35ms) / KeyUp` reusing
+  `executor::CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD` (same polled-input single-poll
+  job as `Action::ControllerButton`'s digital path), Toggle still disallowed,
+  allowlist-validated against `gamepad_button_codes()` at
+  `CreateStepper`/`SetStepperItems`/`config::parse` (sanity guard, new
+  `ConfigError` variant), `button` marshalled through `wire.rs` +
+  `stepper_item_to_variant` from the start (no ticket-63-style retrofit).
+  **Switcher**: plain two-button segmented control ("Keyboard / mouse" |
+  "Controller"), sized to `_dropdown_row_height()` (shorter than the Grid/Library
+  switcher), its **own new row** below the "save automatically" hint and above
+  the existing single `labeled_row` — added to **both** editors, extending ticket
+  91's lockstep by one row (ticket 91 finding (a)'s "same slot" is superseded:
+  that slot is already occupied on both sides). Orthogonal to the Macro step-kind
+  dropdown (not a fourth kind); greyed on `Delay` steps. Default keyboard;
+  session-only shared `ui_state["library_picker_mode"]`; per-mode independent
+  drafts (controller draft defaults `BTN_SOUTH`); Stepper Modifiers row hidden
+  (not greyed) in controller mode. Labels via `controller_picker.LABEL_BY_CODE`
+  (`Btn: A / South`, `↓ Btn: A / South`). CONTEXT.md: Stepper entry drops
+  "designed to extend … later"; Macro entry gains a controller-button-in-steps
+  sentence with the dwell caveat. Ticket 93 carries the build; ticket 94 the
+  hardware verification.
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.
