@@ -46,7 +46,7 @@ Settle at least:
 ## Answer
 
 **The strand is not invalidated: driver mode silences the 20 grid keys and nothing else.**
-Ran against the real unit (serial `PM2443F36300141`, firmware `v1.2`) on 2026-08-16 with the
+Ran against the real unit (serial `PM24XXXXXXXXXXX`, firmware `v1.2`) on 2026-08-16 with the
 Daemon stopped throughout, so all three evdev nodes were ungrabbed. Thirteen processes,
 appended to one capture: [`assets/16-driver-mode-facts.jsonl`](../assets/16-driver-mode-facts.jsonl)
 (2028 records — analog reports, **evdev events this time**, per-keycap mapping observations

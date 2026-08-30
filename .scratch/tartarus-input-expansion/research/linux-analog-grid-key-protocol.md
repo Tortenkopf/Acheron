@@ -21,7 +21,7 @@ hardware and from Linux-side sources that file never read.
    different direction. The protocol is no longer single-sourced.
 2. **The Razer control channel already round-trips real data from Linux on this unit, today.**
    OpenRazer's `razerkbd` is bound to all three interfaces and its Interface-2 `razer_report`
-   query path returns this device's true serial (`PM2443F36300141`, matching what Synapse
+   query path returns this device's true serial (`PM24XXXXXXXXXXX`, matching what Synapse
    reported on Windows), firmware `v1.2`, and `device_mode = 00 00`. The transport is proven;
    only the specific *set*-device-mode command is unproven and risky.
 3. **The reset risk is better characterised, and smaller than it first looks.** OpenRazer's
@@ -105,7 +105,7 @@ replies:
 
 | Attribute | Value read | What it proves |
 |---|---|---|
-| `device_serial` | `PM2443F36300141` | Identical to the serial Synapse reported on Windows (see [firmware note](../../tartarus-keybinder/research/firmware-version-of-our-tartarus-pro.md)) — a real, device-specific reply, not zeros |
+| `device_serial` | `PM24XXXXXXXXXXX` | Identical to the serial Synapse reported on Windows (see [firmware note](../../tartarus-keybinder/research/firmware-version-of-our-tartarus-pro.md)) — a real, device-specific reply, not zeros |
 | `firmware_version` | `v1.2` | Matches Synapse's `1.2.0.0`; latest available as of 2026-08-16 |
 | `device_mode` | `00 00` | Device is currently in **normal mode**; the get-device-mode command (class `0x00`, cmd `0x84`) round-trips fine |
 
@@ -552,7 +552,7 @@ firmware revision.
 - `/sys/bus/hid/devices/0003:1532:0244.{000B,000C,000D}/report_descriptor` — Report `0x06`
   (23 bytes) on Interface 1; 90-byte unnumbered vendor Feature Report on Interface 2.
 - `/sys/bus/hid/devices/0003:1532:0244.000D/{device_serial,firmware_version,device_mode}` —
-  serial `PM2443F36300141`, firmware `v1.2`, device mode `00 00`.
+  serial `PM24XXXXXXXXXXX`, firmware `v1.2`, device mode `00 00`.
 - [Firmware version of our Tartarus Pro](../../tartarus-keybinder/research/firmware-version-of-our-tartarus-pro.md)
   — Synapse-reported `1.2.0.0`, no update offered as of 2026-08-16.
 

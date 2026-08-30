@@ -80,13 +80,13 @@ Response fields: `status` buf[1], `command_class` echo buf[7], `command_id` echo
 
 **Render**: firmware = `format!("v{}.{}", buf[9], buf[10])` (decimal bytes → our unit `v1.2`);
 serial = ASCII `buf[9..31]`, trim on first `0x00` then trailing whitespace (our unit
-`PM2443F36300141`).
+`PM24XXXXXXXXXXX`).
 
 **Gap 1 — `transaction_id`: primary `0xFF`, fallback `0x1F`.** OpenRazer's
 `razer_attr_read_firmware_version` / `razer_attr_read_device_serial` both hardcode `0xFF`
 with *no* per-device switch (unlike `razer_set_device_mode`, which gives the Pro `0x1F`), and
 `0xFF` is already confirmed working on our exact unit — ticket 12 read `v1.2` /
-`PM2443F36300141` out of OpenRazer's sysfs, which sends `0xFF`. Fallback `0x1F` is the
+`PM24XXXXXXXXXXX` out of OpenRazer's sysfs, which sends `0xFF`. Fallback `0x1F` is the
 Tartarus-Pro-specific id OpenRazer uses for this device's other Interface-2 commands. Not the
 unlock's `0x01` (no evidence it applies to standard get commands; `open-tartarus-driver`
 never reads these). **Ticket 101 must confirm live** — our `0xFF` result is via OpenRazer's

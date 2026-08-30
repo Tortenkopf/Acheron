@@ -28,7 +28,7 @@ but trim/redact, move off `main` (history/branch only), or purge from history:
   `Claude-Session:` trailers. Present regardless of the working tree unless history is
   rewritten. Depends on how the repo goes public (flip visibility on this repo vs. a
   fresh repo/history).
-- The device **serial number** `PM2443F36300141` — appears ~10× in `.scratch/**/research/`
+- The device **serial number** `PM24XXXXXXXXXXX` — appears ~10× in `.scratch/**/research/`
   files (and in history). A real hardware identifier of the user's unit.
 - Commit **author identity** `Charon` vs. the real name on `LICENSE`/copyright
   (Justin Milatz) — deliberate themed pseudonym, or to be corrected?
@@ -50,10 +50,10 @@ answered by making `main` a clean release artifact and moving the whole record t
 | **Publish mechanism** | Flip visibility on the existing `Tortenkopf/Acheron` repo; full 131-commit history stays intact (an honest ticket-by-ticket AI-agent-built history is a feature, not something to hide; nobody browsing casually reads `git log`). |
 | **Branch model** | **`dev` is the permanent working branch** — all ticket work and all `.scratch/`/`prototype/` churn happens there. **`main` is release-only**, mechanically rebuilt from `dev`'s non-process paths at each release (`git checkout dev -- daemon gui packaging docs/adr README.md CONTRIBUTING.md CONTEXT.md install.sh LICENSE layout.md .gitignore`), then tagged. `main` is *always* clean for visitors. |
 | **`.scratch/`** | `dev` only. `git rm` from `main`, `.gitignore` it there. |
-| **`prototype/`** | The 8 unmerged `prototype/*` branch dirs were rescued onto `dev` first (so every `prototype/NN` code-comment path resolves on `dev`), then `prototype/` is `dev`-only; `git rm` + `.gitignore` on `main`. The 8 local branches and `origin/prototype/30-chord-recording-ux` deleted. |
+| **`prototype/`** | The `prototype/` dir (3 base spikes: 09/12/13) is `dev`-only; `git rm` + `.gitignore` on `main`. **The 8 `prototype/*` feature branches are kept and pushed as-is** — revised from "rescue the dirs then delete" once inspection showed they aren't `prototype/NN-slug/` dirs at all but single old commits carrying ad-hoc `gui/prototype_NN_*.py` files amid heavy stale divergence. Keeping the branches is zero-archaeology and keeps every `prototype/NN` code comment resolvable via `git show prototype/NN-slug:…`. |
 | **`docs/adr/`, `CONTEXT.md`** | Stay on `main` — genuine, compact developer docs a non-agent contributor needs. |
 | **`CLAUDE.md`, `docs/agents/`** | `dev` only. Pure agent plumbing; `CLAUDE.md`'s issue-tracker section is meaningless without `.scratch/`. A contributor running Claude Code works from `dev` anyway. |
-| **Device serial** | `PM2443F36300141` → `PM24XXXXXXXXXXX` (format-preserving) across `.scratch/**` on `dev`. No history rewrite — it's a serial number, not a credential. |
+| **Device serial** | The unit's real serial → `PM24XXXXXXXXXXX` (format-preserving, 15 chars) everywhere it appeared in `.scratch/**`, on `dev`. No history rewrite — it's a serial number, not a credential. |
 | **Author identity** | Keep `Charon` — a deliberate on-theme pseudonym (the ferryman of the Acheron); `LICENSE`/copyright unambiguously name Justin Milatz. |
 | **Inline code comments** citing `.scratch/…` / `prototype/…` (~15 across `daemon/`+`gui/`) | Left as-is — historical breadcrumbs; CONTRIBUTING notes those paths refer to the `dev` branch. |
 
@@ -61,10 +61,9 @@ answered by making `main` a clean release artifact and moving the whole record t
 
 1. This ticket resolved; map updated; the **Tartarus input expansion** effort archived in `.scratch/README.md`.
 2. `dev` branched from that commit (full record).
-3. On `dev`: 8 prototype branch dirs rescued into `prototype/`; serial scrubbed.
+3. On `dev`: serial scrubbed; this Answer + the map corrected for the kept-branches revision.
 4. On `main`: `.scratch/`, `prototype/`, `docs/agents/`, `CLAUDE.md` removed; `.gitignore` updated; CONTRIBUTING reworded (layout table + Design-record section point at `dev`).
-5. 8 local `prototype/*` branches + `origin/prototype/30-chord-recording-ux` deleted.
-6. `main` + `dev` pushed.
+5. `main`, `dev`, and all 8 `prototype/*` branches pushed. No branches deleted.
 
 Left for the user: `gh repo edit Tortenkopf/Acheron --visibility public`, and `git tag v1.0.0`
 on `main` when cutting the release. The other **Not yet specified** items go to a separate

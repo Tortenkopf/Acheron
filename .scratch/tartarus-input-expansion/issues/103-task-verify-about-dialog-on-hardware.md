@@ -56,7 +56,7 @@ bundled `LICENSE`), `systemctl --user restart acheron-daemon`.
   window (close button now inside the `Gtk.HeaderBar`) hides it to the tray rather than
   quitting; tray "Show" restores it. The `close-request` handler was unaffected as
   predicted.
-- **Device fields, connected**: Firmware `v1.2`, Serial `PM2443F36300141` — the serial
+- **Device fields, connected**: Firmware `v1.2`, Serial `PM24XXXXXXXXXXX` — the serial
   matches the sticker on the device.
 - **Device fields, disconnected**: unplugging the Tartarus Pro and reopening the dialog
   shows "Not connected" for both rows, no crash, no stale value; replugging brings the real

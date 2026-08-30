@@ -818,7 +818,7 @@ Like the previous map, this one carries execution.
   0xC05B4807` with `buf[0]=0x00`; the kernel's report-number-0 offset means the 90-byte
   response lands at `buf[1..91]`, args from `buf[9]` (symmetric with the SET buffer). Render
   firmware `v{buf[9]}.{buf[10]}` (→ `v1.2`), serial ASCII `buf[9..31]` NUL-trimmed (→
-  `PM2443F36300141`). `transaction_id`: primary **`0xFF`** (OpenRazer hardcodes it for these
+  `PM24XXXXXXXXXXX`). `transaction_id`: primary **`0xFF`** (OpenRazer hardcodes it for these
   two reads with no per-device switch, and it already reads our unit's real serial/firmware
   via sysfs), fallback `0x1F`; ticket 101 must confirm on hardware since the `HIDIOCGFEATURE`
   path itself has never run against this device. Safest ordering: read once at device-connect
@@ -908,7 +908,7 @@ Like the previous map, this one carries execution.
   dispatch, which folds it into `GetState()` as two **optional** keys — present when read,
   absent when disconnected/failed (ticket 25's keyed dict makes that safe), no new D-Bus
   method or signal. Live results, all first-attempt: `transaction_id` **`0xFF`** (no fallback
-  needed), firmware **`v1.2`** / serial **`PM2443F36300141`** (exact match to ticket 100 §4),
+  needed), firmware **`v1.2`** / serial **`PM24XXXXXXXXXXX`** (exact match to ticket 100 §4),
   ~11ms per read, **zero resets** across 13+ reads (USB `connected_duration` climbed
   throughout), works fine mid-analog-Capture-mode (settles research gap 3 — no ordering
   dependence). Unplug → both keys gone; replug → re-read fires, keys back. `daemon_stub.py`
@@ -941,7 +941,7 @@ Like the previous map, this one carries execution.
   on both the installed `acheron-gui` and a from-checkout run. Header-bar entry point +
   modal/`transient-for` dialog confirmed; ticket 36 minimize-to-tray unaffected by the
   `Gtk.HeaderBar` (close button now inside it, `close-request` still fires); Device rows show
-  the real Firmware `v1.2` / Serial `PM2443F36300141` (serial matches the device sticker) and
+  the real Firmware `v1.2` / Serial `PM24XXXXXXXXXXX` (serial matches the device sticker) and
   fall back to "Not connected" on unplug with no crash/stale value, real values return on
   replug; version lines correct (bare `1.0.0` installed, `1.0.0-dev+b002c8d` from checkout,
   Daemon line matches); legal block + scrollable full-GPLv3 "View Licence" + all four links
@@ -991,14 +991,17 @@ Like the previous map, this one carries execution.
   becomes the permanent working branch** (all `.scratch/`/`prototype/` churn) and **`main` is
   release-only, rebuilt from `dev`'s non-process paths** at each release, so `main`'s tree is
   always just code + user docs + `docs/adr/` + `CONTEXT.md`. `.scratch/`, `prototype/`,
-  `docs/agents/`, and `CLAUDE.md` move to `dev` only (`prototype/` first absorbing the 8
-  unmerged `prototype/*` branch dirs, which are then deleted along with
-  `origin/prototype/30-chord-recording-ux`). The device serial `PM2443F36300141` is scrubbed to
-  `PM24XXXXXXXXXXX` across `.scratch/**` on `dev` (no history rewrite). `Charon` stays as the
-  commit-author pseudonym. Executed on resolution: `dev` branched, prototype dirs rescued,
-  serial scrubbed, `main` stripped + `.gitignore`/CONTRIBUTING updated, branches deleted, both
-  pushed. Left to the user: `gh repo edit … --visibility public` and `git tag v1.0.0`. **This
-  closes the last pre-v1.0 item on the map.**
+  `docs/agents/`, and `CLAUDE.md` move to `dev` only. The 8 unmerged `prototype/*` feature
+  branches are kept and pushed as-is (revised from "delete them" once inspection showed they're
+  single old commits carrying ad-hoc `gui/prototype_NN_*.py` files, not `prototype/NN-slug/`
+  dirs — keeping them is zero-work and keeps every `prototype/NN` code comment resolvable via
+  `git show`). The unit's real device serial is scrubbed to the placeholder
+  `PM24XXXXXXXXXXX` everywhere it appeared in `.scratch/**` on `dev` (no history rewrite). `Charon` stays as the
+  commit-author pseudonym. Executed on resolution: `dev` branched from the ticket-107 commit,
+  serial scrubbed on `dev`, `main` stripped of `.scratch/`/`prototype/`/`docs/agents/`/`CLAUDE.md`
+  + `.gitignore`/CONTRIBUTING updated, then `main` + `dev` + all 8 `prototype/*` branches pushed.
+  Left to the user: `gh repo edit … --visibility public` and `git tag v1.0.0`. **This closes the
+  last pre-v1.0 item on the map.**
 
 ## Not yet specified
 

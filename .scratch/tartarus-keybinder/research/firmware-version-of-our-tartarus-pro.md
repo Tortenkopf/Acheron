@@ -1,6 +1,6 @@
 The following has been read of our Tartarus Pro device using Razer Synapse:
 
-Serial Number: PM2443F36300141
+Serial Number: PM24XXXXXXXXXXX
 
 Firmware Version: 1.2.0.0
 

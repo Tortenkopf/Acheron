@@ -18,7 +18,7 @@ Settle at least:
 ## Answer
 
 **It works, completely, on the first attempt — and the signal is better than the plan
-predicted.** Ran against the real unit (serial `PM2443F36300141`, firmware `v1.2`) on
+predicted.** Ran against the real unit (serial `PM24XXXXXXXXXXX`, firmware `v1.2`) on
 2026-08-16, in two sessions: the first with `acheron-daemon` running, the second with it
 stopped so the evdev nodes were ungrabbed.
 Prototype: [`prototype/13-analog-grid-capture/prototype.py`](../../../prototype/13-analog-grid-capture/prototype.py).

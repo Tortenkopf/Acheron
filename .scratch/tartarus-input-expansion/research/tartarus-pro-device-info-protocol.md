@@ -27,7 +27,7 @@ confirmed working on our exact unit and firmware:
 
 2. **The read already round-trips real data on our unit.** Ticket 12 / the analog note §1.3
    recorded that OpenRazer's Interface-2 query path returns this device's true serial
-   (`PM2443F36300141`, matching Synapse on Windows) and firmware (`v1.2`). OpenRazer issues
+   (`PM24XXXXXXXXXXX`, matching Synapse on Windows) and firmware (`v1.2`). OpenRazer issues
    both of those reads with `transaction_id = 0xFF` (`razerkbd_driver.c:2044` and `:2067`,
    hardcoded, no Tartarus-Pro override) — so **`0xFF` is the empirically-confirmed value**
    for these two commands on our hardware, not a guess.
@@ -202,7 +202,7 @@ Response field offsets in the returned 91-byte buffer:
   `memcpy(&serial_string[0], &response.arguments[0], 22); serial_string[22] = '\0';`
   (`razer_attr_read_device_serial`, `razerkbd_driver.c:2048-2049`). OpenRazer copies a fixed
   22 bytes then forces a terminator at index 22, so the effective max is 22 chars. Our unit's
-  serial `PM2443F36300141` is 15 chars; the remaining bytes are padding — OpenRazer does not
+  serial `PM24XXXXXXXXXXX` is 15 chars; the remaining bytes are padding — OpenRazer does not
   document whether they are `0x00` or spaces, so ticket 101 should trim on the first `0x00`
   **and** `trim()` trailing whitespace to be safe. Treat non-ASCII / all-zero as "read
   failed" (mirrors `device_connected` going absent).
@@ -237,7 +237,7 @@ def read_report(fd, txn, cmd, data_size):
 
 ctrl = os.open("/dev/hidrawN", os.O_RDWR)  # interface 2, resolved via sysfs
 fw   = read_report(ctrl, 0xFF, 0x81, 2)    # -> b"\x01\x02"  => "v1.2"
-ser  = read_report(ctrl, 0xFF, 0x82, 22)   # -> b"PM2443F36300141\x00..."
+ser  = read_report(ctrl, 0xFF, 0x82, 22)   # -> b"PM24XXXXXXXXXXX\x00..."
 ```
 
 ---
@@ -254,7 +254,7 @@ have no such switch anywhere in the file.
 
 This is not just "what OpenRazer sends" — it is **confirmed working on our exact unit**:
 ticket 12 / the analog note §1.3 read `firmware_version` = `v1.2` and `device_serial` =
-`PM2443F36300141` straight out of OpenRazer's sysfs on this machine, and that path sends
+`PM24XXXXXXXXXXX` straight out of OpenRazer's sysfs on this machine, and that path sends
 `0xFF`. So `0xFF` is the value with a positive hardware result behind it.
 
 ### Fallback: `0x1F`
@@ -292,7 +292,7 @@ The `0xFF` result above is via OpenRazer's `usb_control_msg` path. Acheron will 
 path Acheron has never exercised. Ticket 101's live check: send get-firmware with `0xFF`,
 read back, verify `buf[7]==0x00 && buf[8]==0x81` and `buf[9..11] == [1, 2]` (matching the
 known `v1.2`); if not, fall back to `0x1F`. The serial check is `buf[9..24]` ASCII ==
-`PM2443F36300141`.
+`PM24XXXXXXXXXXX`.
 
 ---
 
@@ -444,7 +444,7 @@ during its first live read, exactly as ticket 13 did, and record a reset if one 
 
 ### First-hand / prior tickets
 - Ticket 12 / [analog grid-key protocol note](./linux-analog-grid-key-protocol.md) §1.3, §2,
-  §5 — our unit's serial `PM2443F36300141` and firmware `v1.2` read via OpenRazer's
+  §5 — our unit's serial `PM24XXXXXXXXXXX` and firmware `v1.2` read via OpenRazer's
   Interface-2 path; the shared 90-byte frame, CRC range and `HIDIOCSFEATURE(91) =
   0xC05B4806`; the `transaction_id` split and reset-risk analysis.
 - `daemon/src/capture/analog.rs` — `build_razer_cmd`, `hidiocsfeature`, `discover_hidraw`,

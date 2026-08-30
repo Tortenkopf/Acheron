@@ -88,7 +88,7 @@ live-check item landed on the first attempt.
 - **`daemon/examples/device_info_probe.rs`** — throwaway HITL probe (read-only, never sends
   `set_device_mode`, no relock needed), `cargo run --example device_info_probe [iterations]`.
 - **`gui/acheron_gui/daemon_stub.py`** — `_firmware_version = "v1.2"` / `_serial_number =
-  "PM2443F36300141"`, in `get_state()` only while `_device_connected` (so
+  "PM24XXXXXXXXXXX"`, in `get_state()` only while `_device_connected` (so
   `simulate_device_disconnected` exercises the absent-key path for ticket 102's screenshots).
 - **`daemon_client.py` / `app.py`** — no change needed: `get_state()` returns the raw keyed
   dict, new optional keys pass straight through. `app.py`'s own consumption is ticket 102's
@@ -99,11 +99,11 @@ live-check item landed on the first attempt.
 | Check | Result |
 |---|---|
 | `transaction_id` | **`0xFF` (primary) — no fallback**. `0x1F` never needed. |
-| firmware / serial | **`v1.2` / `PM2443F36300141`** — exact match to research §4. |
+| firmware / serial | **`v1.2` / `PM24XXXXXXXXXXX`** — exact match to research §4. |
 | exchange timing | ~11–12ms for both reads together (well under budget). |
 | reset / re-enumeration | **none** — 13+ probe reads plus daemon reads; USB `power/connected_duration` climbed monotonically throughout. Confirms research §7 (these are reads, negligible risk). |
 | works in analog Capture mode | **yes** — probe ran fine alongside the running daily-driver daemon (device already unlocked); our daemon read it with `capture_mode=analog`. Research gap 3 settled: no ordering dependence. |
-| `GetState()` keys present when connected | `"firmware_version" s "v1.2"`, `"serial_number" s "PM2443F36300141"`. |
+| `GetState()` keys present when connected | `"firmware_version" s "v1.2"`, `"serial_number" s "PM24XXXXXXXXXXX"`. |
 | both keys absent after unplug | **yes** — `device_connected=false`, both keys gone from `GetState()`. |
 | correct values after replug | **yes** — re-read fired on reconnect (`daemon.log` shows a second "read device info … transaction_id 0xff"). |
 | suites | daemon **380 passed / 0 failed** (new: analog device-info parsing/ioctl tests, a dispatch `GetState()` device-info round-trip test, a `wire.rs` absent-keys test), GUI **337 passed / 0 failed** (new: stub absent-when-disconnected test). `cargo clippy --all-targets` clean, `cargo fmt` applied. |
