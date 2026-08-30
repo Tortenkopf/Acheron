@@ -6,3 +6,10 @@ target/
 
 # personal/local permission overrides, not shared project config
 .claude/settings.local.json
+
+# Build-process record lives on the `dev` branch, never on `main`.
+# (This block is main-only — do not promote .gitignore from `dev`.)
+.scratch/
+prototype/
+CLAUDE.md
+docs/agents/

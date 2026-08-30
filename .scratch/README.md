@@ -1,6 +1,0 @@
-# Efforts index
-
-One line per effort under `.scratch/`, so a fresh session can see what exists without opening any map body. See `docs/agents/issue-tracker.md` for tracker conventions.
-
-- [Tartarus keybinder](tartarus-keybinder/map.md) — **archived**, MVP shipped. Daemon+GUI keybinding/macro control for the Razer Tartarus Pro (Profiles, Layers, Fire-once/Hold-to-repeat/Toggle, D-Bus, systemd packaging).
-- [Tartarus input expansion](tartarus-input-expansion/map.md) — **archived**, v1.0 reached. Charted the course from the shipped MVP to a feature-complete v1.0 (Chord/Stepper/Profile-Switch/Controller-button/Axis Actions, the Macro & Stepper libraries, grid-key analog capture + Analog-repeat, the full output picker, tray icon, About dialog, release docs) and executed it ticket by ticket. Final ticket (107) settled the public-repo layout: development continues on the `dev` branch, `main` is a clean release-only branch. Post-1.0 refinements (Analog-repeat/axis rate curves, joystick hat direction) go to a new effort.
