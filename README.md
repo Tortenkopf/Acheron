@@ -7,17 +7,29 @@ Copyright © 2026 Justin Milatz
 
 **An open keybinding tool for the Razer Tartarus Pro.**
 
+---
+
+> **Disclaimer:** This is an independent, community-developed project, not
+> affiliated with, endorsed by, or supported by Razer Inc. "Razer" and
+> "Tartarus" are trademarks of Razer Inc. Provided as-is, with no warranty
+> (see the [Licence section](#licence)).
+
+---
+
 Acheron remaps the Tartarus Pro's keys and builds macros, layers, and profiles
-for it on Linux — the job Razer's own Synapse software does on Windows, without
-the cloud account and without Windows. It talks to the device directly through
-the Linux kernel (`evdev` in, `uinput` out); nothing about it needs the internet
-after it is installed.
+for it on Linux and enables the use of the Tartarus Pro's analog keys.
+It talks to the device directly through the Linux kernel (`evdev` in, `uinput` out).
+
+---
 
 > The Acheron (/ˈækərən/) is a river in the Epirus region of northwest Greece.
-> … Ancient Greek mythology saw the Acheron, sometimes known as the "river of
-> woe", as one of the five rivers of the Greek underworld. … The Suda describes
-> the river as "a place of healing, not a place of punishment, cleansing and
-> purging the sins of humans".
+> …
+> Ancient Greek mythology saw the Acheron, sometimes known as the "river of
+> woe", as one of the five rivers of the Greek underworld.
+> …
+> The Suda describes the river as "a place of healing, not a place of punishment,
+> cleansing and purging the sins of humans".
+>
 > — [Wikipedia](https://en.wikipedia.org/wiki/Acheron)
 
 ---
