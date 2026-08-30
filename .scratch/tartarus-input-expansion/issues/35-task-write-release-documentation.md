@@ -33,6 +33,15 @@ README's build instructions should mention that a plain `main` checkout will sel
 packager ever needs to pin the string. `install.sh` did **not** gain a version-stamping
 step — the git-tag/tarball detection made one unnecessary.
 
+Ticket 102 (About dialog) hands one installed-path addition here:
+`install.sh` now also copies the repo-root `LICENSE` to
+`~/.local/lib/acheron/acheron_gui/LICENSE` (the About dialog's "View Licence"
+button reads it there; a dev checkout falls back to the repo-root file). Add
+it to the installed-path / uninstall list. Also worth a doc line: the About
+screen is where a user finds the version, the connected device's
+firmware/serial, the acknowledgements, and the GPLv3 notice — reached from
+the main window's header-bar menu ("About Acheron").
+
 ## Question
 
 Write the release documentation a stranger needs to build, install, and use Acheron from a clean

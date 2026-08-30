@@ -83,6 +83,10 @@ rm -rf "$gui_lib_dir/acheron_gui"
 mkdir -p "$gui_lib_dir"
 cp -r "$script_dir/gui/acheron_gui" "$gui_lib_dir/acheron_gui"
 find "$gui_lib_dir/acheron_gui" -name '__pycache__' -type d -prune -exec rm -rf {} +
+# Ticket 102: bundle the GPLv3 text next to the package so the About
+# dialog's "View Licence" button works with no git checkout around it
+# (a dev checkout falls back to the repo-root LICENSE two levels up).
+cp "$script_dir/LICENSE" "$gui_lib_dir/acheron_gui/LICENSE"
 
 echo "==> Installing GUI launcher to $bin_dir/acheron-gui"
 install -m 755 "$launcher_src" "$bin_dir/acheron-gui"

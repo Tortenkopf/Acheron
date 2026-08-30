@@ -917,6 +917,25 @@ Like the previous map, this one carries execution.
   `daemon/examples/device_info_probe.rs`. Unblocks
   [ticket 102](./issues/102-task-build-about-dialog.md) (99 also resolved — now fully clear).
 
+- [Build the About dialog](./issues/102-task-build-about-dialog.md) — the last required-floor
+  GUI item is built (AFK, screenshot-verified). New `gui/acheron_gui/about_dialog.py`: a
+  hand-built modal `Gtk.Window` (no libadwaita), opened from a new `Gtk.HeaderBar` titlebar
+  on the main window whose right-packed primary menu (`Gio.Menu`, one item) fires the
+  `app.about` action. Sections: name/subtitle, Version (GUI `__version__` prominent + Daemon
+  `daemon_version` secondary, "Daemon: not running" when down), the verbatim Acheron-river
+  quote (`...` ellipses preserved, asserted exact) + Wikipedia link, Device
+  (Firmware/Serial from ticket 101's optional `GetState()` keys, "Not connected" when
+  absent), Project (author + three visible-`TBD` rows), Acknowledgements (ultramonaka, Matt
+  Pocock), and the GPLv3 §5(d) legal block with a "View Licence" scrollable full-`LICENSE`
+  window + gnu.org link. Links via `Gtk.LinkButton` (no new deps). `install.sh` now bundles
+  the repo-root `LICENSE` into the installed GUI package (dev-checkout fallback to the
+  repo-root file); `packaging/test_install.sh` asserts it; installed-path addition handed to
+  [ticket 35](./issues/35-task-write-release-documentation.md). Ticket 36's `close-request`
+  minimize-to-tray is a window signal, structurally unaffected by `set_titlebar`. New
+  `gui/tools/shot_about.py`; GUI suite 355 green (+18). Unblocks
+  [ticket 103](./issues/103-task-verify-about-dialog-on-hardware.md) (live firmware/serial +
+  tray verification).
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.

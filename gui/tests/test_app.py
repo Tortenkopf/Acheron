@@ -1,13 +1,16 @@
 from gi.repository import GLib
 
 from acheron_gui.app import (
+    _about_dialog_state,
     _activate_window,
+    _build_primary_menu,
     _ensure_daemon_started_on_launch,
     _present_window,
     _wire_focus_tracking,
     _wire_status_tracking,
     _wire_window_close_to_hide,
 )
+from acheron_gui.daemon_client import DaemonError
 from acheron_gui.daemon_stub import DaemonStub
 
 
@@ -377,3 +380,38 @@ def test_reactivation_reshows_the_window_when_it_was_hidden_to_the_tray():
 
     assert win.visible is True
     assert win.present_calls == 1
+
+
+# --- ticket 102: the header-bar primary menu + About dialog wiring --------
+
+
+def test_primary_menu_has_one_about_item_targeting_the_app_action():
+    menu = _build_primary_menu()
+
+    assert menu.get_n_items() == 1
+    assert menu.get_item_attribute_value(0, "label", None).get_string() == "About Acheron"
+    assert menu.get_item_attribute_value(0, "action", None).get_string() == "app.about"
+
+
+def test_about_dialog_state_returns_the_live_snapshot_when_the_daemon_is_running():
+    stub = DaemonStub()
+
+    state = _about_dialog_state(stub, daemon_running=True)
+
+    assert state["daemon_version"] == "1.0.0"
+    assert state["firmware_version"] == "v1.2"
+
+
+def test_about_dialog_state_is_none_when_the_daemon_is_not_running():
+    stub = DaemonStub()
+
+    # Not even attempted — a stopped Daemon can't answer GetState().
+    assert _about_dialog_state(stub, daemon_running=False) is None
+
+
+def test_about_dialog_state_is_none_when_get_state_raises_a_daemon_error():
+    class _Boom:
+        def get_state(self):
+            raise DaemonError("vanished mid-call")
+
+    assert _about_dialog_state(_Boom(), daemon_running=True) is None

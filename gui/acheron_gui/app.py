@@ -79,8 +79,10 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("GLib", "2.0")
-from gi.repository import Gdk, Gtk, GLib
+from gi.repository import Gdk, Gio, Gtk, GLib
 
+from . import __version__
+from .about_dialog import build_about_dialog
 from .daemon_client import DaemonClient, DaemonError, DBusDaemonClient
 from .device_overview import PLACEHOLDER_CONFIG, build_status_wrapped_view, compute_status
 from .gtk_utils import clear_children
@@ -153,7 +155,37 @@ CSS = """
         transparent 4px, transparent 8px
     );
 }
+/* Ticket 102: the About dialog (about_dialog.py). */
+.about-title { font-size: 1.6em; font-weight: bold; }
+.quote { font-style: italic; opacity: 0.85; }
 """
+
+
+def _build_primary_menu() -> Gio.Menu:
+    """Ticket 102: the header-bar primary menu. One item today ("About
+    Acheron" -> the `app.about` action added in `_build_main_window`), but a
+    `Gio.Menu` rather than a bare button because it's the intended home for
+    future global actions (Quit, Preferences)."""
+    menu = Gio.Menu()
+    menu.append("About Acheron", "app.about")
+    return menu
+
+
+def _about_dialog_state(client: DaemonClient, daemon_running: bool) -> dict | None:
+    """The `GetState()` snapshot the About dialog reads its Daemon version
+    and the connected device's firmware/serial from — `None` when the
+    Daemon isn't running, or when the call races its disappearance, so the
+    dialog shows "not running" / "Not connected" instead of erroring.
+
+    Split out and tested against `DaemonStub` for the same reason the other
+    `app.py` helpers are: the real menu-action wiring in `_build_main_window`
+    needs a registered `Gtk.Application` and a live session bus to drive."""
+    if not daemon_running:
+        return None
+    try:
+        return client.get_state()
+    except (DaemonError, GLib.Error):
+        return None
 
 
 def _wire_focus_tracking(window, client: DaemonClient) -> None:
@@ -412,6 +444,20 @@ class AcheronApplication(Gtk.Application):
         win.set_default_size(1400, 860)
         _wire_window_close_to_hide(win)
 
+        # Ticket 102: a HeaderBar titlebar carrying the primary menu — just
+        # "About Acheron" today, but built as a `Gio.Menu` since it's the
+        # intended home for future global actions. The window's close button
+        # moves into this header bar; `_wire_window_close_to_hide` above
+        # still catches `close-request` (a window signal, independent of the
+        # titlebar widget), so ticket 36's minimize-to-tray is unaffected.
+        header = Gtk.HeaderBar()
+        menu_button = Gtk.MenuButton(
+            icon_name="open-menu-symbolic", menu_model=_build_primary_menu()
+        )
+        menu_button.set_tooltip_text("Main menu")
+        header.pack_end(menu_button)
+        win.set_titlebar(header)
+
         # Ticket 36: the real system tray icon — a standalone D-Bus service
         # (`org.kde.StatusNotifierItem` + `com.canonical.dbusmenu`), not a
         # widget in `content_box`'s own tree. Held on `self` so it outlives
@@ -509,6 +555,20 @@ class AcheronApplication(Gtk.Application):
         status = _wire_status_tracking(self._client, rebuild)
         _wire_focus_tracking(win, self._client)
 
+        # Ticket 102: the `app.about` action the header-bar menu targets.
+        # Opens a fresh modal About dialog reading one `GetState()` snapshot
+        # (or `None` when the Daemon's down) for its version / device lines.
+        about_action = Gio.SimpleAction.new("about", None)
+        about_action.connect(
+            "activate",
+            lambda _a, _p: build_about_dialog(
+                win,
+                gui_version=__version__,
+                state=_about_dialog_state(self._client, status["daemon_running"]),
+            ).present(),
+        )
+        self.add_action(about_action)
+
         # `_wire_status_tracking`/`_wire_focus_tracking` above may have
         # already queued their initial state via `GLib.idle_add` (e.g. the
         # real `Gio.bus_watch_name`'s "already running" announce is often
@@ -541,8 +601,6 @@ def main() -> None:
     # 96), so a launcher that can't even start Python fails CI.
     arg = sys.argv[1] if len(sys.argv) > 1 else ""
     if arg in ("--version", "-V"):
-        from acheron_gui import __version__
-
         print(f"acheron-gui {__version__}")
         return
     if arg in ("--help", "-h"):

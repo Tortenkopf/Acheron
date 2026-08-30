@@ -66,6 +66,8 @@ cp "$repo_root/install.sh" "$sandbox_repo/"
 cp "$repo_root/daemon/Cargo.toml" "$sandbox_repo/daemon/"
 cp -r "$repo_root/packaging" "$sandbox_repo/"
 cp -r "$repo_root/gui/acheron_gui" "$sandbox_repo/gui/"
+# Ticket 102: install.sh bundles the repo-root LICENSE into the GUI package.
+cp "$repo_root/LICENSE" "$sandbox_repo/"
 
 # Stub cargo: records its invocation, then drops a fake release binary where
 # install.sh expects to find one, so the rest of the script has something
@@ -156,6 +158,9 @@ gui_lib="$fake_home/.local/lib/acheron/acheron_gui"
 [[ -f "$gui_lib/__main__.py" ]] || fail "GUI package not installed to ~/.local/lib/acheron (missing __main__.py)"
 [[ -f "$gui_lib/app.py" ]] || fail "GUI package not installed to ~/.local/lib/acheron (missing app.py)"
 [[ -d "$gui_lib/__pycache__" ]] && fail "__pycache__ leaked into the installed GUI package"
+# Ticket 102: the About dialog's "View Licence" reads this bundled copy.
+diff -q "$repo_root/LICENSE" "$gui_lib/LICENSE" >/dev/null \
+  || fail "GPLv3 text not bundled into the installed GUI package (about_dialog.py needs it)"
 
 launcher="$fake_home/.local/bin/acheron-gui"
 [[ -x "$launcher" ]] || fail "launcher not installed to ~/.local/bin/acheron-gui"

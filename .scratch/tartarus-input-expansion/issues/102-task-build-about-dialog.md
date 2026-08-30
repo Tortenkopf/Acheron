@@ -1,5 +1,6 @@
 Type: task
-Status: open
+Status: resolved
+Assignee: Charon (2026-08-30)
 Blocked by: 99, 101
 
 ## Question
@@ -75,3 +76,69 @@ change in this ticket — the Daemon version and firmware/serial come from ticke
 GUI suite green.
 
 ## Answer
+
+Built AFK against `DaemonStub`; every dialog state is screenshot-verified from
+inside the process. The one thing left for **hardware** — the connected unit's real
+firmware/serial in the device rows, and the tray minimize-to-tray still working with the
+new header bar — is [ticket 103](./103-task-verify-about-dialog-on-hardware.md)'s job.
+GUI suite **355 passed / 0 failed** (was 337; +15 `test_about_dialog.py`, +3
+`test_app.py`). No Daemon change.
+
+### What was built
+
+- **`gui/acheron_gui/about_dialog.py`** (new) — `build_about_dialog(parent, *, gui_version,
+  state)` returns a hand-built modal `Gtk.Window`, `transient-for` the parent. **No
+  libadwaita** (per the map's cluster notes). Content in a vertical-scrolling
+  `Gtk.ScrolledWindow` with a fixed bottom action bar (Close). All sections present:
+  name + subtitle; **Version** ("Acheron {gui `__version__`}" prominent, "Daemon
+  {`daemon_version`}" secondary — or **"Daemon: not running"** when `state is None`);
+  **Background** (the river quote reproduced **verbatim including both `...`**, a module
+  constant `RIVER_NOTE` with a test asserting exact equality + `count("...") == 2`, then
+  the Wikipedia link); **Device** ("Firmware: …" / "Serial: …", each **"Not connected"**
+  when its optional `GetState()` key is absent or `state is None`); **Project** (author
+  "Justin Milatz, with Claude Code as co-author" + the three visible-`TBD` placeholder
+  rows); **Acknowledgements** (ultramonaka, Matt Pocock, each with its GitHub link);
+  **Licence** (the GPLv3 §5(d) copyright/no-warranty/redistribution block as the
+  `LEGAL_NOTICE` constant, a **"View Licence"** button, a gnu.org link).
+- **`build_license_window(parent, *, license_text)`** in the same module — a scrollable
+  read-only monospace `Gtk.TextView` of the full bundled `LICENSE`. `license_text=None`
+  (file genuinely not found) degrades to a short message + the gnu.org link rather than an
+  empty window. `_license_text()` reads `acheron_gui/LICENSE` (installed copy) first, then
+  falls back to the repo-root `LICENSE` two levels up (dev checkout).
+- **Links** use `Gtk.LinkButton` — its default `activate-link` handler opens via
+  `gtk_show_uri` (portal / `xdg-open`), **no new dependency**.
+- **`gui/acheron_gui/app.py`** — `_build_main_window` now sets a `Gtk.HeaderBar` titlebar
+  on the main window with a right-packed `Gtk.MenuButton` (`open-menu-symbolic`) whose
+  `Gio.Menu` has one item, **"About Acheron" → `app.about`**. The `app.about`
+  `Gio.SimpleAction` opens a fresh dialog reading one `GetState()` snapshot. Two testable
+  helpers factored out (same compromise as the file's other helpers — the real
+  `_build_main_window` needs a registered app + session bus to drive): `_build_primary_menu()`
+  and `_about_dialog_state(client, daemon_running)` (returns the snapshot, or `None` when
+  the Daemon's down / the call raises).
+- **Ticket 36 interaction** — `_wire_window_close_to_hide` connects to the window's
+  `close-request` signal, which is emitted by `GtkWindow` regardless of whether a titlebar
+  widget is set via `set_titlebar()`. Structurally unaffected; the header bar's own close
+  button routes through the same signal. Verified the whole app still builds/runs with the
+  header bar via the `shot_device_overview.py` / `shot_binding_editor.py` harnesses. Live
+  tray behaviour confirmation is ticket 103.
+- **`LICENSE` bundling** — `install.sh` gained `cp "$script_dir/LICENSE"
+  "$gui_lib_dir/acheron_gui/LICENSE"` after the package copy; `packaging/test_install.sh`
+  copies `LICENSE` into its sandbox repo and asserts the installed package contains it.
+  Installed-path addition handed to [ticket 35](./35-task-write-release-documentation.md).
+  No committed `gui/acheron_gui/LICENSE` — install.sh places it; the checkout uses the
+  repo-root fallback.
+- **`gui/tools/shot_about.py`** (new) — screenshot harness (sibling of
+  `shot_binding_editor.py`): renders the connected / disconnected / daemon-down dialog
+  states and the licence window, dumps every label's text to `about_states.txt`. Run this
+  session; output confirms the verbatim quote, all four links, the legal block, and the
+  "Not connected" / "not running" fallbacks.
+- **`gui/tests/test_about_dialog.py`** (new, 15 tests) + 3 in `test_app.py`
+  (`_build_primary_menu` shape, `_about_dialog_state` running / not-running / raises).
+
+### Not done (out of scope / handed off)
+
+- Live firmware/serial + tray verification → ticket 103.
+- Per-file GPL headers, README license section, documenting the new installed path → ticket
+  35 (handoff note appended there).
+- `acheron-daemon --version` CLI flag — still not added (ticket 99 already noted it; not
+  needed by this dialog, which reads the D-Bus `daemon_version` key).
