@@ -7,6 +7,7 @@ from acheron_gui.about_dialog import (
     GPL_URL,
     LEGAL_NOTICE,
     MATT_POCOCK_URL,
+    REPO_URL,
     RIVER_NOTE,
     ULTRAMONAKA_URL,
     WIKIPEDIA_URL,
@@ -89,7 +90,12 @@ def test_placeholder_rows_are_shown_with_visible_tbd():
     texts = _texts(dialog)
     assert "Project email: TBD" in texts
     assert "Website: TBD" in texts
-    assert "Repository: TBD" in texts
+
+
+def test_repository_row_links_to_the_public_github_repo():
+    dialog = build_about_dialog(state=None)
+    assert "Repository:" in _texts(dialog)
+    assert REPO_URL in _link_uris(dialog)
 
 
 def test_author_line_credits_claude_code_as_co_author():
@@ -102,6 +108,7 @@ def test_every_external_link_is_wired():
     assert _link_uris(dialog) == {
         WIKIPEDIA_URL,
         GPL_URL,
+        REPO_URL,
         ULTRAMONAKA_URL,
         MATT_POCOCK_URL,
     }
