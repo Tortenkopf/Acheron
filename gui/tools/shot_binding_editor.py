@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """Screenshot harness for the per-key Binding editor + key picker (ticket 95).
 
 Sibling of `shot_library.py` — drives the real `AcheronApplication` against a

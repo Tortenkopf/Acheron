@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright © 2026 Justin Milatz
+
 //! The `CaptureSource` seam: "produces a stream of normalized `PhysicalEvent`s
 //! into a shared channel" is the only contract anything downstream of the
 //! channel relies on (see issue 07 / ticket 13). `evdev_source` is the

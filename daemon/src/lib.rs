@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright © 2026 Justin Milatz
+
 /// The Daemon's runtime version string (ticket 99), stamped at compile time
 /// by `build.rs`: `1.0.0` for a release-tag or tarball build, or
 /// `1.0.0-dev+<short-hash>` for any other git checkout. Reported to the GUI

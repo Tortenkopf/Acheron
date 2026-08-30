@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """The real `com.acheron.Daemon` D-Bus client: a synchronous `Gio.DBusProxy`
 (per spec.md's GUI-side client choice — PyGObject's own proxy, already in
 the GUI's dependency tree, not `dbus-python`/`dbus-fast`/`dbus-next`) that

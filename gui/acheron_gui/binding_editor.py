@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """The shared Binding editor — one component used from Device Overview's
 per-key editor windows (ticket 09's resolved IA; the Action Table sidebar
 that once also hosted it was cut outright in ticket 48). Trigger-mode/

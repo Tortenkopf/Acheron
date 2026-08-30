@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """Pure-Python model of the tray's `com.canonical.dbusmenu` item tree — no
 GLib/dasbus involved, so it's unit-testable directly (`tray.py`'s
 dasbus-exported service wraps this for the real D-Bus marshaling, the same

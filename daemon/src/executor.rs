@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright © 2026 Justin Milatz
+
 //! The shared Action executor (ticket 17): compiles a Binding's `Action`
 //! into one flat `Vec<MacroStep>` — a Keypress becomes a canned
 //! modifier-down/key-down/key-up/modifier-up sequence, a Macro's steps map

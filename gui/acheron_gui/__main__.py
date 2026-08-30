@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """`python3 -m acheron_gui` entry point — mirrors `gui/main.py`.
 
 The installed `acheron-gui` launcher (see `packaging/acheron-gui` and

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """A fake `com.acheron.Daemon` backend, in-memory and synchronous, for GUI
 tests — the swappable-backend seam ticket 16 asks for, replacing the ticket
 09/12 prototypes' `DaemonStub` (which stood in for the not-yet-real D-Bus

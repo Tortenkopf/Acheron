@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright © 2026 Justin Milatz
+
 //! The capture supervisor (ticket 18 §6, wired here in ticket 23): owns
 //! *which* `CaptureSource` is currently running — `AnalogCaptureSource` or
 //! `EvdevCaptureSource` — and swaps between them without tearing down

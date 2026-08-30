@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright © 2026 Justin Milatz
+
 //! Stamps the Daemon's runtime version string into the `ACHERON_VERSION`
 //! compile-time env var (ticket 99), read back by `acheron_daemon::VERSION`.
 //!

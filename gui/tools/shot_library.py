@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """Screenshot harness for the Library view (ticket 91, reusable for 92-95).
 
 Drives the real `AcheronApplication` against a `DaemonStub`, clicks through

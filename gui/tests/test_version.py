@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """Ticket 99: the GUI's `__version__` derivation — a bare release string
 from an install or a release-tag checkout, a `-dev+<hash>` suffix from any
 other checkout, and a clean degrade to bare on any git failure."""

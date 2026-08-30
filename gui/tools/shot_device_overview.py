@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """Screenshot harness for the Device Overview grid (ticket 96).
 
 Sibling of `shot_library.py` / `shot_binding_editor.py` — drives the real

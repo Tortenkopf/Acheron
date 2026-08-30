@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright © 2026 Justin Milatz
+
 //! A scripted `CaptureSource` for tests: feeds a fixed sequence of
 //! `PhysicalEvent`s (and, per ticket 20, device-connection transitions) into
 //! the shared channels, no real device involved.

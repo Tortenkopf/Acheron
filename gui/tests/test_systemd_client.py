@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 from acheron_gui.systemd_client import DAEMON_UNIT, DBusSystemdClient
 
 

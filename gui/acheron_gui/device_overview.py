@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """Device Overview — the GUI's one main view, mirroring the physical
 Tartarus Pro layout exactly as built and settled in ticket 09's prototype
 (`prototype/09-gui-information-architecture/prototype.py`): a 4x5 grid (row

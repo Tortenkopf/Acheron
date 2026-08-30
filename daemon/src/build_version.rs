@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright © 2026 Justin Milatz
+
 // The pure half of ticket 99's runtime-version derivation. `include!`d by
 // both `build.rs` (which feeds it real `git` output at compile time) and
 // the crate's own test module, so the `-dev` suffix rule has one home and

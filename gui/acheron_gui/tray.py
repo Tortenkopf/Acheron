@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """The real system tray icon (ticket 36), replacing `device_overview.py`'s
 old in-window `build_tray_mock` placeholder: a hand-rolled, in-process
 `org.kde.StatusNotifierItem` service via `dasbus`, backed by a minimal

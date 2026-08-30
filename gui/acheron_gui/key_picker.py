@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """The real key/mouse-button picker (ticket 42), replacing `binding_editor.py`'s
 free-text `Gtk.Entry` key field. Ports ticket 32's winning variant A — Inline
 Keyboard Panel — from `prototype/32-key-mouse-button-picker-ux` almost

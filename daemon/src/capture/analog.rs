@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright © 2026 Justin Milatz
+
 //! The Analog `CaptureSource` (CONTEXT.md: Capture mode — avoid "driver
 //! mode", the research/prototype write-ups' working name): the Mode key,
 //! thumbstick and wheel keep arriving over evdev exactly as

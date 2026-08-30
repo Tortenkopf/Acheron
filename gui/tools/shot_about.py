@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """Screenshot harness for the About dialog (ticket 102).
 
 Sibling of `shot_binding_editor.py` / `shot_library.py` — builds the real

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright © 2026 Justin Milatz
+
 //! The D-Bus surface (ticket 15 / issue 08): one flat object,
 //! `/com/acheron/Daemon`, on bus name `com.acheron.Daemon`, one combined
 //! interface (also `com.acheron.Daemon`) — no `ObjectManager` hierarchy.

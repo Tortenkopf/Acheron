@@ -952,6 +952,38 @@ Like the previous map, this one carries execution.
   [ticket 35 (release documentation)](./issues/35-task-write-release-documentation.md) remains
   on the map's frontier.
 
+- [Write the release documentation](./issues/35-task-write-release-documentation.md) — the
+  **last frontier ticket; with it resolved the map's frontier is empty and the destination
+  (Acheron v1.0, feature-complete and release-ready) is reached.** Three user-facing decisions,
+  all put to the user and all landing on the recommended option: (1) a single `README.md` +
+  short `CONTRIBUTING.md`, no INSTALL/USAGE split — matches the project's real size; (2) an
+  SPDX one-liner header (`SPDX-License-Identifier: GPL-3.0-or-later` + `Copyright © 2026 Justin
+  Milatz`) on **every source file of the shipped program** — a one-shot pass over **62 files**
+  in `daemon/`+`gui/`+`install.sh`/`packaging/{test_install.sh,acheron-gui}`, deliberately
+  excluding `prototype/`/`.scratch/` (not the program) and non-source config/manifest files;
+  (3) automated install verification this session, a manual clean-clone checklist handed over
+  for the real `sudo`/systemd parts. `README.md` covers what-it-is (+ the verbatim river note),
+  the feature list in CONTEXT.md's vocabulary, a what-it-is-*not* section, the Tartarus-Pro-only
+  hardware requirement, full system requirements (systemd user instance + session bus;
+  Ubuntu/GNOME/Wayland tested, KDE/XFCE expected-not-tested, GNOME AppIndicator extension
+  called out; `plugdev`; Rust ≥ 1.85; Python 3.9+/PyGObject/GTK 4/dasbus), the `install.sh`
+  steps **including the privileged udev step** and `~/.local/bin`-on-`PATH`, a
+  tag-`v1.0.0`-before-building note (else both components self-label `-dev+<hash>`), an
+  installed-files table, an uninstall recipe, usage basics, config-file rules, and
+  troubleshooting. `CONTRIBUTING.md` carries the repo layout, the `.scratch/` design-record
+  pointer, all three test-suite invocations, the hardware-verification discipline, and the
+  header/contribution-licensing convention. Also folded in every hand-off: **`install.sh`
+  fixed** to `rm -f` + `install -m 755` the daemon binary (was a plain `cp`, failed `ETXTBSY`
+  on a rebuild while running — ticket 90 #2); `Device Picture.jpg` removed from the repo
+  entirely (user's call — no device photo in the README or the tree; the two archived
+  `tartarus-keybinder` references repointed to `layout.md`); ticket 97/99/102 installed-path
+  and version notes all documented. Verified this session: `cargo build --release` exit 0, `cargo test` 380 +
+  `pytest` 355 green (post-header-pass, no regressions), `cargo fmt`/`clippy` clean,
+  `packaging/test_install.sh` all-PASS. **The map carries no open tickets and no live fog
+  toward the destination — Acheron v1.0 is reached** (no capstone "cut v1.0" ticket, per Out
+  of scope). Remaining items in **Not yet specified** are all deliberately-deferred
+  post-v1.0 refinements, not blockers.
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """The real axis-target picker (ticket 71), for the parallel Axis-assignment
 concept (ticket 59/60) — structurally independent of `Action`/`Binding`
 (CONTEXT.md: Axis assignment), so this is *not* wired the same way

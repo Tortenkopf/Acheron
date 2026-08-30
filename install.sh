@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
 # Idempotent install/rebuild path for the Acheron Daemon (ticket 21/spec.md
 # "Packaging and lifecycle"): builds the release binary, installs it and the
 # systemd --user unit, then (re)enables the unit so it's running afterward.
@@ -46,7 +48,14 @@ cargo build --release --manifest-path "$daemon_dir/Cargo.toml"
 
 echo "==> Installing binary to $bin_dir/acheron-daemon"
 mkdir -p "$bin_dir"
-cp "$daemon_dir/target/release/acheron-daemon" "$bin_dir/acheron-daemon"
+# `rm -f` then `install` (not a plain `cp` over the top): if the daemon is
+# already running, its binary is a busy text file and an in-place write
+# fails `ETXTBSY` ("Text file busy"). Unlinking first always succeeds (the
+# running process keeps its own open inode); `install` then creates a fresh
+# file. The running daemon keeps executing the old build until it's
+# restarted — `systemctl --user restart acheron-daemon` picks up the new one.
+rm -f "$bin_dir/acheron-daemon"
+install -m 755 "$daemon_dir/target/release/acheron-daemon" "$bin_dir/acheron-daemon"
 
 echo "==> Installing systemd --user unit to $unit_dir/acheron-daemon.service"
 mkdir -p "$unit_dir"

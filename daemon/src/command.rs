@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright © 2026 Justin Milatz
+
 //! `Command`: the message shape D-Bus method calls (ticket 15) push into the
 //! dispatch task's channel, alongside capture's `PhysicalEvent`s (issue 07's
 //! "D-Bus interleaving" — one state-owning consumer, no second lock or state

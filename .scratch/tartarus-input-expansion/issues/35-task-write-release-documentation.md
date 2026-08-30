@@ -1,4 +1,5 @@
 Type: task
+Status: resolved
 
 ## Notice:
 While this Ticket is not technically blocked by anything, it should still deferred towards the end
@@ -71,3 +72,98 @@ Settle at least:
   written instructions?
 
 ## Answer
+
+The three open decisions were put to the user directly and all three landed on the
+recommended option:
+
+- **Structure and scope**: a single `README.md` + a short `CONTRIBUTING.md`, no
+  `INSTALL.md`/`USAGE.md` split — matches the project's real size (one Daemon, one GUI,
+  one `install.sh`).
+- **Per-file headers**: an SPDX one-liner (`SPDX-License-Identifier: GPL-3.0-or-later`
+  + `Copyright © 2026 Justin Milatz`) on **every source file of the shipped program** —
+  `//` for Rust, `#` for Python/shell, after any shebang. Scoped to `daemon/` and
+  `gui/` (incl. tests and tools) plus `install.sh` / `packaging/test_install.sh` /
+  `packaging/acheron-gui`: **62 files** headed by a one-shot mechanical pass. Deliberately
+  **excluded**: `prototype/` and `.scratch/` (throwaway process artifacts, not the
+  program; whether they ship at all is still the map's open "what ships in the public
+  repo" question), and non-source config/manifest files (`Cargo.toml`, the `.service` /
+  `.rules` / `.desktop` files, `.gitignore`) which don't conventionally carry GPL
+  headers. `README.md`/`CONTRIBUTING.md` carry the SPDX lines in an HTML comment.
+- **Install check**: automated + dry review this session; a manual checklist (below)
+  for the parts needing real `sudo`/`systemd`/a clean clone — same build→verify split as
+  every other ticket on this map.
+
+### What was written
+
+- **`README.md`** — what it is (+ the verbatim Acheron-river note with a Wikipedia link),
+  the feature list in `CONTEXT.md`'s vocabulary, a "what it is not" section (lighting,
+  auto-profile-switching, generic remapping — all out of scope), the Tartarus-Pro-only
+  hardware requirement, system requirements (Linux + systemd user instance + session bus;
+  Ubuntu/GNOME/Wayland as the tested target, KDE/XFCE expected-not-tested, the GNOME
+  AppIndicator extension called out; `plugdev`; Rust ≥ 1.85 for the build; Python 3.9+ /
+  PyGObject / GTK 4 / dasbus for the GUI; an Ubuntu `apt` one-liner), the `install.sh`
+  build/install steps **including the privileged udev step** and the `~/.local/bin`-on-
+  `PATH` requirement, a release-tagging note (tag `v1.0.0` before building or both
+  components self-label `-dev+<hash>`; canonical versions in `daemon/Cargo.toml` +
+  `gui/acheron_gui/__init__.py` `_BASE_VERSION`; `ACHERON_VERSION` override), an
+  installed-files table, a hand-rolled uninstall recipe, usage basics (Device Overview,
+  Base/Held, Chords, Library, tray, About dialog, the edit-blocked-when-disconnected
+  behavior), a config-file section (Daemon owns it; stop it before hand-editing;
+  refuse-to-start on a bad file), an "after a rebuild → `systemctl --user restart`" note,
+  and a troubleshooting list. Licence + acknowledgements (ultramonaka's
+  open-tartarus-driver, Matt Pocock's skills) close it. Process history is **not** in the
+  README — it's a one-paragraph "Design record" pointer in `CONTRIBUTING.md` only.
+- **`CONTRIBUTING.md`** — repo layout table, the `.scratch/` design-record pointer, the
+  "use `CONTEXT.md`'s vocabulary / flag ADR conflicts" rule, build commands, all three
+  test suites with exact invocations (`cargo test`/`fmt`/`clippy`; a
+  `python3 -m venv --system-site-packages` + `pip install pytest` + `pytest gui/tests`
+  recipe, since there's no committed Python dep manifest and `.venv/` is gitignored;
+  `bash packaging/test_install.sh`), the hardware-verification discipline, the licence-
+  header convention + a DCO-style "you license your contribution GPL-3.0-or-later" line.
+- **`install.sh` fix** (ticket 90 hand-off #2): the daemon binary is now installed with
+  `rm -f` + `install -m 755` instead of a plain `cp` over the top, so a rebuild while the
+  Daemon is running no longer fails `ETXTBSY` ("Text file busy"). Comment added noting the
+  running process keeps the old build until `systemctl --user restart`.
+- **`Device Picture.jpg` removed from the repo entirely** (user's call — no device photo in
+  the README or the tree). The two stale references in the archived `tartarus-keybinder`
+  records (`map.md`, `issues/09`) repointed to `layout.md`, which documents the same physical
+  layout and still exists.
+
+All hand-offs folded in: ticket 90 (`PATH` note ✔, `cp`→`install` ✔), ticket 97
+(tray-icons path in the installed-files/uninstall lists ✔), ticket 99 (version locations
+✔, tag-before-build ✔, `ACHERON_VERSION` ✔), ticket 102 (bundled `LICENSE` path ✔, About
+dialog documented ✔).
+
+### Verification done this session
+
+- `cargo build --release --manifest-path daemon/Cargo.toml` — **exit 0** (the real
+  `install.sh` build step).
+- `cargo test` **380 passed**, `cargo fmt --check` clean, `cargo clippy --all-targets -D
+  warnings` clean — after the 62-file header pass, no regressions.
+- `pytest gui/tests` — **355 passed** — after the header pass, no regressions.
+- `bash packaging/test_install.sh` — **all PASS** (idempotency, unit/udev/desktop
+  content, the launcher smoke-run, tray icons), after the `install.sh` binary-install
+  change.
+- Line-by-line dry review of `install.sh` against the README's written steps — they
+  match.
+
+### Manual checklist handed to the user (needs a clean clone + real sudo/systemd)
+
+1. Fresh `git clone` to an empty dir on a machine with the Tartarus Pro connected;
+   follow **only** the README's Install section.
+2. `./install.sh` completes; the `sudo` udev prompt appears once; declining it still
+   leaves a working (digital-capture) Daemon with the printed manual recovery commands.
+3. `systemctl --user status acheron-daemon` → active; `acheron-gui` launches from the
+   app grid and from the shell.
+4. On a checkout **not** on the `v1.0.0` tag, About shows `1.0.0-dev+<hash>` for both
+   components; on a `git checkout v1.0.0`, both show bare `1.0.0`.
+5. Re-run `./install.sh` with the Daemon running — the binary install no longer errors
+   `Text file busy`; `systemctl --user restart acheron-daemon` picks up the new build.
+6. Follow the uninstall recipe; confirm nothing Acheron-owned is left except (optionally)
+   `~/.config/acheron`.
+
+### Not this ticket's call (left open)
+
+Whether `.scratch/`, `prototype/`, `docs/adr/`, `CONTEXT.md` ship in the public repo at
+all — still tracked in the map's **Not yet specified**. The README simply doesn't lead
+with process, per this ticket's own scope note.

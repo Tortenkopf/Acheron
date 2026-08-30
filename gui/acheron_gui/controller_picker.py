@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """The real controller-button picker (ticket 43), for `Action::ControllerButton`
 (ticket 14). Ports ticket 38's winning variant A — Gamepad Diagram — from
 `prototype/38-controller-button-picker-ux` (a visual controller face for the

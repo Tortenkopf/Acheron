@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
 # Automated coverage for ticket 21's packaging: unit-file content and
 # install.sh idempotency — the parts that don't require a real systemd
 # --user session (per the ticket, the login-autostart and crash-recovery

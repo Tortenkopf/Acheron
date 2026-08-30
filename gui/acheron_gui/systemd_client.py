@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """GUI-side client for systemd's own D-Bus API (`org.freedesktop.systemd1`),
 used only for ticket 21's launch-time safety net: on its own launch, the GUI
 asks systemd to clear any latched `failed` state on the Daemon's unit and

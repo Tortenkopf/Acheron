@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """The Tartarus Pro's `Input` set and display labels, mirroring
 `daemon/src/input.rs`'s flat snake_case strings exactly (`mode_key`,
 `grid_r{row}c{col}`, `thumbstick_up`, `wheel_scroll_up`, `wheel_middle`, …)

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 from gi.repository import Gtk
 
 from acheron_gui.axis_picker import AXIS_LABEL_BY_TARGET, build_inline_axis_picker

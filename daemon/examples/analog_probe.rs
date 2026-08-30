@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright © 2026 Justin Milatz
+
 //! Manual HITL verification tool for ticket 22's `AnalogCaptureSource` —
 //! not part of the daemon itself, and not wired into `main.rs` (that's
 //! ticket 23's job). Runs the real `analog::AnalogCaptureSource` against

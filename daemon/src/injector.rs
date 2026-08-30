@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright © 2026 Justin Milatz
+
 //! The injector task: owns the single `uinput` virtual device for the
 //! process lifetime and serializes every output write through one channel,
 //! so no other task ever touches the fd directly (issue 07).

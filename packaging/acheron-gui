@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
 # Acheron GUI launcher. Installed to ~/.local/bin/acheron-gui by install.sh
 # (ticket 90). Runs the copy of the `acheron_gui` package that install.sh
 # lays down at ~/.local/lib/acheron/ — it does NOT point back at a git

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright © 2026 Justin Milatz
+
 //! The D-Bus wire encoding conventions issue 08 settled: `Input` reuses its
 //! TOML `Display`/`FromStr` form (a plain string); `Action`/`MacroStep`
 //! marshal as `a{sv}` dicts with a `"type"` tag key (hand-written

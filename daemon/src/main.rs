@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright © 2026 Justin Milatz
+
 use std::collections::HashMap;
 use std::io;
 use std::time::Duration;

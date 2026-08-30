@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright © 2026 Justin Milatz
+
 //! The real `CaptureSource`: grabs the Tartarus Pro's three evdev nodes
 //! exclusively (`EVIOCGRAB`) and normalizes their raw events into
 //! `PhysicalEvent`s, per issue 07's design.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright © 2026 Justin Milatz
+
 //! Manual HITL verification tool for ticket 101's device-info read — not
 //! part of the daemon itself and not wired into `main.rs`. Runs
 //! `analog::read_device_info()` against the connected Tartarus Pro and

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """Acheron's GTK4 GUI — edits the Daemon's config live over D-Bus.
 
 See `.scratch/tartarus-keybinder/spec.md` ("GUI information architecture")

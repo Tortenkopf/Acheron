@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """Small Gtk4 helpers shared across widget-building modules."""
 
 from __future__ import annotations

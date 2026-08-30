@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """D-Bus wire encoding for `com.acheron.Daemon`, matching the conventions
 hand-written on the Rust side in `daemon/src/dbus/wire.rs`: `Input` is a
 plain string (its TOML `Display`/`FromStr` form); `Action`/`MacroStep`

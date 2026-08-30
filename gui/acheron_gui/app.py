@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """The GTK4 `Gtk.Application` wiring Device Overview to a `DaemonClient` —
 by default the real `DBusDaemonClient` against `com.acheron.Daemon`, per
 ticket 16. On launch, opens straight to Device Overview reflecting

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright © 2026 Justin Milatz
+
 //! The config-facing domain model and `config.toml` lifecycle (ticket 14).
 //!
 //! Every `Action`/`TriggerMode` variant's schema shape was already fully

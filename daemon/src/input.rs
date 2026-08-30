@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright © 2026 Justin Milatz
+
 //! The Tartarus Pro's `Input` domain model and its evdev code table.
 //!
 //! `Input` is the composite enum from the data-model decision (issue 06):

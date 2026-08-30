@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright © 2026 Justin Milatz
+
 //! The dispatch task: single consumer of both the capture channel and the
 //! D-Bus command channel (issue 07's "D-Bus interleaving" — GUI-originated
 //! calls push a `Command` alongside `PhysicalEvent`s, so one task remains

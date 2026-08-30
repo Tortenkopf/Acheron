@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """The real Steppers/Macros library screen (ticket 52 for Macros, ticket 55
 for Steppers), replacing `device_overview.py`'s old placeholder for the
 "Library" destination — the tab-switched panel pair ticket 31's prototype

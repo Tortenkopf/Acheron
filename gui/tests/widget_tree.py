@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """Test-only helper for walking a built Gtk4 widget tree, including into
 `Gtk.Popover`/`Gtk.MenuButton` contents. A `Gtk.MenuButton`'s popover is
 explicitly walked below since it isn't guaranteed reachable through

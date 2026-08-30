@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright © 2026 Justin Milatz
+
 """Ticket 102: Acheron's About dialog — a hand-built plain `Gtk.Window`.
 
 Deliberately **no libadwaita**: `Adw.AboutDialog` needs libadwaita
