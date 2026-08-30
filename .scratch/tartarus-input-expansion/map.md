@@ -984,10 +984,28 @@ Like the previous map, this one carries execution.
   of scope). Remaining items in **Not yet specified** are all deliberately-deferred
   post-v1.0 refinements, not blockers.
 
+- [Decide what ships in the public repo](./issues/107-decide-what-ships-in-public-repo.md) —
+  graduated from **Not yet specified** at the user's request as the one such item to settle
+  before v1.0 (the rest move to a post-1.0 effort). Settled over a two-round grilling: the repo
+  goes public by **flipping visibility on `Tortenkopf/Acheron` with history intact**; **`dev`
+  becomes the permanent working branch** (all `.scratch/`/`prototype/` churn) and **`main` is
+  release-only, rebuilt from `dev`'s non-process paths** at each release, so `main`'s tree is
+  always just code + user docs + `docs/adr/` + `CONTEXT.md`. `.scratch/`, `prototype/`,
+  `docs/agents/`, and `CLAUDE.md` move to `dev` only (`prototype/` first absorbing the 8
+  unmerged `prototype/*` branch dirs, which are then deleted along with
+  `origin/prototype/30-chord-recording-ux`). The device serial `PM2443F36300141` is scrubbed to
+  `PM24XXXXXXXXXXX` across `.scratch/**` on `dev` (no history rewrite). `Charon` stays as the
+  commit-author pseudonym. Executed on resolution: `dev` branched, prototype dirs rescued,
+  serial scrubbed, `main` stripped + `.gitignore`/CONTRIBUTING updated, branches deleted, both
+  pushed. Left to the user: `gh repo edit … --visibility public` and `git tag v1.0.0`. **This
+  closes the last pre-v1.0 item on the map.**
+
 ## Not yet specified
 
+<!-- These move to a post-1.0 development effort (worked on the `dev` branch), per ticket 107. -->
+
+
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.
-- **What ships in the public repo** — `.scratch/`, `prototype/`, `docs/adr/`, and `CONTEXT.md` are all currently assumed to ship as-is (they're a legible build record, not sensitive), but the user flagged a concern that this much process detail might overwhelm a user who just wants to game. Deliberately deferred rather than decided now; revisit closer to release.
 - **Axis output's own rate-curve refinement (Sticky/latching mode)** — [ticket 59](./issues/59-decide-controller-axis-output.md) deliberately banked forward an internal seam (`(Depth, edge_event) → axis_value`) rather than building it: a mode where the axis value latches to the highest Depth reached since the key's last discrete press, resetting only on the next press (e.g. simulating a throttle detent). Not sharp enough to ticket until the Live/linear resolver has real hands-on feel, mirroring Analog-repeat's own rate-curve fog above.
 - **`ABS_HAT0X`/`Y` hat-direction support on the digital/Binding branch** — [ticket 59](./issues/59-decide-controller-axis-output.md) ruled a joystick hat's 3-state signal closer to a discrete button than a continuous axis, and out of this ticket's scope. A future bindable "Hat direction" target (structurally closer to `Action::ControllerButton` than to Axis assignment) is plausible but not yet specified.
 
