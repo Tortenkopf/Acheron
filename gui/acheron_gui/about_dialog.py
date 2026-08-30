@@ -36,6 +36,7 @@ from . import __version__
 
 WIKIPEDIA_URL = "https://en.wikipedia.org/wiki/Acheron"
 GPL_URL = "https://www.gnu.org/licenses/gpl-3.0.html"
+REPO_URL = "https://github.com/Tortenkopf/Acheron"
 ULTRAMONAKA_URL = "https://github.com/ultramonaka/open-tartarus-driver"
 MATT_POCOCK_URL = "https://github.com/mattpocock/skills"
 
@@ -202,7 +203,8 @@ def build_about_dialog(
     content.append(_line("Author: Justin Milatz, with Claude Code as co-author"))
     content.append(_line("Project email: TBD"))
     content.append(_line("Website: TBD"))
-    content.append(_line("Repository: TBD"))
+    content.append(_line("Repository:"))
+    content.append(_link(REPO_URL, "github.com/Tortenkopf/Acheron"))
 
     content.append(_section("Acknowledgements"))
     content.append(
