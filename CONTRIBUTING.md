@@ -23,17 +23,26 @@ scope is deliberately narrow (see the README's "What it is not").
 | `install.sh` | the only install path |
 | `CONTEXT.md` | the domain glossary — **authoritative vocabulary** |
 | `docs/adr/` | architecture decision records |
-| `.scratch/` | the full issue-by-issue design history (see below) |
-| `prototype/` | throwaway UI/protocol spikes kept for reference |
+
+Development happens on the **`dev`** branch; **`main`** is a clean, release-only
+branch rebuilt from `dev` at each tagged release. Send PRs against `dev`.
 
 ## Design record
 
-Acheron was built ticket by ticket. `.scratch/tartarus-keybinder/` holds the
-original MVP (a `spec.md` plus its issues); `.scratch/tartarus-input-expansion/`
-holds the road to v1.0 as a `map.md` (the index) with one file per decision
-under `issues/`. If you want to know *why* something is the way it is, the
-relevant ticket's "Answer" almost certainly says. `CONTEXT.md` and `docs/adr/`
-are the distilled version.
+Acheron was built ticket by ticket, and the full record lives on the **`dev`**
+branch (kept off `main` so a casual checkout stays lean):
+
+- `.scratch/tartarus-keybinder/` — the original MVP: a `spec.md` plus its issues.
+- `.scratch/tartarus-input-expansion/` — the road to v1.0 as a `map.md` (the
+  index) with one file per decision under `issues/`.
+- `prototype/` (3 base spikes) plus the `prototype/*` branches — throwaway
+  UI/protocol spikes; `prototype/NN-…` paths in code comments refer to the
+  matching branch (`git show prototype/NN-slug:<path>`).
+- `CLAUDE.md`, `docs/agents/` — the agent workflow the project was built with.
+
+If you want to know *why* something is the way it is, the relevant ticket's
+"Answer" on `dev` almost certainly says. `CONTEXT.md` and `docs/adr/` (on both
+branches) are the distilled version.
 
 Use the vocabulary `CONTEXT.md` defines (Profile, Layer, Input, Binding,
 Action, Chord, Stepper, Trigger mode, Daemon, GUI, …) and avoid the synonyms it
