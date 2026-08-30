@@ -1,5 +1,6 @@
 Type: task
-Status: open
+Status: resolved
+Assignee: Charon
 Blocked by: 100
 
 ## Question
@@ -50,3 +51,74 @@ replug, and no reset/reconnect disturbance across repeated reads. Daemon + GUI s
 map's standing hardware-testing discipline.
 
 ## Answer
+
+Built against [ticket 100](./100-research-firmware-serial-read-protocol.md)'s note and
+**verified end-to-end on the real Tartarus Pro this session** — no separate verify ticket
+needed (unlike tickets 22→24 / 26→27, the hardware run happened here). Every ticket-100
+live-check item landed on the first attempt.
+
+### What was built
+
+- **`daemon/src/capture/analog.rs`** — the device-info read, pure/impure split the same way
+  the capture logic is:
+  - `hidiocsfeature`/`hidiocgfeature` refactored onto one `hidioc_feature(nr, size)` helper
+    (`0x06` vs `0x07`); `hidiocgfeature(91) == 0xC05B4807` pinned by its own test.
+  - Pure, unit-tested: `response_echoes` (class/id echo + tolerated status `0x00..=0x02`, no
+    response-CRC — matches OpenRazer), `parse_firmware` (`v{args[0]}.{args[1]}`), `parse_serial`
+    (22 ASCII bytes, trim at first NUL then trailing whitespace, reject non-ASCII/empty). The
+    request buffers reuse `build_razer_cmd` unchanged — `firmware_request_matches_the_researched_bytes`
+    / `serial_request_matches_the_researched_bytes` confirm `data_size`/`command_id`/CRC
+    (`0x83` / `0x94`).
+  - I/O: `feature_exchange` (one SET→GET with `[1, 3, 10]`ms backoff retries on the GET),
+    `read_device_info()` — opens a fresh short-lived Interface-2 fd (the `relock()` pattern),
+    tries `transaction_id 0xFF` then `0x1F`, logs which one worked. `pub` so the probe can call it.
+    `DeviceInfo { firmware_version, serial_number }`.
+- **`daemon/src/capture/supervisor.rs`** — on the connection edge into `connected` (once per
+  connection, re-armed on disconnect so a physically different unit is re-read), spawns
+  `spawn_blocking(analog::read_device_info)` and pushes `Some(info)` to dispatch over a new
+  `device_info_tx` channel; pushes `None` on disconnect. Independent of `mode`, so
+  forced-digital / analog-failed sessions still populate it. A failed read logs once and
+  leaves the keys absent.
+- **`daemon/src/command.rs` / `dispatch.rs` / `dbus/wire.rs`** — `State` gains
+  `firmware_version: Option<String>` / `serial_number: Option<String>`; dispatch caches the
+  latest `rx_device_info` value and folds it into `GetState()`; `state_to_dict` emits the two
+  keys **only when `Some`** — absent otherwise, which the keyed dict (ticket 25) makes safe.
+  No new D-Bus method, no signal (the About dialog reads a snapshot on open; the data never
+  changes within a connection). `main.rs` wires the channel.
+- **`daemon/examples/device_info_probe.rs`** — throwaway HITL probe (read-only, never sends
+  `set_device_mode`, no relock needed), `cargo run --example device_info_probe [iterations]`.
+- **`gui/acheron_gui/daemon_stub.py`** — `_firmware_version = "v1.2"` / `_serial_number =
+  "PM2443F36300141"`, in `get_state()` only while `_device_connected` (so
+  `simulate_device_disconnected` exercises the absent-key path for ticket 102's screenshots).
+- **`daemon_client.py` / `app.py`** — no change needed: `get_state()` returns the raw keyed
+  dict, new optional keys pass straight through. `app.py`'s own consumption is ticket 102's
+  job (the About dialog fetches its own `GetState()` snapshot).
+
+### Live verification (real Tartarus Pro, this session)
+
+| Check | Result |
+|---|---|
+| `transaction_id` | **`0xFF` (primary) — no fallback**. `0x1F` never needed. |
+| firmware / serial | **`v1.2` / `PM2443F36300141`** — exact match to research §4. |
+| exchange timing | ~11–12ms for both reads together (well under budget). |
+| reset / re-enumeration | **none** — 13+ probe reads plus daemon reads; USB `power/connected_duration` climbed monotonically throughout. Confirms research §7 (these are reads, negligible risk). |
+| works in analog Capture mode | **yes** — probe ran fine alongside the running daily-driver daemon (device already unlocked); our daemon read it with `capture_mode=analog`. Research gap 3 settled: no ordering dependence. |
+| `GetState()` keys present when connected | `"firmware_version" s "v1.2"`, `"serial_number" s "PM2443F36300141"`. |
+| both keys absent after unplug | **yes** — `device_connected=false`, both keys gone from `GetState()`. |
+| correct values after replug | **yes** — re-read fired on reconnect (`daemon.log` shows a second "read device info … transaction_id 0xff"). |
+| suites | daemon **380 passed / 0 failed** (new: analog device-info parsing/ioctl tests, a dispatch `GetState()` device-info round-trip test, a `wire.rs` absent-keys test), GUI **337 passed / 0 failed** (new: stub absent-when-disconnected test). `cargo clippy --all-targets` clean, `cargo fmt` applied. |
+| hardware discipline | `config.toml` **byte-identical** (`md5 2a6249ee…` before and after); daily-driver `systemd --user` daemon stopped for the test and restarted. |
+
+### Notes for ticket 102 (About dialog)
+
+- Now **unblocked** (99 and 101 both resolved).
+- Read the keys straight off a `GetState()` snapshot; show "Not connected" (or "—") for
+  whichever is absent. Absent is the honest state — there is deliberately no optimistic
+  placeholder.
+- The stub already returns plausible values while "connected" and drops them on
+  `simulate_device_disconnected`, so both dialog states are screenshot-testable with no device.
+- Minor, accepted: during a `SetForceDigital` capture-source swap the supervisor briefly
+  forwards `connected=false` then `true` (pre-existing behaviour — `device_connected` already
+  flickers there), so the two keys blink absent→present and the device-info read re-runs once.
+  Harmless (idempotent ~11ms read, no device-state change); only visible if the About dialog
+  is open at the exact moment of a force-digital toggle.

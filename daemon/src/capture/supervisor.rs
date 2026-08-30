@@ -30,7 +30,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-use super::analog::AnalogCaptureSource;
+use super::analog::{self, AnalogCaptureSource, DeviceInfo};
 use super::evdev_source::EvdevCaptureSource;
 use super::{CaptureMode, CaptureSource, PhysicalEvent};
 use crate::config::ActuationPoint;
@@ -62,6 +62,10 @@ enum Outcome {
 /// `EvdevCaptureSource::ALL.run(...)` used to sit directly. `force_digital`
 /// is `Config.force_digital`'s value at startup; `control_rx` carries every
 /// later value dispatch pushes on a `SetForceDigital` call.
+// Every parameter is a distinct channel handle this task needs for the
+// process's whole lifetime — the same reasoning `dispatch::run` documents
+// for its own `#[allow]`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     event_tx: mpsc::Sender<PhysicalEvent>,
     connection_tx: mpsc::Sender<bool>,
@@ -69,9 +73,15 @@ pub async fn run(
     depth_tx: watch::Sender<HashMap<Input, u8>>,
     mode_tx: mpsc::Sender<CaptureMode>,
     mut control_rx: mpsc::Receiver<bool>,
+    device_info_tx: mpsc::Sender<Option<DeviceInfo>>,
     force_digital: bool,
 ) -> io::Result<()> {
     let mut force_digital = force_digital;
+    // Ticket 101: `false` until this connection's firmware/serial read has
+    // been dispatched (spawned), back to `false` on disconnect so the next
+    // unit — possibly a physically different one — is re-read. Lives across
+    // the mode loop below since it tracks the *device*, not the source.
+    let mut device_info_read = false;
     let mut mode = if force_digital {
         CaptureMode::Digital
     } else {
@@ -144,6 +154,34 @@ pub async fn run(
                     if connected {
                         grace_armed = false;
                     }
+                    // Ticket 101: read firmware/serial once per connection,
+                    // on the edge into connected, on a throwaway Interface-2
+                    // fd — independent of `mode`, so forced-digital and
+                    // analog-failed sessions populate the About dialog too.
+                    // Off the async loop (`spawn_blocking`: SET/GET ioctls +
+                    // ~ms sleeps); a failed read just logs once and leaves
+                    // the two `GetState()` keys absent.
+                    if connected && !device_info_read {
+                        device_info_read = true;
+                        let device_info_tx = device_info_tx.clone();
+                        tokio::spawn(async move {
+                            match tokio::task::spawn_blocking(analog::read_device_info).await {
+                                Ok(Ok(info)) => {
+                                    let _ = device_info_tx.send(Some(info)).await;
+                                }
+                                Ok(Err(err)) => eprintln!(
+                                    "acheron-daemon: reading device firmware/serial failed \
+                                     (the About dialog will show them as unavailable): {err}"
+                                ),
+                                Err(join_err) => eprintln!(
+                                    "acheron-daemon: device-info read task panicked: {join_err}"
+                                ),
+                            }
+                        });
+                    } else if !connected && device_info_read {
+                        device_info_read = false;
+                        let _ = device_info_tx.send(None).await;
+                    }
                     if should_retry_upgrade(mode, force_digital, ever_connected, last_connected, connected) {
                         break Outcome::SwapTo(CaptureMode::Analog);
                     }
@@ -197,7 +235,7 @@ pub async fn run(
             // Best-effort: a failure here (device already unplugged, no
             // hidraw access) doesn't block the swap itself — there would be
             // nothing left to relock in that case anyway.
-            if let Err(err) = super::analog::relock() {
+            if let Err(err) = analog::relock() {
                 eprintln!(
                     "acheron-daemon: relock before swapping away from analog failed (continuing anyway): {err}"
                 );

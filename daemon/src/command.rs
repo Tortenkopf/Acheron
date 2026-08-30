@@ -31,6 +31,15 @@ pub struct State {
     pub device_connected: bool,
     pub capture_mode: &'static str,
     pub daemon_version: &'static str,
+    /// The connected Tartarus Pro's firmware version (`vX.Y`) and serial
+    /// number, read once per connection over the Interface-2 control channel
+    /// (ticket 100/101) and surfaced for the GUI's About dialog (ticket
+    /// 102). `None` — and absent from `GetState()`'s wire dict — when the
+    /// device is disconnected or the read failed, mirroring how
+    /// `device_connected` flips rather than a dedicated `GetDeviceInfo()`
+    /// call (the data never changes within a connection).
+    pub firmware_version: Option<String>,
+    pub serial_number: Option<String>,
     /// Every Stepper library entry's Daemon-side-only runtime cursor (ticket
     /// 03/54 — CONTEXT.md: Stepper), keyed by `StepperId`, one entry per
     /// entry in `Config.steppers` (defaulting to `0`, "the list's first

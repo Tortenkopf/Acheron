@@ -31,6 +31,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use zbus::object_server::SignalEmitter;
 
+use crate::capture::analog::DeviceInfo;
 use crate::capture::{CaptureMode, EventState, PhysicalEvent};
 use crate::command::{Command, CommandError, State};
 use crate::config::{
@@ -552,6 +553,13 @@ pub async fn run(
     // owns the `Config`/active-Layer state needed to know which Inputs are
     // currently Axis-assigned at all.
     mut rx_depth: watch::Receiver<HashMap<Input, u8>>,
+    // Ticket 101: the supervisor reads the connected Tartarus Pro's
+    // firmware/serial over the Interface-2 control channel once per connect
+    // and pushes the result here — `Some(info)` on a successful read,
+    // `None` on disconnect (so `GetState()`'s keys go absent). Mirrors
+    // `rx_capture_mode`'s "supervisor tells dispatch about the device"
+    // shape; this task owns the one canonical value `GetState()` reads.
+    mut rx_device_info: mpsc::Receiver<Option<DeviceInfo>>,
 ) -> io::Result<()> {
     // Published once up front so the analog capture source's grid task
     // (ticket 22/23) has a correct snapshot to threshold against from the
@@ -598,9 +606,17 @@ pub async fn run(
     // starts `true`: the supervisor reports its real startup choice within
     // milliseconds, so this only briefly matters before the first push.
     let mut capture_mode = CaptureMode::Digital;
+    // The dispatch task's live view of the connected device's firmware/
+    // serial (ticket 101), updated from `rx_device_info` — `None` until the
+    // supervisor's first successful read after a connect, back to `None` on
+    // disconnect. Unlike `device_connected`/`capture_mode` there is no
+    // optimistic startup value: absent is the honest state until a read
+    // actually lands.
+    let mut device_info: Option<DeviceInfo> = None;
     let mut commands_open = true;
     let mut connection_open = true;
     let mut capture_mode_open = true;
+    let mut device_info_open = true;
     // Owns the ~50ms Chord simultaneity window plus every currently-active
     // Chord's Trigger-mode state (ticket 01/40) — reset fresh on every
     // dispatch task start, same as `toggles`/`active_layer`.
@@ -686,9 +702,20 @@ pub async fn run(
                     None => capture_mode_open = false,
                 }
             }
+            info = rx_device_info.recv(), if device_info_open => {
+                match info {
+                    // Ticket 101: no signal — the About dialog reads the
+                    // fields straight from a `GetState()` snapshot it takes
+                    // when it opens, and they never change within a
+                    // connection. `Some(None)` is the disconnect case
+                    // clearing the cache.
+                    Some(update) => device_info = update,
+                    None => device_info_open = false,
+                }
+            }
             cmd = rx_commands.recv(), if commands_open => {
                 match cmd {
-                    Some(cmd) => handle_command(&injector, &mut config, &config_path, &mut toggles, &mut stepper_cursors, &mut axis_state, &mut analog_repeats, &active_layer, device_connected, capture_mode, &signal_emitter, &actuation_tx, &capture_control_tx, cmd).await,
+                    Some(cmd) => handle_command(&injector, &mut config, &config_path, &mut toggles, &mut stepper_cursors, &mut axis_state, &mut analog_repeats, &active_layer, device_connected, capture_mode, device_info.as_ref(), &signal_emitter, &actuation_tx, &capture_control_tx, cmd).await,
                     None => commands_open = false,
                 }
             }
@@ -2176,6 +2203,7 @@ async fn handle_command(
     active_layer: &Layer,
     device_connected: bool,
     capture_mode: CaptureMode,
+    device_info: Option<&DeviceInfo>,
     signal_emitter: &Option<SignalEmitter<'static>>,
     actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
     capture_control_tx: &mpsc::Sender<bool>,
@@ -2202,6 +2230,8 @@ async fn handle_command(
                 device_connected,
                 capture_mode: capture_mode.as_str(),
                 daemon_version: crate::VERSION,
+                firmware_version: device_info.map(|info| info.firmware_version.clone()),
+                serial_number: device_info.map(|info| info.serial_number.clone()),
                 stepper_cursors,
             });
         }
@@ -3094,6 +3124,14 @@ mod tests {
         mpsc::channel(8).1
     }
 
+    /// A fresh device-info `Receiver` for tests that don't exercise the
+    /// supervisor's firmware/serial read (ticket 101) — the paired `Sender`
+    /// is dropped immediately, so `dispatch::run`'s `rx_device_info.recv()`
+    /// arm just closes on its first poll, mirroring `capture_mode_channel`.
+    fn device_info_channel() -> mpsc::Receiver<Option<DeviceInfo>> {
+        mpsc::channel(8).1
+    }
+
     /// A fresh capture-control `Sender` for tests that don't exercise
     /// `SetForceDigital`'s live supervisor swap (ticket 23) — sends into it
     /// just fail silently once the paired `Receiver` (dropped here) is gone,
@@ -3134,6 +3172,7 @@ mod tests {
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
             depth_channel(),
+            device_info_channel(),
         ));
 
         FakeCaptureSource::new(scripted)
@@ -3305,6 +3344,7 @@ mod tests {
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
             depth_channel(),
+            device_info_channel(),
         ));
 
         // Real evdev autorepeat events land tens of milliseconds apart —
@@ -3392,6 +3432,7 @@ mod tests {
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
             depth_channel(),
+            device_info_channel(),
         ));
 
         tx.send(PhysicalEvent {
@@ -3865,6 +3906,7 @@ mod tests {
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
             depth_channel(),
+            device_info_channel(),
         ));
 
         for state in [
@@ -3947,6 +3989,7 @@ mod tests {
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
             depth_channel(),
+            device_info_channel(),
         ));
 
         for state in [EventState::Down, EventState::Repeat, EventState::Up] {
@@ -4003,6 +4046,7 @@ mod tests {
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
             depth_rx,
+            device_info_channel(),
         ));
 
         // A mid-travel Depth, comfortably between the deadzone and the
@@ -4093,6 +4137,7 @@ mod tests {
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
             depth_rx,
+            device_info_channel(),
         ));
 
         let depth: u8 = 100;
@@ -4170,6 +4215,7 @@ mod tests {
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
             depth_rx,
+            device_info_channel(),
         ));
 
         depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), u8::MAX)]));
@@ -4241,6 +4287,7 @@ mod tests {
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
             depth_channel(),
+            device_info_channel(),
         ));
 
         // Down starts a firing that immediately sends KeyDown, then sleeps
@@ -4404,6 +4451,7 @@ mod tests {
         conn_tx: mpsc::Sender<bool>,
         actuation_rx: watch::Receiver<HashMap<Input, ActuationPoint>>,
         depth_tx: watch::Sender<HashMap<Input, u8>>,
+        device_info_tx: mpsc::Sender<Option<DeviceInfo>>,
         sink: RecordingSink,
         gamepad_sink: RecordingSink,
         dispatch_handle: tokio::task::JoinHandle<io::Result<()>>,
@@ -4424,6 +4472,7 @@ mod tests {
             let (cmd_tx, cmd_rx) = mpsc::channel(8);
             let (actuation_tx, actuation_rx) = watch::channel(HashMap::new());
             let (depth_tx, depth_rx) = watch::channel(HashMap::new());
+            let (device_info_tx, device_info_rx) = mpsc::channel(8);
             let dispatch_handle = tokio::spawn(run(
                 event_rx,
                 conn_rx,
@@ -4437,6 +4486,7 @@ mod tests {
                 capture_control_channel(),
                 executor::MIN_TOGGLE_LAP,
                 depth_rx,
+                device_info_rx,
             ));
 
             CommandHarness {
@@ -4446,6 +4496,7 @@ mod tests {
                 event_tx,
                 actuation_rx,
                 depth_tx,
+                device_info_tx,
                 conn_tx,
                 sink,
                 gamepad_sink,
@@ -4898,6 +4949,13 @@ mod tests {
         /// `device_connected`/`DeviceConnectionChanged`.
         async fn set_device_connected(&self, connected: bool) {
             self.conn_tx.send(connected).await.unwrap();
+        }
+
+        /// Stands in for `capture::supervisor` pushing a firmware/serial
+        /// read result (ticket 101) — `Some` after a successful read on
+        /// connect, `None` on disconnect.
+        async fn set_device_info(&self, info: Option<DeviceInfo>) {
+            self.device_info_tx.send(info).await.unwrap();
         }
 
         async fn shut_down(self) -> Vec<Vec<evdev::InputEvent>> {
@@ -5627,6 +5685,41 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(harness.get_state().await.device_connected);
+
+        harness.shut_down().await;
+    }
+
+    /// Ticket 101: a firmware/serial read result pushed by the supervisor
+    /// shows up in `GetState()`; a subsequent disconnect (`None`) clears it
+    /// so the About dialog's keys go absent again.
+    #[tokio::test]
+    async fn get_state_reflects_a_reported_device_info_read_and_its_clearing() {
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+
+        let state = harness.get_state().await;
+        assert_eq!(state.firmware_version, None);
+        assert_eq!(state.serial_number, None);
+
+        harness
+            .set_device_info(Some(DeviceInfo {
+                firmware_version: "v1.2".to_string(),
+                serial_number: "PM2443F36300141".to_string(),
+            }))
+            .await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        let state = harness.get_state().await;
+        assert_eq!(state.firmware_version.as_deref(), Some("v1.2"));
+        assert_eq!(state.serial_number.as_deref(), Some("PM2443F36300141"));
+
+        harness.set_device_info(None).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        let state = harness.get_state().await;
+        assert_eq!(state.firmware_version, None);
+        assert_eq!(state.serial_number, None);
 
         harness.shut_down().await;
     }

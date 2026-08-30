@@ -90,6 +90,11 @@ async fn main() -> io::Result<()> {
     // successful `SetForceDigital` value here so the supervisor can act on
     // it live, without dispatch knowing anything about `CaptureSource`s.
     let (capture_control_tx, capture_control_rx) = tokio::sync::mpsc::channel(8);
+    // The device-info seam (ticket 101): the supervisor reads the connected
+    // Tartarus Pro's firmware/serial over the Interface-2 control channel
+    // once per connect and pushes `Some(info)` here (`None` on disconnect);
+    // dispatch owns the value `GetState()`'s two optional keys report from.
+    let (device_info_tx, device_info_rx) = tokio::sync::mpsc::channel(8);
 
     // Built before the dispatch task so a real `SignalEmitter` (ticket 18's
     // `ActiveLayerChanged`, pushed directly from the dispatch task on every
@@ -135,12 +140,13 @@ async fn main() -> io::Result<()> {
         capture_control_tx,
         toggle_lap_target,
         depth_rx,
+        device_info_rx,
     ));
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     let result = tokio::select! {
-        result = supervisor::run(event_tx, connection_tx, actuation_rx, depth_tx, capture_mode_tx, capture_control_rx, force_digital) => report("capture", result),
+        result = supervisor::run(event_tx, connection_tx, actuation_rx, depth_tx, capture_mode_tx, capture_control_rx, device_info_tx, force_digital) => report("capture", result),
         result = inj_handle => report("injector", flatten(result)),
         result = dispatch_handle => report("dispatch", flatten(result)),
         _ = sigterm.recv() => relock_and_exit("SIGTERM"),

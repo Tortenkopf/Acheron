@@ -1161,6 +1161,7 @@ mod tests {
                 capture_control_tx,
                 crate::executor::MIN_TOGGLE_LAP,
                 depth_rx,
+                tokio::sync::mpsc::channel::<Option<crate::capture::analog::DeviceInfo>>(8).1,
             ));
 
             TestServer {
@@ -2689,6 +2690,7 @@ mod tests {
             capture_control_tx,
             crate::executor::MIN_TOGGLE_LAP,
             depth_rx,
+            tokio::sync::mpsc::channel::<Option<crate::capture::analog::DeviceInfo>>(8).1,
         ));
 
         {

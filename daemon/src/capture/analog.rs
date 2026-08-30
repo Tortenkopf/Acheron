@@ -87,14 +87,65 @@ const DEFAULT_REPEAT_PERIOD_MS: u32 = 33;
 
 const RAZER_CMD_LEN: usize = 91;
 
+// ---------------------------------------------------------------------------
+// Device-info reads (firmware version + serial number) — ticket 100/101.
+// Standard Razer "get" commands on the same Interface-2 control channel and
+// the same 90-byte frame/CRC as the unlock; only `command_id`, `data_size`
+// and the readback differ. Full derivation:
+// `.scratch/tartarus-input-expansion/research/tartarus-pro-device-info-protocol.md`.
+// ---------------------------------------------------------------------------
+
+/// OpenRazer's `razer_attr_read_firmware_version` / `_device_serial` both
+/// hardcode `transaction_id 0xFF` with no per-device switch, and `0xFF` is
+/// the value already confirmed reading `v1.2` / `PM2443F36300141` off our
+/// own unit via OpenRazer's sysfs (research §4). `0x1F` — the
+/// Tartarus-Pro-specific id used for `set_device_mode` and lighting — is the
+/// fallback, tried only if `0xFF`'s response fails validation. Not the
+/// unlock's `0x01`: no evidence it applies to standard get commands.
+const DEVICE_INFO_TXN_PRIMARY: u8 = 0xFF;
+const DEVICE_INFO_TXN_FALLBACK: u8 = 0x1F;
+
+const CMD_GET_FIRMWARE: u8 = 0x81;
+const CMD_GET_SERIAL: u8 = 0x82;
+const FIRMWARE_DATA_SIZE: usize = 2;
+const SERIAL_DATA_SIZE: usize = 22;
+
+/// OpenRazer waits 600–800µs in-kernel between the `SET_REPORT` and the
+/// `GET_REPORT` (`RAZER_BLACKWIDOW_CHROMA_WAIT_*`). From userspace, research
+/// §5 recommends ≥1ms plus a couple of backed-off retries in case the first
+/// GET right after connect is early — these are the per-attempt sleeps.
+const DEVICE_INFO_SETGET_DELAYS_MS: [u64; 3] = [1, 3, 10];
+
+/// Response-struct offsets inside the 91-byte buffer `HIDIOCGFEATURE` fills
+/// (research §3.3): byte 0 stays the report number we wrote and the 90-byte
+/// `razer_report` lands at indices 1..91, so `status` is index 1, the
+/// class/id echo is 7/8, and `arguments` start at index 9 — symmetric with
+/// the SET buffer `build_razer_cmd` produces.
+const RESP_STATUS: usize = 1;
+const RESP_CMD_CLASS: usize = 7;
+const RESP_CMD_ID: usize = 8;
+const RESP_ARGS: usize = 9;
+
 /// Linux's `_IOC(dir, type, nr, size)` (`asm-generic/ioctl.h`), specialized
-/// to `HIDIOCSFEATURE(size)` exactly as `prototype.py`'s `hidiocsfeature`
-/// computes it — checked against the documented `0xC05B4806` for `size =
-/// 91` by `hidiocsfeature_91_matches_the_documented_ioctl_number` below.
-const fn hidiocsfeature(size: u32) -> u64 {
+/// to the HID feature-report ioctls exactly as `prototype.py`'s
+/// `hidiocsfeature` computes it. `nr` `0x06` is `HIDIOCSFEATURE` (write the
+/// request), `0x07` is `HIDIOCGFEATURE` (read the response back) — the two
+/// differ only in that nibble (research `tartarus-pro-device-info-protocol.md`
+/// §3.2). Checked against the documented `0xC05B4806` / `0xC05B4807` for
+/// `size = 91` by the two `hidioc*feature_91_matches_the_documented_ioctl_number`
+/// tests below.
+const fn hidioc_feature(nr: u64, size: u32) -> u64 {
     const IOC_WRITE: u64 = 1;
     const IOC_READ: u64 = 2;
-    ((IOC_WRITE | IOC_READ) << 30) | ((size as u64) << 16) | (b'H' as u64) << 8 | 0x06
+    ((IOC_WRITE | IOC_READ) << 30) | ((size as u64) << 16) | (b'H' as u64) << 8 | nr
+}
+
+const fn hidiocsfeature(size: u32) -> u64 {
+    hidioc_feature(0x06, size)
+}
+
+const fn hidiocgfeature(size: u32) -> u64 {
+    hidioc_feature(0x07, size)
 }
 
 /// Mirrors `prototype.py`'s `build_razer_cmd`: the 91-byte buffer
@@ -355,6 +406,175 @@ pub fn relock() -> io::Result<()> {
         .write(true)
         .open(control_path)?;
     send_relock(&control_file)
+}
+
+// ---------------------------------------------------------------------------
+// Device-info read — firmware version + serial number (ticket 100/101).
+//
+// Pure buffer/response handling (`build_razer_cmd` above, `response_echoes`/
+// `parse_firmware`/`parse_serial` below) is kept separate from the I/O
+// (`feature_exchange`/`read_device_info`) and unit-tested on its own, the
+// same discipline tickets 22/18 used for the capture logic.
+// ---------------------------------------------------------------------------
+
+/// The Tartarus Pro's firmware version (`vX.Y`) and serial number, read once
+/// per connection over the Interface-2 control channel. Surfaced as two
+/// *optional* `GetState()` keys for the About dialog (ticket 102) — present
+/// when known, absent when the device is disconnected or the read failed,
+/// mirroring `device_connected`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceInfo {
+    pub firmware_version: String,
+    pub serial_number: String,
+}
+
+/// True when a `HIDIOCGFEATURE` response buffer is the reply to our own
+/// get-`command_id` request: the class/id echo matches and the `status`
+/// byte is one OpenRazer tolerates (research §5 — `0x00` unset, `0x01`
+/// BUSY, `0x02` SUCCESS; FAILURE `0x03` / TIMEOUT `0x04` / NOT_SUPPORTED
+/// `0x05` are rejected). No response-CRC check — OpenRazer's own keyboard
+/// path doesn't do one either.
+fn response_echoes(resp: &[u8], command_id: u8) -> bool {
+    resp.len() > RESP_ARGS
+        && resp[RESP_CMD_CLASS] == CMD_CLASS_STANDARD
+        && resp[RESP_CMD_ID] == command_id
+        && matches!(resp[RESP_STATUS], 0x00..=0x02)
+}
+
+/// `arguments[0]` major, `arguments[1]` minor, each a plain decimal byte →
+/// `vX.Y` (research §3.4, OpenRazer `razer_attr_read_firmware_version`).
+/// `None` if the buffer isn't a valid firmware reply.
+fn parse_firmware(resp: &[u8]) -> Option<String> {
+    if !response_echoes(resp, CMD_GET_FIRMWARE) || resp.len() < RESP_ARGS + FIRMWARE_DATA_SIZE {
+        return None;
+    }
+    Some(format!("v{}.{}", resp[RESP_ARGS], resp[RESP_ARGS + 1]))
+}
+
+/// 22 bytes of ASCII from `arguments[0..22]`, trimmed at the first NUL then
+/// of trailing whitespace — OpenRazer copies a fixed 22 bytes and the
+/// padding is undocumented, so trim defensively (research §3.4 / §8.4). A
+/// non-ASCII or empty result is treated as a failed read (mirrors
+/// `device_connected` going absent).
+fn parse_serial(resp: &[u8]) -> Option<String> {
+    if !response_echoes(resp, CMD_GET_SERIAL) || resp.len() < RESP_ARGS + SERIAL_DATA_SIZE {
+        return None;
+    }
+    let raw = &resp[RESP_ARGS..RESP_ARGS + SERIAL_DATA_SIZE];
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    let text = std::str::from_utf8(&raw[..end]).ok()?.trim();
+    if text.is_empty() || !text.is_ascii() {
+        return None;
+    }
+    Some(text.to_string())
+}
+
+/// One `SET_REPORT`-then-`GET_REPORT` feature-report exchange on an already
+/// open Interface-2 control fd: writes the get-`command_id` request (no
+/// argument bytes — `data_size` is the *expected response* size), waits, and
+/// reads the 91-byte response back, retrying the GET a few times with
+/// backoff (research §5) since the first read right after connect can be
+/// early. Returns the raw response buffer for the pure parsers to validate.
+fn feature_exchange(
+    control: &fs::File,
+    txn: u8,
+    command_id: u8,
+    data_size: usize,
+) -> io::Result<[u8; RAZER_CMD_LEN]> {
+    const ZEROS: [u8; SERIAL_DATA_SIZE] = [0u8; SERIAL_DATA_SIZE];
+    let mut req = build_razer_cmd(txn, CMD_CLASS_STANDARD, command_id, &ZEROS[..data_size]);
+    let set = unsafe {
+        libc::ioctl(
+            control.as_raw_fd(),
+            hidiocsfeature(RAZER_CMD_LEN as u32) as libc::c_ulong,
+            req.as_mut_ptr(),
+        )
+    };
+    if set < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut last_err = io::Error::new(
+        io::ErrorKind::InvalidData,
+        "device-info response never passed echo validation",
+    );
+    for delay_ms in DEVICE_INFO_SETGET_DELAYS_MS {
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        let mut resp = [0u8; RAZER_CMD_LEN];
+        let got = unsafe {
+            libc::ioctl(
+                control.as_raw_fd(),
+                hidiocgfeature(RAZER_CMD_LEN as u32) as libc::c_ulong,
+                resp.as_mut_ptr(),
+            )
+        };
+        if got < 0 {
+            last_err = io::Error::last_os_error();
+            continue;
+        }
+        if response_echoes(&resp, command_id) {
+            return Ok(resp);
+        }
+    }
+    Err(last_err)
+}
+
+fn read_device_info_with(control: &fs::File, txn: u8) -> io::Result<DeviceInfo> {
+    let invalid = |what: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("device-info {what} response failed to parse"),
+        )
+    };
+    let firmware = feature_exchange(control, txn, CMD_GET_FIRMWARE, FIRMWARE_DATA_SIZE)?;
+    let firmware_version = parse_firmware(&firmware).ok_or_else(|| invalid("firmware"))?;
+    let serial = feature_exchange(control, txn, CMD_GET_SERIAL, SERIAL_DATA_SIZE)?;
+    let serial_number = parse_serial(&serial).ok_or_else(|| invalid("serial"))?;
+    Ok(DeviceInfo {
+        firmware_version,
+        serial_number,
+    })
+}
+
+/// Reads the connected Tartarus Pro's firmware version and serial number
+/// over a freshly-opened, short-lived Interface-2 control fd (the
+/// `relock()` fresh-fd pattern) — independent of Capture mode and of any
+/// running grid task, so a forced-digital or analog-failed session still
+/// gets device info (ticket 101). `capture::supervisor` calls this on every
+/// device connect. Tries the primary `transaction_id` first, then the
+/// fallback if the primary's responses don't validate (research §4).
+///
+/// These are reads — they change no device state — so the reset risk is
+/// negligible (research §7). A failure here is non-fatal to the Daemon: the
+/// caller logs it once and leaves both `GetState()` keys absent.
+pub fn read_device_info() -> io::Result<DeviceInfo> {
+    let interfaces = discover_hidraw();
+    let control_path = interfaces
+        .get(&CONTROL_INTERFACE)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+    let control = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(control_path)?;
+
+    let mut last_err = io::Error::new(
+        io::ErrorKind::InvalidData,
+        "no device-info response validated",
+    );
+    for txn in [DEVICE_INFO_TXN_PRIMARY, DEVICE_INFO_TXN_FALLBACK] {
+        match read_device_info_with(&control, txn) {
+            Ok(info) => {
+                eprintln!(
+                    "acheron-daemon: read device info over Interface 2 with transaction_id {txn:#04x}: \
+                     firmware {}, serial {}",
+                    info.firmware_version, info.serial_number
+                );
+                return Ok(info);
+            }
+            Err(err) => last_err = err,
+        }
+    }
+    Err(last_err)
 }
 
 /// Waits up to `UNLOCK_TIMEOUT` for report `0x06` to arrive on the
@@ -887,6 +1107,124 @@ mod tests {
     #[test]
     fn hidiocsfeature_91_matches_the_documented_ioctl_number() {
         assert_eq!(hidiocsfeature(91), 0xC05B4806);
+    }
+
+    #[test]
+    fn hidiocgfeature_91_matches_the_documented_ioctl_number() {
+        // Research §3.2: the read variant differs from `HIDIOCSFEATURE` only
+        // in the direction nr (`0x07` vs `0x06`).
+        assert_eq!(hidiocgfeature(91), 0xC05B4807);
+    }
+
+    // -- device-info requests: same frame/CRC as the unlock, per research §2 --
+
+    #[test]
+    fn firmware_request_matches_the_researched_bytes() {
+        let cmd = build_razer_cmd(
+            DEVICE_INFO_TXN_PRIMARY,
+            CMD_CLASS_STANDARD,
+            CMD_GET_FIRMWARE,
+            &[0u8; FIRMWARE_DATA_SIZE],
+        );
+        assert_eq!(cmd[2], 0xFF, "transaction_id");
+        assert_eq!(cmd[6], 0x02, "data_size");
+        assert_eq!(cmd[7], 0x00, "command_class");
+        assert_eq!(cmd[8], 0x81, "command_id");
+        assert_eq!(
+            cmd[89], 0x83,
+            "crc = data_size ^ command_class ^ command_id"
+        );
+    }
+
+    #[test]
+    fn serial_request_matches_the_researched_bytes() {
+        let cmd = build_razer_cmd(
+            DEVICE_INFO_TXN_PRIMARY,
+            CMD_CLASS_STANDARD,
+            CMD_GET_SERIAL,
+            &[0u8; SERIAL_DATA_SIZE],
+        );
+        assert_eq!(cmd[2], 0xFF, "transaction_id");
+        assert_eq!(cmd[6], 0x16, "data_size");
+        assert_eq!(cmd[7], 0x00, "command_class");
+        assert_eq!(cmd[8], 0x82, "command_id");
+        assert_eq!(
+            cmd[89], 0x94,
+            "crc = data_size ^ command_class ^ command_id"
+        );
+    }
+
+    // -- pure response parsing (research §3.3/§3.4/§5) --------------------
+
+    /// A synthetic 91-byte `HIDIOCGFEATURE` response: byte 0 the report
+    /// number, then the 90-byte struct at 1.., `status` at 1, class/id echo
+    /// at 7/8, `arguments` from 9.
+    fn response(status: u8, command_class: u8, command_id: u8, args: &[u8]) -> [u8; RAZER_CMD_LEN] {
+        let mut resp = [0u8; RAZER_CMD_LEN];
+        resp[RESP_STATUS] = status;
+        resp[RESP_CMD_CLASS] = command_class;
+        resp[RESP_CMD_ID] = command_id;
+        resp[RESP_ARGS..RESP_ARGS + args.len()].copy_from_slice(args);
+        resp
+    }
+
+    #[test]
+    fn parse_firmware_renders_the_two_argument_bytes_as_vmajor_dot_minor() {
+        let resp = response(0x02, 0x00, CMD_GET_FIRMWARE, &[1, 2]);
+        assert_eq!(parse_firmware(&resp).as_deref(), Some("v1.2"));
+    }
+
+    #[test]
+    fn parse_firmware_accepts_the_busy_and_unset_status_bytes() {
+        for status in [0x00, 0x01, 0x02] {
+            let resp = response(status, 0x00, CMD_GET_FIRMWARE, &[3, 4]);
+            assert_eq!(parse_firmware(&resp).as_deref(), Some("v3.4"));
+        }
+    }
+
+    #[test]
+    fn parse_firmware_rejects_a_failure_status_a_wrong_id_echo_and_a_wrong_class() {
+        assert!(parse_firmware(&response(0x03, 0x00, CMD_GET_FIRMWARE, &[1, 2])).is_none());
+        assert!(parse_firmware(&response(0x02, 0x00, CMD_GET_SERIAL, &[1, 2])).is_none());
+        assert!(parse_firmware(&response(0x02, 0x07, CMD_GET_FIRMWARE, &[1, 2])).is_none());
+    }
+
+    #[test]
+    fn parse_serial_extracts_ascii_and_trims_nul_padding() {
+        let mut args = [0u8; SERIAL_DATA_SIZE];
+        args[..15].copy_from_slice(b"PM2443F36300141");
+        let resp = response(0x02, 0x00, CMD_GET_SERIAL, &args);
+        assert_eq!(parse_serial(&resp).as_deref(), Some("PM2443F36300141"));
+    }
+
+    #[test]
+    fn parse_serial_also_trims_trailing_whitespace_padding() {
+        let mut args = [b' '; SERIAL_DATA_SIZE];
+        args[..6].copy_from_slice(b"PM2443");
+        let resp = response(0x02, 0x00, CMD_GET_SERIAL, &args);
+        assert_eq!(parse_serial(&resp).as_deref(), Some("PM2443"));
+    }
+
+    #[test]
+    fn parse_serial_rejects_an_all_zero_or_non_ascii_payload() {
+        assert!(
+            parse_serial(&response(
+                0x02,
+                0x00,
+                CMD_GET_SERIAL,
+                &[0u8; SERIAL_DATA_SIZE]
+            ))
+            .is_none()
+        );
+        assert!(
+            parse_serial(&response(
+                0x02,
+                0x00,
+                CMD_GET_SERIAL,
+                &[0xFF; SERIAL_DATA_SIZE]
+            ))
+            .is_none()
+        );
     }
 
     #[test]

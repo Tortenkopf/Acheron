@@ -898,6 +898,25 @@ Like the previous map, this one carries execution.
   package sync into `~/.local/lib/acheron/` (no daemon rebuild, no sudo). 336 Python + 369
   Rust green. Closes the ticket 104 finding and the 105→106 pair.
 
+- [Make the Daemon read the Tartarus Pro's firmware version and serial number](./issues/101-task-daemon-device-firmware-serial.md)
+  — built and **verified live on the real device this session** (no separate verify ticket).
+  `analog::read_device_info()` opens a fresh short-lived Interface-2 fd (the `relock()`
+  pattern) and does two standard Razer get commands — pure `parse_firmware`/`parse_serial`/
+  echo-validation unit-tested apart from the `feature_exchange` I/O, same discipline as the
+  capture logic. `capture::supervisor` fires it (`spawn_blocking`) on the connect edge, once
+  per connection, re-armed on disconnect; the result rides a new `device_info` channel to
+  dispatch, which folds it into `GetState()` as two **optional** keys — present when read,
+  absent when disconnected/failed (ticket 25's keyed dict makes that safe), no new D-Bus
+  method or signal. Live results, all first-attempt: `transaction_id` **`0xFF`** (no fallback
+  needed), firmware **`v1.2`** / serial **`PM2443F36300141`** (exact match to ticket 100 §4),
+  ~11ms per read, **zero resets** across 13+ reads (USB `connected_duration` climbed
+  throughout), works fine mid-analog-Capture-mode (settles research gap 3 — no ordering
+  dependence). Unplug → both keys gone; replug → re-read fires, keys back. `daemon_stub.py`
+  stands in with plausible values while "connected". 380 Rust + 337 Python green;
+  `config.toml` byte-identical, daily-driver daemon restored. Throwaway probe:
+  `daemon/examples/device_info_probe.rs`. Unblocks
+  [ticket 102](./issues/102-task-build-about-dialog.md) (99 also resolved — now fully clear).
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.

@@ -83,6 +83,14 @@ class DaemonStub:
         # Ticket 99: the real Daemon reports its compile-time `crate::VERSION`
         # here; the stub stands in with a bare release string.
         self._daemon_version = "1.0.0"
+        # Ticket 101: the real Daemon reads these off the connected Tartarus
+        # Pro over the Interface-2 control channel once per connect. The stub
+        # stands in with plausible fixed values (the documented values for
+        # the reference unit), reported by `get_state()` only while
+        # `_device_connected` — so the About dialog's absent-key handling
+        # ("Not connected") is exercised by `simulate_device_disconnected`.
+        self._firmware_version = "v1.2"
+        self._serial_number = "PM2443F36300141"
         self._force_digital = False
         self._daemon_running = True
         self._device_connected = True
@@ -115,7 +123,7 @@ class DaemonStub:
         }
 
     def get_state(self) -> dict:
-        return {
+        state = {
             "profile": self._active_profile,
             "layer": self._layer,
             "active_toggles": list(self._active_toggles),
@@ -129,6 +137,13 @@ class DaemonStub:
                 stepper_id: self._stepper_cursors.get(stepper_id, 0) for stepper_id in self._steppers
             },
         }
+        # Ticket 101: firmware/serial are optional keys — present only when a
+        # device is connected and its read succeeded, absent otherwise. The
+        # real Daemon omits them from the wire dict; the stub omits them here.
+        if self._device_connected:
+            state["firmware_version"] = self._firmware_version
+            state["serial_number"] = self._serial_number
+        return state
 
     def _validate_binding_action(self, binding: dict) -> None:
         # Ticket 51/03/54/40: mirrors the real Daemon's shared

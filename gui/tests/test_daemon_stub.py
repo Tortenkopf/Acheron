@@ -36,6 +36,9 @@ def test_fresh_stub_matches_the_seed_configs_shape():
         "device_connected": True,
         "capture_mode": "digital",
         "daemon_version": "1.0.0",
+        # Ticket 101: present because the stub starts "connected".
+        "firmware_version": "v1.2",
+        "serial_number": "PM2443F36300141",
         "stepper_cursors": {},
     }
 
@@ -476,6 +479,21 @@ def test_set_binding_silently_moves_a_stepper_direction_off_its_old_input():
     bindings = stub.get_config()["profiles"]["Default"]["base"]
     assert "wheel_scroll_up" not in bindings
     assert bindings["grid_r1c1"] == forward
+
+
+def test_get_state_drops_firmware_and_serial_while_disconnected():
+    # Ticket 101: the About dialog keys off these being absent to show "Not
+    # connected", mirroring the real Daemon omitting them from the wire dict.
+    stub = DaemonStub()
+    assert stub.get_state()["firmware_version"] == "v1.2"
+
+    stub.simulate_device_disconnected()
+    state = stub.get_state()
+    assert "firmware_version" not in state
+    assert "serial_number" not in state
+
+    stub.simulate_device_connected()
+    assert stub.get_state()["serial_number"] == "PM2443F36300141"
 
 
 def test_get_state_reports_zero_for_a_stepper_never_yet_stepped():

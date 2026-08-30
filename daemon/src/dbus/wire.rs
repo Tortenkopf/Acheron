@@ -554,6 +554,21 @@ pub fn state_to_dict(state: &State) -> Dict {
         "daemon_version".to_string(),
         scalar(state.daemon_version.to_string()),
     );
+    // Ticket 101: two *optional* keys — present only when the Daemon has a
+    // cached firmware/serial read for the currently-connected device,
+    // absent when disconnected or the read failed. The About dialog (ticket
+    // 102) shows "Not connected" for whichever key is missing. Keying the
+    // whole dict (ticket 25) is what lets these appear/disappear without
+    // breaking any client.
+    if let Some(firmware_version) = &state.firmware_version {
+        dict.insert(
+            "firmware_version".to_string(),
+            scalar(firmware_version.clone()),
+        );
+    }
+    if let Some(serial_number) = &state.serial_number {
+        dict.insert("serial_number".to_string(), scalar(serial_number.clone()));
+    }
     dict.insert(
         "stepper_cursors".to_string(),
         scalar(stepper_cursors_to_dict(&state.stepper_cursors)),
@@ -1172,6 +1187,8 @@ mod tests {
             device_connected: true,
             capture_mode: "analog",
             daemon_version: "1.0.0-dev+abc1234",
+            firmware_version: Some("v1.2".to_string()),
+            serial_number: Some("PM2443F36300141".to_string()),
             stepper_cursors,
         };
 
@@ -1188,6 +1205,8 @@ mod tests {
         );
         assert!(bool::try_from(get(&dict, "device_connected").unwrap()).unwrap());
         assert_eq!(dict_get_string(&dict, "capture_mode"), "analog");
+        assert_eq!(dict_get_string(&dict, "firmware_version"), "v1.2");
+        assert_eq!(dict_get_string(&dict, "serial_number"), "PM2443F36300141");
         let cursors_dict: Dict = get(&dict, "stepper_cursors")
             .unwrap()
             .clone()
@@ -1197,6 +1216,29 @@ mod tests {
             u64::try_from(cursors_dict.get("weapon-wheel").unwrap().clone()).unwrap(),
             2
         );
+    }
+
+    /// Ticket 101: `firmware_version`/`serial_number` are omitted entirely
+    /// when the Daemon has no cached read (device disconnected or the read
+    /// failed) — the About dialog keys off their absence to show "Not
+    /// connected".
+    #[test]
+    fn state_to_dict_omits_firmware_and_serial_when_unknown() {
+        let state = State {
+            profile: "Default".to_string(),
+            layer: "base",
+            active_toggles: vec![],
+            device_connected: false,
+            capture_mode: "digital",
+            daemon_version: "1.0.0",
+            firmware_version: None,
+            serial_number: None,
+            stepper_cursors: HashMap::new(),
+        };
+
+        let dict = state_to_dict(&state);
+        assert!(!dict.contains_key("firmware_version"));
+        assert!(!dict.contains_key("serial_number"));
     }
 
     #[test]
