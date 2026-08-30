@@ -401,7 +401,7 @@ def test_about_dialog_state_returns_the_live_snapshot_when_the_daemon_is_running
 
     state = _about_dialog_state(stub, daemon_running=True)
 
-    assert state["daemon_version"] == "1.0.0"
+    assert state["daemon_version"] == "1.0.1"
     assert state["firmware_version"] == "v1.2"
 
 

@@ -18,7 +18,7 @@ from typing import Callable
 # (`daemon/Cargo.toml`) — the two install as separate units and are free to
 # diverge after v1.0. The About dialog (ticket 102) shows this prominently
 # and the Daemon's `GetState()` `daemon_version` as a secondary line.
-_BASE_VERSION = "1.0.0"
+_BASE_VERSION = "1.0.1"
 
 # A git-probe callable: takes git args (no leading "git"), returns the
 # trimmed stdout, or None on any non-zero exit / failure / empty output.
