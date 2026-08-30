@@ -1,5 +1,6 @@
 Type: task
-Status: open
+Status: resolved
+Assignee: Charon (2026-08-30)
 Blocked by: 102
 
 ## Question
@@ -39,3 +40,45 @@ and the daemon put back on its normal profile afterward. GUI + Daemon suites gre
 This is the last ticket in the About-dialog cluster (99 → {100 → 101} → 102 → 103).
 
 ## Answer
+
+**Every checklist item passed live on the real Tartarus Pro + the daily-driver Daemon**,
+tested by the user on **both** the installed `acheron-gui` and a from-checkout
+`python3 gui/main.py` run. Ticket 102's About dialog is hardware-confirmed; the
+99 → {100 → 101} → 102 → 103 cluster is closed.
+
+Setup: `./install.sh` from the checkout (rebuilt the Daemon at `b002c8d`, synced the GUI,
+bundled `LICENSE`), `systemctl --user restart acheron-daemon`.
+
+- **Entry point**: the `Gtk.HeaderBar` renders on the main window; the `open-menu-symbolic`
+  button opens the primary menu; "About Acheron" launches the dialog, modal and
+  `transient-for` the main window (centres on it, no separate taskbar entry).
+- **Ticket 36 minimize-to-tray** still works with the new header bar — closing the main
+  window (close button now inside the `Gtk.HeaderBar`) hides it to the tray rather than
+  quitting; tray "Show" restores it. The `close-request` handler was unaffected as
+  predicted.
+- **Device fields, connected**: Firmware `v1.2`, Serial `PM2443F36300141` — the serial
+  matches the sticker on the device.
+- **Device fields, disconnected**: unplugging the Tartarus Pro and reopening the dialog
+  shows "Not connected" for both rows, no crash, no stale value; replugging brings the real
+  values back.
+- **Version lines**: installed run shows bare "Acheron 1.0.0"; from-checkout run shows
+  "Acheron 1.0.0-dev+b002c8d"; the "Daemon 1.0.0-dev+b002c8d" line matches the running
+  Daemon (an `install.sh`-built dev binary).
+- **Legal**: the copyright / no-warranty / redistribution block reads as ticket 102
+  specifies; "View Licence" opens the full bundled GPLv3 text, scrollable to the end; the
+  gnu.org link opens in a browser.
+- **Links**: the Wikipedia, ultramonaka, and Matt Pocock links all open in the default
+  browser.
+- **Formatting**: the river quote is verbatim with both `...` ellipses; the "TBD"
+  placeholder rows are visible; nothing clipped at the default size or on resize.
+
+No screenshots captured — the user verified visually in place and did not need them.
+`~/.config/acheron/config.toml` untouched by the read-only dialog (md5
+`2a6249ee3e69c67dabcade827a7f1d1a` throughout); active Profile left as the user's own
+choice. GUI suite **355 passed**, Daemon suite **380 passed**, `packaging/test_install.sh`
+green (including the ticket-102 `LICENSE`-bundling assertion).
+
+Note for the record: during AFK prep this session briefly stopped the systemd
+`acheron-daemon` unit (a stray `acheron-daemon --version` probe — no such flag — plus a
+too-broad `pkill`); it exited cleanly ("relocking device and exiting"), was restarted, and
+the device reconnected fine. No lasting effect.

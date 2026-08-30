@@ -936,6 +936,22 @@ Like the previous map, this one carries execution.
   [ticket 103](./issues/103-task-verify-about-dialog-on-hardware.md) (live firmware/serial +
   tray verification).
 
+- [Verify the About dialog on hardware](./issues/103-task-verify-about-dialog-on-hardware.md) —
+  **every checklist item passed live** on the real Tartarus Pro + daily-driver Daemon, tested
+  on both the installed `acheron-gui` and a from-checkout run. Header-bar entry point +
+  modal/`transient-for` dialog confirmed; ticket 36 minimize-to-tray unaffected by the
+  `Gtk.HeaderBar` (close button now inside it, `close-request` still fires); Device rows show
+  the real Firmware `v1.2` / Serial `PM2443F36300141` (serial matches the device sticker) and
+  fall back to "Not connected" on unplug with no crash/stale value, real values return on
+  replug; version lines correct (bare `1.0.0` installed, `1.0.0-dev+b002c8d` from checkout,
+  Daemon line matches); legal block + scrollable full-GPLv3 "View Licence" + all four links
+  (Wikipedia, ultramonaka, Matt Pocock, gnu.org) open; river quote verbatim with both `...`,
+  `TBD` rows visible, nothing clipped. GUI 355 / Daemon 380 / `test_install.sh` green;
+  `config.toml` untouched. **This closes the 99 → {100 → 101} → 102 → 103 About-dialog
+  cluster** — the last required-floor GUI item is built and hardware-verified. Only
+  [ticket 35 (release documentation)](./issues/35-task-write-release-documentation.md) remains
+  on the map's frontier.
+
 ## Not yet specified
 
 - **Analog-repeat's rate-curve refinement** — [ticket 20](./issues/20-decide-analog-repeat-trigger-mode.md) deliberately shipped a linear curve with hardcoded, non-per-Binding bounds for the fast-follow. A curved (more-resolution-near-the-top) mapping and per-Binding-configurable bounds are plausible later refinements, not sharp enough to ticket now — revisit once [the build ticket](./issues/39-task-build-analog-repeat.md) has real hands-on feel for whether linear/fixed is actually good enough.
