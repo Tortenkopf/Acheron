@@ -74,7 +74,7 @@ alone.
 
 **Blocked by:** None — can start immediately.
 
-**Status:** in-review
+**Status:** resolved
 
 - [x] `config::persist_edit` exists with a generic `E: From<ConfigError>` error
       parameter; `config.rs` does not name `CommandError`; the `spawn_blocking`
@@ -99,3 +99,14 @@ alone.
       both the target Layer and the donor Profile's binding intact.
 - [x] Daemon test suite — including the D-Bus `*_persists` happy-path tests —
       stays green (384 tests); `cargo clippy` is clean.
+
+## Comments
+
+**2026-08-31** — Resolved in `8259fb9`. All 24 mutating sites (23 `handle_command`
+arms + `switch_profile`) now route through `config::persist_edit`; the private
+`persist` `spawn_blocking` wrapper moved to `config.rs` and now serializes on the
+caller's task so it no longer double-clones `Config`. `/code-review` found no
+correctness bug; its two cleanup notes were addressed (the double-clone) or
+scoped out (`config::write` is still a non-atomic truncating `fs::write` — a
+torn-file-on-crash durability concern orthogonal to snapshot-and-restore, noted
+in `persist_edit`'s doc comment; worth its own ticket if it matters).
