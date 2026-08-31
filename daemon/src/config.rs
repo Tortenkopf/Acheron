@@ -1187,15 +1187,83 @@ pub(crate) fn profile_all_bindings(profile: &Profile) -> impl Iterator<Item = &B
         .chain(profile.chords_held.values())
 }
 
+/// Serializes `config` to its `config.toml` text. Split out so the async
+/// `persist` path can do this cheap CPU work on the caller's task and hand
+/// only the finished `String` to the blocking pool — no second full `Config`
+/// clone just to move it across the `spawn_blocking` boundary.
+fn serialize(config: &Config) -> String {
+    toml::to_string_pretty(config).expect("Config always serializes to TOML")
+}
+
+/// Writes `contents` to `path`, creating the parent directory if needed.
+fn write_contents(path: &Path, contents: &str) -> Result<(), ConfigError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(ConfigError::Io)?;
+    }
+    fs::write(path, contents).map_err(ConfigError::Io)
+}
+
 /// Rewrites `config.toml` in full — the only persistence path, used both for
 /// the initial seed and for every live D-Bus mutation (ticket 15), so
 /// `config.toml` on disk always matches in-memory state immediately.
 pub(crate) fn write(path: &Path, config: &Config) -> Result<(), ConfigError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(ConfigError::Io)?;
+    write_contents(path, &serialize(config))
+}
+
+/// Rewrites `config.toml` with the `fs` work moved off onto the async worker
+/// pool: those `std::fs` calls are synchronous, and running them inline on the
+/// dispatch task would stall every queued `PhysicalEvent` behind them for the
+/// write's duration — perceptible input lag in a daemon whose whole job is
+/// low-latency key remapping. Private to this module: every caller goes
+/// through `persist_edit`, which pairs the write with its own
+/// snapshot-and-restore.
+async fn persist(config: &Config, path: &Path) -> Result<(), ConfigError> {
+    let contents = serialize(config);
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || write_contents(&path, &contents))
+        .await
+        .expect("the config.toml write task must not panic")
+}
+
+/// Applies `edit` to `config` and persists the result as one atomic in-memory
+/// unit (ticket 03). If `edit` returns `Err`, or if the `config.toml` write
+/// then fails, the in-memory `Config` is restored to exactly its pre-`edit`
+/// value before the error propagates — so a failed edit can never leave
+/// `GetConfig()` reporting a change that never reached `persist`, for every
+/// command, by construction. (`write_contents` itself is a plain truncating
+/// `fs::write`, so a write that fails *mid-stream* can still leave the file
+/// torn — an orthogonal durability concern, not one snapshot-and-restore
+/// addresses.) On success the closure's `T` is returned (e.g. a freshly
+/// minted `MacroId`/`StepperId`).
+///
+/// The helper's contract is strictly "atomic config edit + persist": on-success
+/// side effects that aren't `Config` (publishing the actuation snapshot,
+/// recomputing axis output, signalling the capture supervisor, …) belong in
+/// the caller, after this returns `Ok`. `E: From<ConfigError>` keeps this
+/// module from naming `command::CommandError`.
+pub(crate) async fn persist_edit<T, E>(
+    config: &mut Config,
+    path: &Path,
+    edit: impl FnOnce(&mut Config) -> Result<T, E>,
+) -> Result<T, E>
+where
+    E: From<ConfigError>,
+{
+    let snapshot = config.clone();
+    let value = match edit(config) {
+        Ok(v) => v,
+        Err(e) => {
+            *config = snapshot;
+            return Err(e);
+        }
+    };
+    match persist(config, path).await {
+        Ok(()) => Ok(value),
+        Err(e) => {
+            *config = snapshot;
+            Err(e.into())
+        }
     }
-    let contents = toml::to_string_pretty(config).expect("Config always serializes to TOML");
-    fs::write(path, contents).map_err(ConfigError::Io)
 }
 
 #[cfg(test)]
@@ -2371,5 +2439,69 @@ action = { type = "keypress", key = "KEY_A" }
         assert!(matches!(err, ConfigError::InvalidChordAnalogRepeat));
 
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    // --- `persist_edit` (ticket 03) --------------------------------------
+
+    #[tokio::test]
+    async fn persist_edit_closure_error_leaves_config_and_disk_untouched() {
+        let (_dir, path) = temp_config_path();
+        let mut config = Config::seed();
+        let before = config.clone();
+
+        let result: Result<(), ConfigError> = persist_edit(&mut config, &path, |c| {
+            c.force_digital = !c.force_digital;
+            Err(ConfigError::MissingSchemaVersion)
+        })
+        .await;
+
+        assert!(matches!(result, Err(ConfigError::MissingSchemaVersion)));
+        assert_eq!(config, before, "the closure's mutation must be rolled back");
+        assert!(!path.exists(), "a failed edit must not write config.toml");
+    }
+
+    #[tokio::test]
+    async fn persist_edit_write_failure_restores_config_and_reports_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where `write` expects a directory — `create_dir_all`
+        // on its parent then fails, so the persist itself errors.
+        let blocker = dir.path().join("not-a-dir");
+        fs::write(&blocker, b"blocker").unwrap();
+        let path = blocker.join("config.toml");
+
+        let mut config = Config::seed();
+        let before = config.clone();
+
+        let result: Result<(), ConfigError> = persist_edit(&mut config, &path, |c| {
+            c.force_digital = !c.force_digital;
+            Ok(())
+        })
+        .await;
+
+        assert!(matches!(result, Err(ConfigError::Io(_))));
+        assert_eq!(
+            config, before,
+            "an unwritable config.toml must roll the in-memory edit back"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_edit_success_writes_the_file_and_returns_the_closure_value() {
+        let (_dir, path) = temp_config_path();
+        let mut config = Config::seed();
+
+        let result: Result<u32, ConfigError> = persist_edit(&mut config, &path, |c| {
+            c.force_digital = true;
+            Ok(42)
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), 42);
+        assert!(config.force_digital);
+        let reloaded = load_or_seed(&path).expect("config.toml must have been written");
+        assert!(
+            reloaded.force_digital,
+            "the persisted file must reflect the edit"
+        );
     }
 }

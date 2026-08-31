@@ -2019,11 +2019,12 @@ async fn switch_profile(
     if !config.profiles.contains_key(&name) {
         return Err(CommandError::NotFound);
     }
-    let previous = std::mem::replace(&mut config.active_profile, name);
-    let result = persist(config, config_path).await;
-    if result.is_err() {
-        config.active_profile = previous;
-    } else {
+    let result = config::persist_edit(config, config_path, |config| {
+        config.active_profile = name;
+        Ok(())
+    })
+    .await;
+    if result.is_ok() {
         stop_all_toggles(toggles).await;
         publish_actuation_snapshot(config, actuation_tx);
         // Ticket 71: the new Profile's Axis-assignment map generally
@@ -2115,21 +2116,20 @@ fn stepper_references(config: &Config, stepper_id: &StepperId) -> bool {
 /// it already matches, so re-saving the same Input's own trigger mode isn't
 /// mistaken for a conflicting second owner — `None` (used by
 /// `SetChordBinding`, which has no ordinary-Input identity of its own to
-/// exclude) steals from every matching Input unconditionally. Returns what
-/// was removed so the caller can restore it if the persist that follows
-/// fails, mirroring every other mutating Command's rollback-on-failure
-/// discipline. `take_stepper_direction_elsewhere_from_chords` is this
-/// function's exact mirror for a Chord's own Step action (ticket 40) — a
-/// Chord is exactly as exclusive an owner of (stepper, direction) as an
-/// ordinary Binding, so both keyspaces must be swept together whenever
-/// either kind of caller claims one.
+/// exclude) steals from every matching Input unconditionally.
+/// `take_stepper_direction_elsewhere_from_chords` is this function's exact
+/// mirror for a Chord's own Step action (ticket 40) — a Chord is exactly as
+/// exclusive an owner of (stepper, direction) as an ordinary Binding, so both
+/// keyspaces must be swept together whenever either kind of caller claims one.
+/// Both run inside a `config::persist_edit` closure (ticket 03), so a persist
+/// failure restores the whole `Config` snapshot — nothing to return for a
+/// caller to undo by hand.
 fn take_stepper_direction_elsewhere(
     config: &mut Config,
     stepper: &StepperId,
     direction: StepDirection,
     except: Option<(&str, Layer, Input)>,
-) -> Vec<(String, Layer, Input, Binding)> {
-    let mut removed = Vec::new();
+) {
     for (profile_name, profile) in config.profiles.iter_mut() {
         for layer in [Layer::Base, Layer::Held] {
             let bindings = profile.layer_mut(layer);
@@ -2146,13 +2146,10 @@ fn take_stepper_direction_elsewhere(
                 .map(|(&input, _)| input)
                 .collect();
             for input in matching {
-                if let Some(binding) = bindings.remove(&input) {
-                    removed.push((profile_name.clone(), layer, input, binding));
-                }
+                bindings.remove(&input);
             }
         }
     }
-    removed
 }
 
 /// `take_stepper_direction_elsewhere`'s exact mirror for a Profile's Chord
@@ -2167,8 +2164,7 @@ fn take_stepper_direction_elsewhere_from_chords(
     stepper: &StepperId,
     direction: StepDirection,
     except: Option<(&str, Layer, &ChordKey)>,
-) -> Vec<(String, Layer, ChordKey, Binding)> {
-    let mut removed = Vec::new();
+) {
     for (profile_name, profile) in config.profiles.iter_mut() {
         for layer in [Layer::Base, Layer::Held] {
             let chords = profile.chords_mut(layer);
@@ -2185,13 +2181,10 @@ fn take_stepper_direction_elsewhere_from_chords(
                 .map(|(key, _)| key.clone())
                 .collect();
             for key in matching {
-                if let Some(binding) = chords.remove(&key) {
-                    removed.push((profile_name.clone(), layer, key, binding));
-                }
+                chords.remove(&key);
             }
         }
     }
-    removed
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2244,86 +2237,47 @@ async fn handle_command(
             binding,
             reply,
         } => {
-            if let Err(err) = validate_binding(&binding, config) {
-                let _ = reply.send(Err(err));
-                return;
-            }
-            if binding.trigger == TriggerMode::AnalogRepeat && !matches!(input, Input::Grid(_, _)) {
-                let _ = reply.send(Err(CommandError::InvalidRequest(
-                    "Analog-repeat is only valid on Grid Inputs".to_string(),
-                )));
-                return;
-            }
-            let profile = config
-                .active_profile()
-                .expect("load_or_seed validates active_profile names a real profile");
-            if axis_conflict(profile, layer, input) {
-                let _ = reply.send(Err(CommandError::InvalidRequest(format!(
-                    "{input} already has an Axis assignment on this Layer — clear it first"
-                ))));
-                return;
-            }
-            // Ticket 03's Answer: assigning a Stepper list to a new Input
-            // silently moves it off its old one — no reject-at-save step,
-            // since at most one Input *or Chord* may carry a given
-            // (stepper, direction) at a time (ticket 40 widened this
-            // invariant to cover Chords too — a Step-action Chord is just
-            // as exclusive an owner). Collected before the target insert
-            // below so all three can roll back together on a persist
-            // failure.
-            let (moved_stepper_bindings, moved_stepper_chord_bindings) =
+            let result = config::persist_edit(config, config_path, |config| {
+                validate_binding(&binding, config)?;
+                if binding.trigger == TriggerMode::AnalogRepeat
+                    && !matches!(input, Input::Grid(_, _))
+                {
+                    return Err(CommandError::InvalidRequest(
+                        "Analog-repeat is only valid on Grid Inputs".to_string(),
+                    ));
+                }
+                let profile = config
+                    .active_profile()
+                    .expect("load_or_seed validates active_profile names a real profile");
+                if axis_conflict(profile, layer, input) {
+                    return Err(CommandError::InvalidRequest(format!(
+                        "{input} already has an Axis assignment on this Layer — clear it first"
+                    )));
+                }
+                // Ticket 03's Answer: assigning a Stepper list to a new Input
+                // silently moves it off its old one — no reject-at-save step,
+                // since at most one Input *or Chord* may carry a given
+                // (stepper, direction) at a time (ticket 40 widened this
+                // invariant to cover Chords too — a Step-action Chord is just
+                // as exclusive an owner). `persist_edit`'s whole-`Config`
+                // snapshot rolls this steal back together with the target
+                // insert on a persist failure.
                 if let Action::Step { stepper, direction } = &binding.action {
                     let active_profile = config.active_profile.clone();
-                    (
-                        take_stepper_direction_elsewhere(
-                            config,
-                            stepper,
-                            *direction,
-                            Some((&active_profile, layer, input)),
-                        ),
-                        take_stepper_direction_elsewhere_from_chords(
-                            config, stepper, *direction, None,
-                        ),
-                    )
-                } else {
-                    (Vec::new(), Vec::new())
-                };
-            let previous = active_profile_mut(config)
-                .layer_mut(layer)
-                .insert(input, binding);
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                // config.toml on disk must always match in-memory state
-                // (spec.md's config lifecycle) — roll the in-memory edit
-                // back rather than let GetConfig lie about what's saved.
-                let bindings = active_profile_mut(config).layer_mut(layer);
-                match previous {
-                    Some(prev) => {
-                        bindings.insert(input, prev);
-                    }
-                    None => {
-                        bindings.remove(&input);
-                    }
+                    take_stepper_direction_elsewhere(
+                        config,
+                        stepper,
+                        *direction,
+                        Some((&active_profile, layer, input)),
+                    );
+                    take_stepper_direction_elsewhere_from_chords(config, stepper, *direction, None);
                 }
-                for (profile_name, moved_layer, moved_input, moved_binding) in
-                    moved_stepper_bindings
-                {
-                    if let Some(profile) = config.profiles.get_mut(&profile_name) {
-                        profile
-                            .layer_mut(moved_layer)
-                            .insert(moved_input, moved_binding);
-                    }
-                }
-                for (profile_name, moved_layer, moved_key, moved_binding) in
-                    moved_stepper_chord_bindings
-                {
-                    if let Some(profile) = config.profiles.get_mut(&profile_name) {
-                        profile
-                            .chords_mut(moved_layer)
-                            .insert(moved_key, moved_binding);
-                    }
-                }
-            }
+                active_profile_mut(config)
+                    .layer_mut(layer)
+                    .insert(input, binding);
+                Ok(())
+            })
+            .await;
             let _ = reply.send(result);
         }
         Command::ClearBinding {
@@ -2331,24 +2285,26 @@ async fn handle_command(
             layer,
             reply,
         } => {
-            let Some(previous) = active_profile_mut(config).layer_mut(layer).remove(&input) else {
-                let _ = reply.send(Err(CommandError::NotFound));
-                return;
-            };
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                active_profile_mut(config)
+            let result = config::persist_edit(config, config_path, |config| {
+                if active_profile_mut(config)
                     .layer_mut(layer)
-                    .insert(input, previous);
-            }
+                    .remove(&input)
+                    .is_none()
+                {
+                    return Err(CommandError::NotFound);
+                }
+                Ok(())
+            })
+            .await;
             let _ = reply.send(result);
         }
         Command::SetModeKeyRole { role, reply } => {
-            let previous = std::mem::replace(&mut active_profile_mut(config).mode_key_role, role);
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                active_profile_mut(config).mode_key_role = previous;
-            } else if role == ModeKeyRole::LayerSwitch {
+            let result = config::persist_edit(config, config_path, |config| {
+                active_profile_mut(config).mode_key_role = role;
+                Ok(())
+            })
+            .await;
+            if result.is_ok() && role == ModeKeyRole::LayerSwitch {
                 // Leaving `Bound`: a Toggle can only ever have been started
                 // on the Mode key while `Bound` (it's the only role that
                 // ever runs it through Trigger-mode dispatch). Once
@@ -2364,44 +2320,39 @@ async fn handle_command(
             let _ = reply.send(result);
         }
         Command::CreateProfile { name, reply } => {
-            if name.trim().is_empty() {
-                let _ = reply.send(Err(CommandError::InvalidRequest(
-                    "Profile name can't be empty".to_string(),
-                )));
-                return;
-            }
-            if config.profiles.contains_key(&name) {
-                let _ = reply.send(Err(CommandError::AlreadyExists));
-                return;
-            }
-            config.profiles.insert(name.clone(), Profile::default());
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config.profiles.remove(&name);
-            }
+            let result = config::persist_edit(config, config_path, |config| {
+                if name.trim().is_empty() {
+                    return Err(CommandError::InvalidRequest(
+                        "Profile name can't be empty".to_string(),
+                    ));
+                }
+                if config.profiles.contains_key(&name) {
+                    return Err(CommandError::AlreadyExists);
+                }
+                config.profiles.insert(name, Profile::default());
+                Ok(())
+            })
+            .await;
             let _ = reply.send(result);
         }
         Command::DeleteProfile { name, reply } => {
-            if name == config.active_profile {
-                let _ = reply.send(Err(CommandError::InvalidRequest(
-                    "cannot delete the active Profile".to_string(),
-                )));
-                return;
-            }
-            if profile_switch_references(config, &name) {
-                let _ = reply.send(Err(CommandError::InvalidRequest(format!(
-                    "Profile {name:?} is still referenced by a Profile Switch Binding"
-                ))));
-                return;
-            }
-            let Some(previous) = config.profiles.remove(&name) else {
-                let _ = reply.send(Err(CommandError::NotFound));
-                return;
-            };
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config.profiles.insert(name, previous);
-            }
+            let result = config::persist_edit(config, config_path, |config| {
+                if name == config.active_profile {
+                    return Err(CommandError::InvalidRequest(
+                        "cannot delete the active Profile".to_string(),
+                    ));
+                }
+                if profile_switch_references(config, &name) {
+                    return Err(CommandError::InvalidRequest(format!(
+                        "Profile {name:?} is still referenced by a Profile Switch Binding"
+                    )));
+                }
+                if config.profiles.remove(&name).is_none() {
+                    return Err(CommandError::NotFound);
+                }
+                Ok(())
+            })
+            .await;
             let _ = reply.send(result);
         }
         Command::RenameProfile {
@@ -2424,31 +2375,26 @@ async fn handle_command(
                 return;
             }
             if old_name == new_name {
+                // The one arm with an `Ok` early-return — routing a rename to
+                // the same name through `persist_edit` would add a spurious
+                // `config.toml` write for a no-op, so it stays a guard ahead
+                // of the helper.
                 let _ = reply.send(Ok(()));
                 return;
             }
-            // Snapshotting the whole map (rather than just the renamed
-            // Profile, as before ticket 34) is what makes the cascade below
-            // cleanly reversible on a persist failure — any other Profile's
-            // Bindings can now change too, not just the renamed entry.
-            let previous_profiles = config.profiles.clone();
-            let previous_active = config.active_profile.clone();
-
-            let profile = config
-                .profiles
-                .remove(&old_name)
-                .expect("just checked old_name exists");
-            config.profiles.insert(new_name.clone(), profile);
-            if config.active_profile == old_name {
-                config.active_profile = new_name.clone();
-            }
-            cascade_rename_profile_switch_targets(config, &old_name, &new_name);
-
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config.profiles = previous_profiles;
-                config.active_profile = previous_active;
-            }
+            let result = config::persist_edit(config, config_path, |config| {
+                let profile = config
+                    .profiles
+                    .remove(&old_name)
+                    .expect("just checked old_name exists");
+                config.profiles.insert(new_name.clone(), profile);
+                if config.active_profile == old_name {
+                    config.active_profile = new_name.clone();
+                }
+                cascade_rename_profile_switch_targets(config, &old_name, &new_name);
+                Ok(())
+            })
+            .await;
             let _ = reply.send(result);
         }
         Command::SwitchProfile { name, reply } => {
@@ -2490,50 +2436,28 @@ async fn handle_command(
             release,
             reply,
         } => {
-            if let Err(err) = reject_non_grid_input(input, "actuation points") {
-                let _ = reply.send(Err(err));
-                return;
-            }
-            if let Err(err) = reject_release_above_actuation(actuation, release) {
-                let _ = reply.send(Err(err));
-                return;
-            }
-            let point = ActuationPoint { actuation, release };
-            let previous = active_profile_mut(config)
-                .actuation_overrides
-                .insert(input, point);
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                let overrides = &mut active_profile_mut(config).actuation_overrides;
-                match previous {
-                    Some(prev) => {
-                        overrides.insert(input, prev);
-                    }
-                    None => {
-                        overrides.remove(&input);
-                    }
-                }
-            } else {
+            let result = config::persist_edit(config, config_path, |config| {
+                reject_non_grid_input(input, "actuation points")?;
+                reject_release_above_actuation(actuation, release)?;
+                active_profile_mut(config)
+                    .actuation_overrides
+                    .insert(input, ActuationPoint { actuation, release });
+                Ok(())
+            })
+            .await;
+            if result.is_ok() {
                 publish_actuation_snapshot(config, actuation_tx);
             }
             let _ = reply.send(result);
         }
         Command::ClearActuationPoint { input, reply } => {
-            if let Err(err) = reject_non_grid_input(input, "actuation points") {
-                let _ = reply.send(Err(err));
-                return;
-            }
-            let previous = active_profile_mut(config)
-                .actuation_overrides
-                .remove(&input);
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                if let Some(prev) = previous {
-                    active_profile_mut(config)
-                        .actuation_overrides
-                        .insert(input, prev);
-                }
-            } else {
+            let result = config::persist_edit(config, config_path, |config| {
+                reject_non_grid_input(input, "actuation points")?;
+                active_profile_mut(config).actuation_overrides.remove(&input);
+                Ok(())
+            })
+            .await;
+            if result.is_ok() {
                 publish_actuation_snapshot(config, actuation_tx);
             }
             let _ = reply.send(result);
@@ -2543,38 +2467,36 @@ async fn handle_command(
             release,
             reply,
         } => {
-            if let Err(err) = reject_release_above_actuation(actuation, release) {
-                let _ = reply.send(Err(err));
-                return;
-            }
-            let previous = std::mem::replace(
-                &mut active_profile_mut(config).default_actuation,
-                ActuationPoint { actuation, release },
-            );
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                active_profile_mut(config).default_actuation = previous;
-            } else {
+            let result = config::persist_edit(config, config_path, |config| {
+                reject_release_above_actuation(actuation, release)?;
+                active_profile_mut(config).default_actuation =
+                    ActuationPoint { actuation, release };
+                Ok(())
+            })
+            .await;
+            if result.is_ok() {
                 publish_actuation_snapshot(config, actuation_tx);
             }
             let _ = reply.send(result);
         }
         Command::ResetActuationPoints { reply } => {
-            let previous = std::mem::take(&mut active_profile_mut(config).actuation_overrides);
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                active_profile_mut(config).actuation_overrides = previous;
-            } else {
+            let result = config::persist_edit(config, config_path, |config| {
+                active_profile_mut(config).actuation_overrides.clear();
+                Ok(())
+            })
+            .await;
+            if result.is_ok() {
                 publish_actuation_snapshot(config, actuation_tx);
             }
             let _ = reply.send(result);
         }
         Command::SetForceDigital { force, reply } => {
-            let previous = std::mem::replace(&mut config.force_digital, force);
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config.force_digital = previous;
-            } else {
+            let result = config::persist_edit(config, config_path, |config| {
+                config.force_digital = force;
+                Ok(())
+            })
+            .await;
+            if result.is_ok() {
                 // Tells the supervisor (ticket 23) to actually swap the live
                 // capture source — only on a successful persist, matching
                 // every other mutating Command's "config.toml on disk always
@@ -2584,63 +2506,52 @@ async fn handle_command(
             let _ = reply.send(result);
         }
         Command::CreateMacro { name, steps, reply } => {
-            if name.trim().is_empty() {
-                let _ = reply.send(Err(CommandError::InvalidRequest(
-                    "Macro name can't be empty".to_string(),
-                )));
-                return;
-            }
-            let macro_id = config::unique_macro_id(config, &name);
-            config
-                .macros
-                .insert(macro_id.clone(), config::MacroDef { name, steps });
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config.macros.remove(&macro_id);
-            }
-            let _ = reply.send(result.map(|()| macro_id));
+            let result = config::persist_edit(config, config_path, |config| {
+                if name.trim().is_empty() {
+                    return Err(CommandError::InvalidRequest(
+                        "Macro name can't be empty".to_string(),
+                    ));
+                }
+                let macro_id = config::unique_macro_id(config, &name);
+                config
+                    .macros
+                    .insert(macro_id.clone(), config::MacroDef { name, steps });
+                Ok(macro_id)
+            })
+            .await;
+            let _ = reply.send(result);
         }
         Command::RenameMacro {
             macro_id,
             new_name,
             reply,
         } => {
-            if new_name.trim().is_empty() {
-                let _ = reply.send(Err(CommandError::InvalidRequest(
-                    "Macro name can't be empty".to_string(),
-                )));
-                return;
-            }
-            let Some(def) = config.macros.get_mut(&macro_id) else {
-                let _ = reply.send(Err(CommandError::NotFound));
-                return;
-            };
-            let previous = std::mem::replace(&mut def.name, new_name);
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config
-                    .macros
-                    .get_mut(&macro_id)
-                    .expect("just written above")
-                    .name = previous;
-            }
+            let result = config::persist_edit(config, config_path, |config| {
+                if new_name.trim().is_empty() {
+                    return Err(CommandError::InvalidRequest(
+                        "Macro name can't be empty".to_string(),
+                    ));
+                }
+                let def = config.macros.get_mut(&macro_id).ok_or(CommandError::NotFound)?;
+                def.name = new_name;
+                Ok(())
+            })
+            .await;
             let _ = reply.send(result);
         }
         Command::DeleteMacro { macro_id, reply } => {
-            if macro_references(config, &macro_id) {
-                let _ = reply.send(Err(CommandError::InvalidRequest(format!(
-                    "{macro_id:?} is still referenced by a Macro Binding"
-                ))));
-                return;
-            }
-            let Some(previous) = config.macros.remove(&macro_id) else {
-                let _ = reply.send(Err(CommandError::NotFound));
-                return;
-            };
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config.macros.insert(macro_id, previous);
-            }
+            let result = config::persist_edit(config, config_path, |config| {
+                if macro_references(config, &macro_id) {
+                    return Err(CommandError::InvalidRequest(format!(
+                        "{macro_id:?} is still referenced by a Macro Binding"
+                    )));
+                }
+                if config.macros.remove(&macro_id).is_none() {
+                    return Err(CommandError::NotFound);
+                }
+                Ok(())
+            })
+            .await;
             let _ = reply.send(result);
         }
         Command::SetMacroSteps {
@@ -2648,83 +2559,66 @@ async fn handle_command(
             steps,
             reply,
         } => {
-            let Some(def) = config.macros.get_mut(&macro_id) else {
-                let _ = reply.send(Err(CommandError::NotFound));
-                return;
-            };
-            let previous = std::mem::replace(&mut def.steps, steps);
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config
-                    .macros
-                    .get_mut(&macro_id)
-                    .expect("just written above")
-                    .steps = previous;
-            }
+            let result = config::persist_edit(config, config_path, |config| {
+                let def = config.macros.get_mut(&macro_id).ok_or(CommandError::NotFound)?;
+                def.steps = steps;
+                Ok(())
+            })
+            .await;
             let _ = reply.send(result);
         }
         Command::CreateStepper { name, items, reply } => {
-            if name.trim().is_empty() {
-                let _ = reply.send(Err(CommandError::InvalidRequest(
-                    "Stepper name can't be empty".to_string(),
-                )));
-                return;
-            }
-            if let Err(err) = validate_stepper_items(&items) {
-                let _ = reply.send(Err(err));
-                return;
-            }
-            let stepper_id = config::unique_stepper_id(config, &name);
-            config
-                .steppers
-                .insert(stepper_id.clone(), config::StepperDef { name, items });
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config.steppers.remove(&stepper_id);
-            }
-            let _ = reply.send(result.map(|()| stepper_id));
+            let result = config::persist_edit(config, config_path, |config| {
+                if name.trim().is_empty() {
+                    return Err(CommandError::InvalidRequest(
+                        "Stepper name can't be empty".to_string(),
+                    ));
+                }
+                validate_stepper_items(&items)?;
+                let stepper_id = config::unique_stepper_id(config, &name);
+                config
+                    .steppers
+                    .insert(stepper_id.clone(), config::StepperDef { name, items });
+                Ok(stepper_id)
+            })
+            .await;
+            let _ = reply.send(result);
         }
         Command::RenameStepper {
             stepper_id,
             new_name,
             reply,
         } => {
-            if new_name.trim().is_empty() {
-                let _ = reply.send(Err(CommandError::InvalidRequest(
-                    "Stepper name can't be empty".to_string(),
-                )));
-                return;
-            }
-            let Some(def) = config.steppers.get_mut(&stepper_id) else {
-                let _ = reply.send(Err(CommandError::NotFound));
-                return;
-            };
-            let previous = std::mem::replace(&mut def.name, new_name);
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config
+            let result = config::persist_edit(config, config_path, |config| {
+                if new_name.trim().is_empty() {
+                    return Err(CommandError::InvalidRequest(
+                        "Stepper name can't be empty".to_string(),
+                    ));
+                }
+                let def = config
                     .steppers
                     .get_mut(&stepper_id)
-                    .expect("just written above")
-                    .name = previous;
-            }
+                    .ok_or(CommandError::NotFound)?;
+                def.name = new_name;
+                Ok(())
+            })
+            .await;
             let _ = reply.send(result);
         }
         Command::DeleteStepper { stepper_id, reply } => {
-            if stepper_references(config, &stepper_id) {
-                let _ = reply.send(Err(CommandError::InvalidRequest(format!(
-                    "{stepper_id:?} is still referenced by a Step Binding"
-                ))));
-                return;
-            }
-            let Some(previous) = config.steppers.remove(&stepper_id) else {
-                let _ = reply.send(Err(CommandError::NotFound));
-                return;
-            };
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config.steppers.insert(stepper_id, previous);
-            } else {
+            let result = config::persist_edit(config, config_path, |config| {
+                if stepper_references(config, &stepper_id) {
+                    return Err(CommandError::InvalidRequest(format!(
+                        "{stepper_id:?} is still referenced by a Step Binding"
+                    )));
+                }
+                if config.steppers.remove(&stepper_id).is_none() {
+                    return Err(CommandError::NotFound);
+                }
+                Ok(())
+            })
+            .await;
+            if result.is_ok() {
                 // The runtime cursor is Daemon-side-only state, not part of
                 // `config`/`persist` — dropped here, on a successful delete,
                 // so a later `CreateStepper` that happens to land on the
@@ -2741,36 +2635,31 @@ async fn handle_command(
             items,
             reply,
         } => {
-            if let Err(err) = validate_stepper_items(&items) {
-                let _ = reply.send(Err(err));
-                return;
-            }
-            let Some(def) = config.steppers.get_mut(&stepper_id) else {
-                let _ = reply.send(Err(CommandError::NotFound));
-                return;
-            };
-            let previous = std::mem::replace(&mut def.items, items);
-            let new_len = config.steppers[&stepper_id].items.len();
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config
+            let result = config::persist_edit(config, config_path, |config| {
+                validate_stepper_items(&items)?;
+                let def = config
                     .steppers
                     .get_mut(&stepper_id)
-                    .expect("just written above")
-                    .items = previous;
-            } else if new_len == 0 {
-                // Nothing left to point at — dropping the entry lets
-                // `resolve_step`'s zero-items short-circuit and `GetState`'s
-                // own default both agree on "index 0" for free, the same
-                // convention a never-yet-stepped cursor already uses.
-                stepper_cursors.remove(&stepper_id);
-            } else {
-                // A shrink can leave a stored cursor pointing past the new
-                // end — clamped here (mirroring `resolve_step`'s own
-                // `.min(len - 1)` guard) so `GetState`'s reported position
-                // never outruns the list it's a position *in*, even before
-                // this Stepper is next fired (code-review finding).
-                if let Some(cursor) = stepper_cursors.get_mut(&stepper_id) {
+                    .ok_or(CommandError::NotFound)?;
+                def.items = items;
+                Ok(())
+            })
+            .await;
+            if result.is_ok() {
+                let new_len = config.steppers[&stepper_id].items.len();
+                if new_len == 0 {
+                    // Nothing left to point at — dropping the entry lets
+                    // `resolve_step`'s zero-items short-circuit and
+                    // `GetState`'s own default both agree on "index 0" for
+                    // free, the same convention a never-yet-stepped cursor
+                    // already uses.
+                    stepper_cursors.remove(&stepper_id);
+                } else if let Some(cursor) = stepper_cursors.get_mut(&stepper_id) {
+                    // A shrink can leave a stored cursor pointing past the new
+                    // end — clamped here (mirroring `resolve_step`'s own
+                    // `.min(len - 1)` guard) so `GetState`'s reported position
+                    // never outruns the list it's a position *in*, even before
+                    // this Stepper is next fired (code-review finding).
                     *cursor = (*cursor).min(new_len - 1);
                 }
             }
@@ -2782,109 +2671,73 @@ async fn handle_command(
             binding,
             reply,
         } => {
-            if inputs.len() < 2 {
-                let _ = reply.send(Err(CommandError::InvalidRequest(
-                    "a Chord needs at least two member Inputs".to_string(),
-                )));
-                return;
-            }
-            if matches!(binding.action, Action::ProfileSwitch { .. }) {
-                // See `ConfigError::InvalidChordProfileSwitch` — a Chord's
-                // own Action can never be ProfileSwitch, since
-                // `fire_chord`/`compile_action` have no `&mut Config` to
-                // actually run a switch through (unlike a Chord *member*'s
-                // own individual Binding, which can be anything — see
-                // `fire_individual_retroactively`).
-                let _ = reply.send(Err(CommandError::InvalidRequest(
-                    "a Chord's Binding can't be a Profile Switch".to_string(),
-                )));
-                return;
-            }
-            if binding.trigger == TriggerMode::AnalogRepeat {
-                // See `ConfigError::InvalidChordAnalogRepeat` — a Chord
-                // fires on a discrete member-set completion, not a single
-                // grid key's continuous Depth, same "no coherent runtime
-                // owner" reasoning as the Profile Switch rejection above.
-                let _ = reply.send(Err(CommandError::InvalidRequest(
-                    "a Chord's Binding can't use Analog-repeat".to_string(),
-                )));
-                return;
-            }
-            if let Err(err) = validate_binding(&binding, config) {
-                let _ = reply.send(Err(err));
-                return;
-            }
-            let profile = config
-                .active_profile()
-                .expect("load_or_seed validates active_profile names a real profile");
-            if let Some(&axis_input) = inputs.iter().find(|&&i| axis_conflict(profile, layer, i)) {
-                let _ = reply.send(Err(CommandError::InvalidRequest(format!(
-                    "{axis_input} already has an Axis assignment on this Layer — clear it first"
-                ))));
-                return;
-            }
-            let key = ChordKey::new(inputs);
-            if let Some(conflicting) =
-                chord_conflict(active_profile_mut(config).chords(layer), &key)
-            {
-                let _ = reply.send(Err(CommandError::InvalidRequest(format!(
-                    "conflicts with the existing Chord {conflicting}: one member set fully contains the other"
-                ))));
-                return;
-            }
-            // Ticket 40: a Step-action Chord is exactly as exclusive an
-            // owner of (stepper, direction) as an ordinary Binding's
-            // (ticket 03's Answer) — steal it from wherever else it
-            // currently lives, in either keyspace, mirroring `SetBinding`'s
-            // own handler.
-            let (moved_stepper_bindings, moved_stepper_chord_bindings) =
+            let result = config::persist_edit(config, config_path, |config| {
+                if inputs.len() < 2 {
+                    return Err(CommandError::InvalidRequest(
+                        "a Chord needs at least two member Inputs".to_string(),
+                    ));
+                }
+                if matches!(binding.action, Action::ProfileSwitch { .. }) {
+                    // See `ConfigError::InvalidChordProfileSwitch` — a Chord's
+                    // own Action can never be ProfileSwitch, since
+                    // `fire_chord`/`compile_action` have no `&mut Config` to
+                    // actually run a switch through (unlike a Chord *member*'s
+                    // own individual Binding, which can be anything — see
+                    // `fire_individual_retroactively`).
+                    return Err(CommandError::InvalidRequest(
+                        "a Chord's Binding can't be a Profile Switch".to_string(),
+                    ));
+                }
+                if binding.trigger == TriggerMode::AnalogRepeat {
+                    // See `ConfigError::InvalidChordAnalogRepeat` — a Chord
+                    // fires on a discrete member-set completion, not a single
+                    // grid key's continuous Depth, same "no coherent runtime
+                    // owner" reasoning as the Profile Switch rejection above.
+                    return Err(CommandError::InvalidRequest(
+                        "a Chord's Binding can't use Analog-repeat".to_string(),
+                    ));
+                }
+                validate_binding(&binding, config)?;
+                let profile = config
+                    .active_profile()
+                    .expect("load_or_seed validates active_profile names a real profile");
+                if let Some(&axis_input) =
+                    inputs.iter().find(|&&i| axis_conflict(profile, layer, i))
+                {
+                    return Err(CommandError::InvalidRequest(format!(
+                        "{axis_input} already has an Axis assignment on this Layer — clear it first"
+                    )));
+                }
+                let key = ChordKey::new(inputs);
+                if let Some(conflicting) =
+                    chord_conflict(active_profile_mut(config).chords(layer), &key)
+                {
+                    return Err(CommandError::InvalidRequest(format!(
+                        "conflicts with the existing Chord {conflicting}: one member set fully contains the other"
+                    )));
+                }
+                // Ticket 40: a Step-action Chord is exactly as exclusive an
+                // owner of (stepper, direction) as an ordinary Binding's
+                // (ticket 03's Answer) — steal it from wherever else it
+                // currently lives, in either keyspace, mirroring `SetBinding`'s
+                // own handler. `persist_edit`'s snapshot rolls the steal back
+                // with the insert on a persist failure.
                 if let Action::Step { stepper, direction } = &binding.action {
                     let active_profile = config.active_profile.clone();
-                    (
-                        take_stepper_direction_elsewhere(config, stepper, *direction, None),
-                        take_stepper_direction_elsewhere_from_chords(
-                            config,
-                            stepper,
-                            *direction,
-                            Some((&active_profile, layer, &key)),
-                        ),
-                    )
-                } else {
-                    (Vec::new(), Vec::new())
-                };
-            let previous = active_profile_mut(config)
-                .chords_mut(layer)
-                .insert(key.clone(), binding);
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                let chords = active_profile_mut(config).chords_mut(layer);
-                match previous {
-                    Some(prev) => {
-                        chords.insert(key, prev);
-                    }
-                    None => {
-                        chords.remove(&key);
-                    }
+                    take_stepper_direction_elsewhere(config, stepper, *direction, None);
+                    take_stepper_direction_elsewhere_from_chords(
+                        config,
+                        stepper,
+                        *direction,
+                        Some((&active_profile, layer, &key)),
+                    );
                 }
-                for (profile_name, moved_layer, moved_input, moved_binding) in
-                    moved_stepper_bindings
-                {
-                    if let Some(profile) = config.profiles.get_mut(&profile_name) {
-                        profile
-                            .layer_mut(moved_layer)
-                            .insert(moved_input, moved_binding);
-                    }
-                }
-                for (profile_name, moved_layer, moved_key, moved_binding) in
-                    moved_stepper_chord_bindings
-                {
-                    if let Some(profile) = config.profiles.get_mut(&profile_name) {
-                        profile
-                            .chords_mut(moved_layer)
-                            .insert(moved_key, moved_binding);
-                    }
-                }
-            }
+                active_profile_mut(config)
+                    .chords_mut(layer)
+                    .insert(key, binding);
+                Ok(())
+            })
+            .await;
             let _ = reply.send(result);
         }
         Command::ClearChordBinding {
@@ -2892,17 +2745,18 @@ async fn handle_command(
             layer,
             reply,
         } => {
-            let key = ChordKey::new(inputs);
-            let Some(previous) = active_profile_mut(config).chords_mut(layer).remove(&key) else {
-                let _ = reply.send(Err(CommandError::NotFound));
-                return;
-            };
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                active_profile_mut(config)
+            let result = config::persist_edit(config, config_path, |config| {
+                let key = ChordKey::new(inputs);
+                if active_profile_mut(config)
                     .chords_mut(layer)
-                    .insert(key, previous);
-            }
+                    .remove(&key)
+                    .is_none()
+                {
+                    return Err(CommandError::NotFound);
+                }
+                Ok(())
+            })
+            .await;
             let _ = reply.send(result);
         }
         Command::SetAxisAssignment {
@@ -2911,52 +2765,33 @@ async fn handle_command(
             target,
             reply,
         } => {
-            if let Err(err) = reject_non_grid_input(input, "Axis assignments") {
-                let _ = reply.send(Err(err));
-                return;
-            }
-            // Ticket 59 §2's mutual exclusion: atomically clears any
-            // existing Binding *and* any Chord membership for (layer,
-            // input) alongside the insert, mirroring `SetBinding`'s own
-            // atomic-persist precedent — unlike `SetBinding`/
-            // `SetChordBinding` (see `axis_conflict` below), which reject
-            // rather than silently steal from an existing Axis assignment.
-            let previous_binding = active_profile_mut(config).layer_mut(layer).remove(&input);
-            let removed_chords: Vec<(ChordKey, Binding)> = {
+            let result = config::persist_edit(config, config_path, |config| {
+                reject_non_grid_input(input, "Axis assignments")?;
+                // Ticket 59 §2's mutual exclusion: atomically clears any
+                // existing Binding *and* any Chord membership for (layer,
+                // input) alongside the insert, mirroring `SetBinding`'s own
+                // atomic-persist precedent — unlike `SetBinding`/
+                // `SetChordBinding` (see `axis_conflict`), which reject rather
+                // than silently steal from an existing Axis assignment.
+                // `persist_edit`'s snapshot rolls all three back together on a
+                // persist failure.
+                active_profile_mut(config).layer_mut(layer).remove(&input);
                 let chords = active_profile_mut(config).chords_mut(layer);
-                let keys: Vec<ChordKey> = chords
+                let member_keys: Vec<ChordKey> = chords
                     .keys()
                     .filter(|key| key.members().contains(&input))
                     .cloned()
                     .collect();
-                keys.into_iter()
-                    .filter_map(|key| chords.remove(&key).map(|binding| (key, binding)))
-                    .collect()
-            };
-            let previous_axis = active_profile_mut(config)
-                .axis_layer_mut(layer)
-                .insert(input, target);
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                let axis_map = active_profile_mut(config).axis_layer_mut(layer);
-                match previous_axis {
-                    Some(prev) => {
-                        axis_map.insert(input, prev);
-                    }
-                    None => {
-                        axis_map.remove(&input);
-                    }
+                for key in member_keys {
+                    chords.remove(&key);
                 }
-                let chords = active_profile_mut(config).chords_mut(layer);
-                for (key, binding) in removed_chords {
-                    chords.insert(key, binding);
-                }
-                if let Some(binding) = previous_binding {
-                    active_profile_mut(config)
-                        .layer_mut(layer)
-                        .insert(input, binding);
-                }
-            } else if layer == *active_layer {
+                active_profile_mut(config)
+                    .axis_layer_mut(layer)
+                    .insert(input, target);
+                Ok(())
+            })
+            .await;
+            if result.is_ok() && layer == *active_layer {
                 let axis_map = active_profile_mut(config).axis_layer(layer).clone();
                 let _ = recompute_and_emit_axes(injector, axis_state, &axis_map).await;
             }
@@ -2967,19 +2802,18 @@ async fn handle_command(
             layer,
             reply,
         } => {
-            let Some(previous) = active_profile_mut(config)
-                .axis_layer_mut(layer)
-                .remove(&input)
-            else {
-                let _ = reply.send(Err(CommandError::NotFound));
-                return;
-            };
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                active_profile_mut(config)
+            let result = config::persist_edit(config, config_path, |config| {
+                if active_profile_mut(config)
                     .axis_layer_mut(layer)
-                    .insert(input, previous);
-            } else {
+                    .remove(&input)
+                    .is_none()
+                {
+                    return Err(CommandError::NotFound);
+                }
+                Ok(())
+            })
+            .await;
+            if result.is_ok() {
                 axis_state.contributions.remove(&input);
                 if layer == *active_layer {
                     let axis_map = active_profile_mut(config).axis_layer(layer).clone();
@@ -2999,20 +2833,6 @@ async fn stop_all_toggles(toggles: &mut HashMap<Input, ActiveToggle>) {
     for (_, toggle) in toggles.drain() {
         toggle.stop().await;
     }
-}
-
-/// Rewrites `config.toml` off the async worker pool: `config::write` is a
-/// synchronous `std::fs` call, and running it inline on the dispatch task
-/// would stall every queued `PhysicalEvent` behind it for the write's
-/// duration — perceptible input lag in a daemon whose whole job is
-/// low-latency key remapping.
-async fn persist(config: &Config, config_path: &Path) -> Result<(), CommandError> {
-    let config = config.clone();
-    let config_path = config_path.to_path_buf();
-    tokio::task::spawn_blocking(move || config::write(&config_path, &config))
-        .await
-        .expect("the config::write blocking task must not panic")
-        .map_err(CommandError::from)
 }
 
 #[cfg(test)]
@@ -4466,7 +4286,20 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let config_path = dir.path().join("config.toml");
             config::write(&config_path, &config).unwrap();
+            Self::spawn_at(config, dir, config_path)
+        }
 
+        /// Spawns the dispatch task pointed at an unwritable `config_path`
+        /// (`/nonexistent/...`) so every `config::persist_edit` call fails at
+        /// the write — the seam for exercising a persist-failure rollback
+        /// through the full dispatch harness (ticket 03). The in-memory
+        /// `Config` still starts correct; only the disk write is broken.
+        fn spawn_with_failing_persist(config: Config) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            Self::spawn_at(config, dir, unused_config_path())
+        }
+
+        fn spawn_at(config: Config, dir: tempfile::TempDir, config_path: PathBuf) -> Self {
             let sink = RecordingSink::new();
             let gamepad_sink = RecordingSink::new();
             let (inj, inj_handle) = injector::spawn(sink.clone(), gamepad_sink.clone());
@@ -5130,6 +4963,79 @@ mod tests {
             config.profiles[DEFAULT_PROFILE_NAME]
                 .base
                 .contains_key(&Input::Grid(3, 1))
+        );
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn set_binding_persist_failure_rolls_back_the_cross_profile_stepper_steal() {
+        // A `Step` Binding on the active Profile that steals a (stepper,
+        // direction) from a *different* Profile, then fails to persist: the
+        // whole edit — the steal *and* the target insert — must roll back, so
+        // the donor Profile keeps its Binding and the active Profile's target
+        // Layer stays empty. No persist-failure rollback had dispatch-harness
+        // coverage before ticket 03's `config::persist_edit`; this locks in
+        // the cross-Profile case the old hand-rolled `SetBinding` block
+        // reversed by replaying a `Vec` of moved Bindings.
+        let stepper_id = StepperId::from("wheel");
+        let step_forward = Binding {
+            trigger: TriggerMode::FireOnce,
+            action: Action::Step {
+                stepper: stepper_id.clone(),
+                direction: StepDirection::Forward,
+            },
+        };
+
+        let mut donor = Profile::default();
+        donor.base.insert(Input::Grid(5, 5), step_forward.clone());
+        let mut profiles = HashMap::new();
+        profiles.insert(DEFAULT_PROFILE_NAME.to_string(), Profile::default());
+        profiles.insert("Alt".to_string(), donor);
+
+        let mut steppers = HashMap::new();
+        steppers.insert(
+            stepper_id.clone(),
+            StepperDef {
+                name: "Wheel".to_string(),
+                items: vec![StepperItem::Key {
+                    key: evdev::KeyCode::KEY_1,
+                    modifiers: Modifiers::default(),
+                }],
+            },
+        );
+
+        let harness = CommandHarness::spawn_with_failing_persist(Config {
+            schema_version: config::SCHEMA_VERSION,
+            active_profile: DEFAULT_PROFILE_NAME.to_string(),
+            profiles,
+            force_digital: false,
+            macros: HashMap::new(),
+            steppers,
+        });
+
+        let result = harness
+            .set_binding(Input::Grid(1, 1), Layer::Base, step_forward)
+            .await;
+        assert!(matches!(result, Err(CommandError::IoError(_))));
+
+        let config = harness.get_config().await;
+        assert!(
+            !config.profiles[DEFAULT_PROFILE_NAME]
+                .base
+                .contains_key(&Input::Grid(1, 1)),
+            "the failed target insert must have rolled back"
+        );
+        assert_eq!(
+            config.profiles["Alt"]
+                .base
+                .get(&Input::Grid(5, 5))
+                .map(|binding| &binding.action),
+            Some(&Action::Step {
+                stepper: stepper_id,
+                direction: StepDirection::Forward,
+            }),
+            "the donor Profile's Binding must have been restored on rollback"
         );
 
         harness.shut_down().await;
