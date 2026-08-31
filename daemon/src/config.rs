@@ -736,7 +736,11 @@ pub struct StepperDef {
 /// all) — `unique_macro_id`/`unique_stepper_id` still guarantee the final
 /// result is collision-free. Shared by both libraries; `fallback` is the
 /// only thing that differs between them (`"macro"`/`"stepper"`).
-fn slug_base(name: &str, fallback: &str) -> String {
+///
+/// `pub(crate)` for `schema::render_schema` (post-release ticket 06), which
+/// emits a worked-example table of this transformation into the GUI-mirror
+/// contract fixture so `rules.slug` can be held to it.
+pub(crate) fn slug_base(name: &str, fallback: &str) -> String {
     let mut result = String::with_capacity(name.len());
     let mut last_was_hyphen = true; // suppresses a leading hyphen
     for ch in name.chars() {

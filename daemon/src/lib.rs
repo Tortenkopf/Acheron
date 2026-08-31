@@ -19,6 +19,14 @@ pub mod executor;
 pub mod injector;
 pub mod input;
 
+/// The GUI-mirror contract fixture generator (post-release ticket 06) — a
+/// single golden-file `#[test]` deriving the daemon's device catalogs and
+/// `config::validate` verdicts and checking `daemon/contract/daemon-schema.json`
+/// against them. Test-only: it drives `config::validate` and nothing links
+/// it into the running daemon.
+#[cfg(test)]
+pub(crate) mod schema;
+
 #[cfg(test)]
 mod build_version_tests {
     include!("build_version.rs");

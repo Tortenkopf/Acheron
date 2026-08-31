@@ -80,6 +80,7 @@ from .daemon_client import DaemonError
 from .gtk_utils import build_name_prompt_popover, build_pinned_sidebar_box
 from .inputs import GRID_COLS, GRID_ROWS, grid_input, input_label
 from .library_view import build_library_content, build_library_sidebar
+from .rules import chord_members_conflict
 
 # Ticket 12/20 — Daemon/device status surface. Mirrors
 # prototype/12-daemon-device-status-indicators/prototype.py's STATUS_STATES
@@ -302,8 +303,7 @@ def _chord_conflict(chords: dict, members: list[str], exclude_key: str | None = 
     for key in chords:
         if key == exclude_key:
             continue
-        other = set(_chord_members(key))
-        if candidate <= other or other <= candidate:
+        if chord_members_conflict(candidate, set(_chord_members(key))):
             return key
     return None
 

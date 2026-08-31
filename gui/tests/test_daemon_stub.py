@@ -410,19 +410,18 @@ def test_set_stepper_items_on_an_unknown_stepper_id_raises_not_found():
         stub.set_stepper_items("nonexistent", [])
 
 
-def test_stepper_items_accept_a_valid_controller_button_and_reject_a_non_gamepad_code():
+def test_set_stepper_items_persists_a_controller_button_item():
+    # The gamepad-allowlist *rule* itself is covered by test_rules.py /
+    # test_rules_contract.py — this keeps only the stub's stateful side:
+    # a valid controller-button item round-trips through GetConfig().
     stub = DaemonStub()
     stepper_id = stub.create_stepper("Weapon Wheel", [])
 
     stub.set_stepper_items(stepper_id, [{"type": "controller_button", "button": "BTN_SOUTH"}])
+
     assert stub.get_config()["steppers"][stepper_id]["items"] == [
         {"type": "controller_button", "button": "BTN_SOUTH"}
     ]
-
-    with pytest.raises(InvalidBindingError):
-        stub.set_stepper_items(stepper_id, [{"type": "controller_button", "button": "KEY_A"}])
-    with pytest.raises(InvalidBindingError):
-        stub.create_stepper("Bad", [{"type": "controller_button", "button": "KEY_A"}])
 
 
 def test_set_binding_with_an_unknown_stepper_id_raises_invalid_binding():
@@ -434,41 +433,6 @@ def test_set_binding_with_an_unknown_stepper_id_raises_invalid_binding():
             "base",
             {"trigger": "fire_once", "type": "step", "stepper_id": "nonexistent", "direction": "forward"},
         )
-
-
-def test_set_binding_rejects_a_toggle_step_binding():
-    stub = DaemonStub()
-    stepper_id = stub.create_stepper("Test stepper", [{"type": "key", "key": "KEY_1"}])
-
-    with pytest.raises(InvalidBindingError):
-        stub.set_binding(
-            "grid_r1c1",
-            "base",
-            {"trigger": "toggle", "type": "step", "stepper_id": stepper_id, "direction": "forward"},
-        )
-
-
-def test_set_binding_rejects_analog_repeat_on_a_non_grid_input():
-    stub = DaemonStub()
-
-    with pytest.raises(InvalidBindingError):
-        stub.set_binding(
-            "mode_key",
-            "base",
-            {"trigger": "analog_repeat", "type": "keypress", "key": "KEY_A", "modifiers": []},
-        )
-
-
-def test_set_binding_accepts_analog_repeat_on_a_grid_input():
-    stub = DaemonStub()
-
-    stub.set_binding(
-        "grid_r1c1",
-        "base",
-        {"trigger": "analog_repeat", "type": "keypress", "key": "KEY_A", "modifiers": []},
-    )
-
-    assert stub.get_config()["profiles"]["Default"]["base"]["grid_r1c1"]["trigger"] == "analog_repeat"
 
 
 def test_set_binding_silently_moves_a_stepper_direction_off_its_old_input():
@@ -537,30 +501,24 @@ def test_switch_profile_clears_active_toggles():
     assert stub.get_state()["active_toggles"] == []
 
 
-def test_set_chord_binding_persists_keyed_by_the_plus_joined_sorted_members():
+def test_set_chord_binding_persists_keyed_by_the_daemons_chord_key_form():
+    # A thin integration check that the stub keys chords through
+    # `rules.chord_key` (the `+`-joined, `Input`-Ord-sorted form) — the
+    # ordering rule itself is unit-tested in test_rules.py / contract-tested
+    # in test_rules_contract.py.
     stub = DaemonStub()
 
     stub.set_chord_binding(
         ["grid_r1c2", "grid_r1c1"], "base", {"trigger": "fire_once", "type": "keypress", "key": "KEY_C"}
     )
+    # Cross-variant: a plain alphabetical sort would key this "grid_r1c1+mode_key".
+    stub.set_chord_binding(
+        ["grid_r1c1", "mode_key"], "base", {"trigger": "fire_once", "type": "keypress", "key": "KEY_D"}
+    )
 
     chords = stub.get_config()["profiles"]["Default"]["chords_base"]
     assert chords["grid_r1c1+grid_r1c2"]["key"] == "KEY_C"
-
-
-def test_chord_key_orders_members_like_the_real_daemons_input_ord_not_alphabetically():
-    # Regression test: a plain alphabetical sort disagrees with the real
-    # Daemon's `ChordKey` Display (ordered by `Input`'s own derived `Ord`:
-    # ModeKey < Grid < Thumbstick < Wheel) for any Chord mixing Input
-    # variant kinds — "grid_r1c1" < "mode_key" alphabetically, but ModeKey
-    # sorts first under the real Ord.
-    stub = DaemonStub()
-
-    stub.set_chord_binding(
-        ["grid_r1c1", "mode_key"], "base", {"trigger": "fire_once", "type": "keypress", "key": "KEY_C"}
-    )
-
-    assert "mode_key+grid_r1c1" in stub.get_config()["profiles"]["Default"]["chords_base"]
+    assert chords["mode_key+grid_r1c1"]["key"] == "KEY_D"
 
 
 def test_set_chord_binding_rejects_fewer_than_two_inputs():
@@ -570,21 +528,16 @@ def test_set_chord_binding_rejects_fewer_than_two_inputs():
         stub.set_chord_binding(["grid_r1c1"], "base", {"trigger": "fire_once", "type": "keypress", "key": "KEY_C"})
 
 
-def test_set_chord_binding_rejects_a_subset_superset_conflict_but_allows_intersection():
+def test_set_chord_binding_rejects_a_subset_superset_conflict():
+    # Thin integration check that the stub routes through
+    # `rules.chord_members_conflict` — the subset/superset/intersection
+    # predicate matrix itself lives in test_rules.py.
     stub = DaemonStub()
     binding = {"trigger": "fire_once", "type": "keypress", "key": "KEY_C"}
     stub.set_chord_binding(["grid_r1c1", "grid_r1c2"], "base", binding)
 
     with pytest.raises(InvalidBindingError):
         stub.set_chord_binding(["grid_r1c1", "grid_r1c2", "mode_key"], "base", binding)
-
-    # Intersects (shares grid_r1c1, each has a member the other lacks) —
-    # allowed, per ticket 01's amended Answer.
-    stub.set_chord_binding(["grid_r1c1", "mode_key"], "base", binding)
-    assert set(stub.get_config()["profiles"]["Default"]["chords_base"]) == {
-        "grid_r1c1+grid_r1c2",
-        "mode_key+grid_r1c1",
-    }
 
 
 def test_set_chord_binding_rejects_a_profile_switch_action():

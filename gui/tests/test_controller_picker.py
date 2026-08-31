@@ -9,6 +9,7 @@ from acheron_gui.controller_picker import (
     build_inline_controller_picker,
     button_css_class,
 )
+from acheron_gui.rules import GAMEPAD_BUTTONS
 
 from .widget_tree import button_labeled, find_all, find_one
 
@@ -86,6 +87,9 @@ def test_button_css_class_classifies_face_shoulder_stick_and_dpad_distinctly():
     assert button_css_class("BTN_START") is None
 
 
-def test_catalog_has_exactly_57_entries_matching_the_daemon_allowlist():
-    assert len(LABEL_BY_CODE) == 57
-    assert sum(len(v) for v in GAMEPAD_CATEGORIES.values()) == 57
+def test_catalog_contents_match_the_daemon_allowlist():
+    # Contents, not just length — a renamed or swapped entry passes a count
+    # check but not this. `rules.GAMEPAD_BUTTONS` is itself contract-tested
+    # against the Daemon's `gamepad_button_codes()` (test_rules_contract.py).
+    assert set(LABEL_BY_CODE) == GAMEPAD_BUTTONS
+    assert {code for entries in GAMEPAD_CATEGORIES.values() for code, _ in entries} == GAMEPAD_BUTTONS

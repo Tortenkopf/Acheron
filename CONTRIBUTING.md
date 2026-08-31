@@ -162,6 +162,23 @@ and it can be verified before merge.
   (startup) and `edit::plan` (every live D-Bus edit) run through, so a new
   arm never needs its own copy.
 
+- **Adding a device-catalog entry or a Binding-legality rule.** The GUI
+  mirrors the Daemon's device vocabularies and the pure part of
+  `config::validate` in `gui/acheron_gui/rules.py` (ADR 0003's split-language
+  stack — the model can't be shared across the D-Bus process seam, so it's
+  copied and *contract-tested*). After changing a gamepad/axis catalog
+  (`input::gamepad_button_codes`, `AxisTarget`), a `TriggerMode`/`Action`
+  rule in `config::validate`, or `config::slug_base`/`ChordKey`:
+
+  1. Regenerate the contract fixture:
+     `ACHERON_BLESS=1 cargo test --manifest-path daemon/Cargo.toml schema`
+     (this rewrites `daemon/contract/daemon-schema.json` from the real
+     `config::validate` — the only "bless" file in the repo).
+  2. Mirror the change into `gui/acheron_gui/rules.py`.
+  3. Run both suites — `daemon/src/schema.rs`'s golden test and
+     `gui/tests/test_rules_contract.py` each fail until the two sides agree
+     again. There is no CI; those two tests are the drift guard.
+
 - Keep `install.sh` idempotent and safe to re-run.
 
 ## Licence

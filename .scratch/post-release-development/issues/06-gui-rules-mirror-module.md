@@ -240,47 +240,49 @@ clearing toggles, the stepper-steal, actuation, `get_state` shape, and Chord
 **Blocked by:** None. Tickets 04 and 05 (the `config::validate` surface this
 mirrors) are merged.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] `gui/acheron_gui/rules.py` exists with the ten symbols in the table, all
+- [x] `gui/acheron_gui/rules.py` exists with the ten symbols in the table, all
       pure (no raises, no `Config`/stub state), depending only one-way on
       `inputs.py`. Its docstring states the mirror contract and the
       mirror-not-share rationale.
-- [ ] `valid_triggers` / `valid_action_kinds` take `input_str: str | None`
+- [x] `valid_triggers` / `valid_action_kinds` take `input_str: str | None`
       (`None` = a Chord's own Binding); `valid_triggers("axis", _)` is the
       empty set.
-- [ ] `daemon/src/schema.rs` exists (`pub(crate)`, wired into `lib.rs`) with a
-      `#[test]` that regenerates `daemon/contract/daemon-schema.json` under
-      `ACHERON_BLESS=1` and asserts equality otherwise; `config::slug_base` is
-      `pub(crate)`.
-- [ ] `daemon/contract/daemon-schema.json` is checked in, holds the two fully
-      enumerated verdict matrices plus the catalogs and the slug / chord-key
-      example lists, and is derived by driving `config::validate` with synthetic
-      single-item `Config`s (dummy macro/stepper/second-profile seeded).
-- [ ] `gui/tests/test_rules_contract.py` loads that file and asserts
+- [x] `daemon/src/schema.rs` exists (`#[cfg(test)] pub(crate) mod`, wired into
+      `lib.rs`) with a `#[test]` that regenerates
+      `daemon/contract/daemon-schema.json` under `ACHERON_BLESS=1` and asserts
+      equality otherwise; `config::slug_base` is `pub(crate)`.
+- [x] `daemon/contract/daemon-schema.json` is checked in, holds the two fully
+      enumerated verdict matrices (580 + 174 rows) plus the catalogs and the
+      slug / chord-key example lists, and is derived by driving
+      `config::validate` with synthetic single-item `Config`s (dummy
+      macro/stepper/second-profile seeded).
+- [x] `gui/tests/test_rules_contract.py` loads that file and asserts
       set-equality on both catalogs and per-row verdict-equality on both
       matrices and both example lists.
-- [ ] `daemon_stub.py` contains no hand-reimplementation of `input_sort_key`,
+- [x] `daemon_stub.py` contains no hand-reimplementation of `input_sort_key`,
       `chord_key`, `slug_base`, or the subset/superset predicate, and no
       hardcoded gamepad / axis-target / trigger-legality literal — each is a
       call into `rules`. It no longer imports from `controller_picker` /
       `axis_picker`. Its Config-walking operation guards and every `raise`
-      remain.
-- [ ] `binding_editor.py` keeps its `Gtk.DropDown` mechanics but derives every
+      remain. (`device_overview.py`'s own copy of the subset/superset
+      predicate was routed through `rules.chord_members_conflict` too.)
+- [x] `binding_editor.py` keeps its `Gtk.DropDown` mechanics but derives every
       trigger / action-kind filter from `rules`; no `"analog_repeat"` /
       `"fire_once"` / `"axis"` rule literal remains in it.
-- [ ] `controller_picker.py` / `axis_picker.py` assert catalog *contents*
+- [x] `controller_picker.py` / `axis_picker.py` assert catalog *contents*
       against `rules.GAMEPAD_BUTTONS` / `rules.AXIS_TARGETS`, not length;
-      `inputs.py`'s test asserts its option-key sets equal
-      `rules.ALL_TRIGGERS` / `rules.ALL_ACTION_KINDS`.
-- [ ] The pure-rule tests listed above have moved out of `test_daemon_stub.py`
+      `inputs.py`'s test (`gui/tests/test_inputs.py`) asserts its option-key
+      sets equal `rules.ALL_TRIGGERS` / `rules.ALL_ACTION_KINDS`.
+- [x] The pure-rule tests listed above have moved out of `test_daemon_stub.py`
       into `test_rules.py`; `test_daemon_stub.py` keeps only its stateful-stub
       coverage.
-- [ ] `key_picker.py` is unchanged; no keycode catalog is added to `rules` or
+- [x] `key_picker.py` is unchanged; no keycode catalog is added to `rules` or
       the fixture.
-- [ ] `CONTRIBUTING.md` has the catalog/rule-change bullet naming
+- [x] `CONTRIBUTING.md` has the catalog/rule-change bullet naming
       `ACHERON_BLESS=1` and the regenerate-then-mirror flow.
-- [ ] Daemon suite green (incl. the new schema test); `cargo clippy` and
+- [x] Daemon suite green (incl. the new schema test); `cargo clippy` and
       `cargo fmt --check` clean; full GUI suite green; packaging suite
       unaffected.
 
