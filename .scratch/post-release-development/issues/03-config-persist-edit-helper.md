@@ -110,3 +110,11 @@ correctness bug; its two cleanup notes were addressed (the double-clone) or
 scoped out (`config::write` is still a non-atomic truncating `fs::write` — a
 torn-file-on-crash durability concern orthogonal to snapshot-and-restore, noted
 in `persist_edit`'s doc comment; worth its own ticket if it matters).
+
+**2026-08-31** — Superseded by ticket 05. `config::persist_edit` no longer
+exists: its job is now split across `edit::plan` (mutate a `Config` clone +
+run `config::validate`) and `edit::apply` (`config::persist` the clone, then
+assign on success). The snapshot-and-restore this ticket introduced collapsed
+to "don't assign the clone on failure" once the edit stopped happening
+in-place on the caller's `Config`. `config::persist` is now `pub(crate)` and
+called only from `edit::apply`.

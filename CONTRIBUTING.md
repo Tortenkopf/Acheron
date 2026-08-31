@@ -131,17 +131,36 @@ and it can be verified before merge.
 - Match the surrounding code — its naming, comment density, and idioms. The
   existing files are the style guide.
 
-- A new **structural invariant of a stored `Config`** — anything that could be
+- **Adding a new mutating `Command`** (ticket 05). Every mutating `Command`
+  flows wire variant → `Edit` variant → `edit::plan` arm → a mechanical
+  translation line in `dispatch::handle_command` → an `Effect` variant *only
+  if* there is a post-commit side effect. Concretely:
+
+  1. Add the `Command` variant in `command.rs` (with its `reply` sender).
+  2. Add the matching data-only `edit::Edit` variant — the same fields minus
+     `reply`.
+  3. Add an `edit::plan` arm. It mutates the `Config` clone, returns an early
+     `Err(CommandError::…)` for every **operation precondition** (things only
+     meaningful relative to the *requested operation*, not the resulting
+     `Config`: `NotFound` / `AlreadyExists`, "can't delete the active
+     Profile", "can't delete a still-referenced Macro/Stepper", a blank
+     create/rename name — the slug, not the name, is the key, so a blank name
+     is a bad request, not a corrupt `Config`), and pushes any `Effect`s. It
+     never checks a **structural invariant of the resulting `Config`** — that
+     is `config::validate`'s job (see below), run once at the end of `plan`.
+  4. Add the one-line arm in `dispatch::handle_command`: translate the
+     `Command` to its `Edit`, `edit::apply` it, `reply.send` **before**
+     running effects, then `run_effects`.
+  5. If the command has a runtime side effect that isn't a `Config` write
+     (republishing actuation, recomputing axes, signalling the supervisor,
+     stopping a Toggle, dropping a stepper cursor, emitting a signal…), add an
+     `edit::Effect` variant and handle it in `dispatch::run_effects`.
+
+  A **structural invariant of a stored `Config`** — anything that could be
   written to `config.toml` and reloaded — goes in `config::validate` and
   nowhere else. It is the single enforcement point both `config::parse`
-  (startup) and `config::persist_edit` (every live D-Bus edit) run through, so
-  a new `Command` arm never needs its own copy. What stays in the arm is
-  everything that is only meaningful relative to the *requested operation*, not
-  to the resulting `Config`: `NotFound` / `AlreadyExists`, "can't delete the
-  active Profile", "can't delete a still-referenced Macro", and required-field
-  checks on a create/rename (e.g. a non-blank Macro or Stepper display name —
-  the slug, not the name, is the key, so a blank name is a bad request, not a
-  corrupt `Config`).
+  (startup) and `edit::plan` (every live D-Bus edit) run through, so a new
+  arm never needs its own copy.
 
 - Keep `install.sh` idempotent and safe to re-run.
 
