@@ -862,6 +862,40 @@ pub enum ConfigError {
     /// discrete member-set completion, not a single grid key's continuous
     /// Depth, mirroring `InvalidChordProfileSwitch`'s exact precedent.
     InvalidChordAnalogRepeat,
+    /// A `default_actuation` or `actuation_overrides` entry whose `release`
+    /// point is not strictly below its `actuation` point (ticket 04) —
+    /// `release >= actuation` defeats hysteresis entirely: a key held at a
+    /// steady Depth crosses both thresholds on every report, chattering
+    /// Down/Up on a motionless key (`capture::analog::observe`). The string
+    /// is the locus — `"default"` for the Profile default, otherwise the
+    /// offending Input's `Display` form.
+    ReleaseNotBelowActuation(String),
+    /// An `actuation_overrides` entry (ticket 17 §3) keyed by an `Input` that
+    /// isn't a `Grid` variant — only grid keys have Depth for an actuation
+    /// point to threshold against, same reasoning as `InvalidAxisInput`.
+    InvalidActuationOverrideInput(String),
+    /// An `Action::ProfileSwitch { target }` naming a Profile not present in
+    /// `[profiles]` (ticket 34/04) — `switch_profile`'s
+    /// `active_profile_mut().expect(...)` path assumes every reachable target
+    /// resolves, so a dangling one is a latent panic, exactly like a dangling
+    /// `Macro`/`Stepper` reference.
+    UnknownProfileSwitchTarget(String),
+    /// Two Chords on one Layer whose member sets are in a subset/superset
+    /// relationship (ticket 01's amended Answer) — completing the smaller is
+    /// indistinguishable from being partway into the larger.
+    ChordMemberSetConflict {
+        key: String,
+        other: String,
+    },
+    /// A stored Chord Binding with fewer than two member Inputs (ticket 01:
+    /// "open-ended, N>=2") — `ChordKey`'s own `FromStr` already refuses this
+    /// on the deserialize path; this is the in-memory structural mirror for
+    /// the live-edit path (`SetChordBinding` builds a `ChordKey` directly).
+    ChordTooFewMembers(String),
+    /// A Profile keyed by an empty or whitespace-only name (ticket 19/04) —
+    /// the structural mirror of `CreateProfile`/`RenameProfile`'s own
+    /// friendly rejection, so a hand-edited `[profiles.""]` refuses to load.
+    EmptyProfileName,
 }
 
 impl fmt::Display for ConfigError {
@@ -885,51 +919,45 @@ impl fmt::Display for ConfigError {
             ),
             ConfigError::InvalidActiveProfile(name) => write!(
                 f,
-                "config.toml's active_profile {name:?} does not name a profile in [profiles]"
+                "active_profile {name:?} does not name a Profile in [profiles]"
             ),
-            ConfigError::InvalidProfileSwitchTrigger => write!(
-                f,
-                "config.toml contains an Action::ProfileSwitch Binding whose trigger is not fire_once"
-            ),
+            ConfigError::InvalidProfileSwitchTrigger => {
+                write!(f, "a Profile Switch Binding must use fire_once")
+            }
             ConfigError::InvalidControllerButton(button) => write!(
                 f,
-                "config.toml contains an Action::ControllerButton Binding whose button {button:?} is not a valid gamepad button"
+                "a Controller Button Binding's button {button:?} is not a valid gamepad button"
             ),
-            ConfigError::InvalidControllerButtonTrigger => write!(
-                f,
-                "config.toml contains an Action::ControllerButton Binding whose trigger is fire_once"
-            ),
+            ConfigError::InvalidControllerButtonTrigger => {
+                write!(f, "a Controller Button Binding must not use fire_once")
+            }
             ConfigError::InvalidControllerButtonStepperItem(button) => write!(
                 f,
-                "config.toml contains a Stepper list item whose controller button {button:?} is not a valid gamepad button"
+                "a Stepper list item's controller button {button:?} is not a valid gamepad button"
             ),
             ConfigError::UnknownMacro(macro_id) => write!(
                 f,
-                "config.toml contains an Action::Macro Binding whose macro_id {macro_id:?} does not name a Macro in [macros]"
+                "a Macro Binding references macro_id {macro_id:?}, which is not in [macros]"
             ),
             ConfigError::UnknownStepper(stepper_id) => write!(
                 f,
-                "config.toml contains an Action::Step Binding whose stepper {stepper_id:?} does not name a Stepper in [steppers]"
+                "a Step Binding references stepper {stepper_id:?}, which is not in [steppers]"
             ),
-            ConfigError::InvalidStepTrigger => write!(
-                f,
-                "config.toml contains an Action::Step Binding whose trigger is toggle"
-            ),
-            ConfigError::InvalidChordProfileSwitch => write!(
-                f,
-                "config.toml contains a Chord Binding whose Action is profile_switch, which is not supported on a Chord"
-            ),
+            ConfigError::InvalidStepTrigger => write!(f, "a Step Binding must not use toggle"),
+            ConfigError::InvalidChordProfileSwitch => {
+                write!(f, "a Chord Binding's Action cannot be profile_switch")
+            }
             ConfigError::InvalidAxisInput(input) => write!(
                 f,
-                "config.toml contains an Axis assignment on {input:?}, which is not a Grid Input"
+                "an Axis assignment on {input:?} is not allowed — only Grid Inputs can carry one"
             ),
             ConfigError::AxisBindingConflict(input) => write!(
                 f,
-                "config.toml contains both an Axis assignment and a Binding for {input:?} on the same Layer"
+                "{input:?} has both an Axis assignment and a Binding on the same Layer"
             ),
             ConfigError::AxisChordConflict(input) => write!(
                 f,
-                "config.toml contains both an Axis assignment for {input:?} and a Chord that has it as a member, on the same Layer"
+                "{input:?} has both an Axis assignment and Chord membership on the same Layer"
             ),
             ConfigError::LegacyInlineMacroBinding(paths) => write!(
                 f,
@@ -938,12 +966,33 @@ impl fmt::Display for ConfigError {
             ),
             ConfigError::InvalidAnalogRepeatInput(input) => write!(
                 f,
-                "config.toml contains an analog_repeat trigger on {input:?}, which is not a Grid Input"
+                "an analog_repeat trigger on {input:?} is not allowed — only Grid Inputs can carry one"
             ),
-            ConfigError::InvalidChordAnalogRepeat => write!(
+            ConfigError::InvalidChordAnalogRepeat => {
+                write!(f, "a Chord Binding's trigger cannot be analog_repeat")
+            }
+            ConfigError::ReleaseNotBelowActuation(locus) => write!(
                 f,
-                "config.toml contains a Chord Binding whose trigger is analog_repeat, which is not supported on a Chord"
+                "the actuation point for {locus} has its release point at or above its actuation point (defeats hysteresis)"
             ),
+            ConfigError::InvalidActuationOverrideInput(input) => write!(
+                f,
+                "an actuation override on {input:?} is not allowed — only Grid Inputs can carry one"
+            ),
+            ConfigError::UnknownProfileSwitchTarget(target) => write!(
+                f,
+                "a Profile Switch Binding targets Profile {target:?}, which is not in [profiles]"
+            ),
+            ConfigError::ChordMemberSetConflict { key, other } => write!(
+                f,
+                "Chord {key} conflicts with Chord {other} on the same Layer — one member set fully contains the other"
+            ),
+            ConfigError::ChordTooFewMembers(key) => {
+                write!(f, "Chord {key} has fewer than two member Inputs")
+            }
+            ConfigError::EmptyProfileName => {
+                write!(f, "a Profile has an empty or whitespace-only name")
+            }
         }
     }
 }
@@ -1019,8 +1068,31 @@ fn parse(contents: &str) -> Result<Config, ConfigError> {
     }
 
     let config: Config = toml::from_str(contents).map_err(ConfigError::Parse)?;
+    validate(&config)?;
+    Ok(config)
+}
+
+/// The single enforcement point for every structural invariant of a stored
+/// `Config` — anything that could be written to `config.toml` and reloaded
+/// (ticket 04). Called from `parse` (after the strongly-typed deserialize)
+/// and from `persist_edit` (after the edit closure, before the disk write),
+/// so a rule lives in exactly one place and a hand-edited file and a live
+/// D-Bus edit are held to the identical contract.
+///
+/// Returns the first violation it finds (as `parse` historically did). The
+/// checks run in `parse`'s original order, with the six ticket-04 additions
+/// appended, so no existing single-violation `parse` test changes which
+/// error it sees.
+///
+/// This is *only* for invariants of the resulting `Config`. Operation
+/// preconditions — "that name isn't taken", "that entry doesn't exist",
+/// "you can't delete the active Profile" — are checked in the
+/// `handle_command` arm that knows the requested operation, never here.
+pub(crate) fn validate(config: &Config) -> Result<(), ConfigError> {
     if !config.profiles.contains_key(&config.active_profile) {
-        return Err(ConfigError::InvalidActiveProfile(config.active_profile));
+        return Err(ConfigError::InvalidActiveProfile(
+            config.active_profile.clone(),
+        ));
     }
     let has_invalid_profile_switch_trigger = config.profiles.values().any(|profile| {
         profile_all_bindings(profile).any(|binding| {
@@ -1169,7 +1241,75 @@ fn parse(contents: &str) -> Result<Config, ConfigError> {
     if let Some(input) = axis_chord_conflict {
         return Err(ConfigError::AxisChordConflict(input.to_string()));
     }
-    Ok(config)
+    // --- ticket 04 additions, appended so existing `parse` tests are undisturbed ---
+    let release_not_below_actuation = config.profiles.values().find_map(|profile| {
+        if profile.default_actuation.release >= profile.default_actuation.actuation {
+            return Some("default".to_string());
+        }
+        profile
+            .actuation_overrides
+            .iter()
+            .find(|(_, point)| point.release >= point.actuation)
+            .map(|(input, _)| input.to_string())
+    });
+    if let Some(locus) = release_not_below_actuation {
+        return Err(ConfigError::ReleaseNotBelowActuation(locus));
+    }
+    let invalid_actuation_override_input = config.profiles.values().find_map(|profile| {
+        profile
+            .actuation_overrides
+            .keys()
+            .find(|input| !matches!(input, Input::Grid(_, _)))
+            .map(ToString::to_string)
+    });
+    if let Some(input) = invalid_actuation_override_input {
+        return Err(ConfigError::InvalidActuationOverrideInput(input));
+    }
+    let unknown_profile_switch_target = config.profiles.values().find_map(|profile| {
+        profile_all_bindings(profile).find_map(|binding| match &binding.action {
+            Action::ProfileSwitch { target } if !config.profiles.contains_key(target) => {
+                Some(target.clone())
+            }
+            _ => None,
+        })
+    });
+    if let Some(target) = unknown_profile_switch_target {
+        return Err(ConfigError::UnknownProfileSwitchTarget(target));
+    }
+    let chord_member_set_conflict = config.profiles.values().find_map(|profile| {
+        [Layer::Base, Layer::Held].into_iter().find_map(|layer| {
+            let chords = profile.chords(layer);
+            chords.keys().find_map(|key| {
+                chords
+                    .keys()
+                    .find(|other| {
+                        key != *other
+                            && (key.members().is_subset(other.members())
+                                || other.members().is_subset(key.members()))
+                    })
+                    .map(|other| (key.to_string(), other.to_string()))
+            })
+        })
+    });
+    if let Some((key, other)) = chord_member_set_conflict {
+        return Err(ConfigError::ChordMemberSetConflict { key, other });
+    }
+    let chord_too_few_members = config.profiles.values().find_map(|profile| {
+        [Layer::Base, Layer::Held].into_iter().find_map(|layer| {
+            profile
+                .chords(layer)
+                .keys()
+                .find(|key| key.members().len() < 2)
+                .map(ToString::to_string)
+        })
+    });
+    if let Some(key) = chord_too_few_members {
+        return Err(ConfigError::ChordTooFewMembers(key));
+    }
+    if config.profiles.keys().any(|name| name.trim().is_empty()) {
+        return Err(ConfigError::EmptyProfileName);
+    }
+    Ok(())
 }
 
 /// Every Binding on `profile`, across both ordinary per-`Input` Layers and
@@ -1225,10 +1365,12 @@ async fn persist(config: &Config, path: &Path) -> Result<(), ConfigError> {
         .expect("the config.toml write task must not panic")
 }
 
-/// Applies `edit` to `config` and persists the result as one atomic in-memory
-/// unit (ticket 03). If `edit` returns `Err`, or if the `config.toml` write
-/// then fails, the in-memory `Config` is restored to exactly its pre-`edit`
-/// value before the error propagates — so a failed edit can never leave
+/// Applies `edit` to `config`, runs `validate` against the result, and
+/// persists it as one atomic in-memory unit (ticket 03/04). If `edit`
+/// returns `Err`, if `validate` rejects the edited `Config`, or if the
+/// `config.toml` write then fails, the in-memory `Config` is restored to
+/// exactly its pre-`edit` value before the error propagates — so a failed
+/// edit can never leave
 /// `GetConfig()` reporting a change that never reached `persist`, for every
 /// command, by construction. (`write_contents` itself is a plain truncating
 /// `fs::write`, so a write that fails *mid-stream* can still leave the file
@@ -1257,6 +1399,13 @@ where
             return Err(e);
         }
     };
+    // Ticket 04: the same single-sourced structural check `parse` runs, on
+    // the same path — a live edit that would leave `Config` structurally
+    // invalid is rejected and rolled back here, before it can reach disk.
+    if let Err(e) = validate(config) {
+        *config = snapshot;
+        return Err(e.into());
+    }
     match persist(config, path).await {
         Ok(()) => Ok(value),
         Err(e) => {
@@ -2439,6 +2588,419 @@ action = { type = "keypress", key = "KEY_A" }
         assert!(matches!(err, ConfigError::InvalidChordAnalogRepeat));
 
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn refuses_to_start_when_a_release_point_is_not_below_its_actuation_point() {
+        let (_dir, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"schema_version = 1
+active_profile = "Default"
+
+[profiles.Default]
+default_actuation = { actuation = 100, release = 120 }
+"#;
+        fs::write(&path, original).unwrap();
+
+        let err = load_or_seed(&path)
+            .expect_err("a Release point at or above Actuation must refuse to start");
+        assert!(matches!(err, ConfigError::ReleaseNotBelowActuation(locus) if locus == "default"));
+    }
+
+    #[test]
+    fn refuses_to_start_when_an_actuation_override_key_is_not_a_grid_input() {
+        let (_dir, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.actuation_overrides]
+mode_key = { actuation = 200, release = 150 }
+"#;
+        fs::write(&path, original).unwrap();
+
+        let err = load_or_seed(&path)
+            .expect_err("an actuation override on a non-Grid Input must refuse to start");
+        assert!(
+            matches!(err, ConfigError::InvalidActuationOverrideInput(input) if input == "mode_key")
+        );
+    }
+
+    #[test]
+    fn refuses_to_start_when_two_chords_on_a_layer_are_in_a_subset_superset_relationship() {
+        let (_dir, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.chords_base."grid_r1c1+grid_r1c2"]
+trigger = "fire_once"
+action = { type = "keypress", key = "KEY_A" }
+
+[profiles.Default.chords_base."grid_r1c1+grid_r1c2+grid_r1c3"]
+trigger = "fire_once"
+action = { type = "keypress", key = "KEY_B" }
+"#;
+        fs::write(&path, original).unwrap();
+
+        let err =
+            load_or_seed(&path).expect_err("a subset/superset Chord pair must refuse to start");
+        assert!(matches!(err, ConfigError::ChordMemberSetConflict { .. }));
+    }
+
+    #[test]
+    fn refuses_to_start_when_a_profile_switch_targets_a_missing_profile() {
+        let (_dir, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base.grid_r1c1]
+trigger = "fire_once"
+action = { type = "profile_switch", target = "Gaming" }
+"#;
+        fs::write(&path, original).unwrap();
+
+        let err = load_or_seed(&path)
+            .expect_err("a ProfileSwitch naming a missing Profile must refuse to start");
+        assert!(
+            matches!(err, ConfigError::UnknownProfileSwitchTarget(target) if target == "Gaming")
+        );
+    }
+
+    // --- `config::validate` (ticket 04) ---------------------------------
+    //
+    // One synchronous case per structural invariant `validate` owns — no
+    // tokio, no tempfile. The `parse` tests above now exercise `validate`
+    // transitively; this module is the direct, exhaustive surface.
+    mod validate_invariants {
+        use super::*;
+
+        fn profile(config: &mut Config) -> &mut Profile {
+            config.profiles.get_mut(DEFAULT_PROFILE_NAME).unwrap()
+        }
+
+        fn keypress() -> Binding {
+            Binding {
+                trigger: TriggerMode::HoldToRepeat,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: KeyCode::KEY_A,
+                },
+            }
+        }
+
+        fn chord(members: impl IntoIterator<Item = Input>) -> ChordKey {
+            ChordKey::new(members.into_iter().collect())
+        }
+
+        fn stepper_def(items: Vec<StepperItem>) -> StepperDef {
+            StepperDef {
+                name: "S".to_string(),
+                items,
+            }
+        }
+
+        #[test]
+        fn the_seed_config_satisfies_every_invariant() {
+            validate(&Config::seed()).expect("Config::seed() must pass validate");
+        }
+
+        struct Case {
+            invariant: &'static str,
+            break_it: fn(&mut Config),
+            matches: fn(&ConfigError) -> bool,
+        }
+
+        #[test]
+        fn each_structural_invariant_has_a_dedicated_rejection() {
+            let cases = [
+                Case {
+                    invariant: "unknown active_profile",
+                    break_it: |c| c.active_profile = "ghost".to_string(),
+                    matches: |e| matches!(e, ConfigError::InvalidActiveProfile(n) if n == "ghost"),
+                },
+                Case {
+                    invariant: "held/toggled ProfileSwitch Binding",
+                    break_it: |c| {
+                        profile(c).base.insert(
+                            Input::Grid(1, 1),
+                            Binding {
+                                trigger: TriggerMode::HoldToRepeat,
+                                action: Action::ProfileSwitch {
+                                    target: DEFAULT_PROFILE_NAME.to_string(),
+                                },
+                            },
+                        );
+                    },
+                    matches: |e| matches!(e, ConfigError::InvalidProfileSwitchTrigger),
+                },
+                Case {
+                    invariant: "ControllerButton outside the gamepad allowlist",
+                    break_it: |c| {
+                        profile(c).base.insert(
+                            Input::Grid(1, 1),
+                            Binding {
+                                trigger: TriggerMode::HoldToRepeat,
+                                action: Action::ControllerButton {
+                                    button: KeyCode::KEY_A,
+                                },
+                            },
+                        );
+                    },
+                    matches: |e| matches!(e, ConfigError::InvalidControllerButton(_)),
+                },
+                Case {
+                    invariant: "Fire-once ControllerButton Binding",
+                    break_it: |c| {
+                        profile(c).base.insert(
+                            Input::Grid(1, 1),
+                            Binding {
+                                trigger: TriggerMode::FireOnce,
+                                action: Action::ControllerButton {
+                                    button: KeyCode::BTN_SOUTH,
+                                },
+                            },
+                        );
+                    },
+                    matches: |e| matches!(e, ConfigError::InvalidControllerButtonTrigger),
+                },
+                Case {
+                    invariant: "dangling Macro reference",
+                    break_it: |c| {
+                        profile(c).base.insert(
+                            Input::Grid(1, 1),
+                            Binding {
+                                trigger: TriggerMode::HoldToRepeat,
+                                action: Action::Macro {
+                                    macro_id: MacroId::from("ghost"),
+                                },
+                            },
+                        );
+                    },
+                    matches: |e| matches!(e, ConfigError::UnknownMacro(_)),
+                },
+                Case {
+                    invariant: "dangling Stepper reference",
+                    break_it: |c| {
+                        profile(c).base.insert(
+                            Input::Grid(1, 1),
+                            Binding {
+                                trigger: TriggerMode::HoldToRepeat,
+                                action: Action::Step {
+                                    stepper: StepperId::from("ghost"),
+                                    direction: StepDirection::Forward,
+                                },
+                            },
+                        );
+                    },
+                    matches: |e| matches!(e, ConfigError::UnknownStepper(_)),
+                },
+                Case {
+                    invariant: "Toggle Step Binding",
+                    break_it: |c| {
+                        c.steppers.insert(
+                            StepperId::from("s"),
+                            stepper_def(vec![StepperItem::Key {
+                                key: KeyCode::KEY_1,
+                                modifiers: Modifiers::default(),
+                            }]),
+                        );
+                        profile(c).base.insert(
+                            Input::Grid(1, 1),
+                            Binding {
+                                trigger: TriggerMode::Toggle,
+                                action: Action::Step {
+                                    stepper: StepperId::from("s"),
+                                    direction: StepDirection::Forward,
+                                },
+                            },
+                        );
+                    },
+                    matches: |e| matches!(e, ConfigError::InvalidStepTrigger),
+                },
+                Case {
+                    invariant: "non-gamepad ControllerButton Stepper item",
+                    break_it: |c| {
+                        c.steppers.insert(
+                            StepperId::from("s"),
+                            stepper_def(vec![StepperItem::ControllerButton {
+                                button: KeyCode::KEY_A,
+                            }]),
+                        );
+                    },
+                    matches: |e| matches!(e, ConfigError::InvalidControllerButtonStepperItem(_)),
+                },
+                Case {
+                    invariant: "Analog-repeat on a non-grid Input",
+                    break_it: |c| {
+                        profile(c).base.insert(
+                            Input::ModeKey,
+                            Binding {
+                                trigger: TriggerMode::AnalogRepeat,
+                                action: Action::Keypress {
+                                    modifiers: Modifiers::default(),
+                                    key: KeyCode::KEY_A,
+                                },
+                            },
+                        );
+                    },
+                    matches: |e| matches!(e, ConfigError::InvalidAnalogRepeatInput(i) if i == "mode_key"),
+                },
+                Case {
+                    invariant: "Analog-repeat Chord Binding",
+                    break_it: |c| {
+                        profile(c).chords_base.insert(
+                            chord([Input::Grid(1, 1), Input::Grid(1, 2)]),
+                            Binding {
+                                trigger: TriggerMode::AnalogRepeat,
+                                action: Action::Keypress {
+                                    modifiers: Modifiers::default(),
+                                    key: KeyCode::KEY_A,
+                                },
+                            },
+                        );
+                    },
+                    matches: |e| matches!(e, ConfigError::InvalidChordAnalogRepeat),
+                },
+                Case {
+                    invariant: "ProfileSwitch Chord Binding",
+                    break_it: |c| {
+                        profile(c).chords_base.insert(
+                            chord([Input::Grid(1, 1), Input::Grid(1, 2)]),
+                            Binding {
+                                trigger: TriggerMode::FireOnce,
+                                action: Action::ProfileSwitch {
+                                    target: DEFAULT_PROFILE_NAME.to_string(),
+                                },
+                            },
+                        );
+                    },
+                    matches: |e| matches!(e, ConfigError::InvalidChordProfileSwitch),
+                },
+                Case {
+                    invariant: "Axis assignment on a non-grid Input",
+                    break_it: |c| {
+                        profile(c)
+                            .axis_base
+                            .insert(Input::ModeKey, AxisTarget::LeftTrigger);
+                    },
+                    matches: |e| matches!(e, ConfigError::InvalidAxisInput(i) if i == "mode_key"),
+                },
+                Case {
+                    invariant: "Axis assignment and Binding on one Input/Layer",
+                    break_it: |c| {
+                        let p = profile(c);
+                        p.axis_base
+                            .insert(Input::Grid(1, 1), AxisTarget::LeftTrigger);
+                        p.base.insert(Input::Grid(1, 1), keypress());
+                    },
+                    matches: |e| matches!(e, ConfigError::AxisBindingConflict(i) if i == "grid_r1c1"),
+                },
+                Case {
+                    invariant: "Axis assignment and Chord membership on one Input/Layer",
+                    break_it: |c| {
+                        let p = profile(c);
+                        p.axis_base
+                            .insert(Input::Grid(1, 1), AxisTarget::LeftTrigger);
+                        p.chords_base
+                            .insert(chord([Input::Grid(1, 1), Input::Grid(1, 2)]), keypress());
+                    },
+                    matches: |e| matches!(e, ConfigError::AxisChordConflict(i) if i == "grid_r1c1"),
+                },
+                Case {
+                    invariant: "release >= actuation on the Profile default",
+                    break_it: |c| {
+                        profile(c).default_actuation = ActuationPoint {
+                            actuation: 100,
+                            release: 120,
+                        };
+                    },
+                    matches: |e| matches!(e, ConfigError::ReleaseNotBelowActuation(l) if l == "default"),
+                },
+                Case {
+                    invariant: "release >= actuation on an override",
+                    break_it: |c| {
+                        profile(c).actuation_overrides.insert(
+                            Input::Grid(1, 1),
+                            ActuationPoint {
+                                actuation: 100,
+                                release: 120,
+                            },
+                        );
+                    },
+                    matches: |e| matches!(e, ConfigError::ReleaseNotBelowActuation(l) if l == "grid_r1c1"),
+                },
+                Case {
+                    invariant: "actuation override on a non-grid Input",
+                    break_it: |c| {
+                        profile(c).actuation_overrides.insert(
+                            Input::ModeKey,
+                            ActuationPoint {
+                                actuation: 200,
+                                release: 150,
+                            },
+                        );
+                    },
+                    matches: |e| matches!(e, ConfigError::InvalidActuationOverrideInput(i) if i == "mode_key"),
+                },
+                Case {
+                    invariant: "dangling ProfileSwitch target",
+                    break_it: |c| {
+                        profile(c).base.insert(
+                            Input::Grid(1, 1),
+                            Binding {
+                                trigger: TriggerMode::FireOnce,
+                                action: Action::ProfileSwitch {
+                                    target: "ghost".to_string(),
+                                },
+                            },
+                        );
+                    },
+                    matches: |e| matches!(e, ConfigError::UnknownProfileSwitchTarget(t) if t == "ghost"),
+                },
+                Case {
+                    invariant: "subset/superset Chord pair on one Layer",
+                    break_it: |c| {
+                        let p = profile(c);
+                        p.chords_base
+                            .insert(chord([Input::Grid(1, 1), Input::Grid(1, 2)]), keypress());
+                        p.chords_base.insert(
+                            chord([Input::Grid(1, 1), Input::Grid(1, 2), Input::Grid(1, 3)]),
+                            keypress(),
+                        );
+                    },
+                    matches: |e| matches!(e, ConfigError::ChordMemberSetConflict { .. }),
+                },
+                Case {
+                    invariant: "stored Chord with fewer than two members",
+                    break_it: |c| {
+                        profile(c)
+                            .chords_base
+                            .insert(chord([Input::Grid(1, 1)]), keypress());
+                    },
+                    matches: |e| matches!(e, ConfigError::ChordTooFewMembers(_)),
+                },
+                Case {
+                    invariant: "empty / whitespace-only Profile name",
+                    break_it: |c| {
+                        c.profiles.insert("   ".to_string(), Profile::default());
+                    },
+                    matches: |e| matches!(e, ConfigError::EmptyProfileName),
+                },
+            ];
+
+            for case in cases {
+                let mut config = Config::seed();
+                (case.break_it)(&mut config);
+                let err = validate(&config).expect_err(case.invariant);
+                assert!(
+                    (case.matches)(&err),
+                    "{}: validate returned the wrong error: {err:?}",
+                    case.invariant
+                );
+            }
+        }
     }
 
     // --- `persist_edit` (ticket 03) --------------------------------------

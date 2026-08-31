@@ -316,6 +316,14 @@ pub enum CommandError {
 
 impl From<crate::config::ConfigError> for CommandError {
     fn from(err: crate::config::ConfigError) -> Self {
-        CommandError::IoError(err.to_string())
+        // Ticket 04: `config::validate` now feeds this conversion too, so a
+        // genuine disk-write failure stays `IoError` while every structural
+        // invariant violation becomes `InvalidRequest` (→ the wire's
+        // `InvalidBinding` bucket → the GUI's `InvalidBindingError`).
+        let message = err.to_string();
+        match err {
+            crate::config::ConfigError::Io(_) => CommandError::IoError(message),
+            _ => CommandError::InvalidRequest(message),
+        }
     }
 }

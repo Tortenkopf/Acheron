@@ -131,6 +131,18 @@ and it can be verified before merge.
 - Match the surrounding code — its naming, comment density, and idioms. The
   existing files are the style guide.
 
+- A new **structural invariant of a stored `Config`** — anything that could be
+  written to `config.toml` and reloaded — goes in `config::validate` and
+  nowhere else. It is the single enforcement point both `config::parse`
+  (startup) and `config::persist_edit` (every live D-Bus edit) run through, so
+  a new `Command` arm never needs its own copy. What stays in the arm is
+  everything that is only meaningful relative to the *requested operation*, not
+  to the resulting `Config`: `NotFound` / `AlreadyExists`, "can't delete the
+  active Profile", "can't delete a still-referenced Macro", and required-field
+  checks on a create/rename (e.g. a non-blank Macro or Stepper display name —
+  the slug, not the name, is the key, so a blank name is a bad request, not a
+  corrupt `Config`).
+
 - Keep `install.sh` idempotent and safe to re-run.
 
 ## Licence

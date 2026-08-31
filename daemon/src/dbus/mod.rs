@@ -2818,17 +2818,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_actuation_point_over_real_dbus_with_a_non_grid_input_is_rejected() {
+    async fn clear_actuation_point_over_real_dbus_on_a_non_grid_input_succeeds_as_a_no_op() {
+        // Ticket 04: `ClearActuationPoint` no longer runs a non-Grid guard —
+        // a non-Grid Input never has an override, so clearing one is the same
+        // silent success as clearing an unoverridden Grid key, over the wire
+        // too (the old `..._with_a_non_grid_input_is_rejected` test is gone).
         let server = TestServer::start().await;
 
-        let err = server
+        server
             .proxy
             .clear_actuation_point("mode_key")
             .await
-            .expect_err("a non-Grid Input must be rejected");
-        assert!(
-            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.InvalidBinding")
-        );
+            .expect("ClearActuationPoint on a non-Grid Input must be a no-op success");
 
         server.shut_down().await;
     }

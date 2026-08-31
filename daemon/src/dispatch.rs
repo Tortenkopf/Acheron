@@ -1835,139 +1835,6 @@ async fn fire(
     }
 }
 
-/// Shared by `SetActuationPoint`/`ClearActuationPoint` (ticket 17 §3) and
-/// `SetAxisAssignment` (ticket 59 §1): both an actuation point and an Axis
-/// assignment are properties of a physical Grid key's Depth, so setting or
-/// clearing either on any other `Input` variant is rejected. `what` names
-/// the caller's own concept (e.g. `"actuation points"`, `"Axis assignments"`)
-/// so the error text stays specific to what was actually being set, rather
-/// than every caller sharing one hardcoded noun.
-fn reject_non_grid_input(input: Input, what: &str) -> Result<(), CommandError> {
-    if matches!(input, Input::Grid(_, _)) {
-        Ok(())
-    } else {
-        Err(CommandError::InvalidRequest(format!(
-            "{what} can only be set on Grid Inputs"
-        )))
-    }
-}
-
-/// Shared by `SetActuationPoint`/`SetDefaultActuation`: the hysteresis
-/// invariant ticket 17 §2 asks for — a Release point at or above its
-/// Actuation point defeats hysteresis entirely rather than merely
-/// narrowing it. Ticket 22's `capture::analog::observe` is what actually
-/// consumes these points against a live Depth stream: at `release ==
-/// actuation`, a key held at a perfectly steady Depth crosses both
-/// thresholds on every single report, chattering Down/Up forever on a
-/// motionless key (code-review finding on ticket 22 — this check
-/// pre-existed from ticket 21, but only became exploitable once ticket 22
-/// gave it a real consumer).
-fn reject_release_above_actuation(actuation: u8, release: u8) -> Result<(), CommandError> {
-    if release < actuation {
-        Ok(())
-    } else {
-        Err(CommandError::InvalidRequest(
-            "release point must be strictly below the actuation point".to_string(),
-        ))
-    }
-}
-
-/// Shared by `SetBinding`/`SetChordBinding` (ticket 40): rejects a Binding
-/// whose Action/Trigger combination is structurally disallowed —
-/// `ProfileSwitch` paired with anything but Fire-once, a `ControllerButton`
-/// naming a non-gamepad code, a `Macro`/`Step` naming an unknown library
-/// entry, or a `Step` paired with Toggle. A Chord Binding is "just a Binding
-/// keyed by a Set<Input>" (ticket 01's Answer), so it's held to the exact
-/// same rules rather than a second, drifting copy of them.
-fn validate_binding(binding: &Binding, config: &Config) -> Result<(), CommandError> {
-    if matches!(binding.action, Action::ProfileSwitch { .. })
-        && binding.trigger != TriggerMode::FireOnce
-    {
-        return Err(CommandError::InvalidRequest(
-            "a Profile Switch Binding must use Fire-once".to_string(),
-        ));
-    }
-    if let Action::ControllerButton { button } = binding.action {
-        if !crate::input::is_gamepad_button(button) {
-            return Err(CommandError::InvalidRequest(format!(
-                "{button:?} is not a valid gamepad button"
-            )));
-        }
-        if binding.trigger == TriggerMode::FireOnce {
-            return Err(CommandError::InvalidRequest(
-                "Fire-once is not allowed for a Controller Button Binding".to_string(),
-            ));
-        }
-    }
-    if let Action::Macro { macro_id } = &binding.action
-        && !config.macros.contains_key(macro_id)
-    {
-        return Err(CommandError::InvalidRequest(format!(
-            "{macro_id:?} does not name a Macro in the library"
-        )));
-    }
-    if let Action::Step { stepper, .. } = &binding.action {
-        if !config.steppers.contains_key(stepper) {
-            return Err(CommandError::InvalidRequest(format!(
-                "{stepper:?} does not name a Stepper in the library"
-            )));
-        }
-        if binding.trigger == TriggerMode::Toggle {
-            return Err(CommandError::InvalidRequest(
-                "Toggle is not allowed for a Stepper Binding".to_string(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Rejects a `StepperItem::ControllerButton` list item naming a non-gamepad
-/// code (ticket 92) — the `CreateStepper`/`SetStepperItems` counterpart of
-/// `validate_binding`'s `Action::ControllerButton` allowlist guard, and of
-/// `config::parse`'s `InvalidControllerButtonStepperItem` check for a
-/// hand-edited `config.toml`. A GUI-emitted item is always valid (the
-/// picker only ever produces allowlist codes); this catches a hand-crafted
-/// D-Bus call, mirroring the two-place enforcement `Action::ControllerButton`
-/// already has (ticket 43).
-fn validate_stepper_items(items: &[StepperItem]) -> Result<(), CommandError> {
-    for item in items {
-        if let StepperItem::ControllerButton { button } = item
-            && !crate::input::is_gamepad_button(*button)
-        {
-            return Err(CommandError::InvalidRequest(format!(
-                "{button:?} is not a valid gamepad button"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Whether `key`'s member set is a subset or superset of any *other*
-/// existing Chord's on `chords` (ticket 01's amended Answer) — the only
-/// case that stays genuinely ambiguous once an Input may belong to any
-/// number of Chords: completing the smaller one is indistinguishable from
-/// being partway into the larger one. Editing the exact same member set
-/// back (`key` already present in `chords`) is not a conflict with itself.
-fn chord_conflict(chords: &HashMap<ChordKey, Binding>, key: &ChordKey) -> Option<ChordKey> {
-    chords
-        .keys()
-        .find(|other| {
-            *other != key
-                && (key.members().is_subset(other.members())
-                    || other.members().is_subset(key.members()))
-        })
-        .cloned()
-}
-
-/// Whether `input` already carries an Axis assignment on `layer` (ticket
-/// 59 §2's mutual exclusion) — `SetBinding`/`SetChordBinding` both reject a
-/// grid key already Axis-assigned there with a specific error rather than
-/// silently overwriting it, the mirror image of `SetAxisAssignment`'s own
-/// atomic steal-from-Binding/Chord-membership behavior.
-fn axis_conflict(profile: &Profile, layer: Layer, input: Input) -> bool {
-    profile.axis_layer(layer).contains_key(&input)
-}
-
 /// The `Default` Profile always exists — `load_or_seed` (issue 11) refuses
 /// to start a `Config` whose `active_profile` doesn't name a real Profile.
 fn active_profile_mut(config: &mut Config) -> &mut Profile {
@@ -2238,22 +2105,13 @@ async fn handle_command(
             reply,
         } => {
             let result = config::persist_edit(config, config_path, |config| {
-                validate_binding(&binding, config)?;
-                if binding.trigger == TriggerMode::AnalogRepeat
-                    && !matches!(input, Input::Grid(_, _))
-                {
-                    return Err(CommandError::InvalidRequest(
-                        "Analog-repeat is only valid on Grid Inputs".to_string(),
-                    ));
-                }
-                let profile = config
-                    .active_profile()
-                    .expect("load_or_seed validates active_profile names a real profile");
-                if axis_conflict(profile, layer, input) {
-                    return Err(CommandError::InvalidRequest(format!(
-                        "{input} already has an Axis assignment on this Layer — clear it first"
-                    )));
-                }
+                // Ticket 04: every Action/Trigger legality rule, the
+                // Analog-repeat-on-non-grid rule, and the
+                // Axis-assignment-already-present conflict are all structural
+                // invariants of the resulting `Config` — `persist_edit` runs
+                // `config::validate` after this closure and rolls the edit
+                // back if any of them is violated.
+                //
                 // Ticket 03's Answer: assigning a Stepper list to a new Input
                 // silently moves it off its old one — no reject-at-save step,
                 // since at most one Input *or Chord* may carry a given
@@ -2321,11 +2179,11 @@ async fn handle_command(
         }
         Command::CreateProfile { name, reply } => {
             let result = config::persist_edit(config, config_path, |config| {
-                if name.trim().is_empty() {
-                    return Err(CommandError::InvalidRequest(
-                        "Profile name can't be empty".to_string(),
-                    ));
-                }
+                // Ticket 04: an empty/whitespace-only Profile name is a
+                // structural invariant — `config::validate` rejects it
+                // (`EmptyProfileName`) after this closure and rolls the
+                // insert back. `AlreadyExists` stays: it's an operation
+                // precondition, not a property of the resulting `Config`.
                 if config.profiles.contains_key(&name) {
                     return Err(CommandError::AlreadyExists);
                 }
@@ -2360,12 +2218,11 @@ async fn handle_command(
             new_name,
             reply,
         } => {
-            if new_name.trim().is_empty() {
-                let _ = reply.send(Err(CommandError::InvalidRequest(
-                    "Profile name can't be empty".to_string(),
-                )));
-                return;
-            }
+            // Ticket 04: an empty/whitespace-only `new_name` is a structural
+            // invariant — `config::validate` rejects it (`EmptyProfileName`)
+            // inside `persist_edit` below and rolls the rename back. `NotFound`
+            // / `AlreadyExists` / the same-name early return stay: they're
+            // operation preconditions, not properties of the resulting `Config`.
             if !config.profiles.contains_key(&old_name) {
                 let _ = reply.send(Err(CommandError::NotFound));
                 return;
@@ -2437,8 +2294,10 @@ async fn handle_command(
             reply,
         } => {
             let result = config::persist_edit(config, config_path, |config| {
-                reject_non_grid_input(input, "actuation points")?;
-                reject_release_above_actuation(actuation, release)?;
+                // Ticket 04: a non-grid override key and a `release >=
+                // actuation` hysteresis violation are both structural
+                // invariants — `config::validate` catches either after this
+                // closure and rolls the insert back.
                 active_profile_mut(config)
                     .actuation_overrides
                     .insert(input, ActuationPoint { actuation, release });
@@ -2452,8 +2311,13 @@ async fn handle_command(
         }
         Command::ClearActuationPoint { input, reply } => {
             let result = config::persist_edit(config, config_path, |config| {
-                reject_non_grid_input(input, "actuation points")?;
-                active_profile_mut(config).actuation_overrides.remove(&input);
+                // Ticket 04: `reject_non_grid_input` is gone — clearing an
+                // override that isn't there (a non-grid key never has one) is
+                // the same silent no-op success it already was for an
+                // unoverridden grid key.
+                active_profile_mut(config)
+                    .actuation_overrides
+                    .remove(&input);
                 Ok(())
             })
             .await;
@@ -2468,7 +2332,9 @@ async fn handle_command(
             reply,
         } => {
             let result = config::persist_edit(config, config_path, |config| {
-                reject_release_above_actuation(actuation, release)?;
+                // Ticket 04: `release >= actuation` defeats hysteresis — a
+                // structural invariant `config::validate` catches after this
+                // closure (locus `"default"`), rolling the change back.
                 active_profile_mut(config).default_actuation =
                     ActuationPoint { actuation, release };
                 Ok(())
@@ -2532,7 +2398,10 @@ async fn handle_command(
                         "Macro name can't be empty".to_string(),
                     ));
                 }
-                let def = config.macros.get_mut(&macro_id).ok_or(CommandError::NotFound)?;
+                let def = config
+                    .macros
+                    .get_mut(&macro_id)
+                    .ok_or(CommandError::NotFound)?;
                 def.name = new_name;
                 Ok(())
             })
@@ -2560,7 +2429,10 @@ async fn handle_command(
             reply,
         } => {
             let result = config::persist_edit(config, config_path, |config| {
-                let def = config.macros.get_mut(&macro_id).ok_or(CommandError::NotFound)?;
+                let def = config
+                    .macros
+                    .get_mut(&macro_id)
+                    .ok_or(CommandError::NotFound)?;
                 def.steps = steps;
                 Ok(())
             })
@@ -2574,7 +2446,9 @@ async fn handle_command(
                         "Stepper name can't be empty".to_string(),
                     ));
                 }
-                validate_stepper_items(&items)?;
+                // Ticket 04: a `controller_button` item naming a non-gamepad
+                // code is a structural invariant — `config::validate` catches
+                // it after this closure.
                 let stepper_id = config::unique_stepper_id(config, &name);
                 config
                     .steppers
@@ -2636,7 +2510,9 @@ async fn handle_command(
             reply,
         } => {
             let result = config::persist_edit(config, config_path, |config| {
-                validate_stepper_items(&items)?;
+                // Ticket 04: a `controller_button` item naming a non-gamepad
+                // code is a structural invariant — `config::validate` catches
+                // it after this closure.
                 let def = config
                     .steppers
                     .get_mut(&stepper_id)
@@ -2672,50 +2548,14 @@ async fn handle_command(
             reply,
         } => {
             let result = config::persist_edit(config, config_path, |config| {
-                if inputs.len() < 2 {
-                    return Err(CommandError::InvalidRequest(
-                        "a Chord needs at least two member Inputs".to_string(),
-                    ));
-                }
-                if matches!(binding.action, Action::ProfileSwitch { .. }) {
-                    // See `ConfigError::InvalidChordProfileSwitch` — a Chord's
-                    // own Action can never be ProfileSwitch, since
-                    // `fire_chord`/`compile_action` have no `&mut Config` to
-                    // actually run a switch through (unlike a Chord *member*'s
-                    // own individual Binding, which can be anything — see
-                    // `fire_individual_retroactively`).
-                    return Err(CommandError::InvalidRequest(
-                        "a Chord's Binding can't be a Profile Switch".to_string(),
-                    ));
-                }
-                if binding.trigger == TriggerMode::AnalogRepeat {
-                    // See `ConfigError::InvalidChordAnalogRepeat` — a Chord
-                    // fires on a discrete member-set completion, not a single
-                    // grid key's continuous Depth, same "no coherent runtime
-                    // owner" reasoning as the Profile Switch rejection above.
-                    return Err(CommandError::InvalidRequest(
-                        "a Chord's Binding can't use Analog-repeat".to_string(),
-                    ));
-                }
-                validate_binding(&binding, config)?;
-                let profile = config
-                    .active_profile()
-                    .expect("load_or_seed validates active_profile names a real profile");
-                if let Some(&axis_input) =
-                    inputs.iter().find(|&&i| axis_conflict(profile, layer, i))
-                {
-                    return Err(CommandError::InvalidRequest(format!(
-                        "{axis_input} already has an Axis assignment on this Layer — clear it first"
-                    )));
-                }
+                // Ticket 04: the two-member minimum, the no-profile_switch and
+                // no-analog_repeat Chord rules, every Action/Trigger legality
+                // rule, an Axis-assignment already on a member, and a
+                // subset/superset member-set conflict with an existing Chord
+                // are all structural invariants of the resulting `Config` —
+                // `persist_edit` runs `config::validate` after this closure
+                // and rolls the edit back if any of them is violated.
                 let key = ChordKey::new(inputs);
-                if let Some(conflicting) =
-                    chord_conflict(active_profile_mut(config).chords(layer), &key)
-                {
-                    return Err(CommandError::InvalidRequest(format!(
-                        "conflicts with the existing Chord {conflicting}: one member set fully contains the other"
-                    )));
-                }
                 // Ticket 40: a Step-action Chord is exactly as exclusive an
                 // owner of (stepper, direction) as an ordinary Binding's
                 // (ticket 03's Answer) — steal it from wherever else it
@@ -2766,7 +2606,9 @@ async fn handle_command(
             reply,
         } => {
             let result = config::persist_edit(config, config_path, |config| {
-                reject_non_grid_input(input, "Axis assignments")?;
+                // Ticket 04: an Axis assignment on a non-grid Input is a
+                // structural invariant — `config::validate` catches it after
+                // this closure and rolls the insert back.
                 // Ticket 59 §2's mutual exclusion: atomically clears any
                 // existing Binding *and* any Chord membership for (layer,
                 // input) alongside the insert, mirroring `SetBinding`'s own
@@ -5042,6 +4884,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_invariant_violating_edit_is_rejected_and_the_in_memory_config_is_rolled_back() {
+        // Ticket 04: the single "reject + roll back" integration test for the
+        // dispatch path. `config::validate` now runs inside `persist_edit`
+        // after the edit closure — a closure that mutates `Config` into a
+        // structurally invalid state (here: a Chord whose member set is a
+        // superset of an existing Chord's, *and* which steals a (stepper,
+        // direction) from another Binding on the way in) is rejected, and the
+        // whole edit — the steal included — is rolled back in memory. The
+        // per-invariant "which error" coverage lives in `config::validate`'s
+        // own synchronous test module; this is the one test that exercises
+        // the rejection through the full dispatch harness.
+        let stepper_id = StepperId::from("wheel");
+        let step_forward = Binding {
+            trigger: TriggerMode::FireOnce,
+            action: Action::Step {
+                stepper: stepper_id.clone(),
+                direction: StepDirection::Forward,
+            },
+        };
+        let mut profile = Profile::default();
+        profile.base.insert(Input::Grid(5, 5), step_forward.clone());
+        profile.chords_base.insert(
+            ChordKey::new(BTreeSet::from([Input::Grid(1, 1), Input::Grid(1, 2)])),
+            keypress_binding(evdev::KeyCode::KEY_1),
+        );
+        let mut profiles = HashMap::new();
+        profiles.insert(DEFAULT_PROFILE_NAME.to_string(), profile);
+        let mut steppers = HashMap::new();
+        steppers.insert(
+            stepper_id.clone(),
+            StepperDef {
+                name: "Wheel".to_string(),
+                items: vec![StepperItem::Key {
+                    key: evdev::KeyCode::KEY_1,
+                    modifiers: Modifiers::default(),
+                }],
+            },
+        );
+        let harness = CommandHarness::spawn(Config {
+            schema_version: config::SCHEMA_VERSION,
+            active_profile: DEFAULT_PROFILE_NAME.to_string(),
+            profiles,
+            force_digital: false,
+            macros: HashMap::new(),
+            steppers,
+        });
+
+        let result = harness
+            .set_chord_binding(
+                [Input::Grid(1, 1), Input::Grid(1, 2), Input::Grid(1, 3)],
+                Layer::Base,
+                step_forward,
+            )
+            .await;
+        assert!(matches!(result, Err(CommandError::InvalidRequest(_))));
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+        let base = &config.profiles[DEFAULT_PROFILE_NAME];
+        assert!(
+            !base
+                .chords_base
+                .contains_key(&ChordKey::new(BTreeSet::from([
+                    Input::Grid(1, 1),
+                    Input::Grid(1, 2),
+                    Input::Grid(1, 3),
+                ]))),
+            "the rejected superset Chord must not have been inserted"
+        );
+        assert!(
+            base.chords_base
+                .contains_key(&ChordKey::new(BTreeSet::from([
+                    Input::Grid(1, 1),
+                    Input::Grid(1, 2),
+                ]))),
+            "the pre-existing Chord must be untouched"
+        );
+        assert_eq!(
+            base.base.get(&Input::Grid(5, 5)).map(|b| &b.action),
+            Some(&Action::Step {
+                stepper: stepper_id,
+                direction: StepDirection::Forward,
+            }),
+            "the (stepper, direction) steal must have rolled back with the rejected insert"
+        );
+    }
+
+    #[tokio::test]
     async fn thumbstick_diagonals_fire_independently_and_share_a_member() {
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
 
@@ -5372,67 +5302,6 @@ mod tests {
         assert!(matches!(err, CommandError::NotFound));
 
         harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn set_chord_binding_rejects_analog_repeat() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .set_chord_binding(
-                [Input::Grid(1, 1), Input::Grid(1, 2)],
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::AnalogRepeat,
-                    action: Action::Keypress {
-                        modifiers: Modifiers::default(),
-                        key: evdev::KeyCode::KEY_A,
-                    },
-                },
-            )
-            .await
-            .expect_err("an Analog-repeat Chord Binding must be rejected");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        let key = ChordKey::new(BTreeSet::from([Input::Grid(1, 1), Input::Grid(1, 2)]));
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-        assert!(
-            !config.profiles[DEFAULT_PROFILE_NAME]
-                .chords(Layer::Base)
-                .contains_key(&key),
-            "the rejected Chord Binding must not have been applied"
-        );
-    }
-
-    #[tokio::test]
-    async fn set_binding_rejects_analog_repeat_on_a_non_grid_input() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .set_binding(
-                Input::ModeKey,
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::AnalogRepeat,
-                    action: Action::Keypress {
-                        modifiers: Modifiers::default(),
-                        key: evdev::KeyCode::KEY_A,
-                    },
-                },
-            )
-            .await
-            .expect_err("an Analog-repeat Binding on a non-Grid Input must be rejected");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-        assert!(
-            !config.profiles[DEFAULT_PROFILE_NAME]
-                .base
-                .contains_key(&Input::ModeKey),
-            "the rejected Binding must not have been applied"
-        );
     }
 
     #[tokio::test]
@@ -5910,66 +5779,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_binding_rejects_a_profile_switch_binding_that_is_not_fire_once() {
-        for trigger in [TriggerMode::HoldToRepeat, TriggerMode::Toggle] {
-            let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-            let err = harness
-                .set_binding(
-                    Input::Grid(1, 1),
-                    Layer::Base,
-                    Binding {
-                        trigger,
-                        action: Action::ProfileSwitch {
-                            target: "Gaming".to_string(),
-                        },
-                    },
-                )
-                .await
-                .expect_err("a non-Fire-once Profile Switch Binding must be rejected");
-            assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-            let config = harness.get_config().await;
-            harness.shut_down().await;
-            assert!(
-                !config.profiles[DEFAULT_PROFILE_NAME]
-                    .base
-                    .contains_key(&Input::Grid(1, 1)),
-                "the rejected Binding must not have been applied"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn set_binding_rejects_a_controller_button_outside_the_gamepad_allowlist() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::FireOnce,
-                    action: Action::ControllerButton {
-                        button: evdev::KeyCode::KEY_A,
-                    },
-                },
-            )
-            .await
-            .expect_err("a non-gamepad ControllerButton Binding must be rejected");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-        assert!(
-            !config.profiles[DEFAULT_PROFILE_NAME]
-                .base
-                .contains_key(&Input::Grid(1, 1)),
-            "the rejected Binding must not have been applied"
-        );
-    }
-
-    #[tokio::test]
     async fn set_binding_accepts_a_controller_button_in_the_gamepad_allowlist() {
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
 
@@ -5994,37 +5803,6 @@ mod tests {
             Action::ControllerButton {
                 button: evdev::KeyCode::BTN_SOUTH,
             }
-        );
-    }
-
-    #[tokio::test]
-    async fn set_binding_rejects_a_fire_once_controller_button_binding() {
-        // Ticket 78: Fire-once is locked out for `Action::ControllerButton`
-        // at the live-write path too, mirroring `config::parse`'s own check.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::FireOnce,
-                    action: Action::ControllerButton {
-                        button: evdev::KeyCode::BTN_SOUTH,
-                    },
-                },
-            )
-            .await
-            .expect_err("a Fire-once ControllerButton Binding must be rejected");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-        assert!(
-            !config.profiles[DEFAULT_PROFILE_NAME]
-                .base
-                .contains_key(&Input::Grid(1, 1)),
-            "the rejected Binding must not have been applied"
         );
     }
 
@@ -6133,23 +5911,6 @@ mod tests {
         assert!(matches!(err, CommandError::AlreadyExists));
 
         harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn create_profile_command_rejects_an_empty_or_whitespace_name() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        for name in ["", "   "] {
-            let err = harness
-                .create_profile(name)
-                .await
-                .expect_err("creating a Profile with an empty name must fail");
-            assert!(matches!(err, CommandError::InvalidRequest(_)));
-        }
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-        assert_eq!(config.profiles.len(), 1, "no empty-named Profile created");
     }
 
     #[tokio::test]
@@ -6349,23 +6110,6 @@ mod tests {
         assert!(matches!(err, CommandError::AlreadyExists));
 
         harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn rename_profile_command_rejects_an_empty_or_whitespace_new_name() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        for new_name in ["", "   "] {
-            let err = harness
-                .rename_profile(DEFAULT_PROFILE_NAME, new_name)
-                .await
-                .expect_err("renaming to an empty name must fail");
-            assert!(matches!(err, CommandError::InvalidRequest(_)));
-        }
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-        assert!(config.profiles.contains_key(DEFAULT_PROFILE_NAME));
     }
 
     #[tokio::test]
@@ -7060,47 +6804,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_stepper_items_rejects_a_controller_button_item_naming_a_non_gamepad_code() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        let stepper_id = harness
-            .create_stepper("Weapon Wheel", vec![])
-            .await
-            .expect("CreateStepper must succeed");
-
-        let err = harness
-            .set_stepper_items(
-                stepper_id.clone(),
-                vec![crate::config::StepperItem::ControllerButton {
-                    button: evdev::KeyCode::KEY_A,
-                }],
-            )
-            .await
-            .expect_err("a non-gamepad controller button item must be rejected");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        // The rejected write never lands.
-        let config = harness.get_config().await;
-        assert!(config.steppers[&stepper_id].items.is_empty());
-    }
-
-    #[tokio::test]
-    async fn create_stepper_rejects_a_controller_button_item_naming_a_non_gamepad_code() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .create_stepper(
-                "Weapon Wheel",
-                vec![crate::config::StepperItem::ControllerButton {
-                    button: evdev::KeyCode::KEY_A,
-                }],
-            )
-            .await
-            .expect_err("a non-gamepad controller button item must be rejected");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-        assert!(harness.get_config().await.steppers.is_empty());
-    }
-
-    #[tokio::test]
     async fn step_binding_wraps_around_at_either_end() {
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
         let stepper_id = harness
@@ -7449,28 +7152,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_binding_rejects_a_macro_action_naming_an_unknown_macro_id() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::FireOnce,
-                    action: Action::Macro {
-                        macro_id: MacroId::from("nonexistent"),
-                    },
-                },
-            )
-            .await
-            .expect_err("SetBinding with an unknown macro_id must fail");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
     async fn switch_profile_command_switches_active_profile_and_persists() {
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
         harness.create_profile("Gaming").await.unwrap();
@@ -7803,49 +7484,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_actuation_point_rejects_a_non_grid_input() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .set_actuation_point(Input::ModeKey, 200, 180)
-            .await
-            .expect_err("a non-Grid Input must be rejected");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn set_actuation_point_rejects_a_release_point_above_actuation() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .set_actuation_point(Input::Grid(1, 1), 100, 150)
-            .await
-            .expect_err("release > actuation must be rejected");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn set_actuation_point_rejects_a_release_point_equal_to_actuation() {
-        // Code-review finding on ticket 22: `release == actuation` used to
-        // pass this check, but `capture::analog::observe` would then
-        // chatter Down/Up forever on a key held at a perfectly steady
-        // Depth — hysteresis requires a strict gap, not just `<=`.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .set_actuation_point(Input::Grid(1, 1), 128, 128)
-            .await
-            .expect_err("release == actuation must be rejected");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
     async fn clear_actuation_point_command_reverts_to_the_profile_default() {
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
 
@@ -7881,14 +7519,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_actuation_point_rejects_a_non_grid_input() {
+    async fn clear_actuation_point_on_a_non_grid_input_is_a_no_op_success() {
+        // Ticket 04: `ClearActuationPoint` no longer runs its own
+        // `reject_non_grid_input` guard — a non-Grid Input never has an
+        // override to clear, so this is the same silent no-op success as
+        // clearing an unoverridden Grid key.
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
 
-        let err = harness
+        harness
             .clear_actuation_point(Input::ModeKey)
             .await
-            .expect_err("a non-Grid Input must be rejected");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
+            .expect("clearing a non-Grid Input must be a no-op success");
 
         harness.shut_down().await;
     }
@@ -7912,19 +7553,6 @@ mod tests {
                 release: 120,
             }
         );
-    }
-
-    #[tokio::test]
-    async fn set_default_actuation_rejects_a_release_point_above_actuation() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .set_default_actuation(100, 150)
-            .await
-            .expect_err("release > actuation must be rejected");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        harness.shut_down().await;
     }
 
     #[tokio::test]
@@ -8147,19 +7775,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_axis_assignment_rejects_a_non_grid_input() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .set_axis_assignment(Input::ModeKey, Layer::Base, AxisTarget::LeftTrigger)
-            .await
-            .expect_err("a non-Grid Input must be rejected");
-        harness.shut_down().await;
-
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-    }
-
-    #[tokio::test]
     async fn set_axis_assignment_atomically_clears_an_existing_binding_on_the_same_input_and_layer()
     {
         let mut bindings = HashMap::new();
@@ -8212,27 +7827,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_binding_rejects_an_input_already_axis_assigned_on_the_same_layer() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_axis_assignment(Input::Grid(1, 1), Layer::Base, AxisTarget::LeftTrigger)
-            .await
-            .expect("SetAxisAssignment must succeed");
-
-        let err = harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                keypress_binding(evdev::KeyCode::KEY_F1),
-            )
-            .await
-            .expect_err("SetBinding on an Axis-assigned Input must be rejected");
-        harness.shut_down().await;
-
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-    }
-
-    #[tokio::test]
     async fn set_binding_on_a_different_layer_than_an_axis_assignment_is_allowed() {
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
         harness
@@ -8249,27 +7843,6 @@ mod tests {
             .await
             .expect("a Binding on the other Layer must be allowed");
         harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn set_chord_binding_rejects_a_member_already_axis_assigned_on_the_same_layer() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_axis_assignment(Input::Grid(1, 1), Layer::Base, AxisTarget::LeftTrigger)
-            .await
-            .expect("SetAxisAssignment must succeed");
-
-        let err = harness
-            .set_chord_binding(
-                [Input::Grid(1, 1), Input::Grid(1, 2)],
-                Layer::Base,
-                keypress_binding(evdev::KeyCode::KEY_C),
-            )
-            .await
-            .expect_err("a Chord with an Axis-assigned member must be rejected");
-        harness.shut_down().await;
-
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
     }
 
     #[tokio::test]
