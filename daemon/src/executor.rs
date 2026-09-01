@@ -150,7 +150,7 @@ pub fn compile(action: &Action, macros: &HashMap<MacroId, MacroDef>) -> Vec<Macr
         // both edges inside the same input-poll frame on the receiving
         // game, silently swallowing the press. Fire-once is locked out for
         // this Action (ticket 78), and both Hold-to-repeat and Toggle are
-        // carved out ahead of `compile_action` in `fire`/`fire_chord`
+        // carved out ahead of `compile_action` in `fire`/`execute_chord_fire`
         // (ticket 75/76's bare-KeyDown hold, ticket 78's Toggle mirror of
         // it) — the only caller still reaching this arm is the
         // Digital-Capture-mode Analog-repeat fallback (ticket 20).

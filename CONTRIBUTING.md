@@ -162,6 +162,15 @@ and it can be verified before merge.
   (startup) and `edit::plan` (every live D-Bus edit) run through, so a new
   arm never needs its own copy.
 
+- **Changing Chord-detection behaviour** (the ~50 ms simultaneity window,
+  which member is suppressed, which fires retroactively, the Hold-to-repeat
+  leader rule…). The decision lives in `daemon/src/chord.rs` as pure
+  `feed` / `tick` logic returning `Vec<ChordEffect>` — add or adjust it
+  there, with a synchronous `chord::tests` case, never in `dispatch`. Only
+  the *execution* of a `ChordEffect` (spawning a firing, stopping a Toggle,
+  the retroactive `dispatch_individual_down`) belongs in
+  `dispatch::run_chord_effects`.
+
 - **Adding a device-catalog entry or a Binding-legality rule.** The GUI
   mirrors the Daemon's device vocabularies and the pure part of
   `config::validate` in `gui/acheron_gui/rules.py` (ADR 0003's split-language

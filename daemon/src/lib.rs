@@ -10,6 +10,7 @@
 pub const VERSION: &str = env!("ACHERON_VERSION");
 
 pub mod capture;
+pub mod chord;
 pub mod command;
 pub mod config;
 pub mod dbus;

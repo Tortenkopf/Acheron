@@ -825,7 +825,7 @@ pub enum ConfigError {
     InvalidStepTrigger,
     /// A Chord Binding (`chords_base`/`chords_held`) whose Action is
     /// `ProfileSwitch` (ticket 40) — refused because `executor::compile`
-    /// panics on it: unlike an ordinary Binding, `dispatch::fire_chord` has
+    /// panics on it: unlike an ordinary Binding, `dispatch::execute_chord_fire` has
     /// no `&mut Config`/`config_path` to actually run a Profile switch
     /// through, so this Action never reaches a Chord at all, structurally
     /// enforced both here (a hand-edited `config.toml`) and by

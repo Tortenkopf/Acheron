@@ -283,6 +283,14 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             // signal fires — all after the D-Bus reply, uniformly, which is
             // what deletes `SwitchProfile`'s old bespoke reply-before-signal
             // reasoning (the hazard it dodged is now the default shape).
+            //
+            // `StopAllToggles` clears only the per-Input `toggles` map, never
+            // `dispatch::ChordRuntime`'s `ChordKey`-keyed firings/toggles —
+            // an active Chord Toggle survives a Profile switch today. That is
+            // pre-existing behaviour, preserved unchanged by post-release
+            // ticket 07's mechanical carve; whether a Chord Toggle *should*
+            // outlive a Profile switch is an open question for the domain
+            // owner, not something to settle here.
             effects.push(Effect::StopAllToggles);
             effects.push(Effect::RepublishActuation);
             effects.push(Effect::ResetAxisOutputs);
