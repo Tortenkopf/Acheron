@@ -282,7 +282,7 @@ pub fn gamepad_button_codes() -> Vec<KeyCode> {
 
 /// Whether `code` is a mouse button, per evdev's own `BTN_LEFT..=BTN_TASK`
 /// block (`0x110`-`0x117`: Left/Right/Middle/Side/Extra/Forward/Back/Task) —
-/// ticket 79/80's carve-out predicate, `dispatch::fire`/`execute_chord_fire`'s way
+/// ticket 79/80's carve-out predicate, `trigger::decide`'s way
 /// of telling a mouse-button `Action::Keypress` apart from a keyboard-key
 /// one so Hold-to-repeat can give it sustained-hold-for-drag instead of a
 /// repeat-tap train. Deliberately wider than the 5 codes the GUI picker

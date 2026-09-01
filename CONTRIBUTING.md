@@ -171,6 +171,18 @@ and it can be verified before merge.
   the retroactive `dispatch_individual_down`) belongs in
   `dispatch::run_chord_effects`.
 
+- **Changing how a Trigger mode fires** (which `(TriggerMode, EventState,
+  Action-shape)` pairs spawn a firing, hold a bare `KeyDown`, start a Toggle,
+  or force-release a stuck key — the mouse-button / `ControllerButton`
+  carve-outs, the Fire-once-only-on-`Down` rule…). The decision lives in
+  `daemon/src/trigger.rs` as the pure `decide` function returning a
+  `TriggerDecision` — add or adjust the arm there and add a row to the
+  `trigger::tests` decision table, never in `dispatch`. It is one matrix for
+  both the individual (`Input`-keyed) and Chord (`ChordKey`-keyed) paths. Only
+  the *performance* of a `TriggerDecision` (`compile_action`, `spawn_fire_once`
+  / `ActiveToggle::spawn{,_held}`, the map insert) belongs in
+  `dispatch::perform_trigger`.
+
 - **Adding a device-catalog entry or a Binding-legality rule.** The GUI
   mirrors the Daemon's device vocabularies and the pure part of
   `config::validate` in `gui/acheron_gui/rules.py` (ADR 0003's split-language

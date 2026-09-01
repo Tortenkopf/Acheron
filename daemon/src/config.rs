@@ -496,7 +496,8 @@ pub fn resolve_axis_value(depth: u8, point: ActuationPoint) -> u8 {
 }
 
 /// CONTEXT.md: Trigger mode. `FireOnce`/`HoldToRepeat`/`Toggle` firing
-/// semantics all live in `dispatch::fire` and `executor` (ticket 17).
+/// semantics all live in `trigger::decide` and `executor` (ticket 17,
+/// post-release ticket 08).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TriggerMode {
@@ -825,9 +826,9 @@ pub enum ConfigError {
     InvalidStepTrigger,
     /// A Chord Binding (`chords_base`/`chords_held`) whose Action is
     /// `ProfileSwitch` (ticket 40) — refused because `executor::compile`
-    /// panics on it: unlike an ordinary Binding, `dispatch::execute_chord_fire` has
-    /// no `&mut Config`/`config_path` to actually run a Profile switch
-    /// through, so this Action never reaches a Chord at all, structurally
+    /// panics on it: unlike an ordinary Binding, a Chord's `FireChord`
+    /// executor has no `&mut Config`/`config_path` to actually run a Profile
+    /// switch through, so this Action never reaches a Chord at all, structurally
     /// enforced both here (a hand-edited `config.toml`) and by
     /// `SetChordBinding`'s own validation (a live D-Bus caller).
     InvalidChordProfileSwitch,

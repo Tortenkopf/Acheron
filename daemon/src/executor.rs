@@ -63,9 +63,9 @@ fn modifier_codes(modifiers: Modifiers) -> Vec<KeyCode> {
 /// whole press is silently swallowed. Originally tuned for Fire-once, but
 /// ticket 78 locked Fire-once out for `Action::ControllerButton` entirely —
 /// this now only fires via `dispatch::compile_action`'s Digital-Capture-mode
-/// Analog-repeat fallback (a Digital-sourced Analog-repeat Binding reaches
-/// `fire`'s generic arm, which still calls straight through to `compile()`,
-/// per ticket 20's Answer), so the same single-poll-swallow risk still
+/// Analog-repeat fallback (a Digital-sourced Analog-repeat Binding resolves
+/// to `trigger::TriggerDecision::SpawnFireOnce`, which calls straight through
+/// to `compile()`, per ticket 20's Answer), so the same single-poll-swallow risk still
 /// applies there. Deliberately *not* shared with
 /// `dispatch::ANALOG_REPEAT_PULSE_HOLD`/`ANALOG_REPEAT_CONTROLLER_PULSE_HOLD`
 /// — the dwells are tuned for unrelated jobs (15ms was tuned against
@@ -150,7 +150,7 @@ pub fn compile(action: &Action, macros: &HashMap<MacroId, MacroDef>) -> Vec<Macr
         // both edges inside the same input-poll frame on the receiving
         // game, silently swallowing the press. Fire-once is locked out for
         // this Action (ticket 78), and both Hold-to-repeat and Toggle are
-        // carved out ahead of `compile_action` in `fire`/`execute_chord_fire`
+        // carved out ahead of `compile_action` in `trigger::decide`
         // (ticket 75/76's bare-KeyDown hold, ticket 78's Toggle mirror of
         // it) — the only caller still reaching this arm is the
         // Digital-Capture-mode Analog-repeat fallback (ticket 20).
@@ -204,8 +204,9 @@ pub struct FiringHandle {
 }
 
 impl FiringHandle {
-    /// Whether the firing's steps have finished walking — used by `fire()`'s
-    /// existing same-Input overlap guard, unchanged from the old bare
+    /// Whether the firing's steps have finished walking — feeds
+    /// `dispatch::slot_for`'s `FiringUnfinished` / `FiringFinished` split for
+    /// `trigger::decide`'s overlap guard, unchanged from the old bare
     /// `JoinHandle<()>` check.
     pub fn is_finished(&self) -> bool {
         self.handle.is_finished()

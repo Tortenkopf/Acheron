@@ -19,6 +19,7 @@ pub mod edit;
 pub mod executor;
 pub mod injector;
 pub mod input;
+pub mod trigger;
 
 /// The GUI-mirror contract fixture generator (post-release ticket 06) — a
 /// single golden-file `#[test]` deriving the daemon's device catalogs and

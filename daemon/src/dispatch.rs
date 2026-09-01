@@ -24,6 +24,7 @@
 //! and Trigger-mode dispatch as any other Input.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -47,6 +48,27 @@ use crate::edit;
 use crate::executor::{self, ActiveToggle, FiringHandle, MacroStep};
 use crate::injector::Injector;
 use crate::input::Input;
+use crate::trigger;
+
+/// Builds a `TriggerCtx` (below) from a `(firings, toggles)` pair plus the
+/// shared `config` view and per-task locals — mirrors this file's own
+/// `effect_ctx!` idiom (a per-call-site borrow struct built from a macro), so
+/// the three `trigger::decide` + `perform_trigger` sites don't each spell the
+/// struct literal. Defined up here because `macro_rules!` is textually scoped
+/// and the first user (`handle_event`) precedes `TriggerCtx`'s own definition.
+macro_rules! trigger_ctx {
+    ($injector:expr, $config:expr, $firings:expr, $toggles:expr, $cursors:expr, $lap:expr $(,)?) => {
+        TriggerCtx {
+            injector: $injector,
+            firings: $firings,
+            toggles: $toggles,
+            macros: &$config.macros,
+            steppers: &$config.steppers,
+            stepper_cursors: $cursors,
+            toggle_lap_target: $lap,
+        }
+    };
+}
 
 /// The Digital Capture mode fallback's per-press step size (ticket 59 §6 /
 /// ticket 71): press/release step-increment in place of a continuous Depth
@@ -61,7 +83,7 @@ const AXIS_DIGITAL_STEP: u8 = 64;
 /// the pure `chord` state machine (post-release ticket 07) never holds. One
 /// `run`-local, built fresh per dispatch task start, mirroring how
 /// `AxisState` bundles its own two maps; the executor derives the
-/// `chord::ChordSlot` liveness snapshot `chord::feed` wants from it.
+/// `trigger::Slot` liveness snapshot `chord::feed` wants from it.
 #[derive(Default)]
 struct ChordRuntime {
     firings: HashMap<ChordKey, FiringHandle>,
@@ -263,11 +285,12 @@ const ANALOG_REPEAT_HOLD_SOLID: u8 = 235;
 /// `ActiveToggle` than to a Fire-once/Hold-to-repeat `FiringHandle`, per
 /// ticket 20's Answer: its lifetime is driven by Depth crossing
 /// `ANALOG_REPEAT_DEADZONE` (see `update_analog_repeats`), not by a single
-/// physical press/release. Never touched from `fire()`, which swallows every
-/// Analog-sourced Down/Repeat/Up for an Analog-repeat Binding outright (see
-/// `handle_event`) — only a Digital-sourced one (no Depth at all) reaches
-/// `fire()`, which treats Analog-repeat exactly like Hold-to-repeat there
-/// (ticket 20's Digital Capture mode fallback).
+/// physical press/release. Never touched from the individual Trigger-mode
+/// path (`trigger::decide` + `perform_trigger`), which never sees an
+/// Analog-sourced Down/Repeat/Up for an Analog-repeat Binding — `handle_event`
+/// swallows those outright — only a Digital-sourced one (no Depth at all)
+/// reaches it, and `trigger::decide` treats Analog-repeat exactly like
+/// Hold-to-repeat there (ticket 20's Digital Capture mode fallback).
 struct ActiveAnalogRepeat {
     cancel: CancellationToken,
     handle: tokio::task::JoinHandle<()>,
@@ -276,7 +299,7 @@ struct ActiveAnalogRepeat {
 impl ActiveAnalogRepeat {
     /// Spawns the task: `steps` is compiled once, here, from the Binding's
     /// Action as of the moment Depth first crossed the deadzone (mirrors
-    /// `fire()`'s own once-per-press `compile_action` call) — not
+    /// `perform_trigger`'s own once-per-fire `compile_action` call) — not
     /// recompiled per tick, so a Stepper Action's cursor advances once per
     /// "press session" rather than auto-cycling at the tick rate. `depth_rx`
     /// is the caller's own clone of the shared live-Depth watch channel
@@ -440,7 +463,7 @@ async fn stop_all_analog_repeats(analog_repeats: &mut HashMap<Input, ActiveAnalo
 /// resolution off the same snapshot. A rising edge through
 /// `ANALOG_REPEAT_DEADZONE` on an Input whose active-Layer Binding is
 /// `TriggerMode::AnalogRepeat` spawns a task (compiling its steps once, the
-/// same "once per press" precedent `fire()` already sets); a falling edge —
+/// same "once per fire" precedent `perform_trigger` follows); a falling edge —
 /// or the Binding no longer being Analog-repeat, best-effort only, see below
 /// — stops one. A Binding changed away from Analog-repeat without an
 /// intervening depth-crossing (e.g. edited live while the key stays
@@ -784,10 +807,7 @@ async fn handle_event(
     // assigns — this press is consumed entirely by the stop, per spec.md's
     // "Toggle behavior across Layer/Profile switches". Only a later press
     // resumes normal evaluation.
-    if event.state == EventState::Down
-        && let Some(toggle) = toggles.remove(&event.input)
-    {
-        toggle.stop().await;
+    if event.state == EventState::Down && trigger::stop_toggle(toggles, &event.input).await {
         return Ok(Vec::new());
     }
 
@@ -852,10 +872,10 @@ async fn handle_event(
 
     match event.state {
         EventState::Down => {
-            // The bound → `fire` / `ProfileSwitch` → `Edit` / unbound →
-            // passthrough tail, shared verbatim with the Chord machine's
-            // `FireIndividual` executor so the retroactive-fire logic exists
-            // once.
+            // The bound → `trigger::decide` + `perform_trigger` /
+            // `ProfileSwitch` → `Edit` / unbound → passthrough tail, shared
+            // verbatim with the Chord machine's `FireIndividual` executor so
+            // the retroactive-fire logic exists once.
             dispatch_individual_down(
                 injector,
                 config,
@@ -881,44 +901,141 @@ async fn handle_event(
             if matches!(binding.action, Action::ProfileSwitch { .. }) {
                 return Ok(Vec::new());
             }
-            fire(
+            let slot = slot_for(in_flight, toggles, &event.input);
+            let decision = trigger::decide(&binding, event.state, slot);
+            let mut ctx = trigger_ctx!(
                 injector,
-                toggles,
+                config,
                 in_flight,
-                event.input,
-                &binding,
-                event.state,
-                &config.macros,
-                &config.steppers,
+                toggles,
                 stepper_cursors,
-                toggle_lap_target,
-            )
-            .await?;
+                toggle_lap_target
+            );
+            perform_trigger(decision, event.input, &binding, &mut ctx).await?;
             Ok(Vec::new())
         }
     }
 }
 
-/// Builds the `chord::ChordSlot` liveness snapshot `chord::feed` wants from
+/// Builds the `trigger::Slot` liveness snapshot `chord::feed` wants from
 /// dispatch's `ChordRuntime` — `toggles` → `Toggle`, `firings` →
 /// `FiringUnfinished` / `FiringFinished` by `handle.is_finished()`. Firings
 /// are inserted first so a `Toggle` entry wins if a live re-bind ever left
 /// both (matching the old `starting`/`stopping` filters, which checked the
-/// toggle map first).
-fn chord_slots(runtime: &ChordRuntime) -> HashMap<ChordKey, chord::ChordSlot> {
+/// toggle map first). `slot_for` reads the same three states for a single key
+/// on the executor paths, but with the opposite tie-break — see its doc.
+fn chord_slots(runtime: &ChordRuntime) -> HashMap<ChordKey, trigger::Slot> {
     let mut live = HashMap::new();
     for (key, handle) in &runtime.firings {
         let slot = if handle.is_finished() {
-            chord::ChordSlot::FiringFinished
+            trigger::Slot::FiringFinished
         } else {
-            chord::ChordSlot::FiringUnfinished
+            trigger::Slot::FiringUnfinished
         };
         live.insert(key.clone(), slot);
     }
     for key in runtime.toggles.keys() {
-        live.insert(key.clone(), chord::ChordSlot::Toggle);
+        live.insert(key.clone(), trigger::Slot::Toggle);
     }
     live
+}
+
+/// The single-key liveness read `trigger::decide`'s overlap guard needs, over
+/// a `(firings, toggles)` pair — `Input`-keyed on the individual path,
+/// `ChordKey`-keyed on the Chord `FireChord` path. Replaces the old `fire` /
+/// `execute_chord_fire` inline `firings.get(&key).is_finished()` checks, which
+/// consulted *only* the firings map — so a firing entry wins here (the guard
+/// `decide` makes is purely `Some(FiringUnfinished)`), and `Toggle` is only
+/// reported as a fallback when no firing exists. This differs deliberately
+/// from `chord_slots`' toggle-wins tie-break, which serves `chord::feed`'s
+/// completion logic, not this guard.
+fn slot_for<K: Eq + Hash>(
+    firings: &HashMap<K, FiringHandle>,
+    toggles: &HashMap<K, ActiveToggle>,
+    key: &K,
+) -> Option<trigger::Slot> {
+    if let Some(handle) = firings.get(key) {
+        return Some(if handle.is_finished() {
+            trigger::Slot::FiringFinished
+        } else {
+            trigger::Slot::FiringUnfinished
+        });
+    }
+    toggles.contains_key(key).then_some(trigger::Slot::Toggle)
+}
+
+/// The runtime state `perform_trigger` performs a `trigger::TriggerDecision`
+/// against, generic over the slot key (`Input` for the individual path,
+/// `ChordKey` for the Chord path). Built fresh per call site from the `run`
+/// task's locals, same discipline as `EffectCtx` (ticket 05) — never held
+/// across a `select!` poll. Dispatch-internal: never part of `trigger`'s
+/// interface, per the `EffectCtx` precedent.
+struct TriggerCtx<'a, K> {
+    injector: &'a Injector,
+    firings: &'a mut HashMap<K, FiringHandle>,
+    toggles: &'a mut HashMap<K, ActiveToggle>,
+    macros: &'a HashMap<MacroId, MacroDef>,
+    steppers: &'a HashMap<StepperId, StepperDef>,
+    stepper_cursors: &'a mut HashMap<StepperId, usize>,
+    toggle_lap_target: Duration,
+}
+
+/// Performs `decision` against `ctx` — `compile_action` (behind the overlap
+/// guard `trigger::decide` already cleared, so a dropped Fire-once /
+/// Hold-to-repeat `Step` firing never advances the cursor) + `executor::
+/// spawn_fire_once` / `ActiveToggle::spawn{,_held}` + map insert, or
+/// `trigger::force_release_stuck`. Never produces an `edit::Edit`
+/// (`ProfileSwitch` is handled before this is ever reached). The old `fire` /
+/// `execute_chord_fire` executor halves, now one generic function.
+async fn perform_trigger<K: Eq + Hash + Clone>(
+    decision: trigger::TriggerDecision,
+    key: K,
+    binding: &Binding,
+    ctx: &mut TriggerCtx<'_, K>,
+) -> io::Result<()> {
+    use trigger::TriggerDecision as D;
+    match decision {
+        D::Nothing => {}
+        D::SpawnFireOnce => {
+            let steps = compile_action(
+                &binding.action,
+                ctx.macros,
+                ctx.steppers,
+                ctx.stepper_cursors,
+            );
+            let handle = executor::spawn_fire_once(ctx.injector.clone(), steps);
+            ctx.firings.insert(key, handle);
+        }
+        D::HoldKeyDown(code) => {
+            // A bare, unbalanced `KeyDown` mirroring the physical hold —
+            // released by a `ForceReleaseStuck` (individual) or
+            // `ChordEffect::ReleaseChordFiring` (Chord) later, reusing ticket
+            // 33's force-release path rather than inventing new architecture.
+            let handle =
+                executor::spawn_fire_once(ctx.injector.clone(), vec![MacroStep::KeyDown(code)]);
+            ctx.firings.insert(key, handle);
+        }
+        D::StartToggleLoop => {
+            let steps = compile_action(
+                &binding.action,
+                ctx.macros,
+                ctx.steppers,
+                ctx.stepper_cursors,
+            );
+            ctx.toggles.insert(
+                key,
+                ActiveToggle::spawn(ctx.injector.clone(), steps, ctx.toggle_lap_target),
+            );
+        }
+        D::StartToggleHeld(code) => {
+            ctx.toggles
+                .insert(key, ActiveToggle::spawn_held(ctx.injector.clone(), code));
+        }
+        D::ForceReleaseStuck => {
+            trigger::force_release_stuck(ctx.firings, &key, ctx.injector).await;
+        }
+    }
+    Ok(())
 }
 
 /// Performs each `chord::ChordEffect` the pure machine decided on, in order,
@@ -946,30 +1063,32 @@ async fn run_chord_effects(
                 binding,
                 state,
             } => {
-                execute_chord_fire(
+                // The Chord path's own Trigger-mode dispatch — `trigger::
+                // decide` (the same matrix the individual path runs) against
+                // this Chord's `ChordKey`-keyed liveness, performed by the
+                // generic `perform_trigger`. A Chord's Action is never
+                // `AnalogRepeat` or `ProfileSwitch`, and `chord::feed` only
+                // ever emits `Down` / `Repeat`, so those `decide` arms are
+                // unreachable here.
+                let slot = slot_for(&chord_runtime.firings, &chord_runtime.toggles, &key);
+                let decision = trigger::decide(&binding, state, slot);
+                let mut ctx = trigger_ctx!(
                     injector,
-                    chord_runtime,
-                    key,
-                    &binding,
-                    state,
-                    &config.macros,
-                    &config.steppers,
+                    config,
+                    &mut chord_runtime.firings,
+                    &mut chord_runtime.toggles,
                     stepper_cursors,
-                    toggle_lap_target,
-                )
-                .await?;
+                    toggle_lap_target
+                );
+                perform_trigger(decision, key, &binding, &mut ctx).await?;
             }
             chord::ChordEffect::ReleaseChordFiring { key } => {
                 // Fire-once / Hold-to-repeat only — a Toggle Chord is
                 // deliberately not stopped by a member's `Up` (ticket 67).
-                if let Some(firing) = chord_runtime.firings.get(&key) {
-                    firing.force_release_stuck(injector).await;
-                }
+                trigger::force_release_stuck(&chord_runtime.firings, &key, injector).await;
             }
             chord::ChordEffect::StopChordToggle { key } => {
-                if let Some(toggle) = chord_runtime.toggles.remove(&key) {
-                    toggle.stop().await;
-                }
+                trigger::stop_toggle(&mut chord_runtime.toggles, &key).await;
             }
             chord::ChordEffect::FireIndividual { input } => {
                 edits.extend(
@@ -987,9 +1106,7 @@ async fn run_chord_effects(
                 );
             }
             chord::ChordEffect::ForceReleaseIndividual { input } => {
-                if let Some(firing) = in_flight.get(&input) {
-                    firing.force_release_stuck(injector).await;
-                }
+                trigger::force_release_stuck(in_flight, &input, injector).await;
             }
         }
     }
@@ -1073,8 +1190,9 @@ async fn handle_connection_change(
 /// Digital (ticket 39): the live-Depth stream every task's rate curve reads
 /// goes stale the moment analog capture stops, and Digital-sourced
 /// Down/Repeat/Up events for the same Bindings are about to start reaching
-/// `fire()`'s own Hold-to-repeat-equivalent fallback instead — a still-
-/// running task would otherwise double-fire alongside it.
+/// the individual Trigger-mode path's own Hold-to-repeat-equivalent fallback
+/// instead (`trigger::decide` treats Analog-repeat as Hold-to-repeat) — a
+/// still-running task would otherwise double-fire alongside it.
 async fn handle_capture_mode_change(
     capture_mode: &mut CaptureMode,
     signal_emitter: &Option<SignalEmitter<'static>>,
@@ -1159,144 +1277,9 @@ async fn handle_depth_update(
     recompute_and_emit_axes(injector, axis_state, axis_map).await
 }
 
-/// The executor half of a `chord::ChordEffect::FireChord` — `fire`'s exact
-/// mirror for a Chord's own Trigger-mode dispatch (ticket 01/40):
-/// Fire-once/Hold-to-repeat share one Chord-scoped `FiringHandle` slot per
-/// `ChordKey`, Toggle spawns/tracks one `ActiveToggle` per `ChordKey`, both
-/// keyed by the Chord's member set rather than by a single Input.
-/// `ProfileSwitch` never reaches here — `SetChordBinding`/`parse` both refuse
-/// to let a Chord's Action be `ProfileSwitch` (see
-/// `ConfigError::InvalidChordProfileSwitch`), since `compile_action` panics
-/// on it (it has no `MacroStep` form, only the individual-Input path ever
-/// specially handles it). Formerly `fire_chord`; the routing decision it
-/// used to make inline is now `chord::feed` / `chord::tick`.
-#[allow(clippy::too_many_arguments)]
-async fn execute_chord_fire(
-    injector: &Injector,
-    chord_runtime: &mut ChordRuntime,
-    key: ChordKey,
-    binding: &Binding,
-    state: EventState,
-    macros: &HashMap<MacroId, MacroDef>,
-    steppers: &HashMap<StepperId, StepperDef>,
-    stepper_cursors: &mut HashMap<StepperId, usize>,
-    toggle_lap_target: Duration,
-) -> io::Result<()> {
-    let chord_in_flight = &mut chord_runtime.firings;
-    let chord_toggles = &mut chord_runtime.toggles;
-    match (binding.trigger, state) {
-        (TriggerMode::HoldToRepeat, EventState::Repeat)
-            if matches!(binding.action, Action::ControllerButton { .. }) =>
-        {
-            // Mirrors `fire`'s own ControllerButton/HoldToRepeat Repeat
-            // arm (ticket 75/76) — the Chord's leader member's Repeat is
-            // ignored outright rather than re-firing.
-            Ok(())
-        }
-        (TriggerMode::HoldToRepeat, EventState::Down)
-            if matches!(binding.action, Action::ControllerButton { .. }) =>
-        {
-            if let Some(handle) = chord_in_flight.get(&key)
-                && !handle.is_finished()
-            {
-                return Ok(());
-            }
-            let Action::ControllerButton { button } = binding.action else {
-                unreachable!("guarded by this arm's own match guard above")
-            };
-            // Mirrors `fire`'s own bare-KeyDown ControllerButton hold —
-            // released by the `ReleaseChordFiring` effect on a member's physical Up.
-            let steps = vec![MacroStep::KeyDown(button)];
-            let handle = executor::spawn_fire_once(injector.clone(), steps);
-            chord_in_flight.insert(key, handle);
-            Ok(())
-        }
-        (TriggerMode::HoldToRepeat, EventState::Repeat)
-            if matches!(
-                binding.action,
-                Action::Keypress { key, .. } if crate::input::is_mouse_button(key)
-            ) =>
-        {
-            // Mirrors `fire`'s own mouse-button/HoldToRepeat Repeat arm
-            // (ticket 79/80) — the Chord's leader member's Repeat is
-            // ignored outright rather than re-firing.
-            Ok(())
-        }
-        (TriggerMode::HoldToRepeat, EventState::Down)
-            if matches!(
-                binding.action,
-                Action::Keypress { key, .. } if crate::input::is_mouse_button(key)
-            ) =>
-        {
-            if let Some(handle) = chord_in_flight.get(&key)
-                && !handle.is_finished()
-            {
-                return Ok(());
-            }
-            let Action::Keypress { key: button, .. } = binding.action else {
-                unreachable!("guarded by this arm's own match guard above")
-            };
-            // Mirrors `fire`'s own bare-KeyDown mouse-button hold —
-            // released by the `ReleaseChordFiring` effect on a member's physical Up.
-            let steps = vec![MacroStep::KeyDown(button)];
-            let handle = executor::spawn_fire_once(injector.clone(), steps);
-            chord_in_flight.insert(key, handle);
-            Ok(())
-        }
-        (TriggerMode::FireOnce, EventState::Down)
-        | (TriggerMode::HoldToRepeat, EventState::Down | EventState::Repeat) => {
-            if let Some(handle) = chord_in_flight.get(&key)
-                && !handle.is_finished()
-            {
-                return Ok(());
-            }
-            let steps = compile_action(&binding.action, macros, steppers, stepper_cursors);
-            let handle = executor::spawn_fire_once(injector.clone(), steps);
-            chord_in_flight.insert(key, handle);
-            Ok(())
-        }
-        (TriggerMode::Toggle, EventState::Down)
-            if matches!(
-                binding.action,
-                Action::Keypress { key, .. } if crate::input::is_mouse_button(key)
-            ) =>
-        {
-            let Action::Keypress { key: button, .. } = binding.action else {
-                unreachable!("guarded by this arm's own match guard above")
-            };
-            // Ticket 82: a mouse-button Chord Toggle gets the same
-            // sustained-hold treatment as a plain Input's own Toggle below
-            // — a single held KeyDown rather than a repeat-tap loop.
-            chord_toggles.insert(key, ActiveToggle::spawn_held(injector.clone(), button));
-            Ok(())
-        }
-        (TriggerMode::Toggle, EventState::Down)
-            if matches!(binding.action, Action::ControllerButton { .. }) =>
-        {
-            let Action::ControllerButton { button } = binding.action else {
-                unreachable!("guarded by this arm's own match guard above")
-            };
-            // Ticket 78: a gamepad button Chord Toggle gets the same
-            // sustained-hold treatment as a plain Input's own ControllerButton
-            // Toggle above, and as the mouse-button Chord Toggle carve-out
-            // above it.
-            chord_toggles.insert(key, ActiveToggle::spawn_held(injector.clone(), button));
-            Ok(())
-        }
-        (TriggerMode::Toggle, EventState::Down) => {
-            let steps = compile_action(&binding.action, macros, steppers, stepper_cursors);
-            chord_toggles.insert(
-                key,
-                ActiveToggle::spawn(injector.clone(), steps, toggle_lap_target),
-            );
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
 /// Dispatches a single fresh `Down` on `input` against the active Layer —
-/// the `ProfileSwitch → Edit` / bound → `fire` / unbound → passthrough tail
+/// the `ProfileSwitch → Edit` / bound → `trigger::decide` + `perform_trigger`
+/// / unbound → passthrough tail
 /// carved out of `handle_event`, shared verbatim by the ordinary input path
 /// and the Chord machine's `FireIndividual` executor (a member's individual
 /// Binding firing retroactively — the window elapsed, or the member was
@@ -1330,26 +1313,25 @@ async fn dispatch_individual_down(
                 return Ok(vec![edit::Edit::SwitchProfile { name: target }]);
             }
             // Accepted gap (ticket 39): a member's own individual Binding
-            // set to Analog-repeat fires once here through `fire()`'s
-            // ordinary one-shot path, rather than starting the depth-driven
-            // background task `update_analog_repeats` normally would — this
-            // retroactive Down is synthetic (no real live Depth to hand a
-            // task), and a grid key that's both a Chord member *and*
-            // individually Analog-repeat-triggered is a narrow combination
-            // this fast-follow doesn't specially engineer for.
-            fire(
+            // set to Analog-repeat fires once here through the ordinary
+            // one-shot path (`decide` treats `AnalogRepeat` as `HoldToRepeat`
+            // for a Down), rather than starting the depth-driven background
+            // task `update_analog_repeats` normally would — this retroactive
+            // Down is synthetic (no real live Depth to hand a task), and a
+            // grid key that's both a Chord member *and* individually
+            // Analog-repeat-triggered is a narrow combination this
+            // fast-follow doesn't specially engineer for.
+            let slot = slot_for(in_flight, toggles, &input);
+            let decision = trigger::decide(&binding, EventState::Down, slot);
+            let mut ctx = trigger_ctx!(
                 injector,
-                toggles,
+                config,
                 in_flight,
-                input,
-                &binding,
-                EventState::Down,
-                &config.macros,
-                &config.steppers,
+                toggles,
                 stepper_cursors,
-                toggle_lap_target,
-            )
-            .await?;
+                toggle_lap_target
+            );
+            perform_trigger(decision, input, &binding, &mut ctx).await?;
             Ok(Vec::new())
         }
         None => {
@@ -1366,7 +1348,8 @@ async fn dispatch_individual_down(
     }
 }
 
-/// Compiles a Binding's `Action` into the flat step sequence `fire` spawns —
+/// Compiles a Binding's `Action` into the flat step sequence `perform_trigger`
+/// spawns —
 /// `executor::compile` for every ordinary Action, or `resolve_step` for
 /// `Action::Step`, whose steps depend on Daemon-owned runtime cursor state
 /// `executor::compile` has no access to (ticket 03/54).
@@ -1428,200 +1411,6 @@ fn resolve_step(
         // the gamepad `uinput` device by the injector's own
         // `input::is_gamepad_button` check.
         StepperItem::ControllerButton { button } => executor::controller_button_steps(button),
-    }
-}
-
-/// Branches on `TriggerMode` x event state, per ticket 17: Fire-once fires
-/// only on `Down`; Hold-to-repeat fires on `Down` and every subsequent
-/// `Repeat` (the device's own evdev autorepeat, no separate repeat-interval
-/// config); Toggle starts its own looping task on `Down` (stopping is
-/// handled earlier, in `handle_event`, before a Binding is even looked up).
-/// `Repeat` for Fire-once/Toggle is ignored outright — no passthrough of the
-/// original key for a bound Input, matching the pre-ticket-17 Fire-once
-/// behavior. `Up` for Fire-once/Hold-to-repeat is ticket 33's stuck-key fix:
-/// force-releases anything that Input's most recent firing left down (a
-/// no-op for an already-self-released, balanced Macro); Toggle's own `Up` is
-/// still a no-op, since a Toggle's stop is a second `Down`, not a release.
-/// Analog-repeat rides the exact same Down/Repeat/Up arms as Hold-to-repeat
-/// (ticket 20's Digital Capture mode fallback) — the only way this function
-/// ever sees an Analog-repeat Binding at all, since `handle_event` swallows
-/// every Analog-*sourced* Down/Repeat/Up for one outright, before `fire` is
-/// ever called (real Analog-mode firing is `update_analog_repeats`'s own
-/// depth-driven background task).
-///
-/// `Action::ControllerButton` + Hold-to-repeat is a carved-out exception
-/// (ticket 75/76): a real gamepad button doesn't autorepeat in hardware, so
-/// `Down` fires a bare, unbalanced `KeyDown` (not `compile_action`'s own
-/// pulse) that mirrors the physical hold, every `Repeat` is ignored outright
-/// (no re-fire), and the existing `Up` arm below force-releases it — the
-/// same "held until the physical Up force-releases it" shape ticket 33
-/// already relies on for an unbalanced Macro, reused rather than invented
-/// fresh. `Action::ControllerButton` + Toggle gets the analogous carve-out
-/// (ticket 78): `spawn_held`'s single sustained KeyDown rather than
-/// `compile_action`'s repeat-tap loop, mirroring the mouse-button Toggle fix
-/// (ticket 82/83) below — a real gamepad button doesn't have a "turbo" Toggle
-/// mode any more than it autorepeats, so a latched Toggle should just hold it
-/// down. Fire-once is disallowed for `Action::ControllerButton` entirely
-/// (ticket 78, enforced at config-load/write time, not here).
-#[allow(clippy::too_many_arguments)]
-async fn fire(
-    injector: &Injector,
-    toggles: &mut HashMap<Input, ActiveToggle>,
-    in_flight: &mut HashMap<Input, FiringHandle>,
-    input: Input,
-    binding: &Binding,
-    state: EventState,
-    macros: &HashMap<MacroId, MacroDef>,
-    steppers: &HashMap<StepperId, StepperDef>,
-    stepper_cursors: &mut HashMap<StepperId, usize>,
-    toggle_lap_target: Duration,
-) -> io::Result<()> {
-    match (binding.trigger, state) {
-        (TriggerMode::HoldToRepeat, EventState::Repeat)
-            if matches!(binding.action, Action::ControllerButton { .. }) =>
-        {
-            // Ticket 75/76: a real gamepad button doesn't autorepeat in
-            // hardware — held down, it just stays down — so once the
-            // physical Down's own KeyDown below is holding it, every
-            // intervening kernel-autorepeat Repeat is ignored outright, no
-            // re-fire.
-            Ok(())
-        }
-        (TriggerMode::HoldToRepeat, EventState::Down)
-            if matches!(binding.action, Action::ControllerButton { .. }) =>
-        {
-            // Same overlap guard as the ordinary arm below.
-            if let Some(handle) = in_flight.get(&input)
-                && !handle.is_finished()
-            {
-                return Ok(());
-            }
-            let Action::ControllerButton { button } = binding.action else {
-                unreachable!("guarded by this arm's own match guard above")
-            };
-            // Deliberately not `compile_action`'s own KeyDown/Delay/KeyUp
-            // pulse (that's Fire-once's shape): a bare, unbalanced `KeyDown`
-            // that mirrors the physical press for as long as it's actually
-            // held, released by the physical Up's own arm below — reusing
-            // the same "leaves a key held, a later force-release cleans it
-            // up" mechanism ticket 33 already relies on, rather than
-            // inventing new architecture.
-            let steps = vec![MacroStep::KeyDown(button)];
-            let handle = executor::spawn_fire_once(injector.clone(), steps);
-            in_flight.insert(input, handle);
-            Ok(())
-        }
-        (TriggerMode::HoldToRepeat, EventState::Repeat)
-            if matches!(
-                binding.action,
-                Action::Keypress { key, .. } if crate::input::is_mouse_button(key)
-            ) =>
-        {
-            // Ticket 79/80: a mouse-button Keypress gets the same
-            // sustained-hold treatment as ControllerButton above, so a
-            // Hold-to-repeat mouse Binding supports click-and-drag instead
-            // of a repeat-tap train — once the physical Down's own KeyDown
-            // below is holding it, every intervening kernel-autorepeat
-            // Repeat is ignored outright, no re-fire.
-            Ok(())
-        }
-        (TriggerMode::HoldToRepeat, EventState::Down)
-            if matches!(
-                binding.action,
-                Action::Keypress { key, .. } if crate::input::is_mouse_button(key)
-            ) =>
-        {
-            // Same overlap guard as the ordinary arm below.
-            if let Some(handle) = in_flight.get(&input)
-                && !handle.is_finished()
-            {
-                return Ok(());
-            }
-            let Action::Keypress { key, .. } = binding.action else {
-                unreachable!("guarded by this arm's own match guard above")
-            };
-            // Deliberately not `compile_action`'s own KeyDown/Delay/KeyUp
-            // pulse: a bare, unbalanced `KeyDown` that mirrors the physical
-            // press for as long as it's actually held, released by the
-            // physical Up's own arm below (ticket 33's force-release path).
-            let steps = vec![MacroStep::KeyDown(key)];
-            let handle = executor::spawn_fire_once(injector.clone(), steps);
-            in_flight.insert(input, handle);
-            Ok(())
-        }
-        (TriggerMode::FireOnce, EventState::Down)
-        | (
-            TriggerMode::HoldToRepeat | TriggerMode::AnalogRepeat,
-            EventState::Down | EventState::Repeat,
-        ) => {
-            // Same-Input firings must never run concurrently — their raw
-            // steps share one Injector channel, and two interleaved firings
-            // could land their KeyDown/KeyUp writes out of order. A still-
-            // running previous firing (a slow Macro outlasting a fast
-            // HoldToRepeat autorepeat) means this one is dropped rather than
-            // queued: the previous firing already reproduces the intended
-            // effect, and queuing would only build an ever-growing backlog
-            // while the key stays held. For a Stepper Binding this also
-            // means a dropped firing must never advance the cursor — nothing
-            // fired, so nothing moved — which is exactly what falls out of
-            // `compile_action` only running once this guard has passed.
-            if let Some(handle) = in_flight.get(&input)
-                && !handle.is_finished()
-            {
-                return Ok(());
-            }
-            let steps = compile_action(&binding.action, macros, steppers, stepper_cursors);
-            let handle = executor::spawn_fire_once(injector.clone(), steps);
-            in_flight.insert(input, handle);
-            Ok(())
-        }
-        (TriggerMode::Toggle, EventState::Down)
-            if matches!(
-                binding.action,
-                Action::Keypress { key, .. } if crate::input::is_mouse_button(key)
-            ) =>
-        {
-            let Action::Keypress { key, .. } = binding.action else {
-                unreachable!("guarded by this arm's own match guard above")
-            };
-            // Ticket 82: a mouse-button Toggle gets the same sustained-hold
-            // treatment as HoldToRepeat's own mouse-button carve-out above —
-            // a single held KeyDown rather than a repeat-tap loop.
-            toggles.insert(input, ActiveToggle::spawn_held(injector.clone(), key));
-            Ok(())
-        }
-        (TriggerMode::Toggle, EventState::Down)
-            if matches!(binding.action, Action::ControllerButton { .. }) =>
-        {
-            let Action::ControllerButton { button } = binding.action else {
-                unreachable!("guarded by this arm's own match guard above")
-            };
-            // Ticket 78: a gamepad button Toggle gets the same sustained-hold
-            // treatment as the mouse-button carve-out above (and as
-            // ControllerButton's own Hold-to-repeat carve-out, ticket 75/76)
-            // — a single held KeyDown rather than a repeat-tap loop, matching
-            // a real held gamepad button (e.g. a latched sprint/aim).
-            toggles.insert(input, ActiveToggle::spawn_held(injector.clone(), button));
-            Ok(())
-        }
-        (TriggerMode::Toggle, EventState::Down) => {
-            let steps = compile_action(&binding.action, macros, steppers, stepper_cursors);
-            toggles.insert(
-                input,
-                ActiveToggle::spawn(injector.clone(), steps, toggle_lap_target),
-            );
-            Ok(())
-        }
-        (
-            TriggerMode::FireOnce | TriggerMode::HoldToRepeat | TriggerMode::AnalogRepeat,
-            EventState::Up,
-        ) => {
-            if let Some(firing) = in_flight.get(&input) {
-                firing.force_release_stuck(injector).await;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
     }
 }
 
@@ -2286,127 +2075,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fire_once_binding_ignores_repeat_and_up_fires_only_on_down() {
-        let mut bindings = HashMap::new();
-        bindings.insert(
-            Input::Grid(1, 1),
-            Binding {
-                trigger: TriggerMode::FireOnce,
-                action: Action::Keypress {
-                    modifiers: Modifiers::default(),
-                    key: evdev::KeyCode::KEY_F1,
-                },
-            },
-        );
-
-        let scripted = vec![
-            PhysicalEvent {
-                input: Input::Grid(1, 1),
-                state: EventState::Down,
-                depth: None,
-            },
-            PhysicalEvent {
-                input: Input::Grid(1, 1),
-                state: EventState::Repeat,
-                depth: None,
-            },
-            PhysicalEvent {
-                input: Input::Grid(1, 1),
-                state: EventState::Up,
-                depth: None,
-            },
-        ];
-
-        let batches = run_scripted(scripted, bindings).await;
-
-        // Only the Down produced output: one press batch + one release batch.
-        assert_eq!(batches.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn hold_to_repeat_fires_on_down_and_every_repeat_but_not_up() {
-        let mut bindings = HashMap::new();
-        bindings.insert(
-            Input::Grid(1, 1),
-            Binding {
-                trigger: TriggerMode::HoldToRepeat,
-                action: Action::Keypress {
-                    modifiers: Modifiers::default(),
-                    key: evdev::KeyCode::KEY_F1,
-                },
-            },
-        );
-
-        let sink = RecordingSink::new();
-        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
-        let (tx, rx) = mpsc::channel(8);
-        let (_conn_tx, conn_rx) = mpsc::channel(8);
-        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
-        let dispatch_handle = tokio::spawn(run(
-            rx,
-            conn_rx,
-            cmd_rx,
-            inj.clone(),
-            config_with_bindings(bindings),
-            unused_config_path(),
-            None,
-            actuation_channel(),
-            capture_mode_channel(),
-            capture_control_channel(),
-            executor::MIN_TOGGLE_LAP,
-            depth_channel(),
-            device_info_channel(),
-        ));
-
-        // Real evdev autorepeat events land tens of milliseconds apart —
-        // comfortably enough for a same-Input firing's steps to finish. Send
-        // each event with yields in between so the previous firing's spawned
-        // task runs to completion first, exercising the code review fix
-        // (ticket 17): overlapping same-Input firings are dropped, not
-        // queued, so back-to-back events with no gap would otherwise only
-        // produce the first firing's output.
-        for state in [
-            EventState::Down,
-            EventState::Repeat,
-            EventState::Repeat,
-            EventState::Up,
-        ] {
-            tx.send(PhysicalEvent {
-                input: Input::Grid(1, 1),
-                state,
-                depth: None,
-            })
-            .await
-            .unwrap();
-            for _ in 0..5 {
-                tokio::task::yield_now().await;
-            }
-        }
-
-        drop(tx);
-        dispatch_handle.await.unwrap().unwrap();
-        drop(inj);
-        inj_handle.await.unwrap().unwrap();
-
-        let batches = sink.batches();
-
-        // Down + two Repeats = three firings, each a KeyDown/KeyUp pair; the
-        // trailing Up produced nothing.
-        assert_eq!(batches.len(), 6);
-        for pair in batches.chunks(2) {
-            let evdev::EventSummary::Key(_, down_code, down_value) = pair[0][0].destructure()
-            else {
-                panic!("expected a key event");
-            };
-            let evdev::EventSummary::Key(_, up_code, up_value) = pair[1][0].destructure() else {
-                panic!("expected a key event");
-            };
-            assert_eq!((down_code, down_value), (evdev::KeyCode::KEY_F1, 1));
-            assert_eq!((up_code, up_value), (evdev::KeyCode::KEY_F1, 0));
-        }
-    }
-
-    #[tokio::test]
     async fn hold_to_repeats_unbalanced_macro_is_force_released_on_physical_up() {
         // Ticket 33's reproduction, verbatim: a single-step Macro
         // (`KeyDown` with no matching `KeyUp`) under Hold-to-repeat, used to
@@ -2532,101 +2200,6 @@ mod tests {
         assert_eq!(batches.len(), 2);
         assert_eq!(key_and_value(batches[0][0]), (evdev::KeyCode::BTN_SOUTH, 1));
         assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::BTN_SOUTH, 0));
-    }
-
-    #[tokio::test]
-    async fn hold_to_repeat_chord_controller_button_ignores_repeat_and_releases_on_member_up() {
-        // Ticket 75/76's Chord blast radius: the same treatment applies
-        // uniformly when a Chord's own Action is `ControllerButton`, mirrors
-        // `hold_to_repeat_chord_refires_only_on_the_leader_members_repeat`.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_chord_binding(
-                [Input::Grid(1, 1), Input::Grid(1, 2)],
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::HoldToRepeat,
-                    action: Action::ControllerButton {
-                        button: evdev::KeyCode::BTN_SOUTH,
-                    },
-                },
-            )
-            .await
-            .unwrap();
-
-        harness.press(Input::Grid(1, 1)).await;
-        harness.press(Input::Grid(1, 2)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        harness.repeat(Input::Grid(1, 1)).await;
-        harness.repeat(Input::Grid(1, 2)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        harness.release(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-
-        let batches = harness.gamepad_batches();
-        harness.shut_down().await;
-
-        // Exactly one KeyDown (the completing Down) and one KeyUp (the
-        // first member's physical Up) — both members' Repeats produced
-        // nothing.
-        assert_eq!(batches.len(), 2);
-        assert_eq!(key_and_value(batches[0][0]), (evdev::KeyCode::BTN_SOUTH, 1));
-        assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::BTN_SOUTH, 0));
-    }
-
-    #[tokio::test]
-    async fn hold_to_repeat_chord_mouse_button_ignores_repeat_and_releases_on_member_up() {
-        // Ticket 79/80's Chord blast radius, kept at the byte level (post-
-        // release ticket 07): `execute_chord_fire`'s mouse-button Keypress
-        // Hold-to-repeat arm (`is_mouse_button` → bare `KeyDown`) is a
-        // distinct executor branch from the `ControllerButton` one above, so
-        // it keeps its own uinput-level test; the *decision* (leader-only
-        // re-fire, release on member Up) is covered synchronously in
-        // `chord::tests`.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_chord_binding(
-                [Input::Grid(1, 1), Input::Grid(1, 2)],
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::HoldToRepeat,
-                    action: Action::Keypress {
-                        modifiers: Modifiers::default(),
-                        key: evdev::KeyCode::BTN_LEFT,
-                    },
-                },
-            )
-            .await
-            .unwrap();
-
-        harness.press(Input::Grid(1, 1)).await;
-        harness.press(Input::Grid(1, 2)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        harness.repeat(Input::Grid(1, 1)).await;
-        harness.repeat(Input::Grid(1, 2)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        harness.release(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-
-        let batches = harness.shut_down().await;
-
-        // One KeyDown (the completing Down), one KeyUp (the first member's
-        // physical Up) — both members' Repeats produced nothing.
-        assert_eq!(batches.len(), 2);
-        assert_eq!(key_and_value(batches[0][0]), (evdev::KeyCode::BTN_LEFT, 1));
-        assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::BTN_LEFT, 0));
     }
 
     #[tokio::test]
@@ -2884,94 +2457,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn analog_repeat_digital_sourced_behaves_like_hold_to_repeat() {
-        // Ticket 20's Digital Capture mode fallback: with no Depth at all
-        // (`event.depth: None`, exactly mirroring `hold_to_repeat_fires_on_
-        // down_and_every_repeat_but_not_up` above), Analog-repeat fires on
-        // Down/Repeat and force-releases on Up, identically to Hold-to-repeat.
-        let mut bindings = HashMap::new();
-        bindings.insert(
-            Input::Grid(1, 1),
-            Binding {
-                trigger: TriggerMode::AnalogRepeat,
-                action: Action::Keypress {
-                    modifiers: Modifiers::default(),
-                    key: evdev::KeyCode::KEY_F1,
-                },
-            },
-        );
-
-        let sink = RecordingSink::new();
-        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
-        let (tx, rx) = mpsc::channel(8);
-        let (_conn_tx, conn_rx) = mpsc::channel(8);
-        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
-        let dispatch_handle = tokio::spawn(run(
-            rx,
-            conn_rx,
-            cmd_rx,
-            inj.clone(),
-            config_with_bindings(bindings),
-            unused_config_path(),
-            None,
-            actuation_channel(),
-            capture_mode_channel(),
-            capture_control_channel(),
-            executor::MIN_TOGGLE_LAP,
-            depth_channel(),
-            device_info_channel(),
-        ));
-
-        for state in [
-            EventState::Down,
-            EventState::Repeat,
-            EventState::Repeat,
-            EventState::Up,
-        ] {
-            tx.send(PhysicalEvent {
-                input: Input::Grid(1, 1),
-                state,
-                depth: None,
-            })
-            .await
-            .unwrap();
-            for _ in 0..5 {
-                tokio::task::yield_now().await;
-            }
-        }
-
-        drop(tx);
-        dispatch_handle.await.unwrap().unwrap();
-        drop(inj);
-        inj_handle.await.unwrap().unwrap();
-
-        let batches = sink.batches();
-        assert_eq!(batches.len(), 6);
-        for pair in batches.chunks(2) {
-            let evdev::EventSummary::Key(_, down_code, down_value) = pair[0][0].destructure()
-            else {
-                panic!("expected a key event");
-            };
-            let evdev::EventSummary::Key(_, up_code, up_value) = pair[1][0].destructure() else {
-                panic!("expected a key event");
-            };
-            assert_eq!((down_code, down_value), (evdev::KeyCode::KEY_F1, 1));
-            assert_eq!((up_code, up_value), (evdev::KeyCode::KEY_F1, 0));
-        }
-    }
-
-    #[tokio::test]
     async fn analog_repeat_analog_sourced_events_are_swallowed() {
         // The opposite case from the test above: an Analog-*sourced* Down/
         // Repeat/Up (`event.depth: Some(_)`, synthesized from the key's
-        // ordinary Actuation/Release points) must never reach `fire()` at
-        // all for an Analog-repeat Binding — real firing is
-        // `update_analog_repeats`'s own depth-driven background task,
+        // ordinary Actuation/Release points) must never reach the individual
+        // Trigger-mode path at all for an Analog-repeat Binding — real firing
+        // is `update_analog_repeats`'s own depth-driven background task,
         // exercised separately below. No depth-watch crossing is ever
         // published here (`depth_channel()`'s Sender is dropped
-        // immediately), so if this Binding fell through to `fire()` instead
-        // of being swallowed, it would produce ordinary Hold-to-repeat
-        // output — this asserts zero output instead.
+        // immediately), so if this Binding fell through to `trigger::decide`
+        // instead of being swallowed, it would produce ordinary
+        // Hold-to-repeat output — this asserts zero output instead.
         let mut bindings = HashMap::new();
         bindings.insert(
             Input::Grid(1, 1),
@@ -4032,102 +3528,6 @@ mod tests {
             }),
             "the (stepper, direction) steal must have rolled back with the rejected insert"
         );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn toggle_chord_mouse_button_holds_a_single_keydown_and_full_completion_stops_it() {
-        // Ticket 82/83's Chord blast radius: the same sustained-hold
-        // treatment applies when a Chord's own Action is a mouse-button
-        // Keypress under Toggle, mirroring a single Input's own Toggle
-        // above.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_chord_binding(
-                [Input::Grid(1, 1), Input::Grid(1, 2)],
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::Toggle,
-                    action: Action::Keypress {
-                        modifiers: Modifiers::default(),
-                        key: evdev::KeyCode::BTN_LEFT,
-                    },
-                },
-            )
-            .await
-            .unwrap();
-
-        harness.press(Input::Grid(1, 1)).await;
-        harness.press(Input::Grid(1, 2)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-
-        for _ in 0..7 {
-            tokio::time::advance(executor::MIN_TOGGLE_LAP).await;
-            tokio::task::yield_now().await;
-        }
-
-        // A fresh completion of the full member set stops it, mirroring a
-        // single Input's own Toggle.
-        harness.press(Input::Grid(1, 1)).await;
-        harness.press(Input::Grid(1, 2)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-
-        let batches = harness.shut_down().await;
-
-        assert_eq!(batches.len(), 2, "no re-fires between the two completions");
-        assert_eq!(key_and_value(batches[0][0]), (evdev::KeyCode::BTN_LEFT, 1));
-        assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::BTN_LEFT, 0));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn toggle_chord_controller_button_holds_a_single_keydown_and_full_completion_stops_it() {
-        // Ticket 78's Chord blast radius: the same sustained-hold treatment
-        // applies when a Chord's own Action is `ControllerButton` under
-        // Toggle, mirroring a single Input's own ControllerButton Toggle
-        // above and the mouse-button Chord Toggle carve-out above it.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_chord_binding(
-                [Input::Grid(1, 1), Input::Grid(1, 2)],
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::Toggle,
-                    action: Action::ControllerButton {
-                        button: evdev::KeyCode::BTN_SOUTH,
-                    },
-                },
-            )
-            .await
-            .unwrap();
-
-        harness.press(Input::Grid(1, 1)).await;
-        harness.press(Input::Grid(1, 2)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-
-        for _ in 0..7 {
-            tokio::time::advance(executor::MIN_TOGGLE_LAP).await;
-            tokio::task::yield_now().await;
-        }
-
-        // A fresh completion of the full member set stops it, mirroring a
-        // single Input's own Toggle.
-        harness.press(Input::Grid(1, 1)).await;
-        harness.press(Input::Grid(1, 2)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-
-        let batches = harness.gamepad_batches();
-        harness.shut_down().await;
-
-        assert_eq!(batches.len(), 2, "no re-fires between the two completions");
-        assert_eq!(key_and_value(batches[0][0]), (evdev::KeyCode::BTN_SOUTH, 1));
-        assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::BTN_SOUTH, 0));
     }
 
     #[tokio::test]

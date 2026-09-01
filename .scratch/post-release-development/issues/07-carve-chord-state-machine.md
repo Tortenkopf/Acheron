@@ -373,3 +373,15 @@ hoisted the AnalogRepeat swallow guard above `handle_event`'s `event.state`
 match (was duplicated across the Down and Repeat|Up arms), and restored
 `hold_to_repeat_chord_mouse_button_ignores_repeat_and_releases_on_member_up`
 (distinct `execute_chord_fire` branch, no other coverage). 350 tests green.
+
+**2026-09-01** — The deferred `trigger` unification named in this ticket's "Out
+of scope" section (_"A real unification — one `trigger` module both paths call
+— is its own candidate … File it once this ticket lands and the residual
+duplication is visible."_) landed in ticket 08 (`08-carve-trigger-module.md`).
+`fire` and `execute_chord_fire` no longer exist: both the individual
+(`Input`-keyed) and Chord (`ChordKey`-keyed) paths now route through the pure
+`trigger::decide` + the generic `dispatch::perform_trigger`. `chord::ChordSlot`
+was folded into `trigger::Slot` (identical three states); `chord::feed` and
+`dispatch::chord_slots` take `trigger::Slot`. The mouse-button Chord executor
+test restored above is deleted by ticket 08 — the branch it guarded is exactly
+the one ticket 08 removes.

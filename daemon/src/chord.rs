@@ -24,6 +24,7 @@ use tokio::time::Instant;
 use crate::capture::{EventState, PhysicalEvent};
 use crate::config::{Binding, ChordKey, TriggerMode};
 use crate::input::Input;
+use crate::trigger::Slot;
 
 /// The fixed simultaneity window between a Chord's first and last member
 /// going down (ticket 01's Answer, §"Simultaneity detection") — a Rust
@@ -48,9 +49,9 @@ struct ChordWindow {
 /// Reset fresh on every dispatch task start, same as the old `ChordState`.
 /// The `ChordKey`-keyed firing/toggle *handles* are NOT here — they stay in
 /// `dispatch::ChordRuntime` and their liveness is passed into every `feed`
-/// call as a `ChordSlot` snapshot.
+/// call as a `trigger::Slot` snapshot.
 #[derive(Default)]
-pub struct ChordMachine {
+pub(crate) struct ChordMachine {
     window: Option<ChordWindow>,
     /// Every Input currently "owned" by the Chord machinery — either still
     /// inside an open window, or physically held down as a member of a
@@ -63,45 +64,15 @@ pub struct ChordMachine {
     claimed: HashSet<Input>,
 }
 
-/// Liveness of one Chord's dispatch-side firing/toggle, passed IN to `feed`
-/// rather than held by the machine — the machine stays pure, tests construct
-/// the snapshot map directly. An absent key means no live firing or toggle
-/// for that Chord.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChordSlot {
-    /// An active Toggle-mode Chord.
-    Toggle,
-    /// A Fire-once / Hold-to-repeat Chord firing still in flight.
-    FiringUnfinished,
-    /// A Fire-once Chord whose firing has already completed on its own — the
-    /// map entry lingers (never cleaned, mirroring `fire`'s own `in_flight`),
-    /// so this must be a distinct state from "absent" or the Chord could
-    /// never complete again.
-    FiringFinished,
-}
-
-impl ChordSlot {
-    /// Whether this slot represents a live (or lingering-but-finished)
-    /// Fire-once / Hold-to-repeat firing — i.e. bare presence in dispatch's
-    /// `ChordRuntime::firings` map, the old `chord_in_flight.contains_key`
-    /// check.
-    fn is_firing(&self) -> bool {
-        matches!(
-            self,
-            ChordSlot::FiringUnfinished | ChordSlot::FiringFinished
-        )
-    }
-}
-
 /// A post-decision effect the `dispatch` executor must perform. Ordering
 /// within a returned `Vec<ChordEffect>` is significant and preserves the
 /// pre-carve behaviour: completions (`FireChord`) before re-completion stops
 /// (`StopChordToggle`); a `FireIndividual` immediately followed by its
 /// `ForceReleaseIndividual` on the early-release path.
 #[derive(Debug, Clone, PartialEq)]
-pub enum ChordEffect {
-    /// Run this Chord's own Trigger-mode dispatch (the old `fire_chord`),
-    /// keyed by member set.
+pub(crate) enum ChordEffect {
+    /// Run this Chord's own Trigger-mode dispatch (`trigger::decide` +
+    /// `dispatch::perform_trigger`, ex-`fire_chord`), keyed by member set.
     FireChord {
         key: ChordKey,
         binding: Binding,
@@ -130,7 +101,7 @@ pub enum ChordEffect {
 
 /// The answer `feed` / `tick` give the caller.
 #[derive(Debug, Clone, PartialEq)]
-pub enum ChordOutcome {
+pub(crate) enum ChordOutcome {
     /// Not an event the Chord machine owns — `handle_event` falls through to
     /// ordinary Binding lookup. Replaces `handle_event`'s old inline
     /// `chord_state.claimed` / `chord_keys_containing` check.
@@ -143,10 +114,10 @@ pub enum ChordOutcome {
 /// machine needs no other `Config` view (macro / stepper / individual-Binding
 /// lookup is the executor's job). `live` is the per-`ChordKey` liveness
 /// snapshot `dispatch` derives from its `ChordRuntime`.
-pub fn feed(
+pub(crate) fn feed(
     machine: &mut ChordMachine,
     chords: &HashMap<ChordKey, Binding>,
-    live: &HashMap<ChordKey, ChordSlot>,
+    live: &HashMap<ChordKey, Slot>,
     event: PhysicalEvent,
 ) -> ChordOutcome {
     let owned = machine.claimed.contains(&event.input);
@@ -173,7 +144,7 @@ pub fn feed(
 fn feed_down(
     machine: &mut ChordMachine,
     chords: &HashMap<ChordKey, Binding>,
-    live: &HashMap<ChordKey, ChordSlot>,
+    live: &HashMap<ChordKey, Slot>,
     input: Input,
 ) -> Vec<ChordEffect> {
     machine.claimed.insert(input);
@@ -187,16 +158,15 @@ fn feed_down(
     // A stale-but-*finished* firing entry must not permanently exclude a
     // FireOnce/HoldToRepeat Chord from ever completing again — the executor
     // only force-releases it, it never removes the map entry (mirroring
-    // `fire`'s own single-Input `in_flight`), so a `FiringFinished` slot is
+    // the individual path's own single-Input firings map), so a
+    // `FiringFinished` slot is
     // treated as "may complete again", only `FiringUnfinished` / `Toggle`
     // block a fresh completion.
     let starting: Vec<(ChordKey, Binding)> = chords
         .iter()
         .filter(|(key, _)| {
-            !matches!(
-                live.get(*key),
-                Some(ChordSlot::Toggle | ChordSlot::FiringUnfinished)
-            ) && key.members().is_subset(&down_snapshot)
+            !matches!(live.get(*key), Some(Slot::Toggle | Slot::FiringUnfinished))
+                && key.members().is_subset(&down_snapshot)
         })
         .map(|(key, binding)| (key.clone(), binding.clone()))
         .collect();
@@ -207,8 +177,7 @@ fn feed_down(
     let stopping: Vec<ChordKey> = chords
         .keys()
         .filter(|key| {
-            matches!(live.get(*key), Some(ChordSlot::Toggle))
-                && key.members().is_subset(&down_snapshot)
+            matches!(live.get(*key), Some(Slot::Toggle)) && key.members().is_subset(&down_snapshot)
         })
         .cloned()
         .collect();
@@ -232,8 +201,9 @@ fn feed_down(
 
 /// A `Repeat` on an Input the machine owns. A still-pending (not yet
 /// completed) member is "held, not fired" — Repeat is a no-op for it,
-/// mirroring `fire`'s own FireOnce/Toggle handling of Repeat. Only a member
-/// of an already-active Hold-to-repeat Chord re-fires, and only the member
+/// mirroring `trigger::decide`'s own FireOnce/Toggle handling of Repeat.
+/// Only a member of an already-active Hold-to-repeat Chord re-fires, and
+/// only the member
 /// sorted first by `ChordKey`'s `BTreeSet` ordering drives it: while a Chord
 /// is active every member stays physically down, so the kernel independently
 /// autorepeats each of them, and re-firing on any member's Repeat would make
@@ -241,12 +211,12 @@ fn feed_down(
 /// would (hardware-verified regression, ticket 67).
 fn feed_repeat(
     chords: &HashMap<ChordKey, Binding>,
-    live: &HashMap<ChordKey, ChordSlot>,
+    live: &HashMap<ChordKey, Slot>,
     input: Input,
 ) -> Vec<ChordEffect> {
     chords_with_member(chords, input)
         .filter(|(key, _)| key.members().iter().next() == Some(&input))
-        .filter(|(key, _)| live.get(*key).is_some_and(ChordSlot::is_firing))
+        .filter(|(key, _)| live.get(*key).is_some_and(slot_is_firing))
         .filter(|(_, binding)| binding.trigger == TriggerMode::HoldToRepeat)
         .map(|(key, binding)| ChordEffect::FireChord {
             key: key.clone(),
@@ -267,7 +237,7 @@ fn feed_repeat(
 fn feed_up(
     machine: &mut ChordMachine,
     chords: &HashMap<ChordKey, Binding>,
-    live: &HashMap<ChordKey, ChordSlot>,
+    live: &HashMap<ChordKey, Slot>,
     input: Input,
 ) -> Vec<ChordEffect> {
     machine.claimed.remove(&input);
@@ -285,7 +255,7 @@ fn feed_up(
     }
 
     chords_with_member(chords, input)
-        .filter(|(key, _)| live.get(*key).is_some_and(ChordSlot::is_firing))
+        .filter(|(key, _)| live.get(*key).is_some_and(slot_is_firing))
         .map(|(key, _)| ChordEffect::ReleaseChordFiring { key: key.clone() })
         .collect()
 }
@@ -297,7 +267,7 @@ fn feed_up(
 /// from `down` when they fired, so this only ever touches genuinely-pending
 /// ones. `now` guards against a spurious call before the deadline; in `run`
 /// the `select!` `sleep_until` branch guarantees `now >= deadline`.
-pub fn tick(machine: &mut ChordMachine, now: Instant) -> ChordOutcome {
+pub(crate) fn tick(machine: &mut ChordMachine, now: Instant) -> ChordOutcome {
     let elapsed = machine
         .window
         .as_ref()
@@ -319,7 +289,7 @@ pub fn tick(machine: &mut ChordMachine, now: Instant) -> ChordOutcome {
 
 /// The active window's deadline, or `None`. The `run` loop's `select!`
 /// timeout branch arms on this (replacing the old `chord_window_deadline`).
-pub fn next_deadline(machine: &ChordMachine) -> Option<Instant> {
+pub(crate) fn next_deadline(machine: &ChordMachine) -> Option<Instant> {
     machine.window.as_ref().map(|window| window.deadline)
 }
 
@@ -340,6 +310,15 @@ fn close_window_if_drained(machine: &mut ChordMachine) {
     if machine.window.as_ref().is_some_and(|w| w.down.is_empty()) {
         machine.window = None;
     }
+}
+
+/// Whether a `trigger::Slot` is a live (or lingering-but-finished)
+/// Fire-once / Hold-to-repeat firing — bare presence in dispatch's
+/// `ChordRuntime::firings` map, the old `chord_in_flight.contains_key`
+/// check. Only a firing (not a Toggle) re-fires a Hold-to-repeat leader's
+/// `Repeat` or releases on a completed member's `Up`.
+fn slot_is_firing(slot: &Slot) -> bool {
+    matches!(slot, Slot::FiringUnfinished | Slot::FiringFinished)
 }
 
 /// Every `(ChordKey, Binding)` in `chords` with `input` among its members —
@@ -588,7 +567,7 @@ mod tests {
         handled(feed(&mut machine, &chords, &HashMap::new(), down(G11)));
         handled(feed(&mut machine, &chords, &HashMap::new(), down(G12)));
 
-        let live = HashMap::from([(key.clone(), ChordSlot::FiringUnfinished)]);
+        let live = HashMap::from([(key.clone(), Slot::FiringUnfinished)]);
         // Non-leader Repeat: no-op.
         assert!(handled(feed(&mut machine, &chords, &live, repeat(G12))).is_empty());
         // Leader Repeat: re-fires.
@@ -622,7 +601,7 @@ mod tests {
             }]
         );
 
-        let live = HashMap::from([(key.clone(), ChordSlot::Toggle)]);
+        let live = HashMap::from([(key.clone(), Slot::Toggle)]);
         // Releasing one completed member does nothing to a Toggle Chord.
         assert!(handled(feed(&mut machine, &chords, &live, up(G11))).is_empty());
 
@@ -644,7 +623,7 @@ mod tests {
         handled(feed(&mut machine, &chords, &HashMap::new(), down(G12)));
 
         // The firing has finished on its own; its map entry lingers.
-        let live = HashMap::from([(key.clone(), ChordSlot::FiringFinished)]);
+        let live = HashMap::from([(key.clone(), Slot::FiringFinished)]);
         assert_eq!(
             handled(feed(&mut machine, &chords, &live, up(G11))),
             vec![ChordEffect::ReleaseChordFiring { key: key.clone() }]
@@ -711,7 +690,7 @@ mod tests {
         );
     }
 
-    /// The `(TriggerMode, EventState, ChordSlot)` decision table — a
+    /// The `(TriggerMode, EventState, Slot)` decision table — a
     /// completing `Down`, a leader `Repeat` while active, and a completed
     /// member's `Up`, over every slot state — exercised directly rather than
     /// only transitively through the dispatch harness.
@@ -722,7 +701,7 @@ mod tests {
         struct Case {
             trigger: TriggerMode,
             event: EventState,
-            slot: Option<ChordSlot>,
+            slot: Option<Slot>,
             expect: Vec<ChordEffect>,
         }
 
@@ -741,13 +720,13 @@ mod tests {
             Case {
                 trigger: TriggerMode::FireOnce,
                 event: EventState::Down,
-                slot: Some(ChordSlot::FiringUnfinished),
+                slot: Some(Slot::FiringUnfinished),
                 expect: vec![],
             },
             Case {
                 trigger: TriggerMode::FireOnce,
                 event: EventState::Down,
-                slot: Some(ChordSlot::FiringFinished),
+                slot: Some(Slot::FiringFinished),
                 expect: vec![ChordEffect::FireChord {
                     key: key.clone(),
                     binding: keypress(TriggerMode::FireOnce, KeyCode::KEY_C),
@@ -757,14 +736,14 @@ mod tests {
             Case {
                 trigger: TriggerMode::Toggle,
                 event: EventState::Down,
-                slot: Some(ChordSlot::Toggle),
+                slot: Some(Slot::Toggle),
                 expect: vec![ChordEffect::StopChordToggle { key: key.clone() }],
             },
             // A leader Repeat while active.
             Case {
                 trigger: TriggerMode::HoldToRepeat,
                 event: EventState::Repeat,
-                slot: Some(ChordSlot::FiringUnfinished),
+                slot: Some(Slot::FiringUnfinished),
                 expect: vec![ChordEffect::FireChord {
                     key: key.clone(),
                     binding: keypress(TriggerMode::HoldToRepeat, KeyCode::KEY_C),
@@ -774,7 +753,7 @@ mod tests {
             Case {
                 trigger: TriggerMode::HoldToRepeat,
                 event: EventState::Repeat,
-                slot: Some(ChordSlot::FiringFinished),
+                slot: Some(Slot::FiringFinished),
                 expect: vec![ChordEffect::FireChord {
                     key: key.clone(),
                     binding: keypress(TriggerMode::HoldToRepeat, KeyCode::KEY_C),
@@ -784,7 +763,7 @@ mod tests {
             Case {
                 trigger: TriggerMode::FireOnce,
                 event: EventState::Repeat,
-                slot: Some(ChordSlot::FiringUnfinished),
+                slot: Some(Slot::FiringUnfinished),
                 expect: vec![],
             },
             Case {
@@ -797,19 +776,19 @@ mod tests {
             Case {
                 trigger: TriggerMode::HoldToRepeat,
                 event: EventState::Up,
-                slot: Some(ChordSlot::FiringUnfinished),
+                slot: Some(Slot::FiringUnfinished),
                 expect: vec![ChordEffect::ReleaseChordFiring { key: key.clone() }],
             },
             Case {
                 trigger: TriggerMode::FireOnce,
                 event: EventState::Up,
-                slot: Some(ChordSlot::FiringFinished),
+                slot: Some(Slot::FiringFinished),
                 expect: vec![ChordEffect::ReleaseChordFiring { key: key.clone() }],
             },
             Case {
                 trigger: TriggerMode::Toggle,
                 event: EventState::Up,
-                slot: Some(ChordSlot::Toggle),
+                slot: Some(Slot::Toggle),
                 expect: vec![],
             },
             Case {
@@ -823,8 +802,8 @@ mod tests {
         for (i, case) in cases.into_iter().enumerate() {
             let binding = keypress(case.trigger, KeyCode::KEY_C);
             let chords = HashMap::from([(key.clone(), binding)]);
-            let live = match &case.slot {
-                Some(slot) => HashMap::from([(key.clone(), slot.clone())]),
+            let live = match case.slot {
+                Some(slot) => HashMap::from([(key.clone(), slot)]),
                 None => HashMap::new(),
             };
             let mut machine = ChordMachine::default();
