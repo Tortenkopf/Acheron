@@ -15,12 +15,14 @@
 //! ticket lifts the whole transaction — edit, validate, persist, and the
 //! post-commit effect derivation — out of `dispatch.rs` and into one deep,
 //! pure, synchronously-testable module. `config::validate` is unchanged and
-//! stays the single invariant point; the `handle_command` arms that used to
-//! carry preconditions and rollback are now purely mechanical translation.
+//! stays the single invariant point. Ticket 11 then removed the shallow
+//! `Command` envelope that mirrored `Edit` field-for-field: the D-Bus layer
+//! now builds `Edit` values directly and the dispatch task runs them through
+//! one `Command::Apply` arm, so `Edit` (and `CommandError`, moved here) is the
+//! whole contract between `dbus` and the config transaction.
 
 use std::path::Path;
 
-use crate::command::CommandError;
 use crate::config::{
     self, Action, ActuationPoint, AxisTarget, Binding, ChordKey, Config, Layer, MacroId,
     MacroStepDto, ModeKeyRole, Profile, StepDirection, StepperId, StepperItem,
@@ -28,100 +30,197 @@ use crate::config::{
 use crate::input::Input;
 
 /// A single requested mutation to the stored `Config` — one data-only variant
-/// per mutating `Command` (24), carrying the same fields minus the `reply`
-/// sender. `GetConfig` / `GetState` / `StopAllToggles` have no `Edit`: they
-/// never touch `Config`, so they stay wholly in `dispatch`.
+/// per mutating operation the D-Bus surface exposes (24). `GetConfig` /
+/// `GetState` / `StopAllToggles` have no `Edit`: they never touch `Config`, so
+/// they stay wholly in `dispatch` / `command`. Each variant's doc comment is
+/// the failure-mode contract `plan` enforces for it — the `Err` cases and why.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Edit {
+pub enum Edit {
+    /// Creates or edits a Binding on the active Profile's `layer`. Fails
+    /// `InvalidRequest` if the Action/Trigger combination fails
+    /// `config::validate` (a Macro/Stepper naming an unknown library entry, a
+    /// `ControllerButton` naming an unknown gamepad button, `ProfileSwitch`
+    /// paired with a non-fire-once trigger, `analog_repeat` on a non-Grid
+    /// Input, an existing Axis assignment for `(layer, input)`). Assigning a
+    /// `Step` Action silently steals that `(stepper, direction)` off its old
+    /// Input or Chord (ticket 03/40).
     SetBinding {
         input: Input,
         layer: Layer,
         binding: Binding,
     },
-    ClearBinding {
-        input: Input,
-        layer: Layer,
-    },
-    SetModeKeyRole {
-        role: ModeKeyRole,
-    },
-    CreateProfile {
-        name: String,
-    },
-    DeleteProfile {
-        name: String,
-    },
-    RenameProfile {
-        old_name: String,
-        new_name: String,
-    },
-    SwitchProfile {
-        name: String,
-    },
+    /// Removes a Binding (ordinary passthrough resumes). Fails `NotFound` if
+    /// `input` has no Binding on `layer`.
+    ClearBinding { input: Input, layer: Layer },
+    /// Flips the active Profile's `mode_key_role` (ticket 18). Never fails on
+    /// its own account — the active Profile always exists — but `plan` still
+    /// returns a `Result` for symmetry with the other mutating `Edit`s and
+    /// room for a future validation rule.
+    SetModeKeyRole { role: ModeKeyRole },
+    /// Creates a new, empty Profile (ticket 19) — both Layers present with
+    /// empty Binding maps, `mode_key_role` defaulting to `LayerSwitch`, same
+    /// shape as the seed `Default` Profile. Fails `AlreadyExists` if `name`
+    /// is already taken, or `InvalidRequest` if `name` is empty/whitespace —
+    /// validated here (not just client-side by the GUI's own popover) since
+    /// any `com.acheron.Daemon` caller can reach this operation.
+    CreateProfile { name: String },
+    /// Deletes a Profile by name. Fails `NotFound` if it doesn't exist, or
+    /// `InvalidRequest` if it's the active Profile — a Config's
+    /// `active_profile` must always name a real Profile (the same invariant
+    /// `load_or_seed` enforces on startup), so the active one can never be
+    /// deleted out from under itself. Since a lone remaining Profile is
+    /// always the active one, this also guarantees at least one Profile
+    /// always survives.
+    DeleteProfile { name: String },
+    /// Renames a Profile, updating `active_profile` too if the renamed one
+    /// is currently active. Fails `NotFound` if `old_name` doesn't exist,
+    /// `AlreadyExists` if `new_name` is already taken by a different
+    /// Profile, or `InvalidRequest` if `new_name` is empty/whitespace. A
+    /// rename to the same name is not special-cased — it existence-checks
+    /// like any other, then rewrites byte-identical `config.toml`.
+    RenameProfile { old_name: String, new_name: String },
+    /// Switches the active Profile (ticket 19). Force-stops every currently
+    /// running Toggle — force-releasing each one's tracked held keys via the
+    /// injector (the same mechanism ticket 17's `ActiveToggle::stop` uses) —
+    /// before the new Profile's state becomes active, per spec.md's "Toggle
+    /// behavior across Layer/Profile switches". Fails `NotFound` if `name`
+    /// doesn't name a real Profile.
+    SwitchProfile { name: String },
+    /// Sets a per-key Actuation/Release point override on the active
+    /// Profile (ticket 17 §5/§7). Fails `InvalidRequest` if `input` isn't a
+    /// `Grid` variant, or if `release > actuation`.
     SetActuationPoint {
         input: Input,
         actuation: u8,
         release: u8,
     },
-    ClearActuationPoint {
-        input: Input,
-    },
-    SetDefaultActuation {
-        actuation: u8,
-        release: u8,
-    },
+    /// Removes a per-key override, reverting that key to the active
+    /// Profile's `default_actuation`. Fails `InvalidRequest` if `input`
+    /// isn't a `Grid` variant; idempotent otherwise (clearing an
+    /// already-unoverridden key succeeds with no effect).
+    ClearActuationPoint { input: Input },
+    /// Sets the active Profile's `default_actuation` — the Actuation/Release
+    /// point every Grid key uses unless it has its own override. Fails
+    /// `InvalidRequest` if `release > actuation`.
+    SetDefaultActuation { actuation: u8, release: u8 },
+    /// Clears every per-key override on the active Profile in one
+    /// `config.toml` rewrite — the GUI's "reset all keys to Profile default"
+    /// affordance (ticket 17 §5), not 20 individual `ClearActuationPoint`
+    /// operations. Never fails on validation grounds (clearing an
+    /// already-empty `actuation_overrides` map is a no-op) — the `Result`
+    /// exists only for the same `config.toml`-write-failure case every other
+    /// persisting `Edit` carries.
     ResetActuationPoints,
-    SetForceDigital {
-        force: bool,
-    },
+    /// Sets `Config.force_digital` — the user-facing override that forces
+    /// Digital Capture mode even when Analog would otherwise unlock (ticket
+    /// 17 §4). Persists the flag and (ticket 23, on a successful persist)
+    /// triggers the supervisor's live capture-source swap.
+    SetForceDigital { force: bool },
+    /// Creates a new Macro library entry (ticket 15/51) — a `MacroId` is
+    /// derived from `name` via the slug algorithm (`config::unique_macro_id`)
+    /// and frozen; `Outcome.created` carries that assigned id back to the
+    /// caller, unlike `CreateProfile` (whose identity *is* the caller-chosen
+    /// name). Fails `InvalidRequest` if `name` is empty/whitespace. No
+    /// `AlreadyExists` case — a slug collision is resolved automatically
+    /// (numeric suffix), never rejected.
     CreateMacro {
         name: String,
         steps: Vec<MacroStepDto>,
     },
-    RenameMacro {
-        macro_id: MacroId,
-        new_name: String,
-    },
-    DeleteMacro {
-        macro_id: MacroId,
-    },
+    /// Renames a Macro — a pure `MacroDef.name` field write, the `MacroId`
+    /// itself never changes (ticket 15's Answer: identity is deliberately
+    /// decoupled from the editable display name). Fails `NotFound` if
+    /// `macro_id` doesn't exist, or `InvalidRequest` if `new_name` is
+    /// empty/whitespace. No `AlreadyExists` — display names aren't unique.
+    RenameMacro { macro_id: MacroId, new_name: String },
+    /// Deletes a Macro. Fails `NotFound` if it doesn't exist, or
+    /// `InvalidRequest` if any Binding anywhere (`base`/`held`, any Profile)
+    /// still references its `MacroId` — mirrors `DeleteProfile`'s identical
+    /// reasoning, making a dangling `macro_id` structurally impossible.
+    DeleteMacro { macro_id: MacroId },
+    /// Overwrites a Macro's step sequence — a pure `MacroDef.steps` field
+    /// write, the `MacroId` and `name` untouched. Ticket 52's library
+    /// editor needs this to persist add/remove/reorder edits made against
+    /// an *existing* library entry; `CreateMacro` alone only covers the
+    /// steps a Macro is born with. Fails `NotFound` if `macro_id` doesn't
+    /// exist. No `InvalidRequest` case — an empty step sequence is exactly
+    /// as valid here as it is for a freshly `CreateMacro`'d entry.
     SetMacroSteps {
         macro_id: MacroId,
         steps: Vec<MacroStepDto>,
     },
+    /// Creates a new Stepper library entry (ticket 03/54), mirroring
+    /// `CreateMacro` exactly — a `StepperId` is derived from `name` via the
+    /// slug algorithm (`config::unique_stepper_id`) and frozen;
+    /// `Outcome.created` carries that assigned id back to the caller. Fails
+    /// `InvalidRequest` if `name` is empty/whitespace. No `AlreadyExists`
+    /// case — a slug collision is resolved automatically (numeric suffix),
+    /// never rejected.
     CreateStepper {
         name: String,
         items: Vec<StepperItem>,
     },
+    /// Renames a Stepper — a pure `StepperDef.name` field write, the
+    /// `StepperId` itself never changes, mirroring `RenameMacro` exactly.
+    /// Fails `NotFound` if `stepper_id` doesn't exist, or `InvalidRequest`
+    /// if `new_name` is empty/whitespace.
     RenameStepper {
         stepper_id: StepperId,
         new_name: String,
     },
-    DeleteStepper {
-        stepper_id: StepperId,
-    },
+    /// Deletes a Stepper. Fails `NotFound` if it doesn't exist, or
+    /// `InvalidRequest` if any Binding anywhere (`base`/`held`, any Profile,
+    /// either direction) still references its `StepperId` — mirrors
+    /// `DeleteMacro`'s identical reasoning, making a dangling `stepper_id`
+    /// structurally impossible.
+    DeleteStepper { stepper_id: StepperId },
+    /// Overwrites a Stepper's item list — a pure `StepperDef.items` field
+    /// write, the `StepperId` and `name` untouched, mirroring
+    /// `SetMacroSteps` exactly. Fails `NotFound` if `stepper_id` doesn't
+    /// exist.
     SetStepperItems {
         stepper_id: StepperId,
         items: Vec<StepperItem>,
     },
+    /// Creates or edits a Chord Binding on the active Profile (ticket 01/40
+    /// — CONTEXT.md: Chord): atomic/immediately-applied/immediately-
+    /// persisted, mirroring `SetBinding` exactly but keyed by `inputs`
+    /// (≥2 members) instead of a single `Input`. Fails `InvalidRequest` if
+    /// `inputs` has fewer than two members, if the Action/Trigger
+    /// combination fails the same validation `SetBinding` already runs
+    /// (Macro/Stepper naming a real library entry, ControllerButton naming a
+    /// real gamepad button, ProfileSwitch pairing only with Fire-once), or
+    /// if `inputs`' member set is a subset or superset of an existing
+    /// Chord's on the same Layer (ticket 01's amended Answer) — editing the
+    /// exact same member set back (same `inputs`) is not a conflict with
+    /// itself.
     SetChordBinding {
         inputs: std::collections::BTreeSet<Input>,
         layer: Layer,
         binding: Binding,
     },
+    /// Removes a Chord Binding by its exact member set. Fails `NotFound` if
+    /// no Chord with exactly that member set exists on `layer`.
     ClearChordBinding {
         inputs: std::collections::BTreeSet<Input>,
         layer: Layer,
     },
+    /// Creates or edits an Axis assignment on the active Profile (ticket
+    /// 59/71 — CONTEXT.md: Axis assignment): atomic/immediately-applied/
+    /// immediately-persisted, mirroring `SetBinding` exactly but clearing
+    /// any existing Binding *and* any Chord membership for `(layer, input)`
+    /// atomically alongside the insert (ticket 59 §2's mutual exclusion —
+    /// unlike `SetBinding`/`SetChordBinding`, which reject rather than
+    /// overwrite an existing Axis assignment there). Fails `InvalidRequest`
+    /// if `input` isn't a `Grid` variant.
     SetAxisAssignment {
         input: Input,
         layer: Layer,
         target: AxisTarget,
     },
-    ClearAxisAssignment {
-        input: Input,
-        layer: Layer,
-    },
+    /// Removes an Axis assignment, reverting `input` to ordinary passthrough
+    /// on `layer`. Fails `NotFound` if `input` has no Axis assignment there.
+    ClearAxisAssignment { input: Input, layer: Layer },
 }
 
 /// A post-commit effect the caller must run — described here by `plan`,
@@ -161,7 +260,7 @@ pub(crate) enum Effect {
 /// The freshly-minted id a `CreateMacro` / `CreateStepper` mints — the D-Bus
 /// reply carries it back to the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CreatedId {
+pub enum CreatedId {
     Macro(MacroId),
     Stepper(StepperId),
 }
@@ -641,6 +740,38 @@ fn take_stepper_direction_elsewhere_from_chords(
             for key in matching {
                 chords.remove(&key);
             }
+        }
+    }
+}
+
+/// The reason an `Edit` was rejected — produced entirely by `plan` (each
+/// operation precondition, an explicit early-return `Err`) and, via the `From`
+/// below, by `config::validate` (each structural invariant of the resulting
+/// `Config`). Deliberately narrower than the D-Bus surface's
+/// `com.acheron.Daemon.Error.*` set (`dbus::DaemonError`) — malformed wire
+/// payloads are rejected before an `Edit` is ever built. `InvalidRequest` maps
+/// onto the wire's `InvalidBinding` bucket (issue 08's "small named set", not
+/// one error per validation rule) since it's the closest fit for "the request
+/// itself is malformed/disallowed," even for a non-Binding request like
+/// deleting the active Profile.
+#[derive(Debug)]
+pub enum CommandError {
+    NotFound,
+    AlreadyExists,
+    InvalidRequest(String),
+    IoError(String),
+}
+
+impl From<crate::config::ConfigError> for CommandError {
+    fn from(err: crate::config::ConfigError) -> Self {
+        // Ticket 04: `config::validate` now feeds this conversion too, so a
+        // genuine disk-write failure stays `IoError` while every structural
+        // invariant violation becomes `InvalidRequest` (→ the wire's
+        // `InvalidBinding` bucket → the GUI's `InvalidBindingError`).
+        let message = err.to_string();
+        match err {
+            crate::config::ConfigError::Io(_) => CommandError::IoError(message),
+            _ => CommandError::InvalidRequest(message),
         }
     }
 }

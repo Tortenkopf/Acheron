@@ -8,9 +8,9 @@
 //! each `PhysicalEvent`'s `Input` against the active Profile's active Layer
 //! (ticket 18) and, per ticket 17, branches on `TriggerMode` — Fire-once
 //! fires once on `Down`, Hold-to-repeat fires on `Down` and every `Repeat`,
-//! Toggle starts/stops only on `Down`. Applies `Command`s (ticket 15) by
-//! mutating `Config` in place and rewriting `config.toml` immediately,
-//! atomically per call.
+//! Toggle starts/stops only on `Down`. Applies a `Command::Apply` (ticket
+//! 15/11) by handing its `edit::Edit` to `edit::apply` — mutating `Config` in
+//! place and rewriting `config.toml` immediately, atomically per call.
 //!
 //! Ticket 18: this task also owns the one piece of Layer runtime state —
 //! `active_layer` — since it's momentary (Mode-key-held) rather than
@@ -38,7 +38,7 @@ use crate::axis;
 use crate::capture::analog::DeviceInfo;
 use crate::capture::{CaptureMode, EventState, PhysicalEvent};
 use crate::chord;
-use crate::command::{Command, CommandError, State};
+use crate::command::{Command, State};
 use crate::config::{
     self, Action, ActuationPoint, Binding, ChordKey, Config, Layer, MacroDef, MacroId, ModeKeyRole,
     StepDirection, StepperDef, StepperId, StepperItem, TriggerMode,
@@ -598,30 +598,13 @@ impl DispatchState {
         }
     }
 
-    /// Translates each `Command` into its `edit::Edit` and commits it (ticket
-    /// 05): the 3 non-edit arms (`GetConfig`/`GetState`/`StopAllToggles`)
-    /// inline, the 24 edit arms each a mechanical `edit::apply` → `reply.send`
-    /// → `run_effects`, with `reply` sent before effects run for every arm —
-    /// which is what deletes `SwitchProfile`'s old special-case
+    /// Four arms (ticket 11): `GetConfig` / `GetState` / `StopAllToggles`
+    /// inline, and one `Apply` arm — the sole mutating path — that `edit::apply`s
+    /// the `Edit`, sends the reply (carrying `Outcome.created`) **before**
+    /// `run_effects`, and runs effects only on success. Reply-before-effects is
+    /// uniform, which is what deleted `SwitchProfile`'s old special-case
     /// reply-before-signal reasoning: that ordering is now the default shape.
     async fn handle_command(&mut self, config: &mut Config, config_path: &Path, cmd: Command) {
-        /// `edit::apply` → send `Ok(())` / `Err` → run effects on success. Every
-        /// edit arm whose reply is `Result<(), CommandError>` (i.e. all but the
-        /// two create commands, which carry a fresh id back).
-        macro_rules! commit {
-            ($reply:expr, $edit:expr) => {{
-                match edit::apply(config, config_path, $edit).await {
-                    Ok(outcome) => {
-                        let _ = $reply.send(Ok(()));
-                        self.run_effects(outcome.effects, config).await;
-                    }
-                    Err(err) => {
-                        let _ = $reply.send(Err(err));
-                    }
-                }
-            }};
-        }
-
         match cmd {
             Command::GetConfig(reply) => {
                 let _ = reply.send(config.clone());
@@ -663,99 +646,14 @@ impl DispatchState {
                 stop_all_toggles(&mut self.toggles).await;
                 let _ = reply.send(());
             }
-            Command::SetBinding {
-                input,
-                layer,
-                binding,
-                reply,
-            } => commit!(
-                reply,
-                edit::Edit::SetBinding {
-                    input,
-                    layer,
-                    binding
-                }
-            ),
-            Command::ClearBinding {
-                input,
-                layer,
-                reply,
-            } => commit!(reply, edit::Edit::ClearBinding { input, layer }),
-            Command::SetModeKeyRole { role, reply } => {
-                commit!(reply, edit::Edit::SetModeKeyRole { role })
-            }
-            Command::CreateProfile { name, reply } => {
-                commit!(reply, edit::Edit::CreateProfile { name })
-            }
-            Command::DeleteProfile { name, reply } => {
-                commit!(reply, edit::Edit::DeleteProfile { name })
-            }
-            Command::RenameProfile {
-                old_name,
-                new_name,
-                reply,
-            } => {
-                // The one arm with an `Ok` early-return — routing a rename to the
-                // same name through `edit::apply` would add a spurious
-                // `config.toml` write for a no-op, so it stays a guard ahead of
-                // the helper (ticket 03 / 05 precedent). `AlreadyExists` moved
-                // into `edit::plan`; the same-name `NotFound` check stays here so
-                // a same-name rename of a missing Profile still fails exactly as
-                // it did pre-ticket-05 (the guard sat *after* the existence check
-                // in ticket 03's arm).
-                if old_name == new_name {
-                    let reply_value = if config.profiles.contains_key(&old_name) {
-                        Ok(())
-                    } else {
-                        Err(CommandError::NotFound)
-                    };
-                    let _ = reply.send(reply_value);
-                    return;
-                }
-                commit!(reply, edit::Edit::RenameProfile { old_name, new_name })
-            }
-            Command::SwitchProfile { name, reply } => {
-                commit!(reply, edit::Edit::SwitchProfile { name })
-            }
-            Command::SetActuationPoint {
-                input,
-                actuation,
-                release,
-                reply,
-            } => commit!(
-                reply,
-                edit::Edit::SetActuationPoint {
-                    input,
-                    actuation,
-                    release,
-                }
-            ),
-            Command::ClearActuationPoint { input, reply } => {
-                commit!(reply, edit::Edit::ClearActuationPoint { input })
-            }
-            Command::SetDefaultActuation {
-                actuation,
-                release,
-                reply,
-            } => commit!(
-                reply,
-                edit::Edit::SetDefaultActuation { actuation, release }
-            ),
-            Command::ResetActuationPoints { reply } => {
-                commit!(reply, edit::Edit::ResetActuationPoints)
-            }
-            Command::SetForceDigital { force, reply } => {
-                commit!(reply, edit::Edit::SetForceDigital { force })
-            }
-            Command::CreateMacro { name, steps, reply } => {
-                match edit::apply(config, config_path, edit::Edit::CreateMacro { name, steps })
-                    .await
-                {
+            Command::Apply { edit, reply } => {
+                // The sole mutating path (ticket 11): the old `commit!` body
+                // inlined once. `reply` carries `Outcome.created` — `None` for
+                // the 22 non-create edits, `Some` for `CreateMacro` /
+                // `CreateStepper` — and is sent before effects run.
+                match edit::apply(config, config_path, edit).await {
                     Ok(outcome) => {
-                        let Some(edit::CreatedId::Macro(macro_id)) = outcome.created else {
-                            unreachable!("CreateMacro always sets Outcome.created to a Macro id")
-                        };
-                        let _ = reply.send(Ok(macro_id));
+                        let _ = reply.send(Ok(outcome.created));
                         self.run_effects(outcome.effects, config).await;
                     }
                     Err(err) => {
@@ -763,96 +661,6 @@ impl DispatchState {
                     }
                 }
             }
-            Command::RenameMacro {
-                macro_id,
-                new_name,
-                reply,
-            } => commit!(reply, edit::Edit::RenameMacro { macro_id, new_name }),
-            Command::DeleteMacro { macro_id, reply } => {
-                commit!(reply, edit::Edit::DeleteMacro { macro_id })
-            }
-            Command::SetMacroSteps {
-                macro_id,
-                steps,
-                reply,
-            } => commit!(reply, edit::Edit::SetMacroSteps { macro_id, steps }),
-            Command::CreateStepper { name, items, reply } => {
-                match edit::apply(
-                    config,
-                    config_path,
-                    edit::Edit::CreateStepper { name, items },
-                )
-                .await
-                {
-                    Ok(outcome) => {
-                        let Some(edit::CreatedId::Stepper(stepper_id)) = outcome.created else {
-                            unreachable!(
-                                "CreateStepper always sets Outcome.created to a Stepper id"
-                            )
-                        };
-                        let _ = reply.send(Ok(stepper_id));
-                        self.run_effects(outcome.effects, config).await;
-                    }
-                    Err(err) => {
-                        let _ = reply.send(Err(err));
-                    }
-                }
-            }
-            Command::RenameStepper {
-                stepper_id,
-                new_name,
-                reply,
-            } => commit!(
-                reply,
-                edit::Edit::RenameStepper {
-                    stepper_id,
-                    new_name
-                }
-            ),
-            Command::DeleteStepper { stepper_id, reply } => {
-                commit!(reply, edit::Edit::DeleteStepper { stepper_id })
-            }
-            Command::SetStepperItems {
-                stepper_id,
-                items,
-                reply,
-            } => commit!(reply, edit::Edit::SetStepperItems { stepper_id, items }),
-            Command::SetChordBinding {
-                inputs,
-                layer,
-                binding,
-                reply,
-            } => commit!(
-                reply,
-                edit::Edit::SetChordBinding {
-                    inputs,
-                    layer,
-                    binding
-                }
-            ),
-            Command::ClearChordBinding {
-                inputs,
-                layer,
-                reply,
-            } => commit!(reply, edit::Edit::ClearChordBinding { inputs, layer }),
-            Command::SetAxisAssignment {
-                input,
-                layer,
-                target,
-                reply,
-            } => commit!(
-                reply,
-                edit::Edit::SetAxisAssignment {
-                    input,
-                    layer,
-                    target
-                }
-            ),
-            Command::ClearAxisAssignment {
-                input,
-                layer,
-                reply,
-            } => commit!(reply, edit::Edit::ClearAxisAssignment { input, layer }),
         }
     }
 }
@@ -1333,6 +1141,7 @@ mod tests {
     use crate::config::{
         Action, ActuationPoint, AxisTarget, DEFAULT_PROFILE_NAME, MacroStepDto, Modifiers, Profile,
     };
+    use crate::edit::{CommandError, CreatedId};
     use crate::injector::testing::RecordingSink;
     use crate::injector::{self};
     use crate::input::{Direction, WheelEvent};
@@ -2540,36 +2349,38 @@ mod tests {
             }
         }
 
+        /// Sends an `Edit` through the `Command::Apply` channel and awaits the
+        /// dispatch task's verdict — the round-trip every typed helper below
+        /// shares (ticket 11). Signatures and return types are unchanged; only
+        /// the message this builds internally is.
+        async fn apply(&self, edit: edit::Edit) -> Result<Option<CreatedId>, CommandError> {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::Apply { edit, reply })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
         async fn set_binding(
             &self,
             input: Input,
             layer: Layer,
             binding: Binding,
         ) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::SetBinding {
-                    input,
-                    layer,
-                    binding,
-                    reply,
-                })
-                .await
-                .unwrap();
-            rx.await.unwrap()
+            self.apply(edit::Edit::SetBinding {
+                input,
+                layer,
+                binding,
+            })
+            .await
+            .map(|_| ())
         }
 
         async fn clear_binding(&self, input: Input, layer: Layer) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::ClearBinding {
-                    input,
-                    layer,
-                    reply,
-                })
+            self.apply(edit::Edit::ClearBinding { input, layer })
                 .await
-                .unwrap();
-            rx.await.unwrap()
+                .map(|_| ())
         }
 
         async fn set_chord_binding(
@@ -2578,26 +2389,19 @@ mod tests {
             layer: Layer,
             binding: Binding,
         ) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::SetChordBinding {
-                    inputs: inputs.into_iter().collect(),
-                    layer,
-                    binding,
-                    reply,
-                })
-                .await
-                .unwrap();
-            rx.await.unwrap()
+            self.apply(edit::Edit::SetChordBinding {
+                inputs: inputs.into_iter().collect(),
+                layer,
+                binding,
+            })
+            .await
+            .map(|_| ())
         }
 
         async fn set_mode_key_role(&self, role: ModeKeyRole) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::SetModeKeyRole { role, reply })
+            self.apply(edit::Edit::SetModeKeyRole { role })
                 .await
-                .unwrap();
-            rx.await.unwrap()
+                .map(|_| ())
         }
 
         async fn create_stepper(
@@ -2605,25 +2409,22 @@ mod tests {
             name: &str,
             items: Vec<crate::config::StepperItem>,
         ) -> Result<StepperId, CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::CreateStepper {
+            match self
+                .apply(edit::Edit::CreateStepper {
                     name: name.to_string(),
                     items,
-                    reply,
                 })
-                .await
-                .unwrap();
-            rx.await.unwrap()
+                .await?
+            {
+                Some(CreatedId::Stepper(id)) => Ok(id),
+                other => unreachable!("CreateStepper must mint a Stepper id, got {other:?}"),
+            }
         }
 
         async fn delete_stepper(&self, stepper_id: StepperId) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::DeleteStepper { stepper_id, reply })
+            self.apply(edit::Edit::DeleteStepper { stepper_id })
                 .await
-                .unwrap();
-            rx.await.unwrap()
+                .map(|_| ())
         }
 
         async fn set_stepper_items(
@@ -2631,28 +2432,17 @@ mod tests {
             stepper_id: StepperId,
             items: Vec<crate::config::StepperItem>,
         ) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::SetStepperItems {
-                    stepper_id,
-                    items,
-                    reply,
-                })
+            self.apply(edit::Edit::SetStepperItems { stepper_id, items })
                 .await
-                .unwrap();
-            rx.await.unwrap()
+                .map(|_| ())
         }
 
         async fn switch_profile(&self, name: &str) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::SwitchProfile {
-                    name: name.to_string(),
-                    reply,
-                })
-                .await
-                .unwrap();
-            rx.await.unwrap()
+            self.apply(edit::Edit::SwitchProfile {
+                name: name.to_string(),
+            })
+            .await
+            .map(|_| ())
         }
 
         async fn stop_all_toggles(&self) {
@@ -2670,26 +2460,19 @@ mod tests {
             actuation: u8,
             release: u8,
         ) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::SetActuationPoint {
-                    input,
-                    actuation,
-                    release,
-                    reply,
-                })
-                .await
-                .unwrap();
-            rx.await.unwrap()
+            self.apply(edit::Edit::SetActuationPoint {
+                input,
+                actuation,
+                release,
+            })
+            .await
+            .map(|_| ())
         }
 
         async fn clear_actuation_point(&self, input: Input) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::ClearActuationPoint { input, reply })
+            self.apply(edit::Edit::ClearActuationPoint { input })
                 .await
-                .unwrap();
-            rx.await.unwrap()
+                .map(|_| ())
         }
 
         async fn set_default_actuation(
@@ -2697,34 +2480,21 @@ mod tests {
             actuation: u8,
             release: u8,
         ) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::SetDefaultActuation {
-                    actuation,
-                    release,
-                    reply,
-                })
+            self.apply(edit::Edit::SetDefaultActuation { actuation, release })
                 .await
-                .unwrap();
-            rx.await.unwrap()
+                .map(|_| ())
         }
 
         async fn reset_actuation_points(&self) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::ResetActuationPoints { reply })
+            self.apply(edit::Edit::ResetActuationPoints)
                 .await
-                .unwrap();
-            rx.await.unwrap()
+                .map(|_| ())
         }
 
         async fn set_force_digital(&self, force: bool) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::SetForceDigital { force, reply })
+            self.apply(edit::Edit::SetForceDigital { force })
                 .await
-                .unwrap();
-            rx.await.unwrap()
+                .map(|_| ())
         }
 
         async fn get_config(&self) -> Config {
@@ -2808,16 +2578,9 @@ mod tests {
             input: Input,
             layer: Layer,
         ) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::ClearAxisAssignment {
-                    input,
-                    layer,
-                    reply,
-                })
+            self.apply(edit::Edit::ClearAxisAssignment { input, layer })
                 .await
-                .unwrap();
-            rx.await.unwrap()
+                .map(|_| ())
         }
 
         /// The gamepad device's own recorded batches (ticket 71) — every

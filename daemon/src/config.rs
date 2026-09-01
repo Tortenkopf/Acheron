@@ -525,7 +525,7 @@ impl Default for TriggerMode {
 /// `Vec<executor::MacroStep>` (ticket 17's `executor::compile`);
 /// `ProfileSwitch` (ticket 34) has no `MacroStep` form at all — it's
 /// intercepted in `dispatch::handle_event` before `compile` is ever called,
-/// the same way `Command::SwitchProfile` mutates `Config` directly.
+/// the same way `edit::Edit::SwitchProfile` mutates `Config` directly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Action {
