@@ -137,7 +137,7 @@ pub(crate) enum Effect {
     /// Axis-assignment map touches. A no-op in `run_effects` when `layer`
     /// isn't the currently-active Layer (the check `plan` can't make).
     RecomputeAxes { layer: Layer },
-    /// Drop the given Input's live axis contribution from `AxisState`.
+    /// Drop the given Input's live axis contribution from the axis engine.
     ForgetAxisContribution(Input),
     /// Tell the capture supervisor to swap the live capture source (ticket
     /// 23) — `SetForceDigital`'s only side effect.
@@ -148,7 +148,7 @@ pub(crate) enum Effect {
     StopAllToggles,
     /// Force-stop every running Analog-repeat task.
     StopAllAnalogRepeats,
-    /// Center every live axis output and clear `AxisState`.
+    /// Center every live axis output and clear the axis engine's state.
     ResetAxisOutputs,
     /// Drop the given Stepper's Daemon-side runtime cursor.
     DropStepperCursor(StepperId),

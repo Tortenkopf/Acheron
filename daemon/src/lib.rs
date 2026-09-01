@@ -9,6 +9,8 @@
 /// bug reports.
 pub const VERSION: &str = env!("ACHERON_VERSION");
 
+pub mod analog_repeat;
+pub mod axis;
 pub mod capture;
 pub mod chord;
 pub mod command;

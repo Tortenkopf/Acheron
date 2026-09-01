@@ -29,19 +29,19 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use evdev::{AbsoluteAxisCode, KeyCode};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
-use tokio_util::sync::CancellationToken;
 use zbus::object_server::SignalEmitter;
 
+use crate::analog_repeat;
+use crate::axis;
 use crate::capture::analog::DeviceInfo;
 use crate::capture::{CaptureMode, EventState, PhysicalEvent};
 use crate::chord;
 use crate::command::{Command, CommandError, State};
 use crate::config::{
-    self, Action, ActuationPoint, AxisPolarity, AxisTarget, Binding, ChordKey, Config, Layer,
-    MacroDef, MacroId, ModeKeyRole, StepDirection, StepperDef, StepperId, StepperItem, TriggerMode,
+    self, Action, ActuationPoint, Binding, ChordKey, Config, Layer, MacroDef, MacroId, ModeKeyRole,
+    StepDirection, StepperDef, StepperId, StepperItem, TriggerMode,
 };
 use crate::dbus::Daemon;
 use crate::edit;
@@ -74,391 +74,16 @@ macro_rules! trigger_ctx {
     };
 }
 
-/// The Digital Capture mode fallback's per-press step size (ticket 59 §6 /
-/// ticket 71): press/release step-increment in place of a continuous Depth
-/// stream, since Digital-sourced events carry no Depth at all. A build-time-
-/// tuned constant, same precedent as Analog-repeat's four TBD constants
-/// (ticket 20) — exact feel to be adjusted against real hardware in ticket
-/// 72, not designed here.
-const AXIS_DIGITAL_STEP: u8 = 64;
-
 /// Every piece of Daemon-owned, `ChordKey`-keyed runtime state a Chord's own
 /// Trigger-mode dispatch touches (ticket 01/40) — the firing/toggle *handles*
 /// the pure `chord` state machine (post-release ticket 07) never holds. One
 /// nested `DispatchState` field, reset fresh per dispatch task start,
-/// mirroring how `AxisState` bundles its own two maps; the executor derives
+/// mirroring how `axis::Engine` bundles its own two maps; the executor derives
 /// the `trigger::Slot` liveness snapshot `chord::feed` wants from it.
 #[derive(Default)]
 struct ChordRuntime {
     firings: HashMap<ChordKey, FiringHandle>,
     toggles: HashMap<ChordKey, ActiveToggle>,
-}
-
-/// Every piece of Daemon-owned runtime state Axis-assignment resolution
-/// needs (ticket 59/71), mirroring `toggles`/`ChordRuntime`'s own per-Input
-/// runtime-state shape. `contributions` is the live, per-Input 0-255 output
-/// value every Axis-assigned Input currently wants to drive its target
-/// with — written by `handle_depth_update` (the continuous Analog half of
-/// ticket 59 §7's `(Depth, edge_event) -> axis_value` seam,
-/// `config::resolve_axis_value`) and by `handle_axis_edge_event` (the
-/// Digital-mode step-increment fallback, ticket 59 §6) alike, so both flows
-/// feed the exact same conflict-resolution/emit path
-/// (`recompute_and_emit_axes`) rather than two drifting copies of it.
-/// `owners` is which single Input currently "wins" each signed axis's
-/// opposite-half suppression (ticket 59 §5) — absent means neither half is
-/// currently outputting.
-#[derive(Default)]
-struct AxisState {
-    contributions: HashMap<Input, u8>,
-    owners: HashMap<AbsoluteAxisCode, Input>,
-}
-
-/// The runtime-conflict half of ticket 59 §5, as a pure/unit-testable
-/// function: `positive`/`negative` are every currently-nonzero contributor
-/// sharing one `ABS_*` code, split by `AxisTarget::polarity` (an unsigned
-/// target's single contribution always lands in `positive` — there is no
-/// opposite half for it to conflict with, so this reduces to the same
-/// "greater Depth wins" rule ticket 59 §5 gives same-half sharing, with no
-/// special-casing needed). Two keys sharing one same-signed target take the
-/// greater of the two Depths (`positive`/`negative` are each reduced to
-/// their own max independently); two keys on opposite halves resolve by
-/// "whichever key is already actively outputting suppresses the other" —
-/// `current_owner` (persisted across calls in `AxisState::owners`) keeps the
-/// already-active half winning once both go nonzero, defaulting to the
-/// positive half only the first time both activate with no prior owner at
-/// all (an arbitrary but harmless tie-break: ticket 59 doesn't specify one
-/// for a genuinely simultaneous first activation, and live tuning against
-/// real hardware is ticket 72's job, not this one's).
-fn resolve_axis_contribution(
-    positive: &[(Input, u8)],
-    negative: &[(Input, u8)],
-    current_owner: Option<Input>,
-) -> (i32, Option<Input>) {
-    let pos = positive
-        .iter()
-        .copied()
-        .filter(|&(_, v)| v > 0)
-        .max_by_key(|&(_, v)| v);
-    let neg = negative
-        .iter()
-        .copied()
-        .filter(|&(_, v)| v > 0)
-        .max_by_key(|&(_, v)| v);
-    match (pos, neg) {
-        (Some(p), Some(n)) => {
-            if current_owner == Some(n.0) {
-                (-i32::from(n.1), Some(n.0))
-            } else {
-                (i32::from(p.1), Some(p.0))
-            }
-        }
-        (Some(p), None) => (i32::from(p.1), Some(p.0)),
-        (None, Some(n)) => (-i32::from(n.1), Some(n.0)),
-        (None, None) => (0, None),
-    }
-}
-
-/// Recomputes and writes every `ABS_*` code `axis_map` (the active Layer's
-/// resolved Axis-assignment map) currently touches, from `axis_state`'s
-/// latest per-Input contributions — the shared tail end of both the
-/// continuous Analog path (`handle_depth_update`) and the Digital-mode edge
-/// path (`handle_axis_edge_event`), per `AxisState`'s own doc comment.
-async fn recompute_and_emit_axes(
-    injector: &Injector,
-    axis_state: &mut AxisState,
-    axis_map: &HashMap<Input, AxisTarget>,
-) -> io::Result<()> {
-    // Positive-polarity contributors, negative-polarity contributors, per
-    // `ABS_*` code — see `resolve_axis_contribution`'s own doc comment for
-    // why unsigned targets always land in the positive side.
-    type Contributors = (Vec<(Input, u8)>, Vec<(Input, u8)>);
-    let mut by_code: HashMap<AbsoluteAxisCode, Contributors> = HashMap::new();
-    for (&input, &target) in axis_map {
-        let value = axis_state.contributions.get(&input).copied().unwrap_or(0);
-        let (positive, negative) = by_code.entry(target.abs_code()).or_default();
-        match target.polarity() {
-            None | Some(AxisPolarity::Positive) => positive.push((input, value)),
-            Some(AxisPolarity::Negative) => negative.push((input, value)),
-        }
-    }
-    // A code this Input used to own but that no longer has *any* contributor
-    // at all in `axis_map` (its last remaining Input was cleared/retargeted
-    // to a different `ABS_*` code) would otherwise never be revisited by the
-    // loop below, which only ever iterates codes `axis_map` currently names
-    // — leaving its last-written value stuck (code-review finding).
-    let stale_codes: Vec<AbsoluteAxisCode> = axis_state
-        .owners
-        .keys()
-        .filter(|code| !by_code.contains_key(code))
-        .copied()
-        .collect();
-    for code in stale_codes {
-        axis_state.owners.remove(&code);
-        injector
-            .set_axis_value(code, 0)
-            .await
-            .map_err(io::Error::other)?;
-    }
-
-    for (code, (positive, negative)) in by_code {
-        let current_owner = axis_state.owners.get(&code).copied();
-        let (value, new_owner) = resolve_axis_contribution(&positive, &negative, current_owner);
-        match new_owner {
-            Some(owner) => {
-                axis_state.owners.insert(code, owner);
-            }
-            None => {
-                axis_state.owners.remove(&code);
-            }
-        }
-        injector
-            .set_axis_value(code, value)
-            .await
-            .map_err(io::Error::other)?;
-    }
-    Ok(())
-}
-
-/// Centers every `ABS_*` code `axis_state` currently has an owner for back
-/// to 0 and clears every piece of `AxisState`, so a Layer or Profile switch
-/// never leaves a stale axis value driving output for an Input that's no
-/// longer even Axis-assigned on the newly-active Layer/Profile — mirrors
-/// `stop_all_toggles`'s identical "force-stop on switch" precedent for
-/// Toggles. A true no-op (no injector writes at all) when no Axis
-/// assignment has ever driven output — the overwhelmingly common case for
-/// most Profiles/Layers — so an ordinary Layer/Profile switch that never
-/// touches Axis assignment stays exactly as write-free as it was before
-/// ticket 71.
-async fn reset_axis_outputs(injector: &Injector, axis_state: &mut AxisState) -> io::Result<()> {
-    if axis_state.owners.is_empty() {
-        axis_state.contributions.clear();
-        return Ok(());
-    }
-    let codes: Vec<AbsoluteAxisCode> = axis_state.owners.keys().copied().collect();
-    axis_state.contributions.clear();
-    axis_state.owners.clear();
-    for code in codes {
-        injector
-            .set_axis_value(code, 0)
-            .await
-            .map_err(io::Error::other)?;
-    }
-    Ok(())
-}
-
-/// Analog-repeat's fixed start/stop threshold (ticket 20/39) — deliberately
-/// not the key's own tunable Actuation point, so the rate curve gets the
-/// key's full physical travel to work with. Placeholder: left TBD by ticket
-/// 20's Answer, to be tuned live against the real device — no physical
-/// Tartarus Pro was available in the session that built this.
-const ANALOG_REPEAT_DEADZONE: u8 = 12;
-
-/// Analog-repeat's minimum/maximum re-fire rate (ticket 20/39), linearly
-/// interpolated across the key's full 0-255 Depth range. Placeholders, same
-/// live-tuning status as `ANALOG_REPEAT_DEADZONE`.
-const ANALOG_REPEAT_MIN_HZ: f64 = 2.0;
-const ANALOG_REPEAT_MAX_HZ: f64 = 20.0;
-
-/// Analog-repeat's fixed per-fire hold duration (ticket 20/39) — the same
-/// every tick regardless of Depth; only the tick-to-tick *rate* varies.
-/// Placeholder, same live-tuning status as `ANALOG_REPEAT_DEADZONE`. Used for
-/// every output Action except `Action::ControllerButton`, which selects
-/// `ANALOG_REPEAT_CONTROLLER_PULSE_HOLD` instead (ticket 78) — Keypress/
-/// mouse-button output is interrupt-driven on the receiving side, not subject
-/// to the per-frame-polling risk a gamepad read has.
-const ANALOG_REPEAT_PULSE_HOLD: Duration = Duration::from_millis(15);
-
-/// `Action::ControllerButton`'s own Analog-repeat pulse-hold floor (ticket
-/// 78): `ANALOG_REPEAT_MAX_HZ`'s 20Hz already yields a 50ms period at the
-/// fastest end of the rate curve, comfortably above this 35ms dwell — the
-/// same frame-safe floor ticket 76 already vetted for `Action::
-/// ControllerButton` output against a polled 60fps game read (the class of
-/// problem ticket 74 flagged as unaddressed for Analog-repeat's own
-/// pre-existing 15ms dwell). Deliberately its own constant, not shared with
-/// `ANALOG_REPEAT_PULSE_HOLD` or `executor::CONTROLLER_BUTTON_DIGITAL_PULSE_
-/// HOLD` — three dwells tuned for unrelated jobs.
-const ANALOG_REPEAT_CONTROLLER_PULSE_HOLD: Duration = Duration::from_millis(35);
-
-/// Analog-repeat's near-full-travel threshold (ticket 20/39) at or above
-/// which the key holds down solid instead of continuing to tap. Placeholder,
-/// same live-tuning status as `ANALOG_REPEAT_DEADZONE`.
-const ANALOG_REPEAT_HOLD_SOLID: u8 = 235;
-
-/// A running Analog-repeat background task (ticket 20/39), as tracked in
-/// dispatch's `HashMap<Input, ActiveAnalogRepeat>` — structurally closer to
-/// `ActiveToggle` than to a Fire-once/Hold-to-repeat `FiringHandle`, per
-/// ticket 20's Answer: its lifetime is driven by Depth crossing
-/// `ANALOG_REPEAT_DEADZONE` (see `update_analog_repeats`), not by a single
-/// physical press/release. Never touched from the individual Trigger-mode
-/// path (`trigger::decide` + `perform_trigger`), which never sees an
-/// Analog-sourced Down/Repeat/Up for an Analog-repeat Binding — `handle_event`
-/// swallows those outright — only a Digital-sourced one (no Depth at all)
-/// reaches it, and `trigger::decide` treats Analog-repeat exactly like
-/// Hold-to-repeat there (ticket 20's Digital Capture mode fallback).
-struct ActiveAnalogRepeat {
-    cancel: CancellationToken,
-    handle: tokio::task::JoinHandle<()>,
-}
-
-impl ActiveAnalogRepeat {
-    /// Spawns the task: `steps` is compiled once, here, from the Binding's
-    /// Action as of the moment Depth first crossed the deadzone (mirrors
-    /// `perform_trigger`'s own once-per-fire `compile_action` call) — not
-    /// recompiled per tick, so a Stepper Action's cursor advances once per
-    /// "press session" rather than auto-cycling at the tick rate. `depth_rx`
-    /// is the caller's own clone of the shared live-Depth watch channel
-    /// (ticket 26), read fresh on every tick to drive the rate curve.
-    fn spawn(
-        injector: Injector,
-        input: Input,
-        steps: Vec<MacroStep>,
-        pulse_hold: Duration,
-        depth_rx: watch::Receiver<HashMap<Input, u8>>,
-    ) -> Self {
-        let cancel = CancellationToken::new();
-        let handle = tokio::spawn(run_analog_repeat_loop(
-            injector,
-            input,
-            steps,
-            pulse_hold,
-            depth_rx,
-            cancel.clone(),
-        ));
-        ActiveAnalogRepeat { cancel, handle }
-    }
-
-    /// Stops the task and waits for its force-release to complete, mirroring
-    /// `ActiveToggle::stop`'s exact contract.
-    async fn stop(self) {
-        self.cancel.cancel();
-        let _ = self.handle.await;
-    }
-}
-
-/// Fires `steps`' Down phase, holds for `pulse_hold` (`ANALOG_REPEAT_PULSE_
-/// HOLD`, or `ANALOG_REPEAT_CONTROLLER_PULSE_HOLD` for `Action::
-/// ControllerButton` output, per ticket 78), then fires the Up phase in
-/// reverse order — matching `keypress_steps`'s own down/up nesting (modifiers
-/// released in the reverse of how they were pressed). Deliberately ignores
-/// any `MacroStep::Delay` a Macro Action might embed: Analog-repeat's whole
-/// idea (ticket 20's Answer) is a single fixed-duration pulse, not a
-/// multi-step timed sequence.
-async fn fire_analog_repeat_pulse(
-    injector: &Injector,
-    steps: &[MacroStep],
-    pulse_hold: Duration,
-    held: &mut HashSet<KeyCode>,
-) {
-    for step in steps {
-        if let MacroStep::KeyDown(_) = step {
-            let _ = executor::execute_step(injector, held, *step).await;
-        }
-    }
-    tokio::time::sleep(pulse_hold).await;
-    for step in steps.iter().rev() {
-        if let MacroStep::KeyUp(_) = step {
-            let _ = executor::execute_step(injector, held, *step).await;
-        }
-    }
-}
-
-/// The task body `ActiveAnalogRepeat::spawn` runs. Two states, toggled by
-/// `depth_rx`'s own live snapshot on every loop iteration: below
-/// `ANALOG_REPEAT_HOLD_SOLID`, fires `fire_analog_repeat_pulse` at a rate
-/// linearly interpolated between `ANALOG_REPEAT_MIN_HZ`/`_MAX_HZ` across the
-/// full 0-255 Depth range (ticket 20's Answer: not renormalized to the key's
-/// own Actuation/Release band); at or above it, holds every Down step solid
-/// with no further tapping until Depth drops back below the threshold.
-/// Exits (force-releasing whatever it's still holding) only on external
-/// cancellation — `update_analog_repeats` is the sole owner of *when* that
-/// happens, driven by Depth crossing back down through the deadzone.
-async fn run_analog_repeat_loop(
-    injector: Injector,
-    input: Input,
-    steps: Vec<MacroStep>,
-    pulse_hold: Duration,
-    mut depth_rx: watch::Receiver<HashMap<Input, u8>>,
-    cancel: CancellationToken,
-) {
-    let mut held: HashSet<KeyCode> = HashSet::new();
-    let mut holding_solid = false;
-    loop {
-        let depth = *depth_rx.borrow().get(&input).unwrap_or(&0);
-        if depth >= ANALOG_REPEAT_HOLD_SOLID {
-            if !holding_solid {
-                for step in &steps {
-                    if let MacroStep::KeyDown(_) = step {
-                        let _ = executor::execute_step(&injector, &mut held, *step).await;
-                    }
-                }
-                holding_solid = true;
-            }
-            tokio::select! {
-                () = cancel.cancelled() => break,
-                _ = depth_rx.changed() => {}
-            }
-            continue;
-        }
-        if holding_solid {
-            for step in steps.iter().rev() {
-                if let MacroStep::KeyUp(_) = step {
-                    let _ = executor::execute_step(&injector, &mut held, *step).await;
-                }
-            }
-            holding_solid = false;
-        }
-        // Below the deadzone: `update_analog_repeats` is the sole owner of
-        // *stopping* this task and is about to (or a stale wakeup is racing
-        // it) — wait rather than firing a spurious pulse at the curve's own
-        // minimum rate. Without this check, a `depth_rx.changed()` wakeup
-        // that wins its `select!` against the hold-solid branch's own
-        // `cancel.cancelled()` above (both become ready around the same
-        // depth update that crosses back below the deadzone) would
-        // otherwise fall through into the tapping branch below and fire one
-        // extra Down/Up pulse before the external stop's cancellation ever
-        // lands — reproduced by this module's own `analog_repeat_holds_
-        // solid_above_the_hold_threshold` test, intermittently, before this
-        // check existed.
-        if depth < ANALOG_REPEAT_DEADZONE {
-            tokio::select! {
-                () = cancel.cancelled() => break,
-                _ = depth_rx.changed() => {}
-            }
-            continue;
-        }
-        let rate_hz = ANALOG_REPEAT_MIN_HZ
-            + (ANALOG_REPEAT_MAX_HZ - ANALOG_REPEAT_MIN_HZ) * (f64::from(depth) / 255.0);
-        let period = Duration::from_secs_f64(1.0 / rate_hz);
-        let tick_start = Instant::now();
-        let cancelled = tokio::select! {
-            () = cancel.cancelled() => true,
-            () = fire_analog_repeat_pulse(&injector, &steps, pulse_hold, &mut held) => false,
-        };
-        if cancelled {
-            break;
-        }
-        let elapsed = tick_start.elapsed();
-        if elapsed < period {
-            tokio::select! {
-                () = cancel.cancelled() => break,
-                () = tokio::time::sleep(period - elapsed) => {}
-            }
-        }
-    }
-    executor::force_release(&injector, held).await;
-}
-
-/// Force-stops every currently running Analog-repeat task — mirrors
-/// `stop_all_toggles`'s exact shape, called on Layer switch/Profile switch
-/// (an Analog-repeat task is tied to one specific Layer's Binding, closer to
-/// a continuous Axis output than to a Toggle's deliberately-persisted latch
-/// — same reasoning as `reset_axis_outputs`'s own call sites) and on an
-/// Analog-to-Digital capture-mode transition (the live-Depth stream driving
-/// every task's rate curve goes stale the moment that happens).
-async fn stop_all_analog_repeats(analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>) {
-    for (_, task) in analog_repeats.drain() {
-        task.stop().await;
-    }
 }
 
 /// Every piece of ephemeral runtime state the dispatch task owns — built
@@ -477,8 +102,8 @@ struct DispatchState {
     active_layer: Layer,
     chord_machine: chord::ChordMachine,
     chord_runtime: ChordRuntime,
-    axis_state: AxisState,
-    analog_repeats: HashMap<Input, ActiveAnalogRepeat>,
+    axis: axis::Engine,
+    analog_repeat: analog_repeat::Engine,
     device_connected: bool,
     capture_mode: CaptureMode,
     device_info: Option<DeviceInfo>,
@@ -508,8 +133,8 @@ impl DispatchState {
             active_layer: Layer::Base,
             chord_machine: chord::ChordMachine::default(),
             chord_runtime: ChordRuntime::default(),
-            axis_state: AxisState::default(),
-            analog_repeats: HashMap::new(),
+            axis: axis::Engine::default(),
+            analog_repeat: analog_repeat::Engine::default(),
             device_connected: true,
             capture_mode: CaptureMode::Digital,
             device_info: None,
@@ -540,11 +165,11 @@ impl DispatchState {
                 &self.injector,
                 &mut self.active_layer,
                 &self.signal_emitter,
-                &mut self.axis_state,
-                &mut self.analog_repeats,
+                &mut self.axis,
+                &mut self.analog_repeat,
                 event.state,
             )
-            .await?;
+            .await;
             return Ok(Vec::new());
         }
 
@@ -572,14 +197,9 @@ impl DispatchState {
         let axis_map = profile.axis_layer(self.active_layer);
         if axis_map.contains_key(&event.input) {
             if event.depth.is_none() {
-                handle_axis_edge_event(
-                    &self.injector,
-                    &mut self.axis_state,
-                    axis_map,
-                    event.input,
-                    event.state,
-                )
-                .await?;
+                for w in self.axis.step_digital(axis_map, event.input, event.state) {
+                    let _ = self.injector.set_axis_value(w.code, w.value).await;
+                }
             }
             return Ok(Vec::new());
         }
@@ -728,17 +348,13 @@ impl DispatchState {
     /// `depths` for the subset that's actually Axis-assigned right now — an
     /// empty Axis map (the common case) short-circuits immediately, doing no
     /// work on every ordinary depth tick.
-    async fn handle_depth_update(
-        &mut self,
-        config: &Config,
-        depths: HashMap<Input, u8>,
-    ) -> io::Result<()> {
+    async fn handle_depth_update(&mut self, config: &Config, depths: &HashMap<Input, u8>) {
         let profile = config
             .active_profile()
             .expect("load_or_seed validates active_profile names a real profile");
         let axis_map = profile.axis_layer(self.active_layer);
         if axis_map.is_empty() {
-            return Ok(());
+            return;
         }
         // Ticket 71 code-review finding: reads each relevant Input's own
         // Actuation/Release point directly, rather than building
@@ -746,15 +362,19 @@ impl DispatchState {
         // the 1-4 entries an Axis-assigned Profile actually needs — this runs on
         // every live-Depth tick (sub-millisecond while a key is moving, per
         // ticket 13), so the redundant O(20) rebuild was real hot-path waste.
+        // The `depth → value` ramp stays dispatch-side (it needs the per-Input
+        // Actuation point); the engine's inputs are already-resolved 0-255
+        // contributions.
+        let mut resolved: HashMap<Input, u8> = HashMap::new();
         for &input in axis_map.keys() {
             if let Some(&depth) = depths.get(&input) {
                 let point = profile.resolved_actuation_point(input);
-                self.axis_state
-                    .contributions
-                    .insert(input, config::resolve_axis_value(depth, point));
+                resolved.insert(input, config::resolve_axis_value(depth, point));
             }
         }
-        recompute_and_emit_axes(&self.injector, &mut self.axis_state, axis_map).await
+        for w in self.axis.resolve(axis_map, &resolved) {
+            let _ = self.injector.set_axis_value(w.code, w.value).await;
+        }
     }
 
     /// Dispatches a single fresh `Down` on `input` against the active Layer —
@@ -847,49 +467,47 @@ impl DispatchState {
             .active_profile()
             .expect("load_or_seed validates active_profile names a real profile");
         let bindings = profile.layer(self.active_layer);
-        for (&input, &depth) in snapshot {
-            let binding = bindings.get(&input);
-            let is_analog_repeat = binding.is_some_and(|b| b.trigger == TriggerMode::AnalogRepeat);
-            if is_analog_repeat && depth >= ANALOG_REPEAT_DEADZONE {
-                self.analog_repeats.entry(input).or_insert_with(|| {
-                    let action = &binding
-                        .expect("is_analog_repeat is only true for Some(binding)")
-                        .action;
-                    let steps = compile_action(
-                        action,
-                        &config.macros,
-                        &config.steppers,
-                        &mut self.stepper_cursors,
-                    );
-                    // Ticket 78: a gamepad button gets the 35ms frame-safe
-                    // floor; every other output Action keeps the original
-                    // 15ms dwell.
-                    let pulse_hold = if matches!(action, Action::ControllerButton { .. }) {
-                        ANALOG_REPEAT_CONTROLLER_PULSE_HOLD
-                    } else {
-                        ANALOG_REPEAT_PULSE_HOLD
-                    };
-                    ActiveAnalogRepeat::spawn(
-                        self.injector.clone(),
-                        input,
-                        steps,
-                        pulse_hold,
-                        depth_rx.clone(),
-                    )
-                });
-            } else if let Some(task) = self.analog_repeats.remove(&input) {
-                task.stop().await;
-            }
+        // The set of Inputs whose active-Layer Binding is Analog-repeat —
+        // computed dispatch-side from `Config`; the engine never sees a
+        // `Config`, `CaptureMode`, or `Layer`.
+        let repeat_inputs: HashSet<Input> = bindings
+            .iter()
+            .filter(|(_, b)| b.trigger == TriggerMode::AnalogRepeat)
+            .map(|(&input, _)| input)
+            .collect();
+        for input in self.analog_repeat.update(&repeat_inputs, snapshot).await {
+            let binding = bindings
+                .get(&input)
+                .expect("reconcile only returns Spawn for a repeat_inputs member");
+            // Compiled once, here, from the Binding's Action as of the moment
+            // Depth first crossed the deadzone (mirrors `perform_trigger`'s
+            // own once-per-fire `compile_action` call) — `compile_action`
+            // stays dispatch-side so the engine needn't depend on `dispatch`
+            // or drag `Config` + `stepper_cursors` in.
+            let steps = compile_action(
+                &binding.action,
+                &config.macros,
+                &config.steppers,
+                &mut self.stepper_cursors,
+            );
+            self.analog_repeat.spawn(
+                self.injector.clone(),
+                input,
+                steps,
+                analog_repeat::pulse_hold_for(&binding.action),
+                depth_rx.clone(),
+            );
         }
     }
 
     /// Runs each `edit::Effect` an `edit::plan` derived, in order, against the
     /// `DispatchState` fields it touches (ticket 05). `config` is the
     /// just-committed `Config` — every effect that reads the new state
-    /// (`RepublishActuation`, `RecomputeAxes`) reads it from here. Errors on
-    /// the axis-output path are swallowed exactly as the pre-ticket-05 arm
-    /// code swallowed them (`let _ = recompute_and_emit_axes(...)` /
-    /// `reset_axis_outputs`).
+    /// (`RepublishActuation`, `RecomputeAxes`) reads it from here. Every axis
+    /// `ABS_*` write goes through one dispatch-side emit loop over the
+    /// engine's `Vec<AxisWrite>` with the injector error swallowed (`let _ =`)
+    /// — a deliberate unification (ticket 10) of the old inconsistent `?` /
+    /// `let _ =` on the axis-output path.
     async fn run_effects(&mut self, effects: Vec<edit::Effect>, config: &Config) {
         for effect in effects {
             match effect {
@@ -906,16 +524,13 @@ impl DispatchState {
                             .expect("load_or_seed validates active_profile names a real profile")
                             .axis_layer(layer)
                             .clone();
-                        let _ = recompute_and_emit_axes(
-                            &self.injector,
-                            &mut self.axis_state,
-                            &axis_map,
-                        )
-                        .await;
+                        for w in self.axis.recompute(&axis_map) {
+                            let _ = self.injector.set_axis_value(w.code, w.value).await;
+                        }
                     }
                 }
                 edit::Effect::ForgetAxisContribution(input) => {
-                    self.axis_state.contributions.remove(&input);
+                    self.axis.forget(input);
                 }
                 edit::Effect::SignalCaptureMode(force) => {
                     // Only on a successful persist (which is where `run_effects`
@@ -929,11 +544,11 @@ impl DispatchState {
                     }
                 }
                 edit::Effect::StopAllToggles => stop_all_toggles(&mut self.toggles).await,
-                edit::Effect::StopAllAnalogRepeats => {
-                    stop_all_analog_repeats(&mut self.analog_repeats).await
-                }
+                edit::Effect::StopAllAnalogRepeats => self.analog_repeat.stop_all().await,
                 edit::Effect::ResetAxisOutputs => {
-                    let _ = reset_axis_outputs(&self.injector, &mut self.axis_state).await;
+                    for w in self.axis.reset() {
+                        let _ = self.injector.set_axis_value(w.code, w.value).await;
+                    }
                 }
                 edit::Effect::DropStepperCursor(stepper) => {
                     self.stepper_cursors.remove(&stepper);
@@ -1328,8 +943,11 @@ pub async fn run(
             changed = rx_depth.changed(), if depth_open => {
                 match changed {
                     Ok(()) => {
+                        // Two independent engines sharing only the snapshot
+                        // value — axis-assignment resolution and the
+                        // Analog-repeat spawn/stop policy.
                         let snapshot = rx_depth.borrow_and_update().clone();
-                        state.handle_depth_update(&config, snapshot.clone()).await?;
+                        state.handle_depth_update(&config, &snapshot).await;
                         state.update_analog_repeats(&config, &rx_depth, &snapshot).await;
                     }
                     Err(_) => depth_open = false,
@@ -1362,7 +980,7 @@ pub async fn run(
                     Some(mode) => handle_capture_mode_change(
                         &mut state.capture_mode,
                         &state.signal_emitter,
-                        &mut state.analog_repeats,
+                        &mut state.analog_repeat,
                         mode,
                     )
                     .await,
@@ -1543,25 +1161,26 @@ async fn handle_layer_switch(
     injector: &Injector,
     active_layer: &mut Layer,
     signal_emitter: &Option<SignalEmitter<'static>>,
-    axis_state: &mut AxisState,
-    analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>,
+    axis: &mut axis::Engine,
+    analog_repeat: &mut analog_repeat::Engine,
     state: EventState,
-) -> io::Result<()> {
+) {
     let new_layer = match state {
         EventState::Down => Layer::Held,
         EventState::Up => Layer::Base,
-        EventState::Repeat => return Ok(()),
+        EventState::Repeat => return,
     };
     if new_layer == *active_layer {
-        return Ok(());
+        return;
     }
     *active_layer = new_layer;
-    reset_axis_outputs(injector, axis_state).await?;
-    stop_all_analog_repeats(analog_repeats).await;
+    for w in axis.reset() {
+        let _ = injector.set_axis_value(w.code, w.value).await;
+    }
+    analog_repeat.stop_all().await;
     if let Some(emitter) = signal_emitter {
         let _ = Daemon::active_layer_changed(emitter, new_layer.as_str()).await;
     }
-    Ok(())
 }
 
 /// Updates the dispatch task's view of device connectivity (ticket 20) and
@@ -1597,7 +1216,7 @@ async fn handle_connection_change(
 async fn handle_capture_mode_change(
     capture_mode: &mut CaptureMode,
     signal_emitter: &Option<SignalEmitter<'static>>,
-    analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>,
+    analog_repeat: &mut analog_repeat::Engine,
     mode: CaptureMode,
 ) {
     if mode == *capture_mode {
@@ -1605,36 +1224,11 @@ async fn handle_capture_mode_change(
     }
     *capture_mode = mode;
     if mode == CaptureMode::Digital {
-        stop_all_analog_repeats(analog_repeats).await;
+        analog_repeat.stop_all().await;
     }
     if let Some(emitter) = signal_emitter {
         let _ = Daemon::capture_mode_changed(emitter, mode.as_str()).await;
     }
-}
-
-/// The Digital Capture mode fallback (ticket 59 §6/71): press/release
-/// step-increment for an Axis-assigned Input carrying no Depth at all —
-/// `handle_event` only ever routes a genuinely Digital-sourced event here
-/// (`event.depth` is `None`); an Analog-sourced one is fully handled by the
-/// continuous `handle_depth_update` path instead. Reuses the kernel's own
-/// autorepeat cadence (the same `Repeat` stream Hold-to-repeat rides) to
-/// ramp up by `AXIS_DIGITAL_STEP` on every Down/Repeat, saturating at 255;
-/// `Up` resets to 0 — the closest digital emulation of "Depth rises while
-/// held, drops to 0 on release" ticket 59 §6 asks for.
-async fn handle_axis_edge_event(
-    injector: &Injector,
-    axis_state: &mut AxisState,
-    axis_map: &HashMap<Input, AxisTarget>,
-    input: Input,
-    state: EventState,
-) -> io::Result<()> {
-    let current = axis_state.contributions.get(&input).copied().unwrap_or(0);
-    let next = match state {
-        EventState::Down | EventState::Repeat => current.saturating_add(AXIS_DIGITAL_STEP),
-        EventState::Up => 0,
-    };
-    axis_state.contributions.insert(input, next);
-    recompute_and_emit_axes(injector, axis_state, axis_map).await
 }
 
 /// Compiles a Binding's `Action` into the flat step sequence `perform_trigger`
@@ -1737,7 +1331,7 @@ mod tests {
     use super::*;
     use crate::capture::EventState;
     use crate::config::{
-        Action, ActuationPoint, DEFAULT_PROFILE_NAME, MacroStepDto, Modifiers, Profile,
+        Action, ActuationPoint, AxisTarget, DEFAULT_PROFILE_NAME, MacroStepDto, Modifiers, Profile,
     };
     use crate::injector::testing::RecordingSink;
     use crate::injector::{self};
@@ -1746,6 +1340,14 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use tokio::sync::oneshot;
+
+    /// Mirrors of `analog_repeat`'s documented per-fire hold dwells — its
+    /// constants are private, and the values themselves are pinned by
+    /// `analog_repeat::tests::pulse_hold_for_*`. The kept integration tests
+    /// below only check that the engine's spawned task actually drives uinput
+    /// on that cadence across the module boundary.
+    const AR_PULSE_HOLD: Duration = Duration::from_millis(15);
+    const AR_CONTROLLER_PULSE_HOLD: Duration = Duration::from_millis(35);
 
     /// Same helper as `executor`'s own test module — used by the newer,
     /// terser ControllerButton Hold-to-repeat tests (ticket 75/76) rather
@@ -1980,7 +1582,7 @@ mod tests {
         /// full-rig helpers use.
         async fn finish(mut self) -> Vec<Vec<evdev::InputEvent>> {
             stop_all_toggles(&mut self.state.toggles).await;
-            stop_all_analog_repeats(&mut self.state.analog_repeats).await;
+            self.state.analog_repeat.stop_all().await;
             drop(self.state);
             drop(self.inj);
             self.inj_handle.await.unwrap().unwrap();
@@ -2458,22 +2060,30 @@ mod tests {
         ));
 
         // A mid-travel Depth, comfortably between the deadzone and the
-        // hold-solid threshold — the rising edge spawns the task.
-        let depth: u8 = 100;
-        let rate_hz = ANALOG_REPEAT_MIN_HZ
-            + (ANALOG_REPEAT_MAX_HZ - ANALOG_REPEAT_MIN_HZ) * (f64::from(depth) / 255.0);
-        let period = Duration::from_secs_f64(1.0 / rate_hz);
-        depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), depth)]));
+        // hold-solid threshold — the rising edge spawns the task. The exact
+        // rate curve is pinned by `analog_repeat::tests::rate_period_*`; this
+        // test only checks the spawned task drives repeated pulses and then
+        // genuinely stops.
+        depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), 100u8)]));
         tokio::task::yield_now().await;
 
-        // Two full ticks: each is a KeyDown, a PULSE_HOLD sleep, a KeyUp,
-        // then the rest of the tick's own period.
-        for _ in 0..2 {
-            tokio::time::advance(ANALOG_REPEAT_PULSE_HOLD).await;
-            tokio::task::yield_now().await;
-            tokio::time::advance(period - ANALOG_REPEAT_PULSE_HOLD).await;
+        // Advance ~1s of paused time in small steps so the clock drives each
+        // pulse's KeyDown / dwell / KeyUp / period sleep in turn. Depth 100
+        // resolves to ≈ 9 Hz (pinned exactly by
+        // `analog_repeat::tests::rate_period_*`), so ~1s is ≈ 9 pulses ≈ 18
+        // batches. The bound is wide enough for scheduler jitter but still
+        // catches a roughly-doubled rate, a halved pulse-hold, or an extra
+        // Down/Up pair per tick — the assembled-loop cadence the pure tables
+        // can't see.
+        for _ in 0..40 {
+            tokio::time::advance(Duration::from_millis(25)).await;
             tokio::task::yield_now().await;
         }
+        let while_active = sink.batches().len();
+        assert!(
+            (12..=28).contains(&while_active),
+            "expected ≈ 18 Down/Up batches over the 1s window, got {while_active}"
+        );
 
         // Falling back below the deadzone stops the task — a no-op
         // force-release here, since every pulse above already self-released.
@@ -2481,11 +2091,12 @@ mod tests {
         tokio::task::yield_now().await;
         let after_stop = sink.batches().len();
 
-        // Advancing well past another tick's worth of time produces
-        // nothing further — the task is genuinely gone, not just paused
-        // between ticks.
-        tokio::time::advance(period * 3).await;
-        tokio::task::yield_now().await;
+        // Advancing well past several ticks' worth of time produces nothing
+        // further — the task is genuinely gone, not just paused between ticks.
+        for _ in 0..40 {
+            tokio::time::advance(Duration::from_millis(25)).await;
+            tokio::task::yield_now().await;
+        }
         assert_eq!(sink.batches().len(), after_stop);
 
         drop(tx);
@@ -2495,8 +2106,12 @@ mod tests {
         inj_handle.await.unwrap().unwrap();
 
         let batches = sink.batches();
-        assert_eq!(batches.len(), 4);
-        for pair in batches.chunks(2) {
+        assert!(
+            batches.len() >= 4 && batches.len().is_multiple_of(2),
+            "expected an even run of Down/Up pulses, got {}",
+            batches.len()
+        );
+        for pair in batches.chunks_exact(2) {
             let evdev::EventSummary::Key(_, down_code, down_value) = pair[0][0].destructure()
             else {
                 panic!("expected a key event");
@@ -2554,7 +2169,7 @@ mod tests {
 
         assert_eq!(sink.batches().len(), 1, "the Down must fire immediately");
 
-        tokio::time::advance(ANALOG_REPEAT_PULSE_HOLD).await;
+        tokio::time::advance(AR_PULSE_HOLD).await;
         tokio::task::yield_now().await;
         assert_eq!(
             sink.batches().len(),
@@ -2562,7 +2177,7 @@ mod tests {
             "the ordinary 15ms dwell must not release a ControllerButton pulse"
         );
 
-        tokio::time::advance(ANALOG_REPEAT_CONTROLLER_PULSE_HOLD - ANALOG_REPEAT_PULSE_HOLD).await;
+        tokio::time::advance(AR_CONTROLLER_PULSE_HOLD - AR_PULSE_HOLD).await;
         tokio::task::yield_now().await;
 
         // Fall back below the deadzone to let `update_analog_repeats` stop
@@ -3186,25 +2801,6 @@ mod tests {
         /// this exactly as it would the real channel.
         fn push_depth(&self, values: impl IntoIterator<Item = (Input, u8)>) {
             self.depth_tx.send_replace(values.into_iter().collect());
-        }
-
-        async fn set_axis_assignment(
-            &self,
-            input: Input,
-            layer: Layer,
-            target: AxisTarget,
-        ) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::SetAxisAssignment {
-                    input,
-                    layer,
-                    target,
-                    reply,
-                })
-                .await
-                .unwrap();
-            rx.await.unwrap()
         }
 
         async fn clear_axis_assignment(
@@ -4810,10 +4406,12 @@ mod tests {
 
     #[tokio::test]
     async fn clear_axis_assignment_zeroes_a_still_live_output_that_dropped_out_of_the_map() {
-        // Code-review finding: `recompute_and_emit_axes` used to only ever
-        // walk the codes `axis_map` currently names — a code that drops out
-        // entirely (its last remaining Input cleared) was never revisited,
-        // so its last-written nonzero value stuck forever.
+        // Code-review finding (guarded here across the run_effects → engine →
+        // uinput boundary): axis resolution used to only ever walk the codes
+        // `axis_map` currently names — a code that drops out entirely (its
+        // last remaining Input cleared) was never revisited, so its
+        // last-written nonzero value stuck forever. `axis::Engine::recompute`
+        // carries the stale-code sweep; `axis::tests` covers the decision.
         let mut config = config_with_bindings(HashMap::new());
         config
             .active_profile_mut()
@@ -4843,40 +4441,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retargeting_an_axis_assignment_zeroes_the_old_abs_code() {
-        let mut config = config_with_bindings(HashMap::new());
-        config
-            .active_profile_mut()
-            .unwrap()
-            .axis_base
-            .insert(Input::Grid(1, 1), AxisTarget::LeftTrigger);
-        let harness = CommandHarness::spawn(config);
-
-        harness.push_depth([(Input::Grid(1, 1), 200)]);
-        tokio::task::yield_now().await;
-
-        harness
-            .set_axis_assignment(Input::Grid(1, 1), Layer::Base, AxisTarget::RightTrigger)
-            .await
-            .expect("SetAxisAssignment must succeed");
-
-        let writes = flat_axis_writes(harness.gamepad_batches());
-        harness.shut_down().await;
-
-        // The old code (ABS_Z) is zeroed by the stale-code sweep; the
-        // now-retargeted Input's carried-over Depth immediately drives the
-        // new code (ABS_RZ) in the same recompute pass.
-        assert_eq!(
-            writes,
-            vec![
-                (evdev::AbsoluteAxisCode::ABS_Z, 200),
-                (evdev::AbsoluteAxisCode::ABS_Z, 0),
-                (evdev::AbsoluteAxisCode::ABS_RZ, 200),
-            ]
-        );
-    }
-
-    #[tokio::test]
     async fn an_analog_sourced_event_on_an_axis_assigned_key_never_passes_through() {
         let mut config = config_with_bindings(HashMap::new());
         config
@@ -4897,7 +4461,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn digital_mode_step_fallback_ramps_up_on_repeat_and_resets_on_release() {
+    async fn a_digital_sourced_axis_event_routes_through_the_engine_to_uinput() {
+        // Thin routing guard for `handle_event`'s Digital-mode branch
+        // (`event.depth.is_none()` -> `axis::Engine::step_digital` -> the
+        // emit loop). The ramp / saturate / reset *decision* is owned by
+        // `axis::tests::step_digital_*`; this only checks the seam still
+        // crosses the module boundary and reaches the gamepad device.
         let mut config = config_with_bindings(HashMap::new());
         config
             .active_profile_mut()
@@ -4917,11 +4486,8 @@ mod tests {
         assert_eq!(
             writes,
             vec![
-                (evdev::AbsoluteAxisCode::ABS_Z, i32::from(AXIS_DIGITAL_STEP)),
-                (
-                    evdev::AbsoluteAxisCode::ABS_Z,
-                    i32::from(AXIS_DIGITAL_STEP) * 2
-                ),
+                (evdev::AbsoluteAxisCode::ABS_Z, 64),
+                (evdev::AbsoluteAxisCode::ABS_Z, 128),
                 (evdev::AbsoluteAxisCode::ABS_Z, 0),
             ]
         );
@@ -4944,64 +4510,6 @@ mod tests {
         harness.shut_down().await;
 
         assert_eq!(writes, vec![(evdev::AbsoluteAxisCode::ABS_Z, 200)]);
-    }
-
-    #[tokio::test]
-    async fn two_keys_sharing_one_same_signed_target_take_the_greater_depth() {
-        let mut config = config_with_bindings(HashMap::new());
-        {
-            let profile = config.active_profile_mut().unwrap();
-            profile
-                .axis_base
-                .insert(Input::Grid(1, 1), AxisTarget::LeftTrigger);
-            profile
-                .axis_base
-                .insert(Input::Grid(1, 2), AxisTarget::LeftTrigger);
-        }
-        let harness = CommandHarness::spawn(config);
-
-        harness.push_depth([(Input::Grid(1, 1), 150), (Input::Grid(1, 2), 200)]);
-        tokio::task::yield_now().await;
-
-        let writes = flat_axis_writes(harness.gamepad_batches());
-        harness.shut_down().await;
-
-        assert_eq!(writes, vec![(evdev::AbsoluteAxisCode::ABS_Z, 200)]);
-    }
-
-    #[tokio::test]
-    async fn opposite_signed_halves_let_the_already_active_key_keep_driving() {
-        let mut config = config_with_bindings(HashMap::new());
-        {
-            let profile = config.active_profile_mut().unwrap();
-            profile
-                .axis_base
-                .insert(Input::Grid(1, 1), AxisTarget::LeftStickXPos);
-            profile
-                .axis_base
-                .insert(Input::Grid(1, 2), AxisTarget::LeftStickXNeg);
-        }
-        let harness = CommandHarness::spawn(config);
-
-        // Positive half activates alone first.
-        harness.push_depth([(Input::Grid(1, 1), 200)]);
-        tokio::task::yield_now().await;
-        // Negative half now also activates — the already-active positive
-        // half must keep winning (ticket 59 §5).
-        harness.push_depth([(Input::Grid(1, 1), 200), (Input::Grid(1, 2), 220)]);
-        tokio::task::yield_now().await;
-
-        let writes = flat_axis_writes(harness.gamepad_batches());
-        harness.shut_down().await;
-
-        assert_eq!(
-            writes,
-            vec![
-                (evdev::AbsoluteAxisCode::ABS_X, 200),
-                (evdev::AbsoluteAxisCode::ABS_X, 200),
-            ],
-            "the positive half must keep suppressing the newcomer negative half"
-        );
     }
 
     #[tokio::test]

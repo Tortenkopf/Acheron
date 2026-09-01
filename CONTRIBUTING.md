@@ -183,6 +183,26 @@ and it can be verified before merge.
   / `ActiveToggle::spawn{,_held}`, the map insert) belongs in
   `dispatch::perform_trigger`.
 
+- **Changing axis conflict resolution** (the §5 rule — opposite-half
+  suppression, greater-Depth-wins, the owner tie-break — or the
+  Digital-mode step-increment fallback) — ticket 10. The decision lives in
+  `daemon/src/axis.rs`: the pure `resolve_axis_contribution` fn and the
+  `axis::Engine` methods, which return `Vec<AxisWrite>` and hold no
+  `&Injector`. Add or adjust it there with a synchronous `axis::tests`
+  case, never in `dispatch`. Only the emission (`injector.set_axis_value`
+  over the returned writes) and the `depth → value` ramp
+  (`config::resolve_axis_value`, which needs the per-Input Actuation point)
+  belong in `dispatch`.
+
+- **Changing the Analog-repeat rate curve** (the deadzone / hold-solid
+  bands, the Depth→Hz mapping, the per-fire pulse hold, or the spawn/stop
+  policy) — ticket 10. The decision lives in `daemon/src/analog_repeat.rs`
+  as the pure `tick_plan` / `reconcile` / `pulse_hold_for` functions — add
+  or adjust the logic there and add a row to the `analog_repeat::tests`
+  tables, never in `dispatch`. Only the task shell
+  (`analog_repeat::Engine`, `run_analog_repeat_loop`) and the
+  `compile_action` handoff belong outside the pure core.
+
 - **Adding a new piece of dispatch runtime state** (a new per-Input handle
   map, another momentary mode flag, a live view of something the supervisor
   reports…) — ticket 09. The dispatch task's ephemeral runtime state lives in

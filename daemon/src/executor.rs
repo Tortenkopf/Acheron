@@ -409,7 +409,7 @@ async fn run_toggle_held(injector: Injector, key: KeyCode, cancel: CancellationT
     force_release(&injector, held).await;
 }
 
-/// `pub(crate)` (rather than private) so `dispatch::run_analog_repeat_loop`
+/// `pub(crate)` (rather than private) so `analog_repeat::run_analog_repeat_loop`
 /// can reuse the same step-walking primitive `run_toggle_loop` uses,
 /// pacing it against a live-Depth-driven interval instead of a fixed lap
 /// (ticket 20/39) — mirrors `keypress_steps`'s own promotion precedent
@@ -448,9 +448,9 @@ pub(crate) async fn execute_step(
     }
 }
 
-/// `pub(crate)` for the same reason as `execute_step` above — `dispatch::
-/// run_analog_repeat_loop` needs its own force-release-on-stop, same
-/// bypasses-suppression semantics.
+/// `pub(crate)` for the same reason as `execute_step` above —
+/// `analog_repeat::run_analog_repeat_loop` needs its own force-release-on-stop,
+/// same bypasses-suppression semantics.
 pub(crate) async fn force_release(injector: &Injector, held: HashSet<KeyCode>) {
     for key in held {
         // Bypasses suppression (ticket 25's live-hardware test caught the
