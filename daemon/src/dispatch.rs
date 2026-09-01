@@ -51,11 +51,15 @@ use crate::input::Input;
 use crate::trigger;
 
 /// Builds a `TriggerCtx` (below) from a `(firings, toggles)` pair plus the
-/// shared `config` view and per-task locals — mirrors this file's own
-/// `effect_ctx!` idiom (a per-call-site borrow struct built from a macro), so
-/// the three `trigger::decide` + `perform_trigger` sites don't each spell the
-/// struct literal. Defined up here because `macro_rules!` is textually scoped
-/// and the first user (`handle_event`) precedes `TriggerCtx`'s own definition.
+/// shared `config` view and the `DispatchState` fields it needs — a
+/// per-call-site borrow struct built from a macro, so the three
+/// `trigger::decide` + `perform_trigger` sites don't each spell the struct
+/// literal. Each site passes a disjoint `&mut self.<map>` borrow (`in_flight`
+/// on the individual path, `chord_runtime.{firings,toggles}` on the Chord
+/// path) — a `&mut self` method can't be generic over which map type `K`
+/// selects, so `perform_trigger<K>` stays a free function. Defined up here
+/// because `macro_rules!` is textually scoped and the first user
+/// (`handle_event`) precedes `TriggerCtx`'s own definition.
 macro_rules! trigger_ctx {
     ($injector:expr, $config:expr, $firings:expr, $toggles:expr, $cursors:expr, $lap:expr $(,)?) => {
         TriggerCtx {
@@ -81,9 +85,9 @@ const AXIS_DIGITAL_STEP: u8 = 64;
 /// Every piece of Daemon-owned, `ChordKey`-keyed runtime state a Chord's own
 /// Trigger-mode dispatch touches (ticket 01/40) — the firing/toggle *handles*
 /// the pure `chord` state machine (post-release ticket 07) never holds. One
-/// `run`-local, built fresh per dispatch task start, mirroring how
-/// `AxisState` bundles its own two maps; the executor derives the
-/// `trigger::Slot` liveness snapshot `chord::feed` wants from it.
+/// nested `DispatchState` field, reset fresh per dispatch task start,
+/// mirroring how `AxisState` bundles its own two maps; the executor derives
+/// the `trigger::Slot` liveness snapshot `chord::feed` wants from it.
 #[derive(Default)]
 struct ChordRuntime {
     firings: HashMap<ChordKey, FiringHandle>,
@@ -457,61 +461,783 @@ async fn stop_all_analog_repeats(analog_repeats: &mut HashMap<Input, ActiveAnalo
     }
 }
 
-/// Starts/stops every grid Input's Analog-repeat task from a fresh
-/// `depth_tx` snapshot (ticket 20/39) — the depth-driven half of
-/// Analog-repeat's firing, parallel to `handle_depth_update`'s own Axis
-/// resolution off the same snapshot. A rising edge through
-/// `ANALOG_REPEAT_DEADZONE` on an Input whose active-Layer Binding is
-/// `TriggerMode::AnalogRepeat` spawns a task (compiling its steps once, the
-/// same "once per fire" precedent `perform_trigger` follows); a falling edge —
-/// or the Binding no longer being Analog-repeat, best-effort only, see below
-/// — stops one. A Binding changed away from Analog-repeat without an
-/// intervening depth-crossing (e.g. edited live while the key stays
-/// physically pressed) is a known, accepted residual gap: the stale task
-/// keeps running with the steps it compiled at spawn time until Depth next
-/// crosses the deadzone — the same class of gap ticket 71's Answer accepted
-/// for its own opposite-signed-halves tie-break, not engineered around here.
-#[allow(clippy::too_many_arguments)]
-async fn update_analog_repeats(
-    injector: &Injector,
-    config: &Config,
+/// Every piece of ephemeral runtime state the dispatch task owns — built
+/// fresh on every task start, the same lifetime as the loose `run` locals it
+/// replaces. NOT `Config` (committed state; stays a `run` local so the input
+/// path keeps only `&Config` — ticket 05). NOT the `rx_*` receivers or their
+/// `*_open` liveness flags (pure `select!`-loop plumbing; no handler touches
+/// them). No lifetime parameter — every handle below is owned and `'static`.
+/// Dispatch-internal: never part of any module's interface. Adding a new
+/// piece of dispatch runtime state means a field here, not a fresh `run`
+/// local or a new `handle_*` parameter (CONTRIBUTING.md).
+struct DispatchState {
+    toggles: HashMap<Input, ActiveToggle>,
+    in_flight: HashMap<Input, FiringHandle>,
+    stepper_cursors: HashMap<StepperId, usize>,
     active_layer: Layer,
-    analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>,
-    stepper_cursors: &mut HashMap<StepperId, usize>,
-    depth_rx: &watch::Receiver<HashMap<Input, u8>>,
-    snapshot: &HashMap<Input, u8>,
-) {
-    let profile = config
-        .active_profile()
-        .expect("load_or_seed validates active_profile names a real profile");
-    let bindings = profile.layer(active_layer);
-    for (&input, &depth) in snapshot {
-        let binding = bindings.get(&input);
-        let is_analog_repeat = binding.is_some_and(|b| b.trigger == TriggerMode::AnalogRepeat);
-        if is_analog_repeat && depth >= ANALOG_REPEAT_DEADZONE {
-            analog_repeats.entry(input).or_insert_with(|| {
-                let action = &binding
-                    .expect("is_analog_repeat is only true for Some(binding)")
-                    .action;
-                let steps =
-                    compile_action(action, &config.macros, &config.steppers, stepper_cursors);
-                // Ticket 78: a gamepad button gets the 35ms frame-safe floor;
-                // every other output Action keeps the original 15ms dwell.
-                let pulse_hold = if matches!(action, Action::ControllerButton { .. }) {
-                    ANALOG_REPEAT_CONTROLLER_PULSE_HOLD
-                } else {
-                    ANALOG_REPEAT_PULSE_HOLD
-                };
-                ActiveAnalogRepeat::spawn(
-                    injector.clone(),
-                    input,
-                    steps,
-                    pulse_hold,
-                    depth_rx.clone(),
+    chord_machine: chord::ChordMachine,
+    chord_runtime: ChordRuntime,
+    axis_state: AxisState,
+    analog_repeats: HashMap<Input, ActiveAnalogRepeat>,
+    device_connected: bool,
+    capture_mode: CaptureMode,
+    device_info: Option<DeviceInfo>,
+    injector: Injector,
+    signal_emitter: Option<SignalEmitter<'static>>,
+    actuation_tx: watch::Sender<HashMap<Input, ActuationPoint>>,
+    capture_control_tx: mpsc::Sender<bool>,
+    toggle_lap_target: Duration,
+}
+
+impl DispatchState {
+    /// Builds the struct with every ephemeral field at its task-start value;
+    /// the five owned collaborators come from `run`'s startup parameters (and
+    /// from stub channels in the test seam). `run` calls this once and then
+    /// only drives the `select!` loop.
+    fn new(
+        injector: Injector,
+        signal_emitter: Option<SignalEmitter<'static>>,
+        actuation_tx: watch::Sender<HashMap<Input, ActuationPoint>>,
+        capture_control_tx: mpsc::Sender<bool>,
+        toggle_lap_target: Duration,
+    ) -> Self {
+        DispatchState {
+            toggles: HashMap::new(),
+            in_flight: HashMap::new(),
+            stepper_cursors: HashMap::new(),
+            active_layer: Layer::Base,
+            chord_machine: chord::ChordMachine::default(),
+            chord_runtime: ChordRuntime::default(),
+            axis_state: AxisState::default(),
+            analog_repeats: HashMap::new(),
+            device_connected: true,
+            capture_mode: CaptureMode::Digital,
+            device_info: None,
+            injector,
+            signal_emitter,
+            actuation_tx,
+            capture_control_tx,
+            toggle_lap_target,
+        }
+    }
+
+    /// Resolves one `PhysicalEvent` against the active Profile/Layer. Returns
+    /// the `Edit`s (if any) the `run` loop must commit — in practice empty, or
+    /// a single `Edit::SwitchProfile` when a Fire-once `Action::ProfileSwitch`
+    /// binding fires on `Down` (ticket 05). Takes `&Config`, never `&mut` —
+    /// the `run` loop is the sole commit point.
+    async fn handle_event(
+        &mut self,
+        config: &Config,
+        event: PhysicalEvent,
+    ) -> io::Result<Vec<edit::Edit>> {
+        let profile = config
+            .active_profile()
+            .expect("load_or_seed validates active_profile names a real profile");
+
+        if event.input == Input::ModeKey && profile.mode_key_role == ModeKeyRole::LayerSwitch {
+            handle_layer_switch(
+                &self.injector,
+                &mut self.active_layer,
+                &self.signal_emitter,
+                &mut self.axis_state,
+                &mut self.analog_repeats,
+                event.state,
+            )
+            .await?;
+            return Ok(Vec::new());
+        }
+
+        // A Down on an Input with an active Toggle always stops that Toggle
+        // first, regardless of what Binding the Input's current Layer nominally
+        // assigns — this press is consumed entirely by the stop, per spec.md's
+        // "Toggle behavior across Layer/Profile switches". Only a later press
+        // resumes normal evaluation.
+        if event.state == EventState::Down
+            && trigger::stop_toggle(&mut self.toggles, &event.input).await
+        {
+            return Ok(Vec::new());
+        }
+
+        // An Axis-assigned Input (ticket 59/71) is structurally excluded from
+        // both `bindings_*` and Chord membership on this Layer (enforced
+        // atomically by `SetAxisAssignment`/rejected up front by `SetBinding`/
+        // `SetChordBinding`), so it must never reach the ordinary Binding lookup
+        // or passthrough below. An Analog-sourced event (`event.depth` is
+        // `Some`) is swallowed here — the continuous `rx_depth` watch-channel
+        // path (`handle_depth_update`) already drives this Input's output on
+        // every report, not just on a Down/Up/Repeat transition; a Digital-
+        // sourced one (`None`) runs the press/release step-increment fallback
+        // (ticket 59 §6).
+        let axis_map = profile.axis_layer(self.active_layer);
+        if axis_map.contains_key(&event.input) {
+            if event.depth.is_none() {
+                handle_axis_edge_event(
+                    &self.injector,
+                    &mut self.axis_state,
+                    axis_map,
+                    event.input,
+                    event.state,
                 )
-            });
-        } else if let Some(task) = analog_repeats.remove(&input) {
-            task.stop().await;
+                .await?;
+            }
+            return Ok(Vec::new());
+        }
+
+        // The Chord-detection state machine (ticket 01/40, post-release ticket
+        // 07) runs unconditionally, after the guards above and before ordinary
+        // Binding lookup — it owns the "is this event mine?" predicate now
+        // (`ChordOutcome::NotMine` when it isn't), rather than `handle_event`
+        // reaching into `claimed` / `chord_keys_containing` itself.
+        let live = chord_slots(&self.chord_runtime);
+        match chord::feed(
+            &mut self.chord_machine,
+            profile.chords(self.active_layer),
+            &live,
+            event,
+        ) {
+            chord::ChordOutcome::Handled(effects) => {
+                return self.run_chord_effects(config, effects).await;
+            }
+            chord::ChordOutcome::NotMine => {}
+        }
+
+        let bindings = profile.layer(self.active_layer);
+        let binding = bindings.get(&event.input).cloned();
+
+        // Real firing for an Analog-repeat Binding while Depth is available comes
+        // entirely from `update_analog_repeats`'s own depth-driven background task
+        // (ticket 20/39) — this Analog-sourced edge event (synthesized from the
+        // key's ordinary, *tunable* Actuation point) is swallowed outright rather
+        // than double-firing, mirroring the Axis-assignment swallow above. Never
+        // fires for the Chord machine's synthetic retroactive Down (`depth: None`).
+        if let Some(binding) = &binding
+            && binding.trigger == TriggerMode::AnalogRepeat
+            && event.depth.is_some()
+        {
+            return Ok(Vec::new());
+        }
+
+        match event.state {
+            EventState::Down => {
+                // The bound → `trigger::decide` + `perform_trigger` /
+                // `ProfileSwitch` → `Edit` / unbound → passthrough tail, shared
+                // verbatim with the Chord machine's `FireIndividual` executor so
+                // the retroactive-fire logic exists once.
+                self.dispatch_individual_down(config, event.input).await
+            }
+            EventState::Repeat | EventState::Up => {
+                let Some(binding) = binding else {
+                    self.injector
+                        .inject_physical(event)
+                        .await
+                        .map_err(io::Error::other)?;
+                    return Ok(Vec::new());
+                };
+                // A `ProfileSwitch` binding is validated Fire-once, so only its
+                // `Down` fires it (handled above) — a later Repeat/Up is inert.
+                if matches!(binding.action, Action::ProfileSwitch { .. }) {
+                    return Ok(Vec::new());
+                }
+                let slot = slot_for(&self.in_flight, &self.toggles, &event.input);
+                let decision = trigger::decide(&binding, event.state, slot);
+                let mut ctx = trigger_ctx!(
+                    &self.injector,
+                    config,
+                    &mut self.in_flight,
+                    &mut self.toggles,
+                    &mut self.stepper_cursors,
+                    self.toggle_lap_target,
+                );
+                perform_trigger(decision, event.input, &binding, &mut ctx).await?;
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Performs each `chord::ChordEffect` the pure machine decided on, in
+    /// order, against the runtime state dispatch owns (ticket 07). Returns any
+    /// `edit::Edit`s a `FireIndividual` produced (a member's individual
+    /// Binding resolving to `Action::ProfileSwitch`) for the `run` loop to
+    /// commit, same as the old `handle_chord_event` / `handle_chord_timeout`
+    /// return.
+    async fn run_chord_effects(
+        &mut self,
+        config: &Config,
+        effects: Vec<chord::ChordEffect>,
+    ) -> io::Result<Vec<edit::Edit>> {
+        let mut edits = Vec::new();
+        for effect in effects {
+            match effect {
+                chord::ChordEffect::FireChord {
+                    key,
+                    binding,
+                    state,
+                } => {
+                    // The Chord path's own Trigger-mode dispatch — `trigger::
+                    // decide` (the same matrix the individual path runs) against
+                    // this Chord's `ChordKey`-keyed liveness, performed by the
+                    // generic `perform_trigger`. A Chord's Action is never
+                    // `AnalogRepeat` or `ProfileSwitch`, and `chord::feed` only
+                    // ever emits `Down` / `Repeat`, so those `decide` arms are
+                    // unreachable here.
+                    let slot = slot_for(
+                        &self.chord_runtime.firings,
+                        &self.chord_runtime.toggles,
+                        &key,
+                    );
+                    let decision = trigger::decide(&binding, state, slot);
+                    let mut ctx = trigger_ctx!(
+                        &self.injector,
+                        config,
+                        &mut self.chord_runtime.firings,
+                        &mut self.chord_runtime.toggles,
+                        &mut self.stepper_cursors,
+                        self.toggle_lap_target,
+                    );
+                    perform_trigger(decision, key, &binding, &mut ctx).await?;
+                }
+                chord::ChordEffect::ReleaseChordFiring { key } => {
+                    // Fire-once / Hold-to-repeat only — a Toggle Chord is
+                    // deliberately not stopped by a member's `Up` (ticket 67).
+                    trigger::force_release_stuck(&self.chord_runtime.firings, &key, &self.injector)
+                        .await;
+                }
+                chord::ChordEffect::StopChordToggle { key } => {
+                    trigger::stop_toggle(&mut self.chord_runtime.toggles, &key).await;
+                }
+                chord::ChordEffect::FireIndividual { input } => {
+                    edits.extend(self.dispatch_individual_down(config, input).await?);
+                }
+                chord::ChordEffect::ForceReleaseIndividual { input } => {
+                    trigger::force_release_stuck(&self.in_flight, &input, &self.injector).await;
+                }
+            }
+        }
+        Ok(edits)
+    }
+
+    /// The continuous Analog half of ticket 59 §7's `(Depth, edge_event) ->
+    /// axis_value` seam: reacts to every change of the live-Depth watch
+    /// channel (`capture::analog`'s grid task, ticket 26) by resolving
+    /// `config::resolve_axis_value` for every Input the active Layer currently
+    /// Axis-assigns, then running the shared conflict-resolution/emit path.
+    /// Every Grid key's raw depth is published on every incoming hidraw report
+    /// regardless of Binding/Axis status
+    /// (`capture::analog::relay_grid_blocking`), so this only ever *reads*
+    /// `depths` for the subset that's actually Axis-assigned right now — an
+    /// empty Axis map (the common case) short-circuits immediately, doing no
+    /// work on every ordinary depth tick.
+    async fn handle_depth_update(
+        &mut self,
+        config: &Config,
+        depths: HashMap<Input, u8>,
+    ) -> io::Result<()> {
+        let profile = config
+            .active_profile()
+            .expect("load_or_seed validates active_profile names a real profile");
+        let axis_map = profile.axis_layer(self.active_layer);
+        if axis_map.is_empty() {
+            return Ok(());
+        }
+        // Ticket 71 code-review finding: reads each relevant Input's own
+        // Actuation/Release point directly, rather than building
+        // `resolved_actuation_points()`'s full 20-entry `HashMap` just to read
+        // the 1-4 entries an Axis-assigned Profile actually needs — this runs on
+        // every live-Depth tick (sub-millisecond while a key is moving, per
+        // ticket 13), so the redundant O(20) rebuild was real hot-path waste.
+        for &input in axis_map.keys() {
+            if let Some(&depth) = depths.get(&input) {
+                let point = profile.resolved_actuation_point(input);
+                self.axis_state
+                    .contributions
+                    .insert(input, config::resolve_axis_value(depth, point));
+            }
+        }
+        recompute_and_emit_axes(&self.injector, &mut self.axis_state, axis_map).await
+    }
+
+    /// Dispatches a single fresh `Down` on `input` against the active Layer —
+    /// the `ProfileSwitch → Edit` / bound → `trigger::decide` +
+    /// `perform_trigger` / unbound → passthrough tail carved out of
+    /// `handle_event`, shared verbatim by the ordinary input path and the
+    /// Chord machine's `FireIndividual` executor (a member's individual
+    /// Binding firing retroactively — the window elapsed, or the member was
+    /// released before completing — per ticket 01's Answer: "the pending
+    /// member's individual Binding fires retroactively, delayed by the
+    /// window"). It is *not* a re-entry into `handle_event`: that would re-run
+    /// the layer-switch / toggle-stop / axis / chord guards against a
+    /// synthetic Down, which is wrong. Returns any `Edit::SwitchProfile` the
+    /// member's own Binding produces — a Chord member's individual Binding can
+    /// be any Action, unlike a Chord's own, which can never be `ProfileSwitch`.
+    async fn dispatch_individual_down(
+        &mut self,
+        config: &Config,
+        input: Input,
+    ) -> io::Result<Vec<edit::Edit>> {
+        let profile = config
+            .active_profile()
+            .expect("load_or_seed validates active_profile names a real profile");
+        let binding = profile.layer(self.active_layer).get(&input).cloned();
+        match binding {
+            Some(binding) => {
+                if let Action::ProfileSwitch { target } = binding.action {
+                    // The switch is an `Edit` for the `run` loop to commit
+                    // (ticket 05).
+                    return Ok(vec![edit::Edit::SwitchProfile { name: target }]);
+                }
+                // Accepted gap (ticket 39): a member's own individual Binding
+                // set to Analog-repeat fires once here through the ordinary
+                // one-shot path (`decide` treats `AnalogRepeat` as `HoldToRepeat`
+                // for a Down), rather than starting the depth-driven background
+                // task `update_analog_repeats` normally would — this retroactive
+                // Down is synthetic (no real live Depth to hand a task), and a
+                // grid key that's both a Chord member *and* individually
+                // Analog-repeat-triggered is a narrow combination this
+                // fast-follow doesn't specially engineer for.
+                let slot = slot_for(&self.in_flight, &self.toggles, &input);
+                let decision = trigger::decide(&binding, EventState::Down, slot);
+                let mut ctx = trigger_ctx!(
+                    &self.injector,
+                    config,
+                    &mut self.in_flight,
+                    &mut self.toggles,
+                    &mut self.stepper_cursors,
+                    self.toggle_lap_target,
+                );
+                perform_trigger(decision, input, &binding, &mut ctx).await?;
+                Ok(Vec::new())
+            }
+            None => {
+                self.injector
+                    .inject_physical(PhysicalEvent {
+                        input,
+                        state: EventState::Down,
+                        depth: None,
+                    })
+                    .await
+                    .map_err(io::Error::other)?;
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Starts/stops every grid Input's Analog-repeat task from a fresh
+    /// `depth_tx` snapshot (ticket 20/39) — the depth-driven half of
+    /// Analog-repeat's firing, parallel to `handle_depth_update`'s own Axis
+    /// resolution off the same snapshot. A rising edge through
+    /// `ANALOG_REPEAT_DEADZONE` on an Input whose active-Layer Binding is
+    /// `TriggerMode::AnalogRepeat` spawns a task (compiling its steps once,
+    /// the same "once per fire" precedent `perform_trigger` follows); a
+    /// falling edge — or the Binding no longer being Analog-repeat,
+    /// best-effort only, see below — stops one. A Binding changed away from
+    /// Analog-repeat without an intervening depth-crossing (e.g. edited live
+    /// while the key stays physically pressed) is a known, accepted residual
+    /// gap: the stale task keeps running with the steps it compiled at spawn
+    /// time until Depth next crosses the deadzone — the same class of gap
+    /// ticket 71's Answer accepted for its own opposite-signed-halves
+    /// tie-break, not engineered around here.
+    async fn update_analog_repeats(
+        &mut self,
+        config: &Config,
+        depth_rx: &watch::Receiver<HashMap<Input, u8>>,
+        snapshot: &HashMap<Input, u8>,
+    ) {
+        let profile = config
+            .active_profile()
+            .expect("load_or_seed validates active_profile names a real profile");
+        let bindings = profile.layer(self.active_layer);
+        for (&input, &depth) in snapshot {
+            let binding = bindings.get(&input);
+            let is_analog_repeat = binding.is_some_and(|b| b.trigger == TriggerMode::AnalogRepeat);
+            if is_analog_repeat && depth >= ANALOG_REPEAT_DEADZONE {
+                self.analog_repeats.entry(input).or_insert_with(|| {
+                    let action = &binding
+                        .expect("is_analog_repeat is only true for Some(binding)")
+                        .action;
+                    let steps = compile_action(
+                        action,
+                        &config.macros,
+                        &config.steppers,
+                        &mut self.stepper_cursors,
+                    );
+                    // Ticket 78: a gamepad button gets the 35ms frame-safe
+                    // floor; every other output Action keeps the original
+                    // 15ms dwell.
+                    let pulse_hold = if matches!(action, Action::ControllerButton { .. }) {
+                        ANALOG_REPEAT_CONTROLLER_PULSE_HOLD
+                    } else {
+                        ANALOG_REPEAT_PULSE_HOLD
+                    };
+                    ActiveAnalogRepeat::spawn(
+                        self.injector.clone(),
+                        input,
+                        steps,
+                        pulse_hold,
+                        depth_rx.clone(),
+                    )
+                });
+            } else if let Some(task) = self.analog_repeats.remove(&input) {
+                task.stop().await;
+            }
+        }
+    }
+
+    /// Runs each `edit::Effect` an `edit::plan` derived, in order, against the
+    /// `DispatchState` fields it touches (ticket 05). `config` is the
+    /// just-committed `Config` — every effect that reads the new state
+    /// (`RepublishActuation`, `RecomputeAxes`) reads it from here. Errors on
+    /// the axis-output path are swallowed exactly as the pre-ticket-05 arm
+    /// code swallowed them (`let _ = recompute_and_emit_axes(...)` /
+    /// `reset_axis_outputs`).
+    async fn run_effects(&mut self, effects: Vec<edit::Effect>, config: &Config) {
+        for effect in effects {
+            match effect {
+                edit::Effect::RepublishActuation => {
+                    publish_actuation_snapshot(config, &self.actuation_tx)
+                }
+                edit::Effect::RecomputeAxes { layer } => {
+                    // `RecomputeAxes` for a Layer that isn't the active one is a
+                    // no-op — the resulting `Config` already carries the edit,
+                    // but nothing is driving that Layer's axes right now.
+                    if layer == self.active_layer {
+                        let axis_map = config
+                            .active_profile()
+                            .expect("load_or_seed validates active_profile names a real profile")
+                            .axis_layer(layer)
+                            .clone();
+                        let _ = recompute_and_emit_axes(
+                            &self.injector,
+                            &mut self.axis_state,
+                            &axis_map,
+                        )
+                        .await;
+                    }
+                }
+                edit::Effect::ForgetAxisContribution(input) => {
+                    self.axis_state.contributions.remove(&input);
+                }
+                edit::Effect::SignalCaptureMode(force) => {
+                    // Only on a successful persist (which is where `run_effects`
+                    // runs) — the supervisor swaps the live capture source to
+                    // match `config.toml` on disk.
+                    let _ = self.capture_control_tx.send(force).await;
+                }
+                edit::Effect::StopToggle(input) => {
+                    if let Some(toggle) = self.toggles.remove(&input) {
+                        toggle.stop().await;
+                    }
+                }
+                edit::Effect::StopAllToggles => stop_all_toggles(&mut self.toggles).await,
+                edit::Effect::StopAllAnalogRepeats => {
+                    stop_all_analog_repeats(&mut self.analog_repeats).await
+                }
+                edit::Effect::ResetAxisOutputs => {
+                    let _ = reset_axis_outputs(&self.injector, &mut self.axis_state).await;
+                }
+                edit::Effect::DropStepperCursor(stepper) => {
+                    self.stepper_cursors.remove(&stepper);
+                }
+                edit::Effect::ClampStepperCursor { stepper, len } => {
+                    if let Some(cursor) = self.stepper_cursors.get_mut(&stepper) {
+                        *cursor = (*cursor).min(len - 1);
+                    }
+                }
+                edit::Effect::AnnounceProfileChange(name) => {
+                    if let Some(emitter) = &self.signal_emitter {
+                        let _ = Daemon::active_profile_changed(emitter, &name).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Commits each `Edit` the input path returned (an `Action::ProfileSwitch`
+    /// binding firing — empty or one in practice, only a Fire-once on `Down`),
+    /// in order: `edit::apply` then `run_effects`. The `run` loop is the sole
+    /// commit point for an input-originated `Config` mutation (ticket 05). For
+    /// several returned `Edit::SwitchProfile`s (a genuinely retroactive
+    /// multi-switch) last-write-wins order is unchanged. One narrow shift: when
+    /// a single retroactive chord miss fires a `ProfileSwitch` member
+    /// *alongside* non-switch members, every member's binding now resolves
+    /// against the pre-switch Profile and the switch's effects (stop Toggles,
+    /// reset axes, stop Analog-repeats) run after them, rather than interleaved
+    /// as the old inline `switch_profile` call did — an accepted consequence of
+    /// the input path no longer holding `&mut Config` (see ticket 05's Answer).
+    /// A failed apply is logged and ignored — a dangling `ProfileSwitch` target
+    /// is impossible post-`validate`, so this only ever absorbs a genuine
+    /// `config.toml` write failure.
+    async fn commit_input_edits(
+        &mut self,
+        edits: Vec<edit::Edit>,
+        config: &mut Config,
+        config_path: &Path,
+    ) {
+        for edit in edits {
+            match edit::apply(config, config_path, edit).await {
+                Ok(outcome) => self.run_effects(outcome.effects, config).await,
+                Err(err) => eprintln!(
+                    "acheron-daemon: dispatch: ignoring a failed input-path Config edit: {err:?}"
+                ),
+            }
+        }
+    }
+
+    /// Translates each `Command` into its `edit::Edit` and commits it (ticket
+    /// 05): the 3 non-edit arms (`GetConfig`/`GetState`/`StopAllToggles`)
+    /// inline, the 24 edit arms each a mechanical `edit::apply` → `reply.send`
+    /// → `run_effects`, with `reply` sent before effects run for every arm —
+    /// which is what deletes `SwitchProfile`'s old special-case
+    /// reply-before-signal reasoning: that ordering is now the default shape.
+    async fn handle_command(&mut self, config: &mut Config, config_path: &Path, cmd: Command) {
+        /// `edit::apply` → send `Ok(())` / `Err` → run effects on success. Every
+        /// edit arm whose reply is `Result<(), CommandError>` (i.e. all but the
+        /// two create commands, which carry a fresh id back).
+        macro_rules! commit {
+            ($reply:expr, $edit:expr) => {{
+                match edit::apply(config, config_path, $edit).await {
+                    Ok(outcome) => {
+                        let _ = $reply.send(Ok(()));
+                        self.run_effects(outcome.effects, config).await;
+                    }
+                    Err(err) => {
+                        let _ = $reply.send(Err(err));
+                    }
+                }
+            }};
+        }
+
+        match cmd {
+            Command::GetConfig(reply) => {
+                let _ = reply.send(config.clone());
+            }
+            Command::GetState(reply) => {
+                // Every library entry gets a reported cursor, defaulting to `0`
+                // ("the list's first item") for one never yet stepped — richer
+                // for the GUI than only reporting entries this task has actually
+                // touched (ticket 03/54).
+                let stepper_cursors = config
+                    .steppers
+                    .keys()
+                    .map(|id| {
+                        (
+                            id.clone(),
+                            self.stepper_cursors.get(id).copied().unwrap_or(0),
+                        )
+                    })
+                    .collect();
+                let _ = reply.send(State {
+                    profile: config.active_profile.clone(),
+                    layer: self.active_layer.as_str(),
+                    active_toggles: self.toggles.keys().copied().collect(),
+                    device_connected: self.device_connected,
+                    capture_mode: self.capture_mode.as_str(),
+                    daemon_version: crate::VERSION,
+                    firmware_version: self
+                        .device_info
+                        .as_ref()
+                        .map(|info| info.firmware_version.clone()),
+                    serial_number: self
+                        .device_info
+                        .as_ref()
+                        .map(|info| info.serial_number.clone()),
+                    stepper_cursors,
+                });
+            }
+            Command::StopAllToggles { reply } => {
+                stop_all_toggles(&mut self.toggles).await;
+                let _ = reply.send(());
+            }
+            Command::SetBinding {
+                input,
+                layer,
+                binding,
+                reply,
+            } => commit!(
+                reply,
+                edit::Edit::SetBinding {
+                    input,
+                    layer,
+                    binding
+                }
+            ),
+            Command::ClearBinding {
+                input,
+                layer,
+                reply,
+            } => commit!(reply, edit::Edit::ClearBinding { input, layer }),
+            Command::SetModeKeyRole { role, reply } => {
+                commit!(reply, edit::Edit::SetModeKeyRole { role })
+            }
+            Command::CreateProfile { name, reply } => {
+                commit!(reply, edit::Edit::CreateProfile { name })
+            }
+            Command::DeleteProfile { name, reply } => {
+                commit!(reply, edit::Edit::DeleteProfile { name })
+            }
+            Command::RenameProfile {
+                old_name,
+                new_name,
+                reply,
+            } => {
+                // The one arm with an `Ok` early-return — routing a rename to the
+                // same name through `edit::apply` would add a spurious
+                // `config.toml` write for a no-op, so it stays a guard ahead of
+                // the helper (ticket 03 / 05 precedent). `AlreadyExists` moved
+                // into `edit::plan`; the same-name `NotFound` check stays here so
+                // a same-name rename of a missing Profile still fails exactly as
+                // it did pre-ticket-05 (the guard sat *after* the existence check
+                // in ticket 03's arm).
+                if old_name == new_name {
+                    let reply_value = if config.profiles.contains_key(&old_name) {
+                        Ok(())
+                    } else {
+                        Err(CommandError::NotFound)
+                    };
+                    let _ = reply.send(reply_value);
+                    return;
+                }
+                commit!(reply, edit::Edit::RenameProfile { old_name, new_name })
+            }
+            Command::SwitchProfile { name, reply } => {
+                commit!(reply, edit::Edit::SwitchProfile { name })
+            }
+            Command::SetActuationPoint {
+                input,
+                actuation,
+                release,
+                reply,
+            } => commit!(
+                reply,
+                edit::Edit::SetActuationPoint {
+                    input,
+                    actuation,
+                    release,
+                }
+            ),
+            Command::ClearActuationPoint { input, reply } => {
+                commit!(reply, edit::Edit::ClearActuationPoint { input })
+            }
+            Command::SetDefaultActuation {
+                actuation,
+                release,
+                reply,
+            } => commit!(
+                reply,
+                edit::Edit::SetDefaultActuation { actuation, release }
+            ),
+            Command::ResetActuationPoints { reply } => {
+                commit!(reply, edit::Edit::ResetActuationPoints)
+            }
+            Command::SetForceDigital { force, reply } => {
+                commit!(reply, edit::Edit::SetForceDigital { force })
+            }
+            Command::CreateMacro { name, steps, reply } => {
+                match edit::apply(config, config_path, edit::Edit::CreateMacro { name, steps })
+                    .await
+                {
+                    Ok(outcome) => {
+                        let Some(edit::CreatedId::Macro(macro_id)) = outcome.created else {
+                            unreachable!("CreateMacro always sets Outcome.created to a Macro id")
+                        };
+                        let _ = reply.send(Ok(macro_id));
+                        self.run_effects(outcome.effects, config).await;
+                    }
+                    Err(err) => {
+                        let _ = reply.send(Err(err));
+                    }
+                }
+            }
+            Command::RenameMacro {
+                macro_id,
+                new_name,
+                reply,
+            } => commit!(reply, edit::Edit::RenameMacro { macro_id, new_name }),
+            Command::DeleteMacro { macro_id, reply } => {
+                commit!(reply, edit::Edit::DeleteMacro { macro_id })
+            }
+            Command::SetMacroSteps {
+                macro_id,
+                steps,
+                reply,
+            } => commit!(reply, edit::Edit::SetMacroSteps { macro_id, steps }),
+            Command::CreateStepper { name, items, reply } => {
+                match edit::apply(
+                    config,
+                    config_path,
+                    edit::Edit::CreateStepper { name, items },
+                )
+                .await
+                {
+                    Ok(outcome) => {
+                        let Some(edit::CreatedId::Stepper(stepper_id)) = outcome.created else {
+                            unreachable!(
+                                "CreateStepper always sets Outcome.created to a Stepper id"
+                            )
+                        };
+                        let _ = reply.send(Ok(stepper_id));
+                        self.run_effects(outcome.effects, config).await;
+                    }
+                    Err(err) => {
+                        let _ = reply.send(Err(err));
+                    }
+                }
+            }
+            Command::RenameStepper {
+                stepper_id,
+                new_name,
+                reply,
+            } => commit!(
+                reply,
+                edit::Edit::RenameStepper {
+                    stepper_id,
+                    new_name
+                }
+            ),
+            Command::DeleteStepper { stepper_id, reply } => {
+                commit!(reply, edit::Edit::DeleteStepper { stepper_id })
+            }
+            Command::SetStepperItems {
+                stepper_id,
+                items,
+                reply,
+            } => commit!(reply, edit::Edit::SetStepperItems { stepper_id, items }),
+            Command::SetChordBinding {
+                inputs,
+                layer,
+                binding,
+                reply,
+            } => commit!(
+                reply,
+                edit::Edit::SetChordBinding {
+                    inputs,
+                    layer,
+                    binding
+                }
+            ),
+            Command::ClearChordBinding {
+                inputs,
+                layer,
+                reply,
+            } => commit!(reply, edit::Edit::ClearChordBinding { inputs, layer }),
+            Command::SetAxisAssignment {
+                input,
+                layer,
+                target,
+                reply,
+            } => commit!(
+                reply,
+                edit::Edit::SetAxisAssignment {
+                    input,
+                    layer,
+                    target
+                }
+            ),
+            Command::ClearAxisAssignment {
+                input,
+                layer,
+                reply,
+            } => commit!(reply, edit::Edit::ClearAxisAssignment { input, layer }),
         }
     }
 }
@@ -522,10 +1248,12 @@ async fn update_analog_repeats(
 /// silently. The command channel closing is not fatal: it only means the
 /// D-Bus server side has gone away, and this task's other job (capture ->
 /// injector passthrough/remapping) still has work to do.
-// Ticket 22 grew this by one parameter (`actuation_tx`) past clippy's
-// default arg-count threshold — every parameter here is a distinct channel
-// handle or piece of startup state this task needs for the process's whole
-// lifetime, not something a struct would meaningfully group.
+// The 13 startup parameters: the `rx_*` receivers (plus `config` /
+// `config_path`) stay `run` locals — pure `select!`-loop plumbing no handler
+// touches — and the rest are threaded once into `DispatchState` below.
+// Clippy's arg-count lint fires only here now (ticket 09): the struct literal
+// that consumes them trips nothing, and every `handle_*` helper is a
+// `&mut self` method.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut rx_events: mpsc::Receiver<PhysicalEvent>,
@@ -569,164 +1297,75 @@ pub async fn run(
             .expect("load_or_seed validates active_profile names a real profile")
             .resolved_actuation_points(),
     );
-    // Sole owner of every currently-running Toggle (spec.md: "Active
-    // toggles: HashMap<Input, ActiveToggle>"), mutated only from this task —
-    // no Mutex, matching the rest of the dispatch task's state.
-    let mut toggles: HashMap<Input, ActiveToggle> = HashMap::new();
-    // Tracks the most recent Fire-once/Hold-to-repeat firing spawned per
-    // Input, so a fast HoldToRepeat autorepeat (or a rapid re-Down) can't
-    // spawn a second overlapping firing for the same Input while a slow
-    // Macro's raw uinput writes for the first are still in flight — two
-    // concurrent firings racing on the shared Injector channel could
-    // interleave their KeyDown/KeyUp steps out of order on the wire.
-    let mut in_flight: HashMap<Input, FiringHandle> = HashMap::new();
-    // Every Stepper library entry's Daemon-side-only runtime cursor (ticket
-    // 03/54), owned exclusively by this task — an absent entry means "at the
-    // list's first item," matching the always-resets-to-first-item-on-
-    // restart semantics for free rather than needing an explicit
-    // zero-fill-on-startup pass.
-    let mut stepper_cursors: HashMap<StepperId, usize> = HashMap::new();
-    // The one piece of momentary Layer runtime state (ticket 18) — not part
-    // of `Config`, reset to `Base` whenever this task starts.
-    let mut active_layer = Layer::Base;
-    // The dispatch task's live view of device connectivity (ticket 20),
-    // updated from `rx_connection` — the `CaptureSource`'s poll loop reports
-    // transitions there, this task owns the one canonical value `GetState()`
-    // reads and `DeviceConnectionChanged` fires from. Starts optimistic
-    // (matches the pre-ticket-20 hardcoded default): the real
-    // `EvdevCaptureSource` reports its actual initial view within
-    // milliseconds of this task starting, so this only briefly matters at
-    // startup.
-    let mut device_connected = true;
-    // The dispatch task's live view of which capture path is running
-    // (ticket 23), updated from `rx_capture_mode` — the supervisor pushes a
-    // value on every mode transition, mirroring `device_connected` above.
-    // Starts optimistic as `Digital` for the same reason `device_connected`
-    // starts `true`: the supervisor reports its real startup choice within
-    // milliseconds, so this only briefly matters before the first push.
-    let mut capture_mode = CaptureMode::Digital;
-    // The dispatch task's live view of the connected device's firmware/
-    // serial (ticket 101), updated from `rx_device_info` — `None` until the
-    // supervisor's first successful read after a connect, back to `None` on
-    // disconnect. Unlike `device_connected`/`capture_mode` there is no
-    // optimistic startup value: absent is the honest state until a read
-    // actually lands.
-    let mut device_info: Option<DeviceInfo> = None;
+    // Every piece of the dispatch task's ephemeral runtime state, built fresh
+    // on this task start (see `DispatchState` / `DispatchState::new` for the
+    // task-start values). Each `select!` arm's handler is a `&mut self` method
+    // on it.
+    let mut state = DispatchState::new(
+        injector,
+        signal_emitter,
+        actuation_tx,
+        capture_control_tx,
+        toggle_lap_target,
+    );
+    // Pure `select!`-loop plumbing — the `rx_*` receivers stay `run` locals
+    // (so no `select!` branch expression borrows `state`) and these liveness
+    // flags travel with them; no handler reads either.
     let mut commands_open = true;
     let mut connection_open = true;
     let mut capture_mode_open = true;
     let mut device_info_open = true;
-    // The pure Chord-detection state machine (the ~50ms simultaneity window
-    // plus its `claimed` bookkeeping, ticket 01/40) and the `ChordKey`-keyed
-    // firing/toggle handles its effects run against — both reset fresh on
-    // every dispatch task start, same as `toggles`/`active_layer`.
-    let mut chord_machine = chord::ChordMachine::default();
-    let mut chord_runtime = ChordRuntime::default();
-    // Owns every Axis-assigned Input's live contribution/opposite-half
-    // ownership (ticket 59/71) — reset fresh on every dispatch task start,
-    // same as the Chord runtime state above.
-    let mut axis_state = AxisState::default();
-    // Every currently-running Analog-repeat task (ticket 20/39), keyed by
-    // grid Input — reset fresh on every dispatch task start, same as
-    // `axis_state`; started/stopped by `update_analog_repeats` off every
-    // `rx_depth` snapshot below.
-    let mut analog_repeats: HashMap<Input, ActiveAnalogRepeat> = HashMap::new();
     let mut depth_open = true;
-    // Bundles the task-local runtime state an `edit::Effect` can touch into
-    // the `EffectCtx` `run_effects`/`handle_command` want (ticket 05). Built
-    // fresh at each use site — after the input-path handler that borrows the
-    // same locals `&mut` has returned — never held across a `select!` poll.
-    macro_rules! effect_ctx {
-        () => {
-            EffectCtx {
-                injector: &injector,
-                toggles: &mut toggles,
-                stepper_cursors: &mut stepper_cursors,
-                axis_state: &mut axis_state,
-                analog_repeats: &mut analog_repeats,
-                actuation_tx: &actuation_tx,
-                capture_control_tx: &capture_control_tx,
-                signal_emitter: &signal_emitter,
-                active_layer,
-            }
-        };
-    }
     loop {
         tokio::select! {
             event = rx_events.recv() => {
                 let Some(event) = event else { break };
-                let edits = handle_event(
-                    &injector,
-                    &config,
-                    &mut toggles,
-                    &mut in_flight,
-                    &mut stepper_cursors,
-                    &mut active_layer,
-                    &signal_emitter,
-                    &mut chord_machine,
-                    &mut chord_runtime,
-                    &mut axis_state,
-                    &mut analog_repeats,
-                    toggle_lap_target,
-                    event,
-                )
-                .await?;
+                let edits = state.handle_event(&config, event).await?;
                 if !edits.is_empty() {
-                    let mut ctx = effect_ctx!();
-                    commit_input_edits(edits, &mut config, &config_path, &mut ctx).await;
+                    state.commit_input_edits(edits, &mut config, &config_path).await;
                 }
             }
             changed = rx_depth.changed(), if depth_open => {
                 match changed {
                     Ok(()) => {
                         let snapshot = rx_depth.borrow_and_update().clone();
-                        handle_depth_update(&injector, &config, active_layer, &mut axis_state, snapshot.clone()).await?;
-                        update_analog_repeats(
-                            &injector,
-                            &config,
-                            active_layer,
-                            &mut analog_repeats,
-                            &mut stepper_cursors,
-                            &rx_depth,
-                            &snapshot,
-                        )
-                        .await;
+                        state.handle_depth_update(&config, snapshot.clone()).await?;
+                        state.update_analog_repeats(&config, &rx_depth, &snapshot).await;
                     }
                     Err(_) => depth_open = false,
                 }
             }
-            () = wait_for_chord_deadline(chord::next_deadline(&chord_machine)) => {
-                let edits = match chord::tick(&mut chord_machine, Instant::now()) {
+            () = wait_for_chord_deadline(chord::next_deadline(&state.chord_machine)) => {
+                let edits = match chord::tick(&mut state.chord_machine, Instant::now()) {
                     chord::ChordOutcome::Handled(effects) => {
-                        run_chord_effects(
-                            effects,
-                            &injector,
-                            &config,
-                            &mut chord_runtime,
-                            &mut toggles,
-                            &mut in_flight,
-                            &mut stepper_cursors,
-                            active_layer,
-                            toggle_lap_target,
-                        )
-                        .await?
+                        state.run_chord_effects(&config, effects).await?
                     }
                     chord::ChordOutcome::NotMine => Vec::new(),
                 };
                 if !edits.is_empty() {
-                    let mut ctx = effect_ctx!();
-                    commit_input_edits(edits, &mut config, &config_path, &mut ctx).await;
+                    state.commit_input_edits(edits, &mut config, &config_path).await;
                 }
             }
             connected = rx_connection.recv(), if connection_open => {
                 match connected {
-                    Some(connected) => handle_connection_change(&mut device_connected, &signal_emitter, connected).await,
+                    Some(connected) => handle_connection_change(
+                        &mut state.device_connected,
+                        &state.signal_emitter,
+                        connected,
+                    )
+                    .await,
                     None => connection_open = false,
                 }
             }
             mode = rx_capture_mode.recv(), if capture_mode_open => {
                 match mode {
-                    Some(mode) => handle_capture_mode_change(&mut capture_mode, &signal_emitter, &mut analog_repeats, mode).await,
+                    Some(mode) => handle_capture_mode_change(
+                        &mut state.capture_mode,
+                        &state.signal_emitter,
+                        &mut state.analog_repeats,
+                        mode,
+                    )
+                    .await,
                     None => capture_mode_open = false,
                 }
             }
@@ -737,184 +1376,19 @@ pub async fn run(
                     // when it opens, and they never change within a
                     // connection. `Some(None)` is the disconnect case
                     // clearing the cache.
-                    Some(update) => device_info = update,
+                    Some(update) => state.device_info = update,
                     None => device_info_open = false,
                 }
             }
             cmd = rx_commands.recv(), if commands_open => {
                 match cmd {
-                    Some(cmd) => {
-                        let mut ctx = effect_ctx!();
-                        handle_command(
-                            &mut config,
-                            &config_path,
-                            device_connected,
-                            capture_mode,
-                            device_info.as_ref(),
-                            &mut ctx,
-                            cmd,
-                        )
-                        .await;
-                    }
+                    Some(cmd) => state.handle_command(&mut config, &config_path, cmd).await,
                     None => commands_open = false,
                 }
             }
         }
     }
     Ok(())
-}
-
-/// Resolves one `PhysicalEvent` against the active Profile/Layer. Returns
-/// the `Edit`s (if any) the `run` loop must commit — in practice empty, or a
-/// single `Edit::SwitchProfile` when a Fire-once `Action::ProfileSwitch`
-/// binding fires on `Down` (ticket 05). Takes `&Config`, never `&mut` — the
-/// `run` loop is the sole commit point.
-#[allow(clippy::too_many_arguments)]
-async fn handle_event(
-    injector: &Injector,
-    config: &Config,
-    toggles: &mut HashMap<Input, ActiveToggle>,
-    in_flight: &mut HashMap<Input, FiringHandle>,
-    stepper_cursors: &mut HashMap<StepperId, usize>,
-    active_layer: &mut Layer,
-    signal_emitter: &Option<SignalEmitter<'static>>,
-    chord_machine: &mut chord::ChordMachine,
-    chord_runtime: &mut ChordRuntime,
-    axis_state: &mut AxisState,
-    analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>,
-    toggle_lap_target: Duration,
-    event: PhysicalEvent,
-) -> io::Result<Vec<edit::Edit>> {
-    let profile = config
-        .active_profile()
-        .expect("load_or_seed validates active_profile names a real profile");
-
-    if event.input == Input::ModeKey && profile.mode_key_role == ModeKeyRole::LayerSwitch {
-        handle_layer_switch(
-            injector,
-            active_layer,
-            signal_emitter,
-            axis_state,
-            analog_repeats,
-            event.state,
-        )
-        .await?;
-        return Ok(Vec::new());
-    }
-
-    // A Down on an Input with an active Toggle always stops that Toggle
-    // first, regardless of what Binding the Input's current Layer nominally
-    // assigns — this press is consumed entirely by the stop, per spec.md's
-    // "Toggle behavior across Layer/Profile switches". Only a later press
-    // resumes normal evaluation.
-    if event.state == EventState::Down && trigger::stop_toggle(toggles, &event.input).await {
-        return Ok(Vec::new());
-    }
-
-    // An Axis-assigned Input (ticket 59/71) is structurally excluded from
-    // both `bindings_*` and Chord membership on this Layer (enforced
-    // atomically by `SetAxisAssignment`/rejected up front by `SetBinding`/
-    // `SetChordBinding`), so it must never reach the ordinary Binding lookup
-    // or passthrough below. An Analog-sourced event (`event.depth` is
-    // `Some`) is swallowed here — the continuous `rx_depth` watch-channel
-    // path (`handle_depth_update`) already drives this Input's output on
-    // every report, not just on a Down/Up/Repeat transition; a Digital-
-    // sourced one (`None`) runs the press/release step-increment fallback
-    // (ticket 59 §6).
-    let axis_map = profile.axis_layer(*active_layer);
-    if axis_map.contains_key(&event.input) {
-        if event.depth.is_none() {
-            handle_axis_edge_event(injector, axis_state, axis_map, event.input, event.state)
-                .await?;
-        }
-        return Ok(Vec::new());
-    }
-
-    // The Chord-detection state machine (ticket 01/40, post-release ticket
-    // 07) runs unconditionally, after the guards above and before ordinary
-    // Binding lookup — it owns the "is this event mine?" predicate now
-    // (`ChordOutcome::NotMine` when it isn't), rather than `handle_event`
-    // reaching into `claimed` / `chord_keys_containing` itself.
-    let live = chord_slots(chord_runtime);
-    match chord::feed(chord_machine, profile.chords(*active_layer), &live, event) {
-        chord::ChordOutcome::Handled(effects) => {
-            return run_chord_effects(
-                effects,
-                injector,
-                config,
-                chord_runtime,
-                toggles,
-                in_flight,
-                stepper_cursors,
-                *active_layer,
-                toggle_lap_target,
-            )
-            .await;
-        }
-        chord::ChordOutcome::NotMine => {}
-    }
-
-    let bindings = profile.layer(*active_layer);
-    let binding = bindings.get(&event.input).cloned();
-
-    // Real firing for an Analog-repeat Binding while Depth is available comes
-    // entirely from `update_analog_repeats`'s own depth-driven background task
-    // (ticket 20/39) — this Analog-sourced edge event (synthesized from the
-    // key's ordinary, *tunable* Actuation point) is swallowed outright rather
-    // than double-firing, mirroring the Axis-assignment swallow above. Never
-    // fires for the Chord machine's synthetic retroactive Down (`depth: None`).
-    if let Some(binding) = &binding
-        && binding.trigger == TriggerMode::AnalogRepeat
-        && event.depth.is_some()
-    {
-        return Ok(Vec::new());
-    }
-
-    match event.state {
-        EventState::Down => {
-            // The bound → `trigger::decide` + `perform_trigger` /
-            // `ProfileSwitch` → `Edit` / unbound → passthrough tail, shared
-            // verbatim with the Chord machine's `FireIndividual` executor so
-            // the retroactive-fire logic exists once.
-            dispatch_individual_down(
-                injector,
-                config,
-                toggles,
-                in_flight,
-                stepper_cursors,
-                *active_layer,
-                event.input,
-                toggle_lap_target,
-            )
-            .await
-        }
-        EventState::Repeat | EventState::Up => {
-            let Some(binding) = binding else {
-                injector
-                    .inject_physical(event)
-                    .await
-                    .map_err(io::Error::other)?;
-                return Ok(Vec::new());
-            };
-            // A `ProfileSwitch` binding is validated Fire-once, so only its
-            // `Down` fires it (handled above) — a later Repeat/Up is inert.
-            if matches!(binding.action, Action::ProfileSwitch { .. }) {
-                return Ok(Vec::new());
-            }
-            let slot = slot_for(in_flight, toggles, &event.input);
-            let decision = trigger::decide(&binding, event.state, slot);
-            let mut ctx = trigger_ctx!(
-                injector,
-                config,
-                in_flight,
-                toggles,
-                stepper_cursors,
-                toggle_lap_target
-            );
-            perform_trigger(decision, event.input, &binding, &mut ctx).await?;
-            Ok(Vec::new())
-        }
-    }
 }
 
 /// Builds the `trigger::Slot` liveness snapshot `chord::feed` wants from
@@ -966,10 +1440,12 @@ fn slot_for<K: Eq + Hash>(
 
 /// The runtime state `perform_trigger` performs a `trigger::TriggerDecision`
 /// against, generic over the slot key (`Input` for the individual path,
-/// `ChordKey` for the Chord path). Built fresh per call site from the `run`
-/// task's locals, same discipline as `EffectCtx` (ticket 05) — never held
-/// across a `select!` poll. Dispatch-internal: never part of `trigger`'s
-/// interface, per the `EffectCtx` precedent.
+/// `ChordKey` for the Chord path). Built fresh per call site from a disjoint
+/// `&mut self.<map>` borrow plus `&config` (ticket 05/08) — never held across
+/// a `select!` poll. It survives the ticket-09 `DispatchState` reshape
+/// precisely because a `&mut self` method can't be generic over which map
+/// type `K` selects, so `perform_trigger<K>` stays a free function.
+/// Dispatch-internal: never part of `trigger`'s interface.
 struct TriggerCtx<'a, K> {
     injector: &'a Injector,
     firings: &'a mut HashMap<K, FiringHandle>,
@@ -1036,81 +1512,6 @@ async fn perform_trigger<K: Eq + Hash + Clone>(
         }
     }
     Ok(())
-}
-
-/// Performs each `chord::ChordEffect` the pure machine decided on, in order,
-/// against the runtime state dispatch owns (ticket 07). Returns any
-/// `edit::Edit`s a `FireIndividual` produced (a member's individual Binding
-/// resolving to `Action::ProfileSwitch`) for the `run` loop to commit, same
-/// as the old `handle_chord_event` / `handle_chord_timeout` return.
-#[allow(clippy::too_many_arguments)]
-async fn run_chord_effects(
-    effects: Vec<chord::ChordEffect>,
-    injector: &Injector,
-    config: &Config,
-    chord_runtime: &mut ChordRuntime,
-    toggles: &mut HashMap<Input, ActiveToggle>,
-    in_flight: &mut HashMap<Input, FiringHandle>,
-    stepper_cursors: &mut HashMap<StepperId, usize>,
-    active_layer: Layer,
-    toggle_lap_target: Duration,
-) -> io::Result<Vec<edit::Edit>> {
-    let mut edits = Vec::new();
-    for effect in effects {
-        match effect {
-            chord::ChordEffect::FireChord {
-                key,
-                binding,
-                state,
-            } => {
-                // The Chord path's own Trigger-mode dispatch — `trigger::
-                // decide` (the same matrix the individual path runs) against
-                // this Chord's `ChordKey`-keyed liveness, performed by the
-                // generic `perform_trigger`. A Chord's Action is never
-                // `AnalogRepeat` or `ProfileSwitch`, and `chord::feed` only
-                // ever emits `Down` / `Repeat`, so those `decide` arms are
-                // unreachable here.
-                let slot = slot_for(&chord_runtime.firings, &chord_runtime.toggles, &key);
-                let decision = trigger::decide(&binding, state, slot);
-                let mut ctx = trigger_ctx!(
-                    injector,
-                    config,
-                    &mut chord_runtime.firings,
-                    &mut chord_runtime.toggles,
-                    stepper_cursors,
-                    toggle_lap_target
-                );
-                perform_trigger(decision, key, &binding, &mut ctx).await?;
-            }
-            chord::ChordEffect::ReleaseChordFiring { key } => {
-                // Fire-once / Hold-to-repeat only — a Toggle Chord is
-                // deliberately not stopped by a member's `Up` (ticket 67).
-                trigger::force_release_stuck(&chord_runtime.firings, &key, injector).await;
-            }
-            chord::ChordEffect::StopChordToggle { key } => {
-                trigger::stop_toggle(&mut chord_runtime.toggles, &key).await;
-            }
-            chord::ChordEffect::FireIndividual { input } => {
-                edits.extend(
-                    dispatch_individual_down(
-                        injector,
-                        config,
-                        toggles,
-                        in_flight,
-                        stepper_cursors,
-                        active_layer,
-                        input,
-                        toggle_lap_target,
-                    )
-                    .await?,
-                );
-            }
-            chord::ChordEffect::ForceReleaseIndividual { input } => {
-                trigger::force_release_stuck(in_flight, &input, injector).await;
-            }
-        }
-    }
-    Ok(edits)
 }
 
 /// Awaits the active Chord window's deadline, or never resolves if none is
@@ -1236,118 +1637,6 @@ async fn handle_axis_edge_event(
     recompute_and_emit_axes(injector, axis_state, axis_map).await
 }
 
-/// The continuous Analog half of ticket 59 §7's `(Depth, edge_event) ->
-/// axis_value` seam: reacts to every change of the live-Depth watch channel
-/// (`capture::analog`'s grid task, ticket 26) by resolving
-/// `config::resolve_axis_value` for every Input the active Layer currently
-/// Axis-assigns, then running the shared conflict-resolution/emit path.
-/// Every Grid key's raw depth is published on every incoming hidraw report
-/// regardless of Binding/Axis status (`capture::analog::relay_grid_blocking`),
-/// so this only ever *reads* `depths` for the subset that's actually
-/// Axis-assigned right now — an empty Axis map (the common case) short-
-/// circuits immediately, doing no work on every ordinary depth tick.
-async fn handle_depth_update(
-    injector: &Injector,
-    config: &Config,
-    active_layer: Layer,
-    axis_state: &mut AxisState,
-    depths: HashMap<Input, u8>,
-) -> io::Result<()> {
-    let profile = config
-        .active_profile()
-        .expect("load_or_seed validates active_profile names a real profile");
-    let axis_map = profile.axis_layer(active_layer);
-    if axis_map.is_empty() {
-        return Ok(());
-    }
-    // Ticket 71 code-review finding: reads each relevant Input's own
-    // Actuation/Release point directly, rather than building
-    // `resolved_actuation_points()`'s full 20-entry `HashMap` just to read
-    // the 1-4 entries an Axis-assigned Profile actually needs — this runs on
-    // every live-Depth tick (sub-millisecond while a key is moving, per
-    // ticket 13), so the redundant O(20) rebuild was real hot-path waste.
-    for &input in axis_map.keys() {
-        if let Some(&depth) = depths.get(&input) {
-            let point = profile.resolved_actuation_point(input);
-            axis_state
-                .contributions
-                .insert(input, config::resolve_axis_value(depth, point));
-        }
-    }
-    recompute_and_emit_axes(injector, axis_state, axis_map).await
-}
-
-/// Dispatches a single fresh `Down` on `input` against the active Layer —
-/// the `ProfileSwitch → Edit` / bound → `trigger::decide` + `perform_trigger`
-/// / unbound → passthrough tail
-/// carved out of `handle_event`, shared verbatim by the ordinary input path
-/// and the Chord machine's `FireIndividual` executor (a member's individual
-/// Binding firing retroactively — the window elapsed, or the member was
-/// released before completing — per ticket 01's Answer: "the pending
-/// member's individual Binding fires retroactively, delayed by the window").
-/// It is *not* a re-entry into `handle_event`: that would re-run the
-/// layer-switch / toggle-stop / axis / chord guards against a synthetic
-/// Down, which is wrong. Returns any `Edit::SwitchProfile` the member's own
-/// Binding produces — a Chord member's individual Binding can be any Action,
-/// unlike a Chord's own, which can never be `ProfileSwitch`.
-#[allow(clippy::too_many_arguments)]
-async fn dispatch_individual_down(
-    injector: &Injector,
-    config: &Config,
-    toggles: &mut HashMap<Input, ActiveToggle>,
-    in_flight: &mut HashMap<Input, FiringHandle>,
-    stepper_cursors: &mut HashMap<StepperId, usize>,
-    layer: Layer,
-    input: Input,
-    toggle_lap_target: Duration,
-) -> io::Result<Vec<edit::Edit>> {
-    let profile = config
-        .active_profile()
-        .expect("load_or_seed validates active_profile names a real profile");
-    let binding = profile.layer(layer).get(&input).cloned();
-    match binding {
-        Some(binding) => {
-            if let Action::ProfileSwitch { target } = binding.action {
-                // The switch is an `Edit` for the `run` loop to commit
-                // (ticket 05).
-                return Ok(vec![edit::Edit::SwitchProfile { name: target }]);
-            }
-            // Accepted gap (ticket 39): a member's own individual Binding
-            // set to Analog-repeat fires once here through the ordinary
-            // one-shot path (`decide` treats `AnalogRepeat` as `HoldToRepeat`
-            // for a Down), rather than starting the depth-driven background
-            // task `update_analog_repeats` normally would — this retroactive
-            // Down is synthetic (no real live Depth to hand a task), and a
-            // grid key that's both a Chord member *and* individually
-            // Analog-repeat-triggered is a narrow combination this
-            // fast-follow doesn't specially engineer for.
-            let slot = slot_for(in_flight, toggles, &input);
-            let decision = trigger::decide(&binding, EventState::Down, slot);
-            let mut ctx = trigger_ctx!(
-                injector,
-                config,
-                in_flight,
-                toggles,
-                stepper_cursors,
-                toggle_lap_target
-            );
-            perform_trigger(decision, input, &binding, &mut ctx).await?;
-            Ok(Vec::new())
-        }
-        None => {
-            injector
-                .inject_physical(PhysicalEvent {
-                    input,
-                    state: EventState::Down,
-                    depth: None,
-                })
-                .await
-                .map_err(io::Error::other)?;
-            Ok(Vec::new())
-        }
-    }
-}
-
 /// Compiles a Binding's `Action` into the flat step sequence `perform_trigger`
 /// spawns —
 /// `executor::compile` for every ordinary Action, or `resolve_step` for
@@ -1433,372 +1722,6 @@ fn publish_actuation_snapshot(
     actuation_tx.send_replace(profile.resolved_actuation_points());
 }
 
-/// The runtime state `run_effects` performs an `edit::Effect` against — the
-/// pieces of the dispatch task's own state an effect can touch. Built fresh
-/// per call site (the `run` loop's command / input-path arms) from the
-/// task's locals; `edit` never sees it. `active_layer` is copied in by value
-/// so `RecomputeAxes` can no-op when its Layer isn't the active one — the
-/// check `edit::plan` can't make.
-struct EffectCtx<'a> {
-    injector: &'a Injector,
-    toggles: &'a mut HashMap<Input, ActiveToggle>,
-    stepper_cursors: &'a mut HashMap<StepperId, usize>,
-    axis_state: &'a mut AxisState,
-    analog_repeats: &'a mut HashMap<Input, ActiveAnalogRepeat>,
-    actuation_tx: &'a watch::Sender<HashMap<Input, ActuationPoint>>,
-    capture_control_tx: &'a mpsc::Sender<bool>,
-    signal_emitter: &'a Option<SignalEmitter<'static>>,
-    active_layer: Layer,
-}
-
-/// Runs each `edit::Effect` an `edit::plan` derived, in order, against the
-/// runtime state `ctx` borrows (ticket 05). `config` is the just-committed
-/// `Config` — every effect that reads the new state (`RepublishActuation`,
-/// `RecomputeAxes`) reads it from here. Errors on the axis-output path are
-/// swallowed exactly as the pre-ticket-05 arm code swallowed them
-/// (`let _ = recompute_and_emit_axes(...)` / `reset_axis_outputs`).
-async fn run_effects(effects: Vec<edit::Effect>, config: &Config, ctx: &mut EffectCtx<'_>) {
-    for effect in effects {
-        match effect {
-            edit::Effect::RepublishActuation => {
-                publish_actuation_snapshot(config, ctx.actuation_tx)
-            }
-            edit::Effect::RecomputeAxes { layer } => {
-                // `RecomputeAxes` for a Layer that isn't the active one is a
-                // no-op — the resulting `Config` already carries the edit,
-                // but nothing is driving that Layer's axes right now.
-                if layer == ctx.active_layer {
-                    let axis_map = config
-                        .active_profile()
-                        .expect("load_or_seed validates active_profile names a real profile")
-                        .axis_layer(layer)
-                        .clone();
-                    let _ = recompute_and_emit_axes(ctx.injector, ctx.axis_state, &axis_map).await;
-                }
-            }
-            edit::Effect::ForgetAxisContribution(input) => {
-                ctx.axis_state.contributions.remove(&input);
-            }
-            edit::Effect::SignalCaptureMode(force) => {
-                // Only on a successful persist (which is where `run_effects`
-                // runs) — the supervisor swaps the live capture source to
-                // match `config.toml` on disk.
-                let _ = ctx.capture_control_tx.send(force).await;
-            }
-            edit::Effect::StopToggle(input) => {
-                if let Some(toggle) = ctx.toggles.remove(&input) {
-                    toggle.stop().await;
-                }
-            }
-            edit::Effect::StopAllToggles => stop_all_toggles(ctx.toggles).await,
-            edit::Effect::StopAllAnalogRepeats => stop_all_analog_repeats(ctx.analog_repeats).await,
-            edit::Effect::ResetAxisOutputs => {
-                let _ = reset_axis_outputs(ctx.injector, ctx.axis_state).await;
-            }
-            edit::Effect::DropStepperCursor(stepper) => {
-                ctx.stepper_cursors.remove(&stepper);
-            }
-            edit::Effect::ClampStepperCursor { stepper, len } => {
-                if let Some(cursor) = ctx.stepper_cursors.get_mut(&stepper) {
-                    *cursor = (*cursor).min(len - 1);
-                }
-            }
-            edit::Effect::AnnounceProfileChange(name) => {
-                if let Some(emitter) = ctx.signal_emitter {
-                    let _ = Daemon::active_profile_changed(emitter, &name).await;
-                }
-            }
-        }
-    }
-}
-
-/// Commits each `Edit` the input path returned (an `Action::ProfileSwitch`
-/// binding firing — empty or one in practice, only a Fire-once on `Down`),
-/// in order: `edit::apply` then `run_effects`. The `run` loop is the sole
-/// commit point for an input-originated `Config` mutation (ticket 05). For
-/// several returned `Edit::SwitchProfile`s (a genuinely retroactive
-/// multi-switch) last-write-wins order is unchanged. One narrow shift: when a
-/// single retroactive chord miss fires a `ProfileSwitch` member *alongside*
-/// non-switch members, every member's binding now resolves against the
-/// pre-switch Profile and the switch's effects (stop Toggles, reset axes,
-/// stop Analog-repeats) run after them, rather than interleaved as the old
-/// inline `switch_profile` call did — an accepted consequence of the input
-/// path no longer holding `&mut Config` (see ticket 05's Answer). A failed
-/// apply is logged and ignored — a dangling `ProfileSwitch` target is
-/// impossible post-`validate`, so this only ever absorbs a genuine
-/// `config.toml` write failure.
-async fn commit_input_edits(
-    edits: Vec<edit::Edit>,
-    config: &mut Config,
-    config_path: &Path,
-    ctx: &mut EffectCtx<'_>,
-) {
-    for edit in edits {
-        match edit::apply(config, config_path, edit).await {
-            Ok(outcome) => run_effects(outcome.effects, config, ctx).await,
-            Err(err) => eprintln!(
-                "acheron-daemon: dispatch: ignoring a failed input-path Config edit: {err:?}"
-            ),
-        }
-    }
-}
-
-/// Translates each `Command` into its `edit::Edit` and commits it (ticket
-/// 05): the 3 non-edit arms (`GetConfig`/`GetState`/`StopAllToggles`) inline,
-/// the 24 edit arms each a mechanical `edit::apply` → `reply.send` →
-/// `run_effects`, with `reply` sent before effects run for every arm — which
-/// is what deletes `SwitchProfile`'s old special-case reply-before-signal
-/// reasoning: that ordering is now the default shape.
-async fn handle_command(
-    config: &mut Config,
-    config_path: &Path,
-    device_connected: bool,
-    capture_mode: CaptureMode,
-    device_info: Option<&DeviceInfo>,
-    ctx: &mut EffectCtx<'_>,
-    cmd: Command,
-) {
-    /// `edit::apply` → send `Ok(())` / `Err` → run effects on success. Every
-    /// edit arm whose reply is `Result<(), CommandError>` (i.e. all but the
-    /// two create commands, which carry a fresh id back).
-    macro_rules! commit {
-        ($reply:expr, $edit:expr) => {{
-            match edit::apply(config, config_path, $edit).await {
-                Ok(outcome) => {
-                    let _ = $reply.send(Ok(()));
-                    run_effects(outcome.effects, config, ctx).await;
-                }
-                Err(err) => {
-                    let _ = $reply.send(Err(err));
-                }
-            }
-        }};
-    }
-
-    match cmd {
-        Command::GetConfig(reply) => {
-            let _ = reply.send(config.clone());
-        }
-        Command::GetState(reply) => {
-            // Every library entry gets a reported cursor, defaulting to `0`
-            // ("the list's first item") for one never yet stepped — richer
-            // for the GUI than only reporting entries this task has actually
-            // touched (ticket 03/54).
-            let stepper_cursors = config
-                .steppers
-                .keys()
-                .map(|id| {
-                    (
-                        id.clone(),
-                        ctx.stepper_cursors.get(id).copied().unwrap_or(0),
-                    )
-                })
-                .collect();
-            let _ = reply.send(State {
-                profile: config.active_profile.clone(),
-                layer: ctx.active_layer.as_str(),
-                active_toggles: ctx.toggles.keys().copied().collect(),
-                device_connected,
-                capture_mode: capture_mode.as_str(),
-                daemon_version: crate::VERSION,
-                firmware_version: device_info.map(|info| info.firmware_version.clone()),
-                serial_number: device_info.map(|info| info.serial_number.clone()),
-                stepper_cursors,
-            });
-        }
-        Command::StopAllToggles { reply } => {
-            stop_all_toggles(ctx.toggles).await;
-            let _ = reply.send(());
-        }
-        Command::SetBinding {
-            input,
-            layer,
-            binding,
-            reply,
-        } => commit!(
-            reply,
-            edit::Edit::SetBinding {
-                input,
-                layer,
-                binding
-            }
-        ),
-        Command::ClearBinding {
-            input,
-            layer,
-            reply,
-        } => commit!(reply, edit::Edit::ClearBinding { input, layer }),
-        Command::SetModeKeyRole { role, reply } => {
-            commit!(reply, edit::Edit::SetModeKeyRole { role })
-        }
-        Command::CreateProfile { name, reply } => {
-            commit!(reply, edit::Edit::CreateProfile { name })
-        }
-        Command::DeleteProfile { name, reply } => {
-            commit!(reply, edit::Edit::DeleteProfile { name })
-        }
-        Command::RenameProfile {
-            old_name,
-            new_name,
-            reply,
-        } => {
-            // The one arm with an `Ok` early-return — routing a rename to the
-            // same name through `edit::apply` would add a spurious
-            // `config.toml` write for a no-op, so it stays a guard ahead of
-            // the helper (ticket 03 / 05 precedent). `AlreadyExists` moved
-            // into `edit::plan`; the same-name `NotFound` check stays here so
-            // a same-name rename of a missing Profile still fails exactly as
-            // it did pre-ticket-05 (the guard sat *after* the existence check
-            // in ticket 03's arm).
-            if old_name == new_name {
-                let reply_value = if config.profiles.contains_key(&old_name) {
-                    Ok(())
-                } else {
-                    Err(CommandError::NotFound)
-                };
-                let _ = reply.send(reply_value);
-                return;
-            }
-            commit!(reply, edit::Edit::RenameProfile { old_name, new_name })
-        }
-        Command::SwitchProfile { name, reply } => {
-            commit!(reply, edit::Edit::SwitchProfile { name })
-        }
-        Command::SetActuationPoint {
-            input,
-            actuation,
-            release,
-            reply,
-        } => commit!(
-            reply,
-            edit::Edit::SetActuationPoint {
-                input,
-                actuation,
-                release,
-            }
-        ),
-        Command::ClearActuationPoint { input, reply } => {
-            commit!(reply, edit::Edit::ClearActuationPoint { input })
-        }
-        Command::SetDefaultActuation {
-            actuation,
-            release,
-            reply,
-        } => commit!(
-            reply,
-            edit::Edit::SetDefaultActuation { actuation, release }
-        ),
-        Command::ResetActuationPoints { reply } => {
-            commit!(reply, edit::Edit::ResetActuationPoints)
-        }
-        Command::SetForceDigital { force, reply } => {
-            commit!(reply, edit::Edit::SetForceDigital { force })
-        }
-        Command::CreateMacro { name, steps, reply } => {
-            match edit::apply(config, config_path, edit::Edit::CreateMacro { name, steps }).await {
-                Ok(outcome) => {
-                    let Some(edit::CreatedId::Macro(macro_id)) = outcome.created else {
-                        unreachable!("CreateMacro always sets Outcome.created to a Macro id")
-                    };
-                    let _ = reply.send(Ok(macro_id));
-                    run_effects(outcome.effects, config, ctx).await;
-                }
-                Err(err) => {
-                    let _ = reply.send(Err(err));
-                }
-            }
-        }
-        Command::RenameMacro {
-            macro_id,
-            new_name,
-            reply,
-        } => commit!(reply, edit::Edit::RenameMacro { macro_id, new_name }),
-        Command::DeleteMacro { macro_id, reply } => {
-            commit!(reply, edit::Edit::DeleteMacro { macro_id })
-        }
-        Command::SetMacroSteps {
-            macro_id,
-            steps,
-            reply,
-        } => commit!(reply, edit::Edit::SetMacroSteps { macro_id, steps }),
-        Command::CreateStepper { name, items, reply } => {
-            match edit::apply(
-                config,
-                config_path,
-                edit::Edit::CreateStepper { name, items },
-            )
-            .await
-            {
-                Ok(outcome) => {
-                    let Some(edit::CreatedId::Stepper(stepper_id)) = outcome.created else {
-                        unreachable!("CreateStepper always sets Outcome.created to a Stepper id")
-                    };
-                    let _ = reply.send(Ok(stepper_id));
-                    run_effects(outcome.effects, config, ctx).await;
-                }
-                Err(err) => {
-                    let _ = reply.send(Err(err));
-                }
-            }
-        }
-        Command::RenameStepper {
-            stepper_id,
-            new_name,
-            reply,
-        } => commit!(
-            reply,
-            edit::Edit::RenameStepper {
-                stepper_id,
-                new_name
-            }
-        ),
-        Command::DeleteStepper { stepper_id, reply } => {
-            commit!(reply, edit::Edit::DeleteStepper { stepper_id })
-        }
-        Command::SetStepperItems {
-            stepper_id,
-            items,
-            reply,
-        } => commit!(reply, edit::Edit::SetStepperItems { stepper_id, items }),
-        Command::SetChordBinding {
-            inputs,
-            layer,
-            binding,
-            reply,
-        } => commit!(
-            reply,
-            edit::Edit::SetChordBinding {
-                inputs,
-                layer,
-                binding
-            }
-        ),
-        Command::ClearChordBinding {
-            inputs,
-            layer,
-            reply,
-        } => commit!(reply, edit::Edit::ClearChordBinding { inputs, layer }),
-        Command::SetAxisAssignment {
-            input,
-            layer,
-            target,
-            reply,
-        } => commit!(
-            reply,
-            edit::Edit::SetAxisAssignment {
-                input,
-                layer,
-                target
-            }
-        ),
-        Command::ClearAxisAssignment {
-            input,
-            layer,
-            reply,
-        } => commit!(reply, edit::Edit::ClearAxisAssignment { input, layer }),
-    }
-}
-
 /// Force-stops every currently running Toggle — shared by `SwitchProfile`'s
 /// `StopAllToggles` effect and the `StopAllToggles` command (ticket 25, on
 /// its own, GUI-focus-gain triggered) so the drain-and-stop loop has exactly
@@ -1812,8 +1735,7 @@ async fn stop_all_toggles(toggles: &mut HashMap<Input, ActiveToggle>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::fake::FakeCaptureSource;
-    use crate::capture::{CaptureSource, EventState};
+    use crate::capture::EventState;
     use crate::config::{
         Action, ActuationPoint, DEFAULT_PROFILE_NAME, MacroStepDto, Modifiers, Profile,
     };
@@ -1949,42 +1871,121 @@ mod tests {
         watch::channel(HashMap::new()).1
     }
 
-    async fn run_scripted(
-        scripted: Vec<PhysicalEvent>,
-        bindings: HashMap<Input, Binding>,
-    ) -> Vec<Vec<evdev::InputEvent>> {
-        let sink = RecordingSink::new();
-        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
+    /// The direct `DispatchState` seam (ticket 09): a `RecordingSink` injector
+    /// plus an in-memory `Config`, no channels and no tempfile. Feed
+    /// `PhysicalEvent`s (and `Command`s) straight into the handler methods and
+    /// read the injected batches back — it replaces the old `run`-plus-
+    /// `FakeCaptureSource` `run_scripted` helper for the per-handler-logic
+    /// tests that never needed the `select!` plumbing. Tests that genuinely
+    /// exercise channel-close, persist-failure rollback, `select!` arm
+    /// interleaving, or the D-Bus round trip keep the full `CommandHarness`
+    /// rig.
+    struct Seam {
+        state: DispatchState,
+        config: Config,
+        sink: RecordingSink,
+        gamepad_sink: RecordingSink,
+        inj: Injector,
+        inj_handle: tokio::task::JoinHandle<io::Result<()>>,
+    }
 
-        let (tx, rx) = mpsc::channel(8);
-        let (conn_tx, conn_rx) = mpsc::channel(8);
-        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
-        let dispatch_handle = tokio::spawn(run(
-            rx,
-            conn_rx,
-            cmd_rx,
-            inj.clone(),
-            config_with_bindings(bindings),
-            unused_config_path(),
-            None,
-            actuation_channel(),
-            capture_mode_channel(),
-            capture_control_channel(),
-            executor::MIN_TOGGLE_LAP,
-            depth_channel(),
-            device_info_channel(),
-        ));
+    impl Seam {
+        fn new(config: Config) -> Self {
+            let sink = RecordingSink::new();
+            let gamepad_sink = RecordingSink::new();
+            let (inj, inj_handle) = injector::spawn(sink.clone(), gamepad_sink.clone());
+            let state = DispatchState::new(
+                inj.clone(),
+                None,
+                actuation_channel(),
+                capture_control_channel(),
+                executor::MIN_TOGGLE_LAP,
+            );
+            Seam {
+                state,
+                config,
+                sink,
+                gamepad_sink,
+                inj,
+                inj_handle,
+            }
+        }
 
-        FakeCaptureSource::new(scripted)
-            .run(tx, conn_tx)
-            .await
-            .unwrap();
+        fn with_bindings(bindings: HashMap<Input, Binding>) -> Self {
+            Self::new(config_with_bindings(bindings))
+        }
 
-        drop(inj);
-        dispatch_handle.await.unwrap().unwrap();
-        inj_handle.await.unwrap().unwrap();
+        /// Feeds one event through `handle_event`, then yields a handful of
+        /// times so any firing it spawned gets to run — the same
+        /// `yield_now` spacing the `CommandHarness` tests put between presses.
+        async fn feed(&mut self, event: PhysicalEvent) -> Vec<edit::Edit> {
+            let edits = self.state.handle_event(&self.config, event).await.unwrap();
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            edits
+        }
 
-        sink.batches()
+        async fn press(&mut self, input: Input) {
+            let edits = self
+                .feed(PhysicalEvent {
+                    input,
+                    state: EventState::Down,
+                    depth: None,
+                })
+                .await;
+            assert!(edits.is_empty(), "unexpected input-path Edits: {edits:?}");
+        }
+
+        async fn repeat(&mut self, input: Input) {
+            let edits = self
+                .feed(PhysicalEvent {
+                    input,
+                    state: EventState::Repeat,
+                    depth: None,
+                })
+                .await;
+            assert!(edits.is_empty(), "unexpected input-path Edits: {edits:?}");
+        }
+
+        async fn release(&mut self, input: Input) {
+            let edits = self
+                .feed(PhysicalEvent {
+                    input,
+                    state: EventState::Up,
+                    depth: None,
+                })
+                .await;
+            assert!(edits.is_empty(), "unexpected input-path Edits: {edits:?}");
+        }
+
+        async fn get_state(&mut self) -> State {
+            let (reply, rx) = oneshot::channel();
+            self.state
+                .handle_command(
+                    &mut self.config,
+                    &unused_config_path(),
+                    Command::GetState(reply),
+                )
+                .await;
+            rx.await.unwrap()
+        }
+
+        fn gamepad_batches(&self) -> Vec<Vec<evdev::InputEvent>> {
+            self.gamepad_sink.batches()
+        }
+
+        /// Stops every background task the state still owns, then drains the
+        /// injector — mirrors `run` returning and the drop-and-join tail the
+        /// full-rig helpers use.
+        async fn finish(mut self) -> Vec<Vec<evdev::InputEvent>> {
+            stop_all_toggles(&mut self.state.toggles).await;
+            stop_all_analog_repeats(&mut self.state.analog_repeats).await;
+            drop(self.state);
+            drop(self.inj);
+            self.inj_handle.await.unwrap().unwrap();
+            self.sink.batches()
+        }
     }
 
     #[tokio::test]
@@ -2016,7 +2017,11 @@ mod tests {
             },
         ];
 
-        let batches = run_scripted(scripted.clone(), HashMap::new()).await;
+        let mut seam = Seam::with_bindings(HashMap::new());
+        for event in &scripted {
+            seam.feed(*event).await;
+        }
+        let batches = seam.finish().await;
         assert_eq!(batches.len(), scripted.len());
 
         // Grid(2,3) -> KEY_W, value 2 (Repeat).
@@ -2051,13 +2056,9 @@ mod tests {
             },
         );
 
-        let scripted = vec![PhysicalEvent {
-            input: Input::Grid(1, 1),
-            state: EventState::Down,
-            depth: None,
-        }];
-
-        let batches = run_scripted(scripted, bindings).await;
+        let mut seam = Seam::with_bindings(bindings);
+        seam.press(Input::Grid(1, 1)).await;
+        let batches = seam.finish().await;
 
         // One press batch + one release batch of KEY_F1 — not the grid
         // key's own passthrough code (KEY_1).
@@ -2093,54 +2094,15 @@ mod tests {
             },
         );
 
-        let sink = RecordingSink::new();
-        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
-        let (tx, rx) = mpsc::channel(8);
-        let (_conn_tx, conn_rx) = mpsc::channel(8);
-        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
-        let dispatch_handle = tokio::spawn(run(
-            rx,
-            conn_rx,
-            cmd_rx,
-            inj.clone(),
-            config_with_bindings_and_macros(bindings, macros),
-            unused_config_path(),
-            None,
-            actuation_channel(),
-            capture_mode_channel(),
-            capture_control_channel(),
-            executor::MIN_TOGGLE_LAP,
-            depth_channel(),
-            device_info_channel(),
-        ));
+        let mut seam = Seam::new(config_with_bindings_and_macros(bindings, macros));
 
-        tx.send(PhysicalEvent {
-            input: Input::Grid(1, 1),
-            state: EventState::Down,
-            depth: None,
-        })
-        .await
-        .unwrap();
-        // Let the one-step firing (no Delay) finish before the physical
-        // release lands — the realistic case, since a physical press/release
-        // cycle vastly outlasts an instant single-step Macro.
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        tx.send(PhysicalEvent {
-            input: Input::Grid(1, 1),
-            state: EventState::Up,
-            depth: None,
-        })
-        .await
-        .unwrap();
-
-        drop(tx);
-        dispatch_handle.await.unwrap().unwrap();
-        drop(inj);
-        inj_handle.await.unwrap().unwrap();
-
-        let batches = sink.batches();
+        // The `press` helper's own `yield_now` spacing lets the one-step
+        // firing (no Delay) finish before the physical release lands — the
+        // realistic case, since a physical press/release cycle vastly
+        // outlasts an instant single-step Macro.
+        seam.press(Input::Grid(1, 1)).await;
+        seam.release(Input::Grid(1, 1)).await;
+        let batches = seam.finish().await;
 
         // The firing's own KeyDown, then a force-released KeyUp triggered by
         // the physical Up — no stuck key, no reboot needed.
@@ -2162,38 +2124,26 @@ mod tests {
         // `Action::ControllerButton` fires exactly one KeyDown on the
         // physical Down, ignores every kernel-autorepeat Repeat outright
         // (no re-fire), and only releases on the physical Up.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::HoldToRepeat,
-                    action: Action::ControllerButton {
-                        button: evdev::KeyCode::BTN_SOUTH,
-                    },
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::HoldToRepeat,
+                action: Action::ControllerButton {
+                    button: evdev::KeyCode::BTN_SOUTH,
                 },
-            )
-            .await
-            .unwrap();
+            },
+        );
+        let mut seam = Seam::with_bindings(bindings);
 
-        harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.press(Input::Grid(1, 1)).await;
         for _ in 0..3 {
-            harness.repeat(Input::Grid(1, 1)).await;
-            for _ in 0..5 {
-                tokio::task::yield_now().await;
-            }
+            seam.repeat(Input::Grid(1, 1)).await;
         }
-        harness.release(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.release(Input::Grid(1, 1)).await;
 
-        let batches = harness.gamepad_batches();
-        harness.shut_down().await;
+        let batches = seam.gamepad_batches();
+        seam.finish().await;
 
         // Exactly one KeyDown (the physical Down) and one KeyUp (the
         // physical Up) — the three Repeats produced nothing.
@@ -2211,38 +2161,26 @@ mod tests {
         // Repeat outright (no re-fire), and only releases on the physical
         // Up — the same sustained-hold treatment ticket 75/76 gave
         // `ControllerButton`, now supporting click-and-drag.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::HoldToRepeat,
-                    action: Action::Keypress {
-                        modifiers: Modifiers::default(),
-                        key: evdev::KeyCode::BTN_LEFT,
-                    },
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::HoldToRepeat,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: evdev::KeyCode::BTN_LEFT,
                 },
-            )
-            .await
-            .unwrap();
+            },
+        );
+        let mut seam = Seam::with_bindings(bindings);
 
-        harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.press(Input::Grid(1, 1)).await;
         for _ in 0..3 {
-            harness.repeat(Input::Grid(1, 1)).await;
-            for _ in 0..5 {
-                tokio::task::yield_now().await;
-            }
+            seam.repeat(Input::Grid(1, 1)).await;
         }
-        harness.release(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.release(Input::Grid(1, 1)).await;
 
-        let batches = harness.shut_down().await;
+        let batches = seam.finish().await;
 
         // Exactly one KeyDown (the physical Down) and one KeyUp (the
         // physical Up) — the three Repeats produced nothing.
@@ -2259,36 +2197,24 @@ mod tests {
         // Hold-to-repeat arm still applies. Mirrors ticket 76's own
         // `hold_to_repeat_mouse_button_still_refires_on_every_repeat`
         // negative test, but in the other direction.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::HoldToRepeat,
-                    action: Action::Keypress {
-                        modifiers: Modifiers::default(),
-                        key: evdev::KeyCode::KEY_A,
-                    },
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::HoldToRepeat,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: evdev::KeyCode::KEY_A,
                 },
-            )
-            .await
-            .unwrap();
+            },
+        );
+        let mut seam = Seam::with_bindings(bindings);
 
-        harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        harness.repeat(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        harness.release(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.press(Input::Grid(1, 1)).await;
+        seam.repeat(Input::Grid(1, 1)).await;
+        seam.release(Input::Grid(1, 1)).await;
 
-        let batches = harness.shut_down().await;
+        let batches = seam.finish().await;
 
         // Down + one Repeat = two firings, each a KeyDown/KeyUp pair; the
         // trailing Up produced nothing — unchanged from before ticket 79/80.
@@ -2305,26 +2231,20 @@ mod tests {
         // sustained hold instead of the ordinary repeat-tap loop — one
         // KeyDown while toggled on, no matter how long, released by exactly
         // one KeyUp when the same key stops it.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::Toggle,
-                    action: Action::Keypress {
-                        modifiers: Modifiers::default(),
-                        key: evdev::KeyCode::BTN_LEFT,
-                    },
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::Toggle,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: evdev::KeyCode::BTN_LEFT,
                 },
-            )
-            .await
-            .unwrap();
+            },
+        );
+        let mut seam = Seam::with_bindings(bindings);
 
-        harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.press(Input::Grid(1, 1)).await;
 
         // Advance well past several ordinary Toggle laps' worth of time —
         // a looping Toggle would have re-pressed several times by now.
@@ -2333,17 +2253,14 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        let state = harness.get_state().await;
+        let state = seam.get_state().await;
         assert_eq!(state.active_toggles, vec![Input::Grid(1, 1)]);
 
         // Same physical key, still toggled on: stops it rather than
         // starting a second one.
-        harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.press(Input::Grid(1, 1)).await;
 
-        let batches = harness.shut_down().await;
+        let batches = seam.finish().await;
 
         assert_eq!(
             batches.len(),
@@ -2363,25 +2280,19 @@ mod tests {
         // released by exactly one KeyUp when the same key stops it. Before
         // this ticket, this fell through to the ordinary looping Toggle arm
         // instead.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::Toggle,
-                    action: Action::ControllerButton {
-                        button: evdev::KeyCode::BTN_SOUTH,
-                    },
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::Toggle,
+                action: Action::ControllerButton {
+                    button: evdev::KeyCode::BTN_SOUTH,
                 },
-            )
-            .await
-            .unwrap();
+            },
+        );
+        let mut seam = Seam::with_bindings(bindings);
 
-        harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.press(Input::Grid(1, 1)).await;
 
         // Advance well past several ordinary Toggle laps' worth of time —
         // a looping Toggle would have re-pressed several times by now.
@@ -2390,18 +2301,15 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        let state = harness.get_state().await;
+        let state = seam.get_state().await;
         assert_eq!(state.active_toggles, vec![Input::Grid(1, 1)]);
 
         // Same physical key, still toggled on: stops it rather than
         // starting a second one.
-        harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.press(Input::Grid(1, 1)).await;
 
-        let batches = harness.gamepad_batches();
-        harness.shut_down().await;
+        let batches = seam.gamepad_batches();
+        seam.finish().await;
 
         assert_eq!(
             batches.len(),
@@ -2418,37 +2326,28 @@ mod tests {
         // carve-out must not bleed onto keyboard-key output — `is_mouse_
         // button` rejects an ordinary keyboard `KeyCode`, so the ordinary
         // looping Toggle arm still applies.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::Toggle,
-                    action: Action::Keypress {
-                        modifiers: Modifiers::default(),
-                        key: evdev::KeyCode::KEY_A,
-                    },
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::Toggle,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: evdev::KeyCode::KEY_A,
                 },
-            )
-            .await
-            .unwrap();
+            },
+        );
+        let mut seam = Seam::with_bindings(bindings);
 
-        harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.press(Input::Grid(1, 1)).await;
         for _ in 0..7 {
             tokio::time::advance(executor::MIN_TOGGLE_LAP).await;
             tokio::task::yield_now().await;
         }
 
-        harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.press(Input::Grid(1, 1)).await;
 
-        let batches = harness.shut_down().await;
+        let batches = seam.finish().await;
 
         assert!(
             batches.len() > 2,
@@ -2916,24 +2815,23 @@ mod tests {
                 action,
             },
         );
-        let harness = CommandHarness::spawn(config_with_bindings_and_macros(bindings, macros));
+        let mut seam = Seam::new(config_with_bindings_and_macros(bindings, macros));
 
-        harness.press(Input::Grid(1, 1)).await;
+        seam.press(Input::Grid(1, 1)).await;
         tokio::time::advance(Duration::from_millis(10)).await;
         tokio::task::yield_now().await;
 
-        let state = harness.get_state().await;
+        let state = seam.get_state().await;
         assert_eq!(state.active_toggles, vec![Input::Grid(1, 1)]);
 
         // Same physical key, still Down: stops the Toggle instead of
         // starting a second one — this press is consumed entirely by the
-        // stop, no re-fire. `shut_down` closes the event channel right
-        // after this send and awaits dispatch to drain it, which only
-        // happens once this stop (including its force-release) has fully
-        // run, so there's nothing racy left to synchronize on here.
-        harness.press(Input::Grid(1, 1)).await;
+        // stop, no re-fire. `Seam::press` awaits `handle_event` to
+        // completion, which includes the stop's own force-release, so
+        // there's nothing racy left to synchronize on here.
+        seam.press(Input::Grid(1, 1)).await;
 
-        let batches = harness.shut_down().await;
+        let batches = seam.finish().await;
 
         // One KeyDown from the loop's single lap, then a force-released
         // KeyUp for exactly that key on stop — no stuck key, no extra output.
@@ -3749,36 +3647,25 @@ mod tests {
     async fn held_layer_binding_fires_only_while_the_mode_key_is_down() {
         let mut held = HashMap::new();
         held.insert(Input::Grid(1, 1), keypress_binding(evdev::KeyCode::KEY_F1));
-        let harness = CommandHarness::spawn(config_with_profile(profile_with_held_bindings(held)));
+        let mut seam = Seam::new(config_with_profile(profile_with_held_bindings(held)));
 
         // Base layer: Grid(1,1) is unbound there, so pressing it while the
         // Mode key is up must passthrough (KEY_1), never the Held binding.
-        harness.press(Input::Grid(1, 1)).await;
+        seam.press(Input::Grid(1, 1)).await;
 
-        harness
-            .event_tx
-            .send(PhysicalEvent {
-                input: Input::ModeKey,
-                state: EventState::Down,
-                depth: None,
-            })
-            .await
-            .unwrap();
-        // `PhysicalEvent`s and `Command`s arrive on separate channels the
-        // dispatch task `select!`s over with no ordering guarantee between
-        // them, so a `GetState` sent right after this event isn't
-        // guaranteed to observe it applied yet — yield a few times first,
-        // same pattern the Toggle tests above use.
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(harness.get_state().await.layer, "held");
+        seam.feed(PhysicalEvent {
+            input: Input::ModeKey,
+            state: EventState::Down,
+            depth: None,
+        })
+        .await;
+        assert_eq!(seam.get_state().await.layer, "held");
 
         // Held layer active: the same physical key now fires the Held
         // Binding instead.
-        harness.press(Input::Grid(1, 1)).await;
+        seam.press(Input::Grid(1, 1)).await;
 
-        let batches = harness.shut_down().await;
+        let batches = seam.finish().await;
 
         assert_eq!(
             batches.len(),
@@ -3799,38 +3686,28 @@ mod tests {
     async fn releasing_the_mode_key_reverts_to_the_base_layer() {
         let mut held = HashMap::new();
         held.insert(Input::Grid(1, 1), keypress_binding(evdev::KeyCode::KEY_F1));
-        let harness = CommandHarness::spawn(config_with_profile(profile_with_held_bindings(held)));
+        let mut seam = Seam::new(config_with_profile(profile_with_held_bindings(held)));
 
-        harness
-            .event_tx
-            .send(PhysicalEvent {
-                input: Input::ModeKey,
-                state: EventState::Down,
-                depth: None,
-            })
-            .await
-            .unwrap();
-        harness
-            .event_tx
-            .send(PhysicalEvent {
-                input: Input::ModeKey,
-                state: EventState::Up,
-                depth: None,
-            })
-            .await
-            .unwrap();
-        // Same ordering caveat as the test above.
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.feed(PhysicalEvent {
+            input: Input::ModeKey,
+            state: EventState::Down,
+            depth: None,
+        })
+        .await;
+        seam.feed(PhysicalEvent {
+            input: Input::ModeKey,
+            state: EventState::Up,
+            depth: None,
+        })
+        .await;
 
-        let state = harness.get_state().await;
+        let state = seam.get_state().await;
         assert_eq!(state.layer, "base");
 
         // Base resumed: Grid(1,1) is unbound there, so this passes through.
-        harness.press(Input::Grid(1, 1)).await;
+        seam.press(Input::Grid(1, 1)).await;
 
-        let batches = harness.shut_down().await;
+        let batches = seam.finish().await;
         assert_eq!(batches.len(), 1);
         let evdev::EventSummary::Key(_, code, _) = batches[0][0].destructure() else {
             panic!("expected a key event");
@@ -3844,28 +3721,22 @@ mod tests {
         // it must produce no injected output at all — it's consumed
         // entirely by the Layer transition, never passed through as
         // KEY_LEFTALT the way an ordinary unbound Input would be.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        let mut seam = Seam::with_bindings(HashMap::new());
 
-        harness
-            .event_tx
-            .send(PhysicalEvent {
-                input: Input::ModeKey,
-                state: EventState::Down,
-                depth: None,
-            })
-            .await
-            .unwrap();
-        harness
-            .event_tx
-            .send(PhysicalEvent {
-                input: Input::ModeKey,
-                state: EventState::Up,
-                depth: None,
-            })
-            .await
-            .unwrap();
+        seam.feed(PhysicalEvent {
+            input: Input::ModeKey,
+            state: EventState::Down,
+            depth: None,
+        })
+        .await;
+        seam.feed(PhysicalEvent {
+            input: Input::ModeKey,
+            state: EventState::Up,
+            depth: None,
+        })
+        .await;
 
-        let batches = harness.shut_down().await;
+        let batches = seam.finish().await;
         assert!(batches.is_empty());
     }
 

@@ -183,6 +183,25 @@ and it can be verified before merge.
   / `ActiveToggle::spawn{,_held}`, the map insert) belongs in
   `dispatch::perform_trigger`.
 
+- **Adding a new piece of dispatch runtime state** (a new per-Input handle
+  map, another momentary mode flag, a live view of something the supervisor
+  reports…) — ticket 09. The dispatch task's ephemeral runtime state lives in
+  one `DispatchState` struct in `daemon/src/dispatch.rs`, and each `select!`
+  arm's handler (`handle_event`, `handle_command`, `run_chord_effects`,
+  `run_effects`, `commit_input_edits`, `update_analog_repeats`,
+  `handle_depth_update`, `dispatch_individual_down`) is a `&mut self` method
+  on it. A new piece of that state is a `DispatchState` field, not a fresh
+  `run` local or another parameter threaded through those handlers. `run`
+  builds the struct once at task start and then only drives the `select!`
+  loop. `Config` (the committed half) stays a `run` local by design
+  (ticket 05), as do the `rx_*` receivers and their `*_open` liveness flags
+  (pure `select!` plumbing that no handler reads). A handful of leaf helpers
+  (`handle_layer_switch`, `handle_connection_change`,
+  `handle_capture_mode_change`, `handle_axis_edge_event`) stay free functions
+  taking `&mut` to only the one or two fields they touch — that is fine; the
+  rule is against reintroducing the loose-local *bundle*, not against a
+  narrow borrow.
+
 - **Adding a device-catalog entry or a Binding-legality rule.** The GUI
   mirrors the Daemon's device vocabularies and the pure part of
   `config::validate` in `gui/acheron_gui/rules.py` (ADR 0003's split-language
