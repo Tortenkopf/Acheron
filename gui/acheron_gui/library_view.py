@@ -149,17 +149,26 @@ def build_library_tabs(selected_tab: str, on_select: Callable[[str], None]) -> G
     return row
 
 
+def _profile_all_bindings(profile: dict):
+    """Mirror of `config::profile_all_bindings` — every Binding across both
+    per-Input Layers *and* both Chord Layers (ticket 40). The Daemon's
+    reference-count guards scan all four, so the "used by N" tooltips must
+    too, or the delete button stays enabled on a Macro/Stepper the Daemon
+    would refuse to delete."""
+    for layer_key in ("base", "held", "chords_base", "chords_held"):
+        yield from profile[layer_key].values()
+
+
 def macro_used_by_count(config: dict, macro_id: str) -> int:
-    """How many Bindings, across every Profile's Base/Held Layer, reference
-    `macro_id` — computed client-side from `GetConfig()`'s own data (no new
-    wire field needed, unlike the ticket text's own phrasing might suggest):
-    mirrors the real Daemon's `dispatch.rs::macro_references` scan exactly,
-    just counted rather than boolean so the delete tooltip can name N."""
+    """How many Bindings, across every Profile's Base/Held *and* Chord
+    Layers, reference `macro_id` — computed client-side from `GetConfig()`'s
+    own data, mirroring the real Daemon's `edit.rs::macro_references` scan
+    exactly, just counted rather than boolean so the delete tooltip can
+    name N."""
     return sum(
         1
         for profile in config["profiles"].values()
-        for layer_key in ("base", "held")
-        for binding in profile[layer_key].values()
+        for binding in _profile_all_bindings(profile)
         if binding.get("type") == "macro" and binding.get("macro_id") == macro_id
     )
 
@@ -636,16 +645,15 @@ def _stepper_pair_inputs(bindings: dict, stepper_id: str) -> dict[str, str | Non
 
 
 def stepper_used_by_count(config: dict, stepper_id: str) -> int:
-    """How many Bindings, across every Profile's Base/Held Layer, reference
-    `stepper_id` (either direction counts) — mirrors `macro_used_by_count`
-    exactly, just for `dispatch.rs::stepper_references`'s Stepper
-    counterpart, so the delete tooltip can name N the same way Macro's
-    does."""
+    """How many Bindings, across every Profile's Base/Held *and* Chord
+    Layers, reference `stepper_id` (either direction counts) — mirrors
+    `macro_used_by_count` exactly, just for `edit.rs::stepper_references`'s
+    Stepper counterpart, so the delete tooltip can name N the same way
+    Macro's does."""
     return sum(
         1
         for profile in config["profiles"].values()
-        for layer_key in ("base", "held")
-        for binding in profile[layer_key].values()
+        for binding in _profile_all_bindings(profile)
         if binding.get("type") == "step" and binding.get("stepper_id") == stepper_id
     )
 

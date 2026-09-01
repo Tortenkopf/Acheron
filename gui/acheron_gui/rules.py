@@ -26,8 +26,9 @@ touches a `Config` or any stub state. Whole-`Config` checks (dangling
 `macro_id`/`stepper_id`/`profile_switch` targets, reference counts, the
 stepper-steal, `release < actuation`, the axis↔binding↔chord
 mutual-exclusion clear) stay in `daemon_stub.py` as operation logic over its
-own in-memory state. Keycodes are out — `Action::Keypress.key` accepts any
-`KeyCode` by design, so there is no Daemon SSOT to contract-test.
+own in-memory state — that split is deliberate and is not a deepening target
+(ADR 0005). Keycodes are out — `Action::Keypress.key` accepts any `KeyCode`
+by design, so there is no Daemon SSOT to contract-test.
 
 The one dependency is one-way, `rules` → `inputs` (`is_grid_input`, the grid
 enumeration).

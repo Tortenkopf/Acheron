@@ -11,6 +11,15 @@ Seeded like a fresh install (issue 11): one `Default` Profile, empty Base
 and Held Layers (all passthrough), `mode_key_role` defaulting to
 `"layer_switch"` — matching the real Daemon's ticket 18 `GetConfig()` shape.
 
+This stub re-implements the *stateful* half of the Daemon's edit validation
+(reference-count refusals, the stepper-steal, `ProfileSwitch` rename cascade,
+the actuation numeric check, the axis↔binding mutual-exclusion clear) by hand.
+That is deliberate and is **not** a candidate for sharing, code-generation, or
+a `(Config, Edit)` contract fixture — see ADR 0005
+(`docs/adr/0005-gui-test-stub-mirrors-daemon-validation-by-hand.md`). Keep it
+faithful to `daemon/src/edit.rs` and `daemon/src/config.rs::validate`; the pure
+half lives in `rules.py` and is contract-tested.
+
 `simulate_mode_key_press`/`_release` stand in for a real physical Mode-key
 event reaching the Daemon and it pushing `ActiveLayerChanged` back out: there
 is no capture layer in GUI tests, so this is the seam a test uses to drive
@@ -174,6 +183,10 @@ class DaemonStub:
             raise InvalidBindingError(
                 f"{binding.get('stepper_id')!r} does not name a Stepper in the library"
             )
+        if kind == "profile_switch" and binding.get("target") not in self._profiles:
+            raise InvalidBindingError(
+                f"{binding.get('target')!r} does not name a Profile"
+            )
         if kind == "controller_button" and binding.get("button") not in rules.GAMEPAD_BUTTONS:
             raise InvalidBindingError(f"{binding.get('button')!r} is not a valid gamepad button")
 
@@ -206,25 +219,55 @@ class DaemonStub:
                 f"{input_str!r} already has an Axis assignment on this Layer — clear it first"
             )
 
+    def _steal_stepper_direction(
+        self,
+        stepper_id: str,
+        direction: str,
+        *,
+        keep_input: tuple[str, str, str] | None = None,
+        keep_chord: tuple[str, str, str] | None = None,
+    ) -> None:
+        # Ticket 03's Answer, widened to Chords by ticket 40: a
+        # `(stepper, direction)` pair is unique across *both* the per-Input
+        # and the Chord keyspace, in every Profile/Layer — assigning it
+        # anywhere silently moves it off wherever it was. Mirrors
+        # `edit.rs::take_stepper_direction_elsewhere` *and*
+        # `..._from_chords`, both of which `SetBinding` and
+        # `SetChordBinding` run together. `keep_input` / `keep_chord` is the
+        # `(profile, layer, key)` slot currently being written, left alone.
+        def matches(other_binding: dict) -> bool:
+            return (
+                other_binding.get("type") == "step"
+                and other_binding.get("stepper_id") == stepper_id
+                and other_binding.get("direction") == direction
+            )
+
+        for name, profile in self._profiles.items():
+            for layer in ("base", "held"):
+                bindings = profile[layer]
+                for other in [
+                    key
+                    for key, b in bindings.items()
+                    if matches(b) and (name, layer, key) != keep_input
+                ]:
+                    del bindings[other]
+                chords = profile[f"chords_{layer}"]
+                for other in [
+                    key
+                    for key, b in chords.items()
+                    if matches(b) and (name, layer, key) != keep_chord
+                ]:
+                    del chords[other]
+
     def set_binding(self, input_str: str, layer: str, binding: dict) -> None:
         self._reject_if_axis_assigned(input_str, layer)
         self._validate_binding_action(binding, input_str)
         if binding.get("type") == "step":
-            # Ticket 03's Answer: assigning a Stepper list to a new Input
-            # silently moves it off its old one — no reject-at-save step,
-            # mirroring the real Daemon's `take_stepper_direction_elsewhere`.
-            stepper_id = binding.get("stepper_id")
-            direction = binding.get("direction")
-            for profile in self._profiles.values():
-                for layer_bindings in (profile["base"], profile["held"]):
-                    for other_input in [
-                        other
-                        for other, other_binding in layer_bindings.items()
-                        if other_binding.get("type") == "step"
-                        and other_binding.get("stepper_id") == stepper_id
-                        and other_binding.get("direction") == direction
-                    ]:
-                        del layer_bindings[other_input]
+            self._steal_stepper_direction(
+                binding.get("stepper_id"),
+                binding.get("direction"),
+                keep_input=(self._active_profile, layer, input_str),
+            )
         # Deep-copied for the same reason: SetBinding's real wire encoding
         # (wire.py) copies every field into a GLib.Variant, decoupled from
         # the caller's dict, so mutating `binding` afterward must not reach
@@ -267,6 +310,12 @@ class DaemonStub:
             raise InvalidBindingError(
                 f"conflicts with the existing Chord {conflicting}: one member set fully "
                 "contains the other"
+            )
+        if binding.get("type") == "step":
+            self._steal_stepper_direction(
+                binding.get("stepper_id"),
+                binding.get("direction"),
+                keep_chord=(self._active_profile, layer, key),
             )
         chords[key] = copy.deepcopy(binding)
         self.calls.append(("set_chord_binding", list(inputs), layer, copy.deepcopy(binding)))
@@ -318,6 +367,10 @@ class DaemonStub:
         self.calls.append(("set_mode_key_role", role))
 
     def create_profile(self, name: str) -> None:
+        if not name.strip():
+            # `config::validate`'s `EmptyProfileName` — a blank name is a
+            # bad request, same as for a Macro/Stepper.
+            raise InvalidBindingError("Profile name can't be empty")
         if name in self._profiles:
             raise AlreadyExistsError(f"a Profile named {name!r} already exists")
         self._profiles[name] = copy.deepcopy(self._SEED_PROFILE)
@@ -328,6 +381,12 @@ class DaemonStub:
             raise InvalidBindingError("cannot delete the active Profile")
         if name not in self._profiles:
             raise NotFoundError(f"no Profile named {name!r}")
+        if self._profile_switch_referenced(name):
+            # `edit.rs::profile_switch_references` — a dangling
+            # `ProfileSwitch` target can never exist.
+            raise InvalidBindingError(
+                f"Profile {name!r} is still referenced by a Profile Switch Binding"
+            )
         del self._profiles[name]
         self.calls.append(("delete_profile", name))
 
@@ -336,12 +395,25 @@ class DaemonStub:
             raise NotFoundError(f"no Profile named {old_name!r}")
         if new_name != old_name and new_name in self._profiles:
             raise AlreadyExistsError(f"a Profile named {new_name!r} already exists")
+        if not new_name.strip():
+            raise InvalidBindingError("Profile name can't be empty")
         self.calls.append(("rename_profile", old_name, new_name))
         if new_name == old_name:
             return
         self._profiles[new_name] = self._profiles.pop(old_name)
         if self._active_profile == old_name:
             self._active_profile = new_name
+        # `edit.rs::cascade_rename_profile_switch_targets` — every Base/Held
+        # `ProfileSwitch` Binding that named the old Profile is repointed, so
+        # a rename never silently leaves a dangling reference behind.
+        for profile in self._profiles.values():
+            for layer in ("base", "held"):
+                for binding in profile[layer].values():
+                    if (
+                        binding.get("type") == "profile_switch"
+                        and binding.get("target") == old_name
+                    ):
+                        binding["target"] = new_name
 
     def _unique_macro_id(self, name: str) -> str:
         base = rules.slug(name, "macro")
@@ -361,17 +433,34 @@ class DaemonStub:
             n += 1
         return f"{base}-{n}"
 
+    @staticmethod
+    def _all_bindings(profile: dict):
+        # Mirror of `config::profile_all_bindings` — every Binding across
+        # both per-Input Layers *and* both Chord Layers (ticket 40), so the
+        # reference-count guards hold a Macro/Stepper alive when only a
+        # Chord still uses it, exactly as `edit.rs` does.
+        for key in ("base", "held", "chords_base", "chords_held"):
+            yield from profile[key].values()
+
     def _stepper_referenced(self, stepper_id: str) -> bool:
         return any(
             binding.get("type") == "step" and binding.get("stepper_id") == stepper_id
             for profile in self._profiles.values()
-            for layer in ("base", "held")
-            for binding in profile[layer].values()
+            for binding in self._all_bindings(profile)
         )
 
     def _macro_referenced(self, macro_id: str) -> bool:
         return any(
             binding.get("type") == "macro" and binding.get("macro_id") == macro_id
+            for profile in self._profiles.values()
+            for binding in self._all_bindings(profile)
+        )
+
+    def _profile_switch_referenced(self, name: str) -> bool:
+        # Mirror of `edit.rs::profile_switch_references` — Base/Held only
+        # (a Chord's Binding can never be a `profile_switch`).
+        return any(
+            binding.get("type") == "profile_switch" and binding.get("target") == name
             for profile in self._profiles.values()
             for layer in ("base", "held")
             for binding in profile[layer].values()
@@ -468,8 +557,14 @@ class DaemonStub:
         self.calls.append(("stop_all_toggles",))
 
     def set_actuation_point(self, input_str: str, actuation: int, release: int) -> None:
-        if release > actuation:
-            raise InvalidBindingError("release must not exceed actuation")
+        if not is_grid_input(input_str):
+            # `config::validate`'s `InvalidActuationOverrideInput` — only
+            # Grid keys have Depth (same guard as `set_axis_assignment`).
+            raise InvalidBindingError(f"{input_str!r} is not a Grid Input")
+        if release >= actuation:
+            # `config::validate`'s `ReleaseNotBelowActuation` is "at or
+            # above" — equal points defeat hysteresis too.
+            raise InvalidBindingError("release must be below actuation")
         overrides = self._profiles[self._active_profile]["actuation_overrides"]
         overrides[input_str] = {"actuation": actuation, "release": release}
         self.calls.append(("set_actuation_point", input_str, actuation, release))
@@ -479,8 +574,8 @@ class DaemonStub:
         self.calls.append(("clear_actuation_point", input_str))
 
     def set_default_actuation(self, actuation: int, release: int) -> None:
-        if release > actuation:
-            raise InvalidBindingError("release must not exceed actuation")
+        if release >= actuation:
+            raise InvalidBindingError("release must be below actuation")
         self._profiles[self._active_profile]["default_actuation"] = {
             "actuation": actuation,
             "release": release,

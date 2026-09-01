@@ -200,15 +200,21 @@ def test_delete_is_enabled_and_works_once_unreferenced():
     assert ui_state["library_selected_macro"] is None
 
 
-def test_macro_used_by_count_scans_base_and_held_across_profiles():
+def test_macro_used_by_count_scans_base_held_and_chords_across_profiles():
+    # Mirrors `edit.rs::macro_references` (via `config::profile_all_bindings`)
+    # — Chord Bindings count too, so the delete guard the real Daemon
+    # enforces and the tooltip the GUI shows agree.
     stub = DaemonStub()
     stub.create_profile("Gaming")
     macro_id = stub.create_macro("Test macro", [])
     stub.set_binding("grid_r1c1", "base", {"trigger": "fire_once", "type": "macro", "macro_id": macro_id})
+    stub.set_chord_binding(
+        ["grid_r2c1", "grid_r2c2"], "base", {"trigger": "fire_once", "type": "macro", "macro_id": macro_id}
+    )
     stub.switch_profile("Gaming")
     stub.set_binding("grid_r1c2", "held", {"trigger": "fire_once", "type": "macro", "macro_id": macro_id})
 
-    assert macro_used_by_count(stub.get_config(), macro_id) == 2
+    assert macro_used_by_count(stub.get_config(), macro_id) == 3
     assert macro_used_by_count(stub.get_config(), "nonexistent") == 0
 
 
@@ -383,13 +389,19 @@ def test_stepper_delete_is_disabled_with_a_used_by_tooltip_while_referenced():
     assert "Used by 1 Binding(s)" in delete_btn.get_tooltip_text()
 
 
-def test_stepper_used_by_count_scans_base_and_held_across_profiles():
+def test_stepper_used_by_count_counts_a_chord_binding():
+    # Mirrors `edit.rs::stepper_references` — a Chord Binding counts too, so
+    # the delete button stays disabled while only a Chord uses the Stepper.
+    # (A `(stepper, direction)` pair is unique across both keyspaces, so the
+    # per-Input and Chord refs here take different directions.)
     stub = DaemonStub()
-    stub.create_profile("Gaming")
     stepper_id = stub.create_stepper("Weapon Wheel", [])
     stub.set_binding("grid_r1c1", "base", {"trigger": "fire_once", "type": "step", "stepper_id": stepper_id, "direction": "forward"})
-    stub.switch_profile("Gaming")
-    stub.set_binding("grid_r1c2", "held", {"trigger": "fire_once", "type": "step", "stepper_id": stepper_id, "direction": "backward"})
+    stub.set_chord_binding(
+        ["grid_r2c1", "grid_r2c2"],
+        "base",
+        {"trigger": "fire_once", "type": "step", "stepper_id": stepper_id, "direction": "backward"},
+    )
 
     assert stepper_used_by_count(stub.get_config(), stepper_id) == 2
     assert stepper_used_by_count(stub.get_config(), "nonexistent") == 0
