@@ -21,6 +21,7 @@ pub mod edit;
 pub mod executor;
 pub mod injector;
 pub mod input;
+pub mod stepper;
 pub mod trigger;
 
 /// The GUI-mirror contract fixture generator (post-release ticket 06) — a

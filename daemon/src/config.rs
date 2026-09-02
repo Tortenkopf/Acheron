@@ -262,9 +262,10 @@ impl Profile {
 /// TOML string-key convention) this marshals as a `+`-joined, sorted string
 /// of each member's own `Input` `Display` form (e.g.
 /// `"grid_r1c1+grid_r1c2"`). Always at least 2 members — enforced by
-/// `dispatch::handle_command`'s `SetChordBinding` handler, not the type
-/// itself, matching how `ActuationPoint`'s hysteresis invariant is enforced
-/// at the `Command` layer rather than baked into the struct.
+/// `ChordKey`'s `FromStr` on the wire string and by `config::validate` on a
+/// stored `Config` (a live `SetChordBinding` surfaces it via `edit::plan`),
+/// not by the type's constructor, matching how `ActuationPoint`'s hysteresis
+/// invariant is checked at those layers rather than baked into the struct.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ChordKey(BTreeSet<Input>);
 
@@ -708,7 +709,7 @@ pub enum StepperItem {
     },
     /// A gamepad-button press (ticket 92's Answer) — the joystick/controller
     /// extension CONTEXT.md's Stepper entry always anticipated. Compiled by
-    /// `dispatch::resolve_step` to the same down/dwell/up triple as
+    /// `executor::compile_stepper_item` to the same down/dwell/up triple as
     /// `Action::ControllerButton` (`executor::controller_button_steps`),
     /// routed to the gamepad `uinput` device by `input::is_gamepad_button`.
     /// `button` is validated against `input::gamepad_button_codes()`'s

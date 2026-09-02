@@ -23,7 +23,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::capture::analog;
-use crate::config::{Action, MacroDef, MacroId, MacroStepDto, Modifiers};
+use crate::config::{Action, MacroDef, MacroId, MacroStepDto, Modifiers, StepperItem};
 use crate::injector::{Injector, InjectorClosed};
 
 /// The runtime step sequence a compiled `Action` runs as, per spec.md's
@@ -75,7 +75,7 @@ fn modifier_codes(modifiers: Modifiers) -> Vec<KeyCode> {
 /// unrelated tuning knobs. Not final-tuned against a real game yet.
 pub(crate) const CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD: Duration = Duration::from_millis(35);
 
-/// `pub(crate)` (rather than private) so `dispatch::resolve_step` can reuse
+/// `pub(crate)` (rather than private) so `compile_stepper_item` can reuse
 /// the same canned mods-down/key/mods-up sequence for a Stepper item's
 /// modifier combination (ticket 63) — the two callers share the exact
 /// balanced-firing semantics `Action::Keypress` established.
@@ -93,10 +93,10 @@ pub(crate) fn keypress_steps(modifiers: Modifiers, key: KeyCode) -> Vec<MacroSte
 /// compiles to (ticket 75/76's `CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD`
 /// dwell between the edges, so a same-poll-frame game doesn't swallow the
 /// press). Shared by `compile`'s `Action::ControllerButton` arm and
-/// `dispatch::resolve_step`'s `StepperItem::ControllerButton` arm (ticket
+/// `compile_stepper_item`'s `StepperItem::ControllerButton` arm (ticket
 /// 92) — a Stepper item is always an atomic one-shot press, so it hits the
 /// same polled-input risk and reuses the same constant rather than
-/// hand-inlining the triple in `dispatch`.
+/// hand-inlining the triple.
 pub(crate) fn controller_button_steps(button: KeyCode) -> Vec<MacroStep> {
     vec![
         MacroStep::KeyDown(button),
@@ -155,6 +155,23 @@ pub fn compile(action: &Action, macros: &HashMap<MacroId, MacroDef>) -> Vec<Macr
         // it) — the only caller still reaching this arm is the
         // Digital-Capture-mode Analog-repeat fallback (ticket 20).
         Action::ControllerButton { button } => controller_button_steps(*button),
+    }
+}
+
+/// Compiles one already-selected Stepper list item into the flat step
+/// sequence the shared executor runs (ticket 62 / 92, post-release ticket
+/// 12) — `dispatch::compile_action` calls this on the item
+/// `stepper::Cursors::step` returns. A `Key` item reuses `Action::Keypress`'s
+/// mods-down/key/mods-up path, carrying its own modifier combination if it
+/// has one (ticket 62); a `ControllerButton` item reuses
+/// `Action::ControllerButton`'s down/dwell/up triple (ticket 92), routed to
+/// the gamepad `uinput` device by the injector's `input::is_gamepad_button`
+/// check. Both helpers are shared with `compile`'s own arms, so a Stepper
+/// item and the matching Action stay byte-identical.
+pub(crate) fn compile_stepper_item(item: StepperItem) -> Vec<MacroStep> {
+    match item {
+        StepperItem::Key { key, modifiers } => keypress_steps(modifiers, key),
+        StepperItem::ControllerButton { button } => controller_button_steps(button),
     }
 }
 
@@ -466,7 +483,7 @@ pub(crate) async fn force_release(injector: &Injector, held: HashSet<KeyCode>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Action, MacroStepDto, Modifiers};
+    use crate::config::{Action, MacroStepDto, Modifiers, StepperItem};
     use crate::injector::{self, testing::RecordingSink};
 
     /// An empty macro library for tests exercising a non-Macro `Action` —
@@ -560,7 +577,7 @@ mod tests {
 
     #[test]
     fn controller_button_steps_helper_matches_the_compile_arm() {
-        // Ticket 92: `dispatch::resolve_step` reuses this helper for a
+        // Ticket 92: `compile_stepper_item` reuses this helper for a
         // `StepperItem::ControllerButton`, so it must stay identical to
         // what `compile(Action::ControllerButton)` produces.
         assert_eq!(
@@ -571,6 +588,53 @@ mod tests {
                 },
                 &empty_macros(),
             )
+        );
+    }
+
+    /// Ticket 63 (moved here from `dispatch::tests` by post-release ticket
+    /// 12): a modifier-bearing Stepper `Key` item compiles through the same
+    /// canned mods-down/key/mods-up sequence as `Action::Keypress`.
+    #[test]
+    fn compile_stepper_item_with_modifiers_is_the_canned_mods_down_key_up_sequence() {
+        let steps = compile_stepper_item(StepperItem::Key {
+            key: KeyCode::KEY_3,
+            modifiers: Modifiers {
+                ctrl: true,
+                shift: true,
+                alt: false,
+                super_key: false,
+            },
+        });
+
+        assert_eq!(
+            steps,
+            vec![
+                MacroStep::KeyDown(KeyCode::KEY_LEFTCTRL),
+                MacroStep::KeyDown(KeyCode::KEY_LEFTSHIFT),
+                MacroStep::KeyDown(KeyCode::KEY_3),
+                MacroStep::KeyUp(KeyCode::KEY_3),
+                MacroStep::KeyUp(KeyCode::KEY_LEFTSHIFT),
+                MacroStep::KeyUp(KeyCode::KEY_LEFTCTRL),
+            ]
+        );
+    }
+
+    /// Ticket 92 (moved here from `dispatch::tests` by post-release ticket
+    /// 12): a `StepperItem::ControllerButton` compiles to the same
+    /// down/dwell/up triple as `Action::ControllerButton`'s digital path.
+    #[test]
+    fn compile_stepper_item_controller_button_is_the_dwell_triple() {
+        let steps = compile_stepper_item(StepperItem::ControllerButton {
+            button: KeyCode::BTN_SOUTH,
+        });
+
+        assert_eq!(
+            steps,
+            vec![
+                MacroStep::KeyDown(KeyCode::BTN_SOUTH),
+                MacroStep::Delay(CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD),
+                MacroStep::KeyUp(KeyCode::BTN_SOUTH),
+            ]
         );
     }
 

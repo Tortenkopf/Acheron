@@ -153,8 +153,9 @@ and it can be verified before merge.
      step — `Command::Apply` carries the `Edit` verbatim.
   4. If the operation has a runtime side effect that isn't a `Config` write
      (republishing actuation, recomputing axes, signalling the supervisor,
-     stopping a Toggle, dropping a stepper cursor, emitting a signal…), add an
-     `edit::Effect` variant and handle it in `dispatch::run_effects`.
+     stopping a Toggle, reconciling a stepper cursor after its list changed,
+     emitting a signal…), add an `edit::Effect` variant and handle it in
+     `dispatch::run_effects`.
 
   A **structural invariant of a stored `Config`** — anything that could be
   written to `config.toml` and reloaded — goes in `config::validate` and
@@ -203,6 +204,18 @@ and it can be verified before merge.
   (`analog_repeat::Engine`, `run_analog_repeat_loop`) and the
   `compile_action` handoff belong outside the pure core.
 
+- **Changing Stepper cursor behaviour** (the wrap-around, which item a step
+  lands on, the default-to-first, or how an edited/deleted list reconciles a
+  stored position) — post-release ticket 12. The decision lives in
+  `daemon/src/stepper.rs` as the pure `stepper::Cursors` methods (`step`,
+  `reconcile`, `snapshot`) — add or adjust it there with a synchronous
+  `stepper::tests` case, never in `dispatch`. `edit::plan` only emits
+  `Effect::ReconcileStepperCursor(id)` on a `DeleteStepper` /
+  `SetStepperItems`; the drop-vs-clamp rule is `reconcile`'s. The
+  `StepperItem` → `Vec<MacroStep>` compilation is
+  `executor::compile_stepper_item`. Only spawning the compiled firing stays
+  in `dispatch` (`compile_action`).
+
 - **Adding a new piece of dispatch runtime state** (a new per-Input handle
   map, another momentary mode flag, a live view of something the supervisor
   reports…) — ticket 09. The dispatch task's ephemeral runtime state lives in
@@ -217,10 +230,9 @@ and it can be verified before merge.
   (ticket 05), as do the `rx_*` receivers and their `*_open` liveness flags
   (pure `select!` plumbing that no handler reads). A handful of leaf helpers
   (`handle_layer_switch`, `handle_connection_change`,
-  `handle_capture_mode_change`, `handle_axis_edge_event`) stay free functions
-  taking `&mut` to only the one or two fields they touch — that is fine; the
-  rule is against reintroducing the loose-local *bundle*, not against a
-  narrow borrow.
+  `handle_capture_mode_change`) stay free functions taking `&mut` to only the
+  one or two fields they touch — that is fine; the rule is against
+  reintroducing the loose-local *bundle*, not against a narrow borrow.
 
 - **Adding a device-catalog entry or a Binding-legality rule.** The GUI
   mirrors the Daemon's device vocabularies and the pure part of

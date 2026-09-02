@@ -249,10 +249,12 @@ pub(crate) enum Effect {
     StopAllAnalogRepeats,
     /// Center every live axis output and clear the axis engine's state.
     ResetAxisOutputs,
-    /// Drop the given Stepper's Daemon-side runtime cursor.
-    DropStepperCursor(StepperId),
-    /// Clamp the given Stepper's runtime cursor to `len - 1`, if it has one.
-    ClampStepperCursor { stepper: StepperId, len: usize },
+    /// Reconcile the given Stepper's Daemon-side runtime cursor against the
+    /// just-committed `Config` — its list definition changed
+    /// (`DeleteStepper` removes it, `SetStepperItems` reshapes it).
+    /// `dispatch` drops the cursor if the list is gone or empty, clamps it if
+    /// the list shrank, leaves it otherwise (`stepper::Cursors::reconcile`).
+    ReconcileStepperCursor(StepperId),
     /// Emit `ActiveProfileChanged(name)`.
     AnnounceProfileChange(String),
 }
@@ -499,10 +501,12 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             if next.steppers.remove(&stepper_id).is_none() {
                 return Err(CommandError::NotFound);
             }
-            // The runtime cursor is Daemon-side-only state — dropped so a
-            // later `CreateStepper` landing on the same freed slug starts at
-            // the list's first item rather than inheriting a stale position.
-            effects.push(Effect::DropStepperCursor(stepper_id));
+            // The runtime cursor is Daemon-side-only state — `dispatch`
+            // reconciles it against the committed `Config` (here: the list is
+            // gone, so the cursor is dropped) so a later `CreateStepper`
+            // landing on the same freed slug starts at the list's first item
+            // rather than inheriting a stale position.
+            effects.push(Effect::ReconcileStepperCursor(stepper_id));
         }
         Edit::SetStepperItems { stepper_id, items } => {
             let def = next
@@ -510,21 +514,12 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
                 .get_mut(&stepper_id)
                 .ok_or(CommandError::NotFound)?;
             def.items = items;
-            let new_len = def.items.len();
-            if new_len == 0 {
-                // Nothing left to point at — dropping the entry lets
-                // `resolve_step`'s zero-items short-circuit and `GetState`'s
-                // own default both agree on "index 0" for free.
-                effects.push(Effect::DropStepperCursor(stepper_id));
-            } else {
-                // A shrink can leave a stored cursor past the new end —
-                // clamped so `GetState`'s reported position never outruns
-                // the list it's a position *in*.
-                effects.push(Effect::ClampStepperCursor {
-                    stepper: stepper_id,
-                    len: new_len,
-                });
-            }
+            // The stored cursor may now point past the new end, or the list
+            // may be empty — `dispatch` reconciles it against the committed
+            // list (clamp on a shrink, drop when empty). `plan` just names
+            // the list that moved; the drop-vs-clamp rule lives in
+            // `stepper::Cursors`.
+            effects.push(Effect::ReconcileStepperCursor(stepper_id));
         }
         Edit::SetChordBinding {
             inputs,
@@ -1268,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_stepper_drops_its_runtime_cursor() {
+    fn delete_stepper_emits_a_reconcile_effect_for_its_cursor() {
         let mut config = seed();
         let sid = with_stepper(&mut config, "wep");
         let (_, outcome) = plan_ok(
@@ -1277,40 +1272,36 @@ mod tests {
                 stepper_id: sid.clone(),
             },
         );
-        assert_eq!(outcome.effects, vec![Effect::DropStepperCursor(sid)]);
+        assert_eq!(outcome.effects, vec![Effect::ReconcileStepperCursor(sid)]);
     }
 
     #[test]
-    fn set_stepper_items_clamps_or_drops_the_cursor_by_the_new_length() {
+    fn set_stepper_items_emits_a_reconcile_effect_for_the_list_shrunk_or_emptied() {
         let mut config = seed();
         let sid = with_stepper(&mut config, "wep");
 
-        let (_, shrink) = plan_ok(
-            &config,
-            Edit::SetStepperItems {
-                stepper_id: sid.clone(),
-                items: vec![StepperItem::Key {
-                    key: KeyCode::KEY_1,
-                    modifiers: Modifiers::default(),
-                }],
-            },
-        );
-        assert_eq!(
-            shrink.effects,
-            vec![Effect::ClampStepperCursor {
-                stepper: sid.clone(),
-                len: 1
-            }]
-        );
-
-        let (_, emptied) = plan_ok(
-            &config,
-            Edit::SetStepperItems {
-                stepper_id: sid.clone(),
-                items: vec![],
-            },
-        );
-        assert_eq!(emptied.effects, vec![Effect::DropStepperCursor(sid)]);
+        // The drop-vs-clamp decision now lives in `stepper::Cursors`
+        // (covered by `stepper::tests`); `plan` just names the list that
+        // moved, the same effect for a shrink and for an empty list.
+        for items in [
+            vec![StepperItem::Key {
+                key: KeyCode::KEY_1,
+                modifiers: Modifiers::default(),
+            }],
+            vec![],
+        ] {
+            let (_, outcome) = plan_ok(
+                &config,
+                Edit::SetStepperItems {
+                    stepper_id: sid.clone(),
+                    items,
+                },
+            );
+            assert_eq!(
+                outcome.effects,
+                vec![Effect::ReconcileStepperCursor(sid.clone())]
+            );
+        }
     }
 
     #[test]

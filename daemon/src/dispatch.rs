@@ -41,13 +41,14 @@ use crate::chord;
 use crate::command::{Command, State};
 use crate::config::{
     self, Action, ActuationPoint, Binding, ChordKey, Config, Layer, MacroDef, MacroId, ModeKeyRole,
-    StepDirection, StepperDef, StepperId, StepperItem, TriggerMode,
+    StepperDef, StepperId, TriggerMode,
 };
 use crate::dbus::Daemon;
 use crate::edit;
 use crate::executor::{self, ActiveToggle, FiringHandle, MacroStep};
 use crate::injector::Injector;
 use crate::input::Input;
+use crate::stepper;
 use crate::trigger;
 
 /// Builds a `TriggerCtx` (below) from a `(firings, toggles)` pair plus the
@@ -68,7 +69,7 @@ macro_rules! trigger_ctx {
             toggles: $toggles,
             macros: &$config.macros,
             steppers: &$config.steppers,
-            stepper_cursors: $cursors,
+            cursors: $cursors,
             toggle_lap_target: $lap,
         }
     };
@@ -98,7 +99,7 @@ struct ChordRuntime {
 struct DispatchState {
     toggles: HashMap<Input, ActiveToggle>,
     in_flight: HashMap<Input, FiringHandle>,
-    stepper_cursors: HashMap<StepperId, usize>,
+    stepper: stepper::Cursors,
     active_layer: Layer,
     chord_machine: chord::ChordMachine,
     chord_runtime: ChordRuntime,
@@ -129,7 +130,7 @@ impl DispatchState {
         DispatchState {
             toggles: HashMap::new(),
             in_flight: HashMap::new(),
-            stepper_cursors: HashMap::new(),
+            stepper: stepper::Cursors::default(),
             active_layer: Layer::Base,
             chord_machine: chord::ChordMachine::default(),
             chord_runtime: ChordRuntime::default(),
@@ -266,7 +267,7 @@ impl DispatchState {
                     config,
                     &mut self.in_flight,
                     &mut self.toggles,
-                    &mut self.stepper_cursors,
+                    &mut self.stepper,
                     self.toggle_lap_target,
                 );
                 perform_trigger(decision, event.input, &binding, &mut ctx).await?;
@@ -312,7 +313,7 @@ impl DispatchState {
                         config,
                         &mut self.chord_runtime.firings,
                         &mut self.chord_runtime.toggles,
-                        &mut self.stepper_cursors,
+                        &mut self.stepper,
                         self.toggle_lap_target,
                     );
                     perform_trigger(decision, key, &binding, &mut ctx).await?;
@@ -422,7 +423,7 @@ impl DispatchState {
                     config,
                     &mut self.in_flight,
                     &mut self.toggles,
-                    &mut self.stepper_cursors,
+                    &mut self.stepper,
                     self.toggle_lap_target,
                 );
                 perform_trigger(decision, input, &binding, &mut ctx).await?;
@@ -483,12 +484,12 @@ impl DispatchState {
             // Depth first crossed the deadzone (mirrors `perform_trigger`'s
             // own once-per-fire `compile_action` call) — `compile_action`
             // stays dispatch-side so the engine needn't depend on `dispatch`
-            // or drag `Config` + `stepper_cursors` in.
+            // or drag `Config` + the `stepper::Cursors` in.
             let steps = compile_action(
                 &binding.action,
                 &config.macros,
                 &config.steppers,
-                &mut self.stepper_cursors,
+                &mut self.stepper,
             );
             self.analog_repeat.spawn(
                 self.injector.clone(),
@@ -550,13 +551,10 @@ impl DispatchState {
                         let _ = self.injector.set_axis_value(w.code, w.value).await;
                     }
                 }
-                edit::Effect::DropStepperCursor(stepper) => {
-                    self.stepper_cursors.remove(&stepper);
-                }
-                edit::Effect::ClampStepperCursor { stepper, len } => {
-                    if let Some(cursor) = self.stepper_cursors.get_mut(&stepper) {
-                        *cursor = (*cursor).min(len - 1);
-                    }
+                edit::Effect::ReconcileStepperCursor(stepper_id) => {
+                    // Against the just-committed `Config`: `id` gone → drop
+                    // the cursor, list shorter → clamp, list empty → drop.
+                    self.stepper.reconcile(&config.steppers, &stepper_id);
                 }
                 edit::Effect::AnnounceProfileChange(name) => {
                     if let Some(emitter) = &self.signal_emitter {
@@ -610,20 +608,9 @@ impl DispatchState {
                 let _ = reply.send(config.clone());
             }
             Command::GetState(reply) => {
-                // Every library entry gets a reported cursor, defaulting to `0`
-                // ("the list's first item") for one never yet stepped — richer
-                // for the GUI than only reporting entries this task has actually
-                // touched (ticket 03/54).
-                let stepper_cursors = config
-                    .steppers
-                    .keys()
-                    .map(|id| {
-                        (
-                            id.clone(),
-                            self.stepper_cursors.get(id).copied().unwrap_or(0),
-                        )
-                    })
-                    .collect();
+                // One reported cursor per library entry, `0` ("the list's
+                // first item") for one never yet stepped (ticket 03/54).
+                let stepper_cursors = self.stepper.snapshot(&config.steppers);
                 let _ = reply.send(State {
                     profile: config.active_profile.clone(),
                     layer: self.active_layer.as_str(),
@@ -878,7 +865,7 @@ struct TriggerCtx<'a, K> {
     toggles: &'a mut HashMap<K, ActiveToggle>,
     macros: &'a HashMap<MacroId, MacroDef>,
     steppers: &'a HashMap<StepperId, StepperDef>,
-    stepper_cursors: &'a mut HashMap<StepperId, usize>,
+    cursors: &'a mut stepper::Cursors,
     toggle_lap_target: Duration,
 }
 
@@ -899,12 +886,7 @@ async fn perform_trigger<K: Eq + Hash + Clone>(
     match decision {
         D::Nothing => {}
         D::SpawnFireOnce => {
-            let steps = compile_action(
-                &binding.action,
-                ctx.macros,
-                ctx.steppers,
-                ctx.stepper_cursors,
-            );
+            let steps = compile_action(&binding.action, ctx.macros, ctx.steppers, ctx.cursors);
             let handle = executor::spawn_fire_once(ctx.injector.clone(), steps);
             ctx.firings.insert(key, handle);
         }
@@ -918,12 +900,7 @@ async fn perform_trigger<K: Eq + Hash + Clone>(
             ctx.firings.insert(key, handle);
         }
         D::StartToggleLoop => {
-            let steps = compile_action(
-                &binding.action,
-                ctx.macros,
-                ctx.steppers,
-                ctx.stepper_cursors,
-            );
+            let steps = compile_action(&binding.action, ctx.macros, ctx.steppers, ctx.cursors);
             ctx.toggles.insert(
                 key,
                 ActiveToggle::spawn(ctx.injector.clone(), steps, ctx.toggle_lap_target),
@@ -1039,69 +1016,27 @@ async fn handle_capture_mode_change(
     }
 }
 
-/// Compiles a Binding's `Action` into the flat step sequence `perform_trigger`
-/// spawns —
-/// `executor::compile` for every ordinary Action, or `resolve_step` for
-/// `Action::Step`, whose steps depend on Daemon-owned runtime cursor state
-/// `executor::compile` has no access to (ticket 03/54).
+/// Compiles a Binding's `Action` into the flat step sequence
+/// `perform_trigger` spawns — `executor::compile` for every ordinary Action,
+/// or, for `Action::Step`, `stepper::Cursors::step` (which advances the
+/// Daemon-owned per-list cursor `executor::compile` has no access to, ticket
+/// 03/54) followed by `executor::compile_stepper_item`. A zero-item list
+/// steps to nothing.
 fn compile_action(
     action: &Action,
     macros: &HashMap<MacroId, MacroDef>,
     steppers: &HashMap<StepperId, StepperDef>,
-    stepper_cursors: &mut HashMap<StepperId, usize>,
+    cursors: &mut stepper::Cursors,
 ) -> Vec<executor::MacroStep> {
     match action {
-        Action::Step { stepper, direction } => {
-            resolve_step(steppers, stepper_cursors, stepper, *direction)
-        }
+        Action::Step {
+            stepper: id,
+            direction,
+        } => cursors
+            .step(steppers, id, *direction)
+            .map(executor::compile_stepper_item)
+            .unwrap_or_default(),
         other => executor::compile(other, macros),
-    }
-}
-
-/// Advances/retreats a Stepper's per-list cursor (Daemon-side-only runtime
-/// state, ticket 03/54 — CONTEXT.md: Stepper) and compiles the
-/// newly-selected item — "one motion moves the cursor and fires," ticket
-/// 03's Answer's firing semantics. A `Key` item reuses `Action::Keypress`'s
-/// mods-down/key/mods-up compile path, carrying its own modifier
-/// combination if it has one (ticket 62); a `ControllerButton` item (ticket
-/// 92) reuses `Action::ControllerButton`'s down/dwell/up triple. A missing
-/// cursor entry
-/// means "at the list's first item" (index 0), matching `stepper_cursors`'s
-/// own always-resets-to-first-item-on-restart convention. Wraps at either
-/// end. A `stepper` with zero items compiles to no steps at all — nothing to
-/// select, nothing to fire, cursor left untouched.
-fn resolve_step(
-    steppers: &HashMap<StepperId, StepperDef>,
-    stepper_cursors: &mut HashMap<StepperId, usize>,
-    stepper: &StepperId,
-    direction: StepDirection,
-) -> Vec<executor::MacroStep> {
-    let def = steppers.get(stepper).expect(
-        "SetBinding/config::parse validate every Action::Step references an existing StepperDef",
-    );
-    let len = def.items.len();
-    if len == 0 {
-        return Vec::new();
-    }
-    let current = stepper_cursors
-        .get(stepper)
-        .copied()
-        .unwrap_or(0)
-        .min(len - 1);
-    let next = match direction {
-        StepDirection::Forward => (current + 1) % len,
-        StepDirection::Backward => (current + len - 1) % len,
-    };
-    stepper_cursors.insert(stepper.clone(), next);
-    match def.items[next] {
-        // A keyboard/mouse item: the item's own modifier combination
-        // (ticket 62) through `Action::Keypress`'s canned compile path.
-        StepperItem::Key { key, modifiers } => executor::keypress_steps(modifiers, key),
-        // A gamepad-button item (ticket 92): the same atomic down/dwell/up
-        // triple as `Action::ControllerButton`'s digital path, routed to
-        // the gamepad `uinput` device by the injector's own
-        // `input::is_gamepad_button` check.
-        StepperItem::ControllerButton { button } => executor::controller_button_steps(button),
     }
 }
 
@@ -1140,6 +1075,7 @@ mod tests {
     use crate::capture::EventState;
     use crate::config::{
         Action, ActuationPoint, AxisTarget, DEFAULT_PROFILE_NAME, MacroStepDto, Modifiers, Profile,
+        StepDirection, StepperItem,
     };
     use crate::edit::{CommandError, CreatedId};
     use crate::injector::testing::RecordingSink;
@@ -3298,75 +3234,10 @@ mod tests {
         assert_eq!((code, value), (evdev::KeyCode::KEY_2, 0));
     }
 
-    /// Ticket 63: `resolve_step` no longer hardcodes a bare KeyDown/KeyUp
-    /// pair — a modifier-bearing item compiles through the same canned
-    /// mods-down/key/mods-up sequence as `Action::Keypress`, mirroring
-    /// `executor::tests::compile_keypress_is_a_canned_modifier_key_sequence`'s
-    /// shape.
-    #[test]
-    fn resolve_step_with_modifiers_compiles_the_canned_mods_down_key_up_sequence() {
-        let stepper_id = StepperId::from("hotkey-pages");
-        let mut steppers = HashMap::new();
-        steppers.insert(
-            stepper_id.clone(),
-            StepperDef {
-                name: "Hotkey Pages".to_string(),
-                items: vec![crate::config::StepperItem::Key {
-                    key: evdev::KeyCode::KEY_3,
-                    modifiers: Modifiers {
-                        ctrl: true,
-                        shift: true,
-                        alt: false,
-                        super_key: false,
-                    },
-                }],
-            },
-        );
-        let mut cursors = HashMap::new();
-
-        let steps = resolve_step(&steppers, &mut cursors, &stepper_id, StepDirection::Forward);
-
-        assert_eq!(
-            steps,
-            vec![
-                executor::MacroStep::KeyDown(evdev::KeyCode::KEY_LEFTCTRL),
-                executor::MacroStep::KeyDown(evdev::KeyCode::KEY_LEFTSHIFT),
-                executor::MacroStep::KeyDown(evdev::KeyCode::KEY_3),
-                executor::MacroStep::KeyUp(evdev::KeyCode::KEY_3),
-                executor::MacroStep::KeyUp(evdev::KeyCode::KEY_LEFTSHIFT),
-                executor::MacroStep::KeyUp(evdev::KeyCode::KEY_LEFTCTRL),
-            ]
-        );
-    }
-
-    /// Ticket 92: a `StepperItem::ControllerButton` compiles to the same
-    /// down/dwell/up triple as `Action::ControllerButton`'s digital path.
-    #[test]
-    fn resolve_step_compiles_a_controller_button_item_to_the_dwell_triple() {
-        let stepper_id = StepperId::from("weapon-wheel");
-        let mut steppers = HashMap::new();
-        steppers.insert(
-            stepper_id.clone(),
-            StepperDef {
-                name: "Weapon Wheel".to_string(),
-                items: vec![crate::config::StepperItem::ControllerButton {
-                    button: evdev::KeyCode::BTN_SOUTH,
-                }],
-            },
-        );
-        let mut cursors = HashMap::new();
-
-        let steps = resolve_step(&steppers, &mut cursors, &stepper_id, StepDirection::Forward);
-
-        assert_eq!(
-            steps,
-            vec![
-                executor::MacroStep::KeyDown(evdev::KeyCode::BTN_SOUTH),
-                executor::MacroStep::Delay(executor::CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD),
-                executor::MacroStep::KeyUp(evdev::KeyCode::BTN_SOUTH),
-            ]
-        );
-    }
+    // `StepperItem` → `Vec<MacroStep>` compilation (tickets 63 / 92) is
+    // covered by `executor::tests::compile_stepper_item_*` since post-release
+    // ticket 12 moved that match to `executor::compile_stepper_item`; the
+    // cursor movement it feeds is covered by `stepper::tests`.
 
     #[tokio::test]
     async fn step_binding_wraps_around_at_either_end() {
@@ -3487,11 +3358,13 @@ mod tests {
     }
 
     /// Regression test for a `/code-review` finding: `DeleteStepper` used to
-    /// leave the deleted Stepper's runtime cursor sitting in
-    /// `stepper_cursors` — since `unique_stepper_id` can reassign a freed
-    /// slug to a brand-new, unrelated `CreateStepper` call, a stale nonzero
-    /// cursor would leak into that new entry's very first `GetState()`,
-    /// violating "always resets to the list's first item."
+    /// leave the deleted Stepper's runtime cursor sitting in the cursor map —
+    /// since `unique_stepper_id` can reassign a freed slug to a brand-new,
+    /// unrelated `CreateStepper` call, a stale nonzero cursor would leak into
+    /// that new entry's very first `GetState()`, violating "always resets to
+    /// the list's first item." Now `edit::plan` emits
+    /// `Effect::ReconcileStepperCursor` and `stepper::Cursors::reconcile`
+    /// drops it.
     #[tokio::test]
     async fn delete_stepper_command_clears_its_runtime_cursor() {
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
@@ -3552,8 +3425,9 @@ mod tests {
 
     /// Regression test for a `/code-review` finding: `SetStepperItems`
     /// shrinking a list used to leave a stored cursor pointing past the new
-    /// end, so `GetState()` reported an out-of-range index until the
-    /// Stepper was next fired (only `resolve_step` clamped).
+    /// end, so `GetState()` reported an out-of-range index until the Stepper
+    /// was next fired (only a subsequent `step` clamped). Now
+    /// `stepper::Cursors::reconcile` clamps it at commit time.
     #[tokio::test]
     async fn set_stepper_items_clamps_a_cursor_left_stranded_by_a_shrink() {
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
