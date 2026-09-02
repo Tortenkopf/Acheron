@@ -1,0 +1,8 @@
+{"kind": "session", "t": 9.1e-05, "argv": ["set", "111", "--no-driver-mode", "--yes", "--record", ".scratch/tartarus-status-leds/assets/01-keymap.jsonl"], "time": "2026-09-02T19:55:43+0200"}
+{"kind": "driver_mode", "t": 0.034729, "entered": false, "device_mode": "03 00"}
+{"kind": "frame_sent", "t": 0.037717, "label": "LED write orange + green + blue", "hex": "00001f000000090f02010b01000101ffffff0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000f000"}
+{"kind": "presence", "t": 0.038821, "note": "LED write", "present": true, "changed": false, "before": {"0": "/dev/hidraw0", "1": "/dev/hidraw1", "2": "/dev/hidraw4"}, "after": {"0": "/dev/hidraw0", "1": "/dev/hidraw1", "2": "/dev/hidraw4"}}
+{"kind": "readback", "t": 0.043714, "label": "after write", "hex": "00021f000000090f82010b01000001ffffff00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007100", "status": 2, "cmd_class": 15, "cmd_id": 130, "channels": [255, 255, 255], "echoes": true}
+{"kind": "expectation", "t": 0.043762, "channels": [255, 255, 255], "described": "orange + green + blue"}
+{"kind": "session", "t": 4.3e-05, "argv": ["readback", "--no-driver-mode", "--record", ".scratch/tartarus-status-leds/assets/01-keymap.jsonl"], "time": "2026-09-02T19:58:13+0200"}
+{"kind": "readback", "t": 0.022914, "label": "readback", "hex": "00021f000000090f82010b01000001ffffff00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007100", "status": 2, "cmd_class": 15, "cmd_id": 130, "channels": [255, 255, 255], "echoes": true}

@@ -1,0 +1,15 @@
+{"kind": "session", "t": 8.5e-05, "argv": ["set", "000", "--effect-none", "--no-driver-mode", "--yes", "--record", ".scratch/tartarus-status-leds/assets/01-off.jsonl"], "time": "2026-09-02T19:58:24+0200"}
+{"kind": "driver_mode", "t": 0.034758, "entered": false, "device_mode": "03 00"}
+{"kind": "frame_sent", "t": 0.037736, "label": "LED write (all dark)", "hex": "00001f000000060f02010b0000010100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100"}
+{"kind": "presence", "t": 0.038938, "note": "LED write", "present": true, "changed": false, "before": {"0": "/dev/hidraw0", "1": "/dev/hidraw1", "2": "/dev/hidraw4"}, "after": {"0": "/dev/hidraw0", "1": "/dev/hidraw1", "2": "/dev/hidraw4"}}
+{"kind": "readback", "t": 0.043739, "label": "after write", "hex": "00021f000000090f82010b01000001ffffff00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007100", "status": 2, "cmd_class": 15, "cmd_id": 130, "channels": [255, 255, 255], "echoes": true}
+{"kind": "expectation", "t": 0.043791, "channels": [0, 0, 0], "described": "(all dark)"}
+{"kind": "session", "t": 4.7e-05, "argv": ["set", "000", "--no-driver-mode", "--yes", "--record", ".scratch/tartarus-status-leds/assets/01-off.jsonl"], "time": "2026-09-02T19:59:05+0200"}
+{"kind": "driver_mode", "t": 0.035274, "entered": false, "device_mode": "03 00"}
+{"kind": "frame_sent", "t": 0.03801, "label": "LED write (all dark)", "hex": "00001f000000090f02010b0100010100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000f00"}
+{"kind": "presence", "t": 0.039201, "note": "LED write", "present": true, "changed": false, "before": {"0": "/dev/hidraw0", "1": "/dev/hidraw1", "2": "/dev/hidraw4"}, "after": {"0": "/dev/hidraw0", "1": "/dev/hidraw1", "2": "/dev/hidraw4"}}
+{"kind": "readback", "t": 0.044011, "label": "after write", "hex": "00021f000000090f82010b0100000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008e00", "status": 2, "cmd_class": 15, "cmd_id": 130, "channels": [0, 0, 0], "echoes": true}
+{"kind": "expectation", "t": 0.044059, "channels": [0, 0, 0], "described": "(all dark)"}
+{"kind": "session", "t": 4.8e-05, "argv": ["relock", "--yes", "--record", ".scratch/tartarus-status-leds/assets/01-off.jsonl"], "time": "2026-09-02T19:59:08+0200"}
+{"kind": "frame_sent", "t": 0.001548, "label": "set-device-mode 0x00 (normal)", "hex": "00000100000002000400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000600"}
+{"kind": "presence", "t": 0.053183, "note": "relock", "present": true, "changed": false, "before": {"0": "/dev/hidraw0", "1": "/dev/hidraw1", "2": "/dev/hidraw4"}, "after": {"0": "/dev/hidraw0", "1": "/dev/hidraw1", "2": "/dev/hidraw4"}}

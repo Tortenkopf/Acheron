@@ -1,0 +1,6 @@
+{"kind": "session", "t": 8e-05, "argv": ["set", "001", "--nostore", "--no-driver-mode", "--yes", "--record", ".scratch/tartarus-status-leds/assets/01-nostore.jsonl"], "time": "2026-09-02T20:04:26+0200"}
+{"kind": "driver_mode", "t": 0.03485, "entered": false, "device_mode": "00 00"}
+{"kind": "frame_sent", "t": 0.037836, "label": "LED write blue", "hex": "00001f000000090f02000b010001010000ff0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000f100"}
+{"kind": "presence", "t": 0.039123, "note": "LED write", "present": true, "changed": false, "before": {"0": "/dev/hidraw0", "1": "/dev/hidraw1", "2": "/dev/hidraw4"}, "after": {"0": "/dev/hidraw0", "1": "/dev/hidraw1", "2": "/dev/hidraw4"}}
+{"kind": "readback", "t": 0.043832, "label": "after write", "hex": "00021f000000090f82000b010000010000ff00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007000", "status": 2, "cmd_class": 15, "cmd_id": 130, "channels": [0, 0, 255], "echoes": true}
+{"kind": "expectation", "t": 0.043872, "channels": [0, 0, 255], "described": "blue"}

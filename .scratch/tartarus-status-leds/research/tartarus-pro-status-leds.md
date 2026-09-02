@@ -1,7 +1,9 @@
 # Research: how to drive the three side "Status LEDs" on the Razer Tartarus Pro
 
-Status: **standalone research, no effort map yet.** Captured 2026-08-30 so it's on hand once a
-post-release-development map exists. No ticket feeds this yet.
+Status: **feeds the [Tartarus status-LED indicator](../map.md) effort** (charted 2026-09-02).
+Captured 2026-08-30 as standalone research; now the grounding for
+[ticket 01 (prototype)](../issues/01-prototype-status-led-controllability.md) and
+[ticket 02 (wire-protocol research)](../issues/02-research-status-led-wire-protocol.md).
 
 Scope note: these are the **three discrete single-colour LEDs on the side of the device** (Razer
 calls them the *keymap indicator*; Synapse uses them as a profile-active indicator). This is **not**
@@ -70,6 +72,16 @@ CRC: `for (i = 2; i < 88; i++) crc ^= report[i];` (`razer_calculate_crc`, `drive
 
 ## 3. The status-LED command — exact bytes (LED ID `0x0B`)
 
+> **Sharpened by [`status-led-wire-protocol.md`](./status-led-wire-protocol.md) (ticket 02, 2026-09-02)** —
+> read that for the byte-by-byte spec. The arg table below is correct; what changed:
+> send `arg4 = 0x00` (OpenRazer's value, = Razer's own captured static frame; CommandPost's
+> `0x01` lands in an ignored slot); the LED frame needs **no** driver/Capture mode (OpenRazer
+> ships this device with driver mode disabled and its `0x0F` lighting still works — so drop
+> the "enable driver mode first" line below); device read-back is **unreliable** (keep an
+> authoritative RGB triple in the daemon, don't read-modify-write); `effect_none` is used by
+> neither impl; and NOSTORE (`arg0 = 0x00`) is worth trying before VARSTORE for a host-owned
+> indicator.
+
 `command_class 0x0F`, `command_id 0x02` (write) / `0x82` (read), `data_size 0x09`,
 `transaction_id 0x1F`:
 
@@ -136,6 +148,16 @@ gets no `profile_led_*` sysfs files. The open-tartarus-driver author tried this 
 hardware with both `0xFF` and `0x1F` transaction IDs: device ACKed, nothing lit.
 
 ## 5. Hardware-automatic vs host-driven
+
+> **Verified on our unit by [ticket 01](../issues/01-prototype-status-led-controllability.md)
+> (fw v1.2, 2026-09-02):** host-addressable — yes, all 8 combinations. **Persistence — NO:**
+> neither VARSTORE (`0x01`) *nor* NOSTORE (`0x00`) host writes survive a USB re-enumeration;
+> the firmware reclaims the LEDs to its power-on keymap-indicator default ("orange only") on
+> every enumeration. The "survives reconnect" bullet below is **wrong for host writes**.
+> On-device keymap switch — **this unit has no host-independent on-device keymap switch**, so
+> the "does firmware re-assert and clobber" question (below / §7 Q1) is **moot**: there is no
+> on-device switch to trigger it. Firmware *does* assert its default on boot, so a host driver
+> must assert on startup and on every reconnect regardless.
 
 - **Host-addressable: definitively yes.** `plxty` set the three LEDs independently; `z3ntu`
   summarised it and `plxty` confirmed — "depending on the R, G and B values in this call the 3 LEDs
