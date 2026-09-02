@@ -157,8 +157,8 @@ membership take full effect (or unplug/replug the device).
 ### Building a release
 
 Both components self-label their version from git. A plain `main` checkout
-reports `1.0.2-dev+<short-hash>`; a checkout sitting exactly on the `v1.0.2`
-tag (or a tarball with no `.git`) reports the bare `1.0.2`. **Tag the release
+reports `1.1.0-dev+<short-hash>`; a checkout sitting exactly on the `v1.1.0`
+tag (or a tarball with no `.git`) reports the bare `1.1.0`. **Tag the release
 commit before building** the artifacts you hand to users. The canonical
 version numbers live in `daemon/Cargo.toml` and `gui/acheron_gui/__init__.py`
 (`_BASE_VERSION`); a release bumps both. `daemon/build.rs` honours an explicit

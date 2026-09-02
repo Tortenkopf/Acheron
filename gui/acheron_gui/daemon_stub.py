@@ -108,7 +108,7 @@ class DaemonStub:
         self._capture_mode = "digital"
         # Ticket 99: the real Daemon reports its compile-time `crate::VERSION`
         # here; the stub stands in with a bare release string.
-        self._daemon_version = "1.0.2"
+        self._daemon_version = "1.1.0"
         # Ticket 101: the real Daemon reads these off the connected Tartarus
         # Pro over the Interface-2 control channel once per connect. The stub
         # stands in with plausible fixed values (the documented values for
