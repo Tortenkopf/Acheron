@@ -47,8 +47,8 @@ Acheron is two cooperating pieces:
 
 ### Features
 
-- **Profiles** — named, complete binding sets you switch between manually
-  (never automatically by focused window).
+- **Profiles** — named, complete binding sets you switch between manually.
+  The active Profile drives the Tartarus Pro's Status LEDs as indicators.
 - **Layers** — hold the Mode key for a second full set of bindings per Profile
   (Razer calls this "Hypershift").
 - **Bindings** from any Input — the 20 grid keys, the Mode key, the four
@@ -166,17 +166,17 @@ version numbers live in `daemon/Cargo.toml` and `gui/acheron_gui/__init__.py`
 
 ### Installed files
 
-| Path | What |
-|---|---|
-| `~/.local/bin/acheron-daemon` | Daemon binary |
-| `~/.local/bin/acheron-gui` | GUI launcher script |
-| `~/.config/systemd/user/acheron-daemon.service` | systemd --user unit |
-| `/etc/udev/rules.d/60-acheron-tartarus-pro.rules` | analog-access udev rule (root-owned) |
-| `~/.local/lib/acheron/acheron_gui/` | installed GUI package (incl. a bundled `LICENSE`) |
-| `~/.local/share/applications/acheron.desktop` | desktop entry |
-| `~/.local/share/icons/hicolor/*/apps/acheron.png` | app icons |
-| `~/.local/share/acheron/tray-icons/*.svg` | tray status icons |
-| `~/.config/acheron/config.toml` | your configuration (created by the Daemon on first run) |
+| Path                                                | What                                                    |
+| --------------------------------------------------- | ------------------------------------------------------- |
+| `~/.local/bin/acheron-daemon`                     | Daemon binary                                           |
+| `~/.local/bin/acheron-gui`                        | GUI launcher script                                     |
+| `~/.config/systemd/user/acheron-daemon.service`   | systemd --user unit                                     |
+| `/etc/udev/rules.d/60-acheron-tartarus-pro.rules` | analog-access udev rule (root-owned)                    |
+| `~/.local/lib/acheron/acheron_gui/`               | installed GUI package (incl. a bundled`LICENSE`)      |
+| `~/.local/share/applications/acheron.desktop`     | desktop entry                                           |
+| `~/.local/share/icons/hicolor/*/apps/acheron.png` | app icons                                               |
+| `~/.local/share/acheron/tray-icons/*.svg`         | tray status icons                                       |
+| `~/.config/acheron/config.toml`                   | your configuration (created by the Daemon on first run) |
 
 ### Uninstalling
 
@@ -252,8 +252,7 @@ systemctl --user restart acheron-daemon
   `install.sh` printed, confirm `groups` lists `plugdev`, then log out and back
   in.
 - **Daemon won't start after a hand-edit.** The error is in
-  `systemctl --user status acheron-daemon` / `journalctl --user -u
-  acheron-daemon`.
+  `systemctl --user status acheron-daemon` / `journalctl --user -u acheron-daemon`.
 
 ## Development
 
