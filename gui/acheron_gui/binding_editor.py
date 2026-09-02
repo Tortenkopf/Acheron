@@ -102,23 +102,6 @@ def action_summary(
     return f"Macro: {name}  [{TRIGGER_SHORT[binding['trigger']]}]"
 
 
-def describe_step(step: dict) -> str:
-    kind = step["type"]
-    if kind in ("key_down", "key_up"):
-        raw = step["key"]
-        # Ticket 92: a KeyDown/KeyUp step may target a controller button
-        # (routed to the gamepad device by the injector). Render it with the
-        # gamepad catalog's label and a ↓/↑ prefix, e.g. "↓ Btn: A / South".
-        # Mouse buttons (also `BTN_*`) aren't in the gamepad catalog, so
-        # they keep the plain "KeyDown BTN_SIDE" form.
-        if raw in CONTROLLER_LABEL_BY_CODE:
-            return f"{'↓' if kind == 'key_down' else '↑'} Btn: {CONTROLLER_LABEL_BY_CODE[raw]}"
-        return f"{'KeyDown' if kind == 'key_down' else 'KeyUp'} {raw}"
-    if kind == "delay_ms":
-        return f"Delay {step['ms']}ms"
-    return str(step)
-
-
 def labeled_row(label: str, widget: Gtk.Widget) -> Gtk.Box:
     row = Gtk.Box(spacing=8)
     lbl = Gtk.Label(label=label, xalign=0)
@@ -714,7 +697,7 @@ def build_action_and_trigger_fields(
             # dropdown sits alongside the Stepper dropdown; full item
             # authoring and the Forward/Backward *Input*-pair assignment
             # both live in the Library screen
-            # (`library_view.build_stepper_editor_columns`), not here — this
+            # (`library_view.build_editor_columns`), not here — this
             # popover only ever assigns `stepper_id`/`direction` to the
             # Binding on this one Input, exactly like every other branch
             # here only assigns its own field(s).
@@ -773,7 +756,7 @@ def build_action_and_trigger_fields(
             # internal) plus "+ New Macro" to create one inline and assign it
             # right away, replacing ticket 51's temporary read-only stub.
             # Full step authoring lives in the Library screen
-            # (`library_view.build_macro_editor_columns`), not here — this popover
+            # (`library_view.build_editor_columns`), not here — this popover
             # only ever assigns a `macro_id` to the Binding, exactly like the
             # Controller-button/Profile-switch branches only ever assign
             # their own single field.

@@ -1,18 +1,23 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright © 2026 Justin Milatz
 
+from dataclasses import dataclass
+
+import pytest
 from gi.repository import Gtk
 
-from acheron_gui.binding_editor import describe_step
 from acheron_gui.daemon_client import DaemonError
 from acheron_gui.daemon_stub import DaemonStub
 from acheron_gui.inputs import ALL_INPUTS
 from acheron_gui.library_view import (
+    MACRO,
+    STEPPER,
+    LibraryKind,
     build_library_content,
     build_library_sidebar,
+    describe_macro_step,
     describe_stepper_item,
-    macro_used_by_count,
-    stepper_used_by_count,
+    used_by_count,
 )
 
 from .widget_tree import button_labeled, find_all, find_one, walk
@@ -69,6 +74,302 @@ def _fill_and_submit_name_prompt(menu_button: Gtk.MenuButton, name: str, submit_
     find_one(popover, lambda w: isinstance(w, Gtk.Button) and w.get_label() == submit_label).emit("clicked")
 
 
+# --- Kind-agnostic pairs, parameterised over MACRO / STEPPER (ticket 13) ---
+#
+# Every macro/stepper test that exercises the *shared* code path — the
+# browse list, the row (select/rename/delete), the selection default, the
+# reference-count guard, the ↑/↓/× item rows, `persist` — is one
+# parameterised test now, asserting both kinds run one code path. The
+# kind-specific tests below (`describe_*`, the step-kind / modifiers /
+# controller draft UI, the Stepper assignment row, the ticket-91 layout
+# checks) stay verbatim.
+
+
+@dataclass(frozen=True)
+class _KindCase:
+    """Per-kind test data. Everything derivable from the `LibraryKind`
+    adapter — the config sub-dict key, the DaemonStub method names — is a
+    property here rather than a re-typed constant, so the fixture and the
+    adapter can't drift."""
+
+    kind: LibraryKind
+    tab: str
+    a: dict  # sample item + its list-row label
+    a_label: str
+    b: dict
+    b_label: str
+    add_label: str  # "+ Add step" / "+ Add item"
+    add_expected: dict  # what `_add_via_ui` appends (default KeyDown / Key, "F1")
+
+    @property
+    def _slug(self) -> str:
+        return self.kind.noun.lower()  # "macro" / "stepper"
+
+    @property
+    def cfg(self) -> str:  # "macros" / "steppers"
+        return self.kind.config_key
+
+    @property
+    def items(self) -> str:  # "steps" / "items"
+        return self.kind.items_key
+
+    @property
+    def create(self) -> str:  # DaemonStub method + `stub.calls` tag
+        return f"create_{self._slug}"
+
+    @property
+    def rename(self) -> str:
+        return f"rename_{self._slug}"
+
+    @property
+    def set_call(self) -> str:  # "set_macro_steps" / "set_stepper_items"
+        return f"set_{self._slug}_{self.items}"
+
+
+_MACRO_CASE = _KindCase(
+    kind=MACRO,
+    tab="macros",
+    a={"type": "key_down", "key": "KEY_A"},
+    a_label="KeyDown KEY_A",
+    b={"type": "key_down", "key": "KEY_B"},
+    b_label="KeyDown KEY_B",
+    add_label="+ Add step",
+    add_expected={"type": "key_down", "key": "KEY_F1"},
+)
+_STEPPER_CASE = _KindCase(
+    kind=STEPPER,
+    tab="steppers",
+    a={"type": "key", "key": "KEY_A"},
+    a_label="A",
+    b={"type": "key", "key": "KEY_B"},
+    b_label="B",
+    add_label="+ Add item",
+    add_expected={"type": "key", "key": "KEY_F1", "modifiers": []},
+)
+
+
+@pytest.fixture(params=[_MACRO_CASE, _STEPPER_CASE], ids=["macro", "stepper"])
+def case(request) -> _KindCase:
+    return request.param
+
+
+def _make(case: _KindCase, stub: DaemonStub, name: str = "Test", items: list | None = None) -> str:
+    return getattr(stub, case.create)(name, items or [])
+
+
+def _ref_binding(case: _KindCase, entry_id: str, direction: str = "forward") -> dict:
+    if case.kind.binding_type == "macro":
+        return {"trigger": "fire_once", "type": "macro", "macro_id": entry_id}
+    return {"trigger": "fire_once", "type": "step", "stepper_id": entry_id, "direction": direction}
+
+
+def _seed_references(case: _KindCase, stub: DaemonStub, entry_id: str) -> int:
+    """Seed references the way each original used-by test did and return the
+    count. Macro: Base + a Chord + a second Profile's Held (3). Stepper:
+    one direction per keyspace — a `(list, direction)` pair is unique
+    across both the per-Input and the Chord keyspace, so at most 2."""
+    if case.kind.binding_type == "macro":
+        stub.create_profile("Gaming")
+        stub.set_binding("grid_r1c1", "base", _ref_binding(case, entry_id))
+        stub.set_chord_binding(
+            ["grid_r2c1", "grid_r2c2"], "base", _ref_binding(case, entry_id)
+        )
+        stub.switch_profile("Gaming")
+        stub.set_binding("grid_r1c2", "held", _ref_binding(case, entry_id))
+        return 3
+    stub.set_binding("grid_r1c1", "base", _ref_binding(case, entry_id, "forward"))
+    stub.set_chord_binding(
+        ["grid_r2c1", "grid_r2c2"], "base", _ref_binding(case, entry_id, "backward")
+    )
+    return 2
+
+
+def _add_via_ui(case: _KindCase, root) -> None:
+    button_labeled(_row_labeled(root, "Key"), "F1").emit("clicked")
+    button_labeled(root, case.add_label).emit("clicked")
+
+
+def test_empty_library_shows_a_create_prompt_and_no_editor(case):
+    stub = DaemonStub()
+
+    root = _build(stub, {"library_tab": case.tab})
+
+    assert find_one(
+        root, lambda w: isinstance(w, Gtk.Label) and f"No {case.kind.noun}s yet" in w.get_label()
+    )
+
+
+def test_library_list_shows_every_entry_sorted_by_name(case):
+    stub = DaemonStub()
+    _make(case, stub, "Zeta")
+    _make(case, stub, "Alpha")
+
+    root = _build(stub, {"library_tab": case.tab})
+
+    rows = find_all(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() in ("Zeta", "Alpha"))
+    assert [r.get_label() for r in rows] == ["Alpha", "Zeta"]
+
+
+def test_first_entry_is_selected_by_default_and_shows_its_editor(case):
+    stub = DaemonStub()
+    _make(case, stub, "Alpha", [case.a])
+
+    root = _build(stub, {"library_tab": case.tab})
+
+    assert "suggested-action" in button_labeled(root, "Alpha").get_css_classes()
+    assert find_one(
+        root, lambda w: isinstance(w, Gtk.Label) and w.get_label() == case.a_label and w.get_hexpand()
+    )
+
+
+def test_clicking_a_row_selects_it_for_editing(case):
+    stub = DaemonStub()
+    _make(case, stub, "Alpha")
+    _make(case, stub, "Zeta", [case.b])
+    ui_state = {"library_tab": case.tab}
+
+    root = _build(stub, ui_state)
+    button_labeled(root, "Zeta").emit("clicked")
+    assert ui_state[case.kind.selection_key] is not None
+
+    rebuilt = _build(stub, ui_state)
+    assert "suggested-action" in button_labeled(rebuilt, "Zeta").get_css_classes()
+    assert find_one(
+        rebuilt, lambda w: isinstance(w, Gtk.Label) and w.get_label() == case.b_label and w.get_hexpand()
+    )
+
+
+def test_creating_via_new_calls_create_and_selects_it(case):
+    stub = DaemonStub()
+    ui_state = {"library_tab": case.tab}
+
+    root = _build(stub, ui_state)
+    new_btn = find_one(root, lambda w: isinstance(w, Gtk.MenuButton) and w.get_label() == "+ New")
+    _fill_and_submit_name_prompt(new_btn, "Fresh", "Create")
+
+    assert (case.create, "Fresh", []) in stub.calls
+    (entry_id,) = [eid for eid, e in stub.get_config()[case.cfg].items() if e["name"] == "Fresh"]
+    assert ui_state[case.kind.selection_key] == entry_id
+
+
+def test_renaming_via_its_popover_calls_rename(case):
+    stub = DaemonStub()
+    entry_id = _make(case, stub, "Old Name")
+
+    root = _build(stub, {"library_tab": case.tab})
+    rename_btn = find_one(root, lambda w: isinstance(w, Gtk.MenuButton) and w.get_label() == "✎")
+    _fill_and_submit_name_prompt(rename_btn, "New Name", "Rename")
+
+    assert stub.get_config()[case.cfg][entry_id]["name"] == "New Name"
+    assert (case.rename, entry_id, "New Name") in stub.calls
+
+
+def test_delete_is_disabled_with_a_used_by_tooltip_while_referenced(case):
+    stub = DaemonStub()
+    entry_id = _make(case, stub, "Test")
+    stub.set_binding("grid_r1c1", "base", _ref_binding(case, entry_id))
+
+    root = _build(stub, {"library_tab": case.tab})
+
+    delete_btn = find_one(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "×")
+    assert not delete_btn.get_sensitive()
+    assert "Used by 1 Binding(s)" in delete_btn.get_tooltip_text()
+
+
+def test_delete_is_enabled_and_works_once_unreferenced(case):
+    stub = DaemonStub()
+    entry_id = _make(case, stub, "Test")
+    ui_state = {"library_tab": case.tab}
+
+    root = _build(stub, ui_state)
+    delete_btn = find_one(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "×")
+    assert delete_btn.get_sensitive()
+    delete_btn.emit("clicked")
+
+    assert entry_id not in stub.get_config()[case.cfg]
+    assert ui_state[case.kind.selection_key] is None
+
+
+def test_used_by_count_scans_base_held_and_chords_across_profiles(case):
+    # Mirrors `edit.rs::macro_references` / `stepper_references` (via
+    # `config::profile_all_bindings`) — Chord Bindings count too, so the
+    # delete guard the real Daemon enforces and the tooltip the GUI shows
+    # agree.
+    stub = DaemonStub()
+    entry_id = _make(case, stub, "Test")
+    expected = _seed_references(case, stub, entry_id)
+
+    assert used_by_count(stub.get_config(), case.kind, entry_id) == expected
+    assert used_by_count(stub.get_config(), case.kind, "nonexistent") == 0
+
+
+def test_adding_an_item_calls_the_set_call_and_appends(case):
+    stub = DaemonStub()
+    entry_id = _make(case, stub, "Test")
+
+    root = _build(stub, {"library_tab": case.tab})
+    _add_via_ui(case, root)
+
+    assert stub.get_config()[case.cfg][entry_id][case.items] == [case.add_expected]
+
+
+def test_reordering_and_removing_items_calls_the_set_call(case):
+    stub = DaemonStub()
+    entry_id = _make(case, stub, "Test", [case.a, case.b])
+
+    root = _build(stub, {"library_tab": case.tab})
+    _reorder_buttons(root, "↓")[0].emit("clicked")
+    assert stub.get_config()[case.cfg][entry_id][case.items] == [case.b, case.a]
+
+    rebuilt = _build(stub, {"library_tab": case.tab})
+    first_row = find_one(
+        rebuilt, lambda w: isinstance(w, Gtk.Label) and w.get_label() == case.b_label and w.get_hexpand()
+    ).get_parent()
+    button_labeled(first_row, "×").emit("clicked")
+
+    assert stub.get_config()[case.cfg][entry_id][case.items] == [case.a]
+
+
+def test_first_item_up_and_last_item_down_are_disabled(case):
+    stub = DaemonStub()
+    _make(case, stub, "Test", [case.a, case.b])
+
+    root = _build(stub, {"library_tab": case.tab})
+    up_buttons = _reorder_buttons(root, "↑")
+    down_buttons = _reorder_buttons(root, "↓")
+    assert [b.get_sensitive() for b in up_buttons] == [False, True]
+    assert [b.get_sensitive() for b in down_buttons] == [True, False]
+
+
+def test_set_call_failure_shows_the_error_and_does_not_call_on_change(case):
+    class FailingStub(DaemonStub):
+        pass
+
+    def _boom(self, *_a, **_kw):
+        raise DaemonError("boom")
+
+    setattr(FailingStub, case.set_call, _boom)
+    stub = FailingStub()
+    entry_id = _make(case, stub, "Test", [case.a])
+    changed = []
+    root = _build(stub, {"library_tab": case.tab}, lambda: changed.append(1))
+
+    # Scoped through the item's own describe label to reach the editor's
+    # remove button specifically — the browse-row delete button carries the
+    # same "×" label but lives in a different row.
+    item_row = find_one(
+        root, lambda w: isinstance(w, Gtk.Label) and w.get_label() == case.a_label and w.get_hexpand()
+    ).get_parent()
+    button_labeled(item_row, "×").emit("clicked")
+
+    assert changed == []
+    assert find_one(root, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "boom")
+    assert entry_id in stub.get_config()[case.cfg]
+
+
+# --- Tabs (kind-specific: the tab row is the divergence's frame) ---
+
+
 def test_macros_tab_is_selected_by_default():
     stub = DaemonStub()
 
@@ -104,335 +405,40 @@ def test_clicking_the_steppers_tab_records_the_pick_and_calls_on_change():
     assert changed == [1]
 
 
-def test_empty_macro_library_shows_a_create_prompt_and_no_editor():
-    stub = DaemonStub()
-
-    root = _build(stub, {})
-
-    assert find_one(root, lambda w: isinstance(w, Gtk.Label) and "No Macros yet" in w.get_label())
+# --- describe_* (kind-specific: the item shapes genuinely differ) ---
 
 
-def test_macro_list_shows_every_macro_sorted_by_name():
-    stub = DaemonStub()
-    stub.create_macro("Zeta", [])
-    stub.create_macro("Alpha", [])
-
-    root = _build(stub, {})
-
-    rows = find_all(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() in ("Zeta", "Alpha"))
-    assert [r.get_label() for r in rows] == ["Alpha", "Zeta"]
+def test_describe_stepper_item_prefixes_the_modifier_combo():
+    assert describe_stepper_item({"key": "KEY_3", "modifiers": ["ctrl", "shift"]}) == "Ctrl+Shift+3"
 
 
-def test_first_macro_is_selected_by_default_and_shows_its_editor():
-    stub = DaemonStub()
-    stub.create_macro("Alpha", [{"type": "key_down", "key": "KEY_A"}])
-
-    root = _build(stub, {})
-
-    alpha_row_btn = button_labeled(root, "Alpha")
-    assert "suggested-action" in alpha_row_btn.get_css_classes()
-    assert find_one(root, lambda w: isinstance(w, Gtk.Label) and "KeyDown KEY_A" in w.get_label())
+def test_describe_stepper_item_with_no_modifiers_shows_a_bare_key_label():
+    assert describe_stepper_item({"key": "KEY_3", "modifiers": []}) == "3"
+    assert describe_stepper_item({"key": "KEY_3"}) == "3"
 
 
-def test_clicking_a_macro_row_selects_it_for_editing():
-    stub = DaemonStub()
-    stub.create_macro("Alpha", [])
-    stub.create_macro("Zeta", [{"type": "key_down", "key": "KEY_B"}])
-    ui_state = {}
-
-    root = _build(stub, ui_state)
-    button_labeled(root, "Zeta").emit("clicked")
-    assert ui_state["library_selected_macro"] is not None
-
-    rebuilt = _build(stub, ui_state)
-    assert "suggested-action" in button_labeled(rebuilt, "Zeta").get_css_classes()
-    assert find_one(rebuilt, lambda w: isinstance(w, Gtk.Label) and "KeyDown KEY_B" in w.get_label())
-
-
-def test_creating_a_macro_via_new_calls_create_macro_and_selects_it():
-    stub = DaemonStub()
-    ui_state = {}
-
-    root = _build(stub, ui_state)
-    new_btn = find_one(root, lambda w: isinstance(w, Gtk.MenuButton) and w.get_label() == "+ New")
-    _fill_and_submit_name_prompt(new_btn, "Fresh Macro", "Create")
-
-    assert ("create_macro", "Fresh Macro", []) in stub.calls
-    (macro_id,) = [mid for mid, m in stub.get_config()["macros"].items() if m["name"] == "Fresh Macro"]
-    assert ui_state["library_selected_macro"] == macro_id
-
-
-def test_renaming_a_macro_via_its_popover_calls_rename_macro():
-    stub = DaemonStub()
-    macro_id = stub.create_macro("Old Name", [])
-
-    root = _build(stub, {})
-    rename_btn = find_one(root, lambda w: isinstance(w, Gtk.MenuButton) and w.get_label() == "✎")
-    _fill_and_submit_name_prompt(rename_btn, "New Name", "Rename")
-
-    assert stub.get_config()["macros"][macro_id]["name"] == "New Name"
-    assert ("rename_macro", macro_id, "New Name") in stub.calls
-
-
-def test_delete_is_disabled_with_a_used_by_tooltip_while_referenced():
-    stub = DaemonStub()
-    macro_id = stub.create_macro("Test macro", [])
-    stub.set_binding("grid_r1c1", "base", {"trigger": "fire_once", "type": "macro", "macro_id": macro_id})
-
-    root = _build(stub, {})
-
-    delete_btn = find_one(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "×")
-    assert not delete_btn.get_sensitive()
-    assert "Used by 1 Binding(s)" in delete_btn.get_tooltip_text()
-
-
-def test_delete_is_enabled_and_works_once_unreferenced():
-    stub = DaemonStub()
-    macro_id = stub.create_macro("Test macro", [])
-    ui_state = {}
-
-    root = _build(stub, ui_state)
-    delete_btn = find_one(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "×")
-    assert delete_btn.get_sensitive()
-    delete_btn.emit("clicked")
-
-    assert macro_id not in stub.get_config()["macros"]
-    assert ui_state["library_selected_macro"] is None
-
-
-def test_macro_used_by_count_scans_base_held_and_chords_across_profiles():
-    # Mirrors `edit.rs::macro_references` (via `config::profile_all_bindings`)
-    # — Chord Bindings count too, so the delete guard the real Daemon
-    # enforces and the tooltip the GUI shows agree.
-    stub = DaemonStub()
-    stub.create_profile("Gaming")
-    macro_id = stub.create_macro("Test macro", [])
-    stub.set_binding("grid_r1c1", "base", {"trigger": "fire_once", "type": "macro", "macro_id": macro_id})
-    stub.set_chord_binding(
-        ["grid_r2c1", "grid_r2c2"], "base", {"trigger": "fire_once", "type": "macro", "macro_id": macro_id}
-    )
-    stub.switch_profile("Gaming")
-    stub.set_binding("grid_r1c2", "held", {"trigger": "fire_once", "type": "macro", "macro_id": macro_id})
-
-    assert macro_used_by_count(stub.get_config(), macro_id) == 3
-    assert macro_used_by_count(stub.get_config(), "nonexistent") == 0
-
-
-def test_adding_a_step_calls_set_macro_steps_and_appends():
-    stub = DaemonStub()
-    macro_id = stub.create_macro("Test macro", [])
-
-    root = _build(stub, {})
-    dd = find_one(root, lambda w: isinstance(w, Gtk.DropDown))
-    dd.set_selected(2)  # "Delay (ms)"
-    ms_entry = find_one(_row_labeled(root, "Delay (ms)"), lambda w: isinstance(w, Gtk.Entry))
-    ms_entry.set_text("40")
-    button_labeled(root, "+ Add step").emit("clicked")
-
-    assert stub.get_config()["macros"][macro_id]["steps"] == [{"type": "delay_ms", "ms": 40}]
-
-
-def test_reordering_and_removing_steps_calls_set_macro_steps():
-    stub = DaemonStub()
-    macro_id = stub.create_macro(
-        "Test macro",
-        [
-            {"type": "key_down", "key": "KEY_A"},
-            {"type": "key_up", "key": "KEY_A"},
-        ],
+def test_describe_stepper_item_renders_a_controller_button_label():
+    assert (
+        describe_stepper_item({"type": "controller_button", "button": "BTN_SOUTH"})
+        == "Btn: A / South"
     )
 
-    root = _build(stub, {})
-    _reorder_buttons(root, "↓")[0].emit("clicked")
-    assert stub.get_config()["macros"][macro_id]["steps"] == [
-        {"type": "key_up", "key": "KEY_A"},
-        {"type": "key_down", "key": "KEY_A"},
-    ]
 
-    rebuilt = _build(stub, {})
-    first_step_row = find_one(
-        rebuilt, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "KeyUp KEY_A"
-    ).get_parent()
-    button_labeled(first_step_row, "×").emit("clicked")
-
-    assert stub.get_config()["macros"][macro_id]["steps"] == [{"type": "key_down", "key": "KEY_A"}]
+def test_describe_macro_step_renders_a_gamepad_keydown_with_the_button_label():
+    assert describe_macro_step({"type": "key_down", "key": "BTN_SOUTH"}) == "↓ Btn: A / South"
+    assert describe_macro_step({"type": "key_up", "key": "BTN_TL"}) == "↑ Btn: LB (Left bumper)"
+    # A mouse button is also `BTN_*` but isn't in the gamepad catalog — it
+    # keeps the plain form.
+    assert describe_macro_step({"type": "key_down", "key": "BTN_LEFT"}) == "KeyDown BTN_LEFT"
+    assert describe_macro_step({"type": "key_down", "key": "KEY_A"}) == "KeyDown KEY_A"
 
 
-def test_first_step_up_and_last_step_down_are_disabled():
-    stub = DaemonStub()
-    stub.create_macro(
-        "Test macro",
-        [
-            {"type": "key_down", "key": "KEY_A"},
-            {"type": "key_up", "key": "KEY_A"},
-        ],
-    )
-
-    root = _build(stub, {})
-    up_buttons = _reorder_buttons(root, "↑")
-    down_buttons = _reorder_buttons(root, "↓")
-    assert [b.get_sensitive() for b in up_buttons] == [False, True]
-    assert [b.get_sensitive() for b in down_buttons] == [True, False]
-
-
-def test_set_macro_steps_failure_shows_the_error_and_does_not_call_on_change():
-    class FailingStub(DaemonStub):
-        def set_macro_steps(self, macro_id, steps):
-            raise DaemonError("boom")
-
-    stub = FailingStub()
-    stub.create_macro("Test macro", [{"type": "key_down", "key": "KEY_A"}])
-    changed = []
-    root = _build(stub, {}, lambda: changed.append(1))
-
-    # Scoped through the step's own describe_step label to reach the step
-    # editor's remove button specifically — the Macro-row delete button
-    # carries the same "×" label but lives in a different row.
-    step_row = find_one(root, lambda w: isinstance(w, Gtk.Label) and "KeyDown KEY_A" in w.get_label()).get_parent()
-    button_labeled(step_row, "×").emit("clicked")
-
-    assert changed == []
-    assert find_one(root, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "boom")
-
-
-# --- Steppers (ticket 55) ---
+# --- Stepper item modifier row (ticket 62/63, kind-specific) ---
 
 
 def _build_steppers(stub, ui_state=None, on_change=lambda: None):
     ui_state = {"library_tab": "steppers", **(ui_state or {})}
     return _build(stub, ui_state, on_change)
-
-
-def test_empty_stepper_library_shows_a_create_prompt_and_no_editor():
-    stub = DaemonStub()
-
-    root = _build_steppers(stub)
-
-    assert find_one(root, lambda w: isinstance(w, Gtk.Label) and "No Steppers yet" in w.get_label())
-
-
-def test_stepper_list_shows_every_stepper_sorted_by_name():
-    stub = DaemonStub()
-    stub.create_stepper("Zeta", [])
-    stub.create_stepper("Alpha", [])
-
-    root = _build_steppers(stub)
-
-    rows = find_all(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() in ("Zeta", "Alpha"))
-    assert [r.get_label() for r in rows] == ["Alpha", "Zeta"]
-
-
-def test_first_stepper_is_selected_by_default_and_shows_its_editor():
-    stub = DaemonStub()
-    stub.create_stepper("Alpha", [{"type": "key", "key": "KEY_A"}])
-
-    root = _build_steppers(stub)
-
-    alpha_row_btn = button_labeled(root, "Alpha")
-    assert "suggested-action" in alpha_row_btn.get_css_classes()
-    assert find_one(root, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "A" and w.get_hexpand())
-
-
-def test_clicking_a_stepper_row_selects_it_for_editing():
-    stub = DaemonStub()
-    stub.create_stepper("Alpha", [])
-    stub.create_stepper("Zeta", [{"type": "key", "key": "KEY_B"}])
-    ui_state = {"library_tab": "steppers"}
-
-    root = _build(stub, ui_state)
-    button_labeled(root, "Zeta").emit("clicked")
-    assert ui_state["library_selected_stepper"] is not None
-
-    rebuilt = _build(stub, ui_state)
-    assert "suggested-action" in button_labeled(rebuilt, "Zeta").get_css_classes()
-    assert find_one(rebuilt, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "B" and w.get_hexpand())
-
-
-def test_creating_a_stepper_via_new_calls_create_stepper_and_selects_it():
-    stub = DaemonStub()
-    ui_state = {"library_tab": "steppers"}
-
-    root = _build(stub, ui_state)
-    new_btn = find_one(root, lambda w: isinstance(w, Gtk.MenuButton) and w.get_label() == "+ New")
-    _fill_and_submit_name_prompt(new_btn, "Fresh Wheel", "Create")
-
-    assert ("create_stepper", "Fresh Wheel", []) in stub.calls
-    (stepper_id,) = [sid for sid, s in stub.get_config()["steppers"].items() if s["name"] == "Fresh Wheel"]
-    assert ui_state["library_selected_stepper"] == stepper_id
-
-
-def test_renaming_a_stepper_via_its_popover_calls_rename_stepper():
-    stub = DaemonStub()
-    stepper_id = stub.create_stepper("Old Name", [])
-
-    root = _build_steppers(stub)
-    rename_btn = find_one(root, lambda w: isinstance(w, Gtk.MenuButton) and w.get_label() == "✎")
-    _fill_and_submit_name_prompt(rename_btn, "New Name", "Rename")
-
-    assert stub.get_config()["steppers"][stepper_id]["name"] == "New Name"
-    assert ("rename_stepper", stepper_id, "New Name") in stub.calls
-
-
-def test_stepper_delete_is_disabled_with_a_used_by_tooltip_while_referenced():
-    # Parity with Macro's delete gate, by direct instruction: Stepper delete
-    # behaves exactly like Macro's — pre-emptively disabled with a "Used by
-    # N Binding(s)" tooltip while referenced, not just relying on the
-    # Daemon's own refusal to surface as a post-click error.
-    stub = DaemonStub()
-    stepper_id = stub.create_stepper("Weapon Wheel", [])
-    stub.set_binding("grid_r1c1", "base", {"trigger": "fire_once", "type": "step", "stepper_id": stepper_id, "direction": "forward"})
-
-    root = _build_steppers(stub)
-
-    delete_btn = find_one(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "×")
-    assert not delete_btn.get_sensitive()
-    assert "Used by 1 Binding(s)" in delete_btn.get_tooltip_text()
-
-
-def test_stepper_used_by_count_counts_a_chord_binding():
-    # Mirrors `edit.rs::stepper_references` — a Chord Binding counts too, so
-    # the delete button stays disabled while only a Chord uses the Stepper.
-    # (A `(stepper, direction)` pair is unique across both keyspaces, so the
-    # per-Input and Chord refs here take different directions.)
-    stub = DaemonStub()
-    stepper_id = stub.create_stepper("Weapon Wheel", [])
-    stub.set_binding("grid_r1c1", "base", {"trigger": "fire_once", "type": "step", "stepper_id": stepper_id, "direction": "forward"})
-    stub.set_chord_binding(
-        ["grid_r2c1", "grid_r2c2"],
-        "base",
-        {"trigger": "fire_once", "type": "step", "stepper_id": stepper_id, "direction": "backward"},
-    )
-
-    assert stepper_used_by_count(stub.get_config(), stepper_id) == 2
-    assert stepper_used_by_count(stub.get_config(), "nonexistent") == 0
-
-
-def test_stepper_delete_is_enabled_and_works_once_unreferenced():
-    stub = DaemonStub()
-    stepper_id = stub.create_stepper("Weapon Wheel", [])
-    ui_state = {"library_tab": "steppers"}
-
-    root = _build(stub, ui_state)
-    delete_btn = find_one(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "×")
-    assert delete_btn.get_sensitive()
-    delete_btn.emit("clicked")
-
-    assert stepper_id not in stub.get_config()["steppers"]
-    assert ui_state["library_selected_stepper"] is None
-
-
-def test_adding_an_item_calls_set_stepper_items_and_appends():
-    stub = DaemonStub()
-    stepper_id = stub.create_stepper("Weapon Wheel", [])
-
-    root = _build_steppers(stub)
-    picker_row = _row_labeled(root, "Key")
-    button_labeled(picker_row, "F1").emit("clicked")
-    button_labeled(root, "+ Add item").emit("clicked")
-
-    assert stub.get_config()["steppers"][stepper_id]["items"] == [
-        {"type": "key", "key": "KEY_F1", "modifiers": []}
-    ]
 
 
 def test_adding_an_item_with_a_modifier_checked_round_trips_through_on_add_and_the_list_row():
@@ -457,32 +463,29 @@ def test_adding_an_item_with_a_modifier_checked_round_trips_through_on_add_and_t
     assert find_one(rebuilt, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "Ctrl+F1")
 
 
-def test_describe_stepper_item_prefixes_the_modifier_combo():
-    assert describe_stepper_item({"key": "KEY_3", "modifiers": ["ctrl", "shift"]}) == "Ctrl+Shift+3"
+def test_picking_a_bare_modifier_for_a_new_item_shows_no_modifier_warning():
+    # A Stepper item always fires as a bare KeyDown/KeyUp pair (never a
+    # Macro step) and Toggle is disallowed outright for a Stepper Binding,
+    # so the picker's usual "use Toggle with a KeyDown-only Macro step"
+    # warning would point at a workflow this construct can't support —
+    # suppressed the same way the Macro editor already suppresses it for
+    # its own KeyDown-only steps, just for a different reason.
+    stub = DaemonStub()
+    stub.create_stepper("Weapon Wheel", [])
 
-
-def test_describe_stepper_item_with_no_modifiers_shows_a_bare_key_label():
-    assert describe_stepper_item({"key": "KEY_3", "modifiers": []}) == "3"
-    assert describe_stepper_item({"key": "KEY_3"}) == "3"
-
-
-# --- Controller-button items / steps (ticket 92/93) ---
-
-
-def test_describe_stepper_item_renders_a_controller_button_label():
-    assert (
-        describe_stepper_item({"type": "controller_button", "button": "BTN_SOUTH"})
-        == "Btn: A / South"
+    root = _build_steppers(stub)
+    picker_row = _row_labeled(root, "Key")
+    # "Ctrl" appears twice in the grid (Left/Right) — click whichever comes
+    # first, same approach test_binding_editor.py's own `_pick_first_modifier`
+    # uses for the identical ambiguity.
+    find_all(picker_row, lambda w: isinstance(w, Gtk.Button) and "keycap-mod" in w.get_css_classes())[0].emit(
+        "clicked"
     )
 
+    assert find_all(root, lambda w: "warning" in w.get_css_classes()) == []
 
-def test_describe_step_renders_a_gamepad_keydown_with_the_button_label():
-    assert describe_step({"type": "key_down", "key": "BTN_SOUTH"}) == "↓ Btn: A / South"
-    assert describe_step({"type": "key_up", "key": "BTN_TL"}) == "↑ Btn: LB (Left bumper)"
-    # A mouse button is also `BTN_*` but isn't in the gamepad catalog — it
-    # keeps the plain form.
-    assert describe_step({"type": "key_down", "key": "BTN_LEFT"}) == "KeyDown BTN_LEFT"
-    assert describe_step({"type": "key_down", "key": "KEY_A"}) == "KeyDown KEY_A"
+
+# --- Controller-button items / steps (ticket 92/93, kind-specific) ---
 
 
 def _picker_switch_buttons(root):
@@ -645,88 +648,7 @@ def test_switching_modes_back_and_forth_preserves_the_controller_draft():
     ]
 
 
-def test_picking_a_bare_modifier_for_a_new_item_shows_no_modifier_warning():
-    # A Stepper item always fires as a bare KeyDown/KeyUp pair (never a
-    # Macro step) and Toggle is disallowed outright for a Stepper Binding,
-    # so the picker's usual "use Toggle with a KeyDown-only Macro step"
-    # warning would point at a workflow this construct can't support —
-    # suppressed the same way the Macro editor already suppresses it for
-    # its own KeyDown-only steps, just for a different reason.
-    stub = DaemonStub()
-    stub.create_stepper("Weapon Wheel", [])
-
-    root = _build_steppers(stub)
-    picker_row = _row_labeled(root, "Key")
-    # "Ctrl" appears twice in the grid (Left/Right) — click whichever comes
-    # first, same approach test_binding_editor.py's own `_pick_first_modifier`
-    # uses for the identical ambiguity.
-    find_all(picker_row, lambda w: isinstance(w, Gtk.Button) and "keycap-mod" in w.get_css_classes())[0].emit(
-        "clicked"
-    )
-
-    assert find_all(root, lambda w: "warning" in w.get_css_classes()) == []
-
-
-def test_reordering_and_removing_items_calls_set_stepper_items():
-    stub = DaemonStub()
-    stepper_id = stub.create_stepper(
-        "Weapon Wheel",
-        [
-            {"type": "key", "key": "KEY_1"},
-            {"type": "key", "key": "KEY_2"},
-        ],
-    )
-
-    root = _build_steppers(stub)
-    _reorder_buttons(root, "↓")[0].emit("clicked")
-    assert stub.get_config()["steppers"][stepper_id]["items"] == [
-        {"type": "key", "key": "KEY_2"},
-        {"type": "key", "key": "KEY_1"},
-    ]
-
-    rebuilt = _build_steppers(stub)
-    first_item_row = find_one(
-        rebuilt, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "2" and w.get_hexpand()
-    ).get_parent()
-    button_labeled(first_item_row, "×").emit("clicked")
-
-    assert stub.get_config()["steppers"][stepper_id]["items"] == [{"type": "key", "key": "KEY_1"}]
-
-
-def test_first_item_up_and_last_item_down_are_disabled():
-    stub = DaemonStub()
-    stub.create_stepper(
-        "Weapon Wheel",
-        [
-            {"type": "key", "key": "KEY_1"},
-            {"type": "key", "key": "KEY_2"},
-        ],
-    )
-
-    root = _build_steppers(stub)
-    up_buttons = _reorder_buttons(root, "↑")
-    down_buttons = _reorder_buttons(root, "↓")
-    assert [b.get_sensitive() for b in up_buttons] == [False, True]
-    assert [b.get_sensitive() for b in down_buttons] == [True, False]
-
-
-def test_set_stepper_items_failure_shows_the_error_and_does_not_call_on_change():
-    class FailingStub(DaemonStub):
-        def set_stepper_items(self, stepper_id, items):
-            raise DaemonError("boom")
-
-    stub = FailingStub()
-    stub.create_stepper("Weapon Wheel", [{"type": "key", "key": "KEY_1"}])
-    changed = []
-    root = _build_steppers(stub, on_change=lambda: changed.append(1))
-
-    item_row = find_one(
-        root, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "1" and w.get_hexpand()
-    ).get_parent()
-    button_labeled(item_row, "×").emit("clicked")
-
-    assert changed == []
-    assert find_one(root, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "boom")
+# --- Stepper assignment row (ticket 31 round 2, kind-specific) ---
 
 
 def test_assignment_row_defaults_to_unassigned_when_no_binding_exists():
@@ -824,8 +746,8 @@ def test_assigning_this_same_steppers_other_direction_input_clears_it_with_a_toa
     # Forward=A, Backward=B already (a valid pair). Reassigning Forward onto
     # B (the *same* list's own Backward Input) plainly overwrites B's
     # Binding — `take_stepper_direction_elsewhere` only protects the *same*
-    # direction living on two Inputs, not this case — so Backward silently
-    # disappears unless this module surfaces its own toast for it.
+    # direction living on two Inputs — so Backward silently disappears
+    # unless this module surfaces its own toast for it.
     stub = DaemonStub()
     stepper_id = stub.create_stepper("Weapon Wheel", [])
     stub.set_binding(

@@ -48,6 +48,7 @@ from typing import Callable
 from . import rules
 from .daemon_client import AlreadyExistsError, InvalidBindingError, NotFoundError
 from .inputs import is_grid_input
+from .read_model import reference_count
 
 # Display names for a rejected Trigger mode, so the stub's error text stays
 # human ("Toggle is not a valid Trigger mode …") — the legality *decision*
@@ -433,28 +434,20 @@ class DaemonStub:
             n += 1
         return f"{base}-{n}"
 
-    @staticmethod
-    def _all_bindings(profile: dict):
-        # Mirror of `config::profile_all_bindings` — every Binding across
-        # both per-Input Layers *and* both Chord Layers (ticket 40), so the
-        # reference-count guards hold a Macro/Stepper alive when only a
-        # Chord still uses it, exactly as `edit.rs` does.
-        for key in ("base", "held", "chords_base", "chords_held"):
-            yield from profile[key].values()
-
     def _stepper_referenced(self, stepper_id: str) -> bool:
-        return any(
-            binding.get("type") == "step" and binding.get("stepper_id") == stepper_id
-            for profile in self._profiles.values()
-            for binding in self._all_bindings(profile)
-        )
+        # `read_model.reference_count` is the same Base/Held + Chord-Layer
+        # scan `library_view`'s "Used by N" gate runs (post-release ticket
+        # 13, ADR 0005's blessed opportunistic fold), mirroring
+        # `edit.rs::stepper_references` — so a Chord Binding holds a
+        # Stepper alive here exactly as it does in the real Daemon.
+        return reference_count(
+            self._profiles, binding_type="step", id_field="stepper_id", id_value=stepper_id
+        ) > 0
 
     def _macro_referenced(self, macro_id: str) -> bool:
-        return any(
-            binding.get("type") == "macro" and binding.get("macro_id") == macro_id
-            for profile in self._profiles.values()
-            for binding in self._all_bindings(profile)
-        )
+        return reference_count(
+            self._profiles, binding_type="macro", id_field="macro_id", id_value=macro_id
+        ) > 0
 
     def _profile_switch_referenced(self, name: str) -> bool:
         # Mirror of `edit.rs::profile_switch_references` — Base/Held only
