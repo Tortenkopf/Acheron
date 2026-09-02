@@ -53,4 +53,4 @@ def test_probe_over_the_real_repo_root_reports_a_hash():
 
 
 def test_the_real_module_version_starts_from_the_base():
-    assert acheron_gui.__version__ == "1.0.1" or acheron_gui.__version__.startswith("1.0.1-dev+")
+    assert acheron_gui.__version__ == "1.0.2" or acheron_gui.__version__.startswith("1.0.2-dev+")
