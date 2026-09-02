@@ -2,6 +2,12 @@ Label: wayfinder:map
 
 # Tartarus status-LED indicator
 
+> **SPEC READY — this map is done (2026-09-02).** All five tickets are resolved. The
+> destination — [`spec.md`](./spec.md) — is written, along with
+> [ADR-0006](../../docs/adr/0006-status-leds-driven-from-dispatch-over-short-lived-hidraw-fds.md)
+> and the `Status LED` / `Status LED assignment` `CONTEXT.md` entries. **Implementation is a
+> separate, fresh effort**, not a resumption of this map. This map can be archived.
+
 ## Destination
 
 A reviewed **`spec.md`** for a "Profile status-LED indicator" feature — every Profile carries
@@ -84,13 +90,70 @@ prototype adds no daemon changes and carries no caution beyond what analog alrea
   - **Status LED assignment** — the per-Profile triple of on/off states, asserted on Profile
     switch.
 
-**Skills to consult:** `/grilling` + `/domain-modeling` for the two decision tickets (03, 04);
-`/prototype` is *not* needed (the GUI control is conventional, settled in text). Tickets 01
-(prototype) and 02 (research) are resolved.
+**Skills to consult:** none — tickets 01–05 are all resolved and the spec is written. Nothing
+left to decide or do on this map.
 
 ## Decisions so far
 
 <!-- one line per closed ticket: enough to judge relevance, then zoom the link -->
+
+- [Write the Status-LED spec](./issues/05-write-status-led-spec.md) — **done.** The
+  destination is written: [`spec.md`](./spec.md) (feature summary, wire frame, daemon
+  architecture, config schema, D-Bus surface, GUI, startup/shutdown, out-of-scope,
+  vocabulary), [`docs/adr/0006-status-leds-driven-from-dispatch-over-short-lived-hidraw-fds.md`](../../docs/adr/0006-status-leds-driven-from-dispatch-over-short-lived-hidraw-fds.md)
+  (refines ADR-0002), and the `Status LED` / `Status LED assignment` entries in `CONTEXT.md`.
+  `.scratch/README.md` flipped to "spec ready". Nothing new decided — pure consolidation of
+  tickets 01–04. **Implementation is a fresh effort.**
+
+- [GUI ↔ daemon surface for Status LEDs](./issues/04-gui-daemon-surface-for-status-leds.md) —
+  **settled** (HITL grilling). **Config:** new `StatusLeds { orange, green, blue }` struct
+  (named, per ticket 03 §7) + `#[serde(default)] pub status_leds: StatusLeds` on `Profile`,
+  serialized in full like `default_actuation`. **No `schema_version` bump** — the codebase has
+  never bumped (`parse` hard-refuses a mismatch, no migration machinery); the all-off serde
+  default *is* the migration, exactly as ticket 17/18/51/54 added their fields. New parse test
+  mirrors `a_pre_ticket_17_...`. **No `config::validate` rule** (every bool-triple is valid).
+  **D-Bus:** `Edit::SetStatusLeds { orange, green, blue }` / `SetStatusLeds(bbb)` — whole
+  triple, one call, unconditional `Effect::AssertStatusLeds` (ticket 03 owns the effect +
+  handler), no `target == active` gate, **no new signal** (no generic config-changed signal
+  exists; siblings emit none). **`GetState()`: no addition** — config is the single source of
+  truth; the sub-second orange-only connect transient is self-healing and there is no
+  hardware-divergence path (ticket 01), unlike `capture_mode`. **Storage-mode knob: cut**
+  (byte inert, no cached state). **GUI** (per user mockup
+  `screenshots/Status LED location Mockup.png`): a "Status LEDs" group in `device_row`
+  **between the thumbstick and Chords** — three vertically-stacked colour lozenges
+  (orange/green/blue top-to-bottom, mirroring the device), **lit = full-saturation + border,
+  unlit = desaturated + flat** (strong contrast, not a brightness shift), tooltip +
+  `Gtk.Accessible` per lozenge (colour-blind safety), **no visible per-lozenge text**. Edits
+  the **active** Profile (no "selected-for-editing" concept in Acheron — ticket 03 §5).
+  State always from `config[...]["status_leds"]`, never a hardware read; a new Profile shows
+  all-dark (default all-off ≡ "never set"); shown on **both Layers**, **Grid destination
+  only**; renders the stored state even while the device is disconnected. `daemon_client.py` /
+  `daemon_stub.py` / `wire.py` get the mechanical mirror; **`rules.py` gets nothing**.
+  Corrects ticket 05's "schema_version bump + migration" / "GetState additions (if any)"
+  bullets. No new `CONTEXT.md` term or ADR from this ticket (both land with ticket 05).
+  No fog graduates; ticket 05 is now the sole remaining (and unblocked) ticket.
+
+- [Daemon architecture for Status LEDs](./issues/03-daemon-architecture-for-status-leds.md) —
+  **settled** (HITL grilling). Write primitive: `assert_status_leds(StatusLeds)` /
+  `clear_status_leds()` in `analog.rs`, modelled on `relock()` — short-lived Interface-2
+  hidraw fd, one `0x0F/0x02` static frame, **no driver mode, no read-back**. Writer: a
+  dedicated **non-fatal `led` task** (sibling of `injector`, *not* in `main.rs`'s top-level
+  `select!`), fed `watch<Option<StatusLeds>>` from dispatch — serialised `spawn_blocking`
+  writes, `watch` coalesces switch bursts, owns the shutdown all-off write. Decider:
+  **dispatch, sole owner** — `Config.active_profile().status_leds` is the authoritative
+  triple (no cache); new unit `Effect::AssertStatusLeds` emitted by `Edit::SwitchProfile`
+  **and** the ticket-04 set-edit (unconditionally — §5); `run_effects` + the `rx_connection`
+  arm share a `push_status_leds(&config)` helper. Connect/startup/reconnect: assert on
+  **every `connected == true`** from `rx_connection` (no flag — idempotent; the firmware
+  reclaims the LEDs on every enumeration). Device absent ⇒ `Err` logged, non-fatal, never
+  blocks a switch. Shutdown: `relock_and_exit` clears all-off before `relock()`. **No
+  non-active-Profile write path exists** (all D-Bus edits are Profile-unscoped; GUI switches
+  first) → no gate, and ticket 04's "active vs selected-for-editing" framing is dropped.
+  `StatusLeds` must be a **named struct** (not `[bool; 3]`) so brightness/effect/backlight
+  are additive later. No new `CONTEXT.md` term; **ADR-0006 warranted** (drafted in the
+  Answer, filed by ticket 05). Future host-streamed animation would refine the `led` task's
+  fd lifetime without disturbing the transport/ownership/no-driver-mode seams; all future
+  lighting routes through the one `led` task.
 
 - [Research: Status-LED wire protocol](./issues/02-research-status-led-wire-protocol.md) —
   implementation-ready ([write-up](./research/status-led-wire-protocol.md), all primary-source

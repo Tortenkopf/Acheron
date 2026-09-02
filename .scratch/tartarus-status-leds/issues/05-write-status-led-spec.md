@@ -1,5 +1,6 @@
 Type: task
 Blocked by: 02, 03, 04
+Status: resolved (Charon, 2026-09-02)
 
 ## Question
 
@@ -24,10 +25,19 @@ The spec is the hand-off to a separate implementation effort. It should cover:
   reconnect assertion, device-absent handling. (No on-device-keymap re-assert hook — ticket 01
   confirmed the Tartarus Pro has no such switch.)
 - **Config schema** — from [ticket 04](./04-gui-daemon-surface-for-status-leds.md): the
-  `config.toml` table, the `Profile` field, `schema_version` bump + migration.
-- **D-Bus surface** — the new `Command` variant, `GetState()` additions / signal (if any).
-- **GUI** — the three-toggle "Status LEDs" group on Device Overview: placement, which Profile
-  it edits, how it reflects state.
+  `[profiles.<name>.status_leds]` table, the `StatusLeds` struct + `Profile.status_leds`
+  field, **additive `#[serde(default)]` — no `schema_version` bump**, all-off serde default
+  as the migration (ticket 04 §1 corrects the earlier "bump + migration" language).
+- **D-Bus surface** — from [ticket 04](./04-gui-daemon-surface-for-status-leds.md): the new
+  `Edit::SetStatusLeds { orange, green, blue }` / `SetStatusLeds(bbb)` method, whole-triple,
+  unconditional `Effect::AssertStatusLeds`. **No `GetState()` addition and no new signal**
+  (ticket 04 §3).
+- **GUI** — from [ticket 04](./04-gui-daemon-surface-for-status-leds.md) §5: the "Status LEDs"
+  group in `device_row` between the thumbstick and Chords (per the user's mockup,
+  `screenshots/Status LED location Mockup.png`) — three vertically-stacked colour lozenges,
+  lit/unlit from the active Profile's stored triple, Grid-destination-only, shown on both
+  Layers, edits the active Profile. Plus the `daemon_client.py` / `daemon_stub.py` /
+  `wire.py` mirror (ticket 04 §6); nothing in `rules.py`.
 - **Startup / shutdown behaviour** — assert on startup and every reconnect;
   **clear all three LEDs on clean daemon exit** ([ticket 01](./01-prototype-status-led-controllability.md)
   criterion 5: all-off `(0,0,0)` is reachable — the Q6/Q13 contingency does not trigger).
@@ -41,3 +51,55 @@ Also: add the effort's spec to `.scratch/README.md`'s line for this effort, and 
 
 **If [ticket 01](./01-prototype-status-led-controllability.md) killed the effort, this ticket
 is closed unresolved** — no spec — and the map is archived with the negative result.
+
+## Comments
+
+**2026-09-02 (Charon) — [ticket 03](./03-daemon-architecture-for-status-leds.md) resolved.**
+Two additions to this ticket's scope, following the map's lazy discipline (glossary + ADRs
+land when the spec lands):
+
+- **File `docs/adr/0006-status-leds-driven-from-dispatch-over-short-lived-hidraw-fds.md`**
+  (or similar slug — scan `docs/adr/` for the next number) alongside the spec. Full drafted
+  text is in [ticket 03](./03-daemon-architecture-for-status-leds.md)'s Answer §9. It
+  refines ADR-0002. The spec's "Daemon architecture" section then *references* it rather
+  than re-arguing the hidraw-ownership / no-driver-mode choice.
+- **Add the `Status LED` / `Status LED assignment` `CONTEXT.md` entries** (reserved in the
+  map's Notes) as part of this ticket, not a follow-up.
+
+**2026-09-02 (Charon) — [ticket 04](./04-gui-daemon-surface-for-status-leds.md) resolved;
+this ticket is now the sole remaining frontier ticket.** Its Answer settles the full
+config schema, D-Bus surface, and GUI control — nothing new to decide here, this stays a
+pure writing task. Scope bullets above updated to match. Key corrections it makes:
+`schema_version` is **not** bumped (additive `#[serde(default)]` field, all-off serde
+default *is* the migration — the codebase has never bumped and `parse` hard-refuses a
+mismatch); `GetState()` gets **no** new field and there is **no** new signal; the GUI group
+lives in the device area (mockup), not the Profile sidebar.
+
+## Answer
+
+**Done — the spec is written.** Pure consolidation of tickets 01–04; nothing new decided.
+Three files created, two updated:
+
+- **[`.scratch/tartarus-status-leds/spec.md`](../spec.md)** (`Status: ready-for-agent`) —
+  modelled on `tartarus-keybinder/spec.md`. Sections: Problem Statement, Solution, 10 User
+  Stories, Implementation Decisions (wire frame / daemon architecture / config schema /
+  D-Bus surface / GUI / startup-shutdown / domain vocabulary), Testing Decisions (the `led`
+  task seam + the `DaemonStub` seam), Out of Scope (map list carried through, plus the two
+  knobs tickets 01/04 cut), Further Notes (ADR pointer, retroactive corrections, ticket-03
+  §8 future-proofing, prior art). Every byte of the frame, every struct/field/method name,
+  every hook point is quoted from the resolved tickets with links back.
+- **[`docs/adr/0006-status-leds-driven-from-dispatch-over-short-lived-hidraw-fds.md`](../../../docs/adr/0006-status-leds-driven-from-dispatch-over-short-lived-hidraw-fds.md)**
+  — from ticket 03 §9's drafted text, formatted as an ADR (title matches filename, prose +
+  "Considered and rejected"). Refines ADR-0002.
+- **`CONTEXT.md`** — added `Status LED` and `Status LED assignment` at the end of the
+  `### Configuration` glossary section, with `_Avoid_` lines in the file's house style
+  (rules out "profile LED", "keymap indicator", "Chroma", "LED profile").
+- **`.scratch/README.md`** — the effort's line rewritten from "active, frontier: ticket 05"
+  to "**spec ready**", linking `spec.md` and ADR-0006, stating implementation is a fresh
+  effort and this map can be archived.
+- **`map.md`** — a `SPEC READY — this map is done` banner under the title; ticket 05's
+  entry prepended to Decisions so far.
+
+**No fog graduates** (Not yet specified was already empty), **nothing new ruled out of
+scope**, **no new tickets** — ticket 05 was the last one. The map is complete. Implementation
+picks up from `spec.md` as a separate effort.
