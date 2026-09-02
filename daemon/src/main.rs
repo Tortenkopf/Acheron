@@ -6,9 +6,9 @@ use std::io;
 use std::time::Duration;
 
 use acheron_daemon::capture::supervisor;
-use acheron_daemon::config;
+use acheron_daemon::config::{self, StatusLeds};
 use acheron_daemon::dbus::Daemon;
-use acheron_daemon::{dispatch, injector};
+use acheron_daemon::{dispatch, injector, led};
 use tokio::task::JoinError;
 
 /// Loads `config.toml` (seeding it on first run, per issue 11), assembles
@@ -98,6 +98,16 @@ async fn main() -> io::Result<()> {
     // once per connect and pushes `Some(info)` here (`None` on disconnect);
     // dispatch owns the value `GetState()`'s two optional keys report from.
     let (device_info_tx, device_info_rx) = tokio::sync::mpsc::channel(8);
+    // The Status-LED seam (`tartarus-status-leds` ticket 02 / ADR-0006):
+    // dispatch (the sole `Config` owner) pushes the active Profile's triple
+    // here on Profile switch, on Daemon startup, and on every device
+    // (re)connect; the dedicated non-fatal `led` task below drives it to the
+    // hardware over a short-lived Interface-2 hidraw fd. `watch` coalesces a
+    // switch burst to the final triple. Deliberately *not* a branch in the
+    // `tokio::select!` below — an LED write failure must never exit the
+    // process.
+    let (led_tx, led_rx) = tokio::sync::watch::channel::<Option<StatusLeds>>(None);
+    let _led_handle = led::spawn(led_rx);
 
     // Built before the dispatch task so a real `SignalEmitter` (ticket 18's
     // `ActiveLayerChanged`, pushed directly from the dispatch task on every
@@ -144,6 +154,7 @@ async fn main() -> io::Result<()> {
         toggle_lap_target,
         depth_rx,
         device_info_rx,
+        led_tx,
     ));
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -182,6 +193,18 @@ async fn main() -> io::Result<()> {
 /// exit, not a graceful drain nothing was told to start.
 fn relock_and_exit(signal_name: &str) -> ! {
     eprintln!("acheron-daemon: received {signal_name}, relocking device and exiting");
+    // `tartarus-status-leds` ticket 02: a clean Daemon exit clears all three
+    // Status LEDs so a stopped Acheron leaves no stale indicator lit. Sent
+    // before `relock()`, best-effort — a failure (device unplugged, no
+    // `hidraw` access) is harmless and there is nothing left to clean up.
+    // NOT done on the supervisor's swap-away-from-analog `relock()`: there
+    // the Daemon is still running and the LEDs must keep showing the active
+    // Profile.
+    if let Err(err) = acheron_daemon::capture::analog::clear_status_leds() {
+        eprintln!(
+            "acheron-daemon: clearing Status LEDs on shutdown failed (harmless if the device is absent): {err}"
+        );
+    }
     if let Err(err) = acheron_daemon::capture::analog::relock() {
         eprintln!(
             "acheron-daemon: relock on shutdown failed (harmless if the device was never unlocked): {err}"

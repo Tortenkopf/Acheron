@@ -41,7 +41,7 @@ use crate::chord;
 use crate::command::{Command, State};
 use crate::config::{
     self, Action, ActuationPoint, Binding, ChordKey, Config, Layer, MacroDef, MacroId, ModeKeyRole,
-    StepperDef, StepperId, TriggerMode,
+    StatusLeds, StepperDef, StepperId, TriggerMode,
 };
 use crate::dbus::Daemon;
 use crate::edit;
@@ -113,6 +113,12 @@ struct DispatchState {
     actuation_tx: watch::Sender<HashMap<Input, ActuationPoint>>,
     capture_control_tx: mpsc::Sender<bool>,
     toggle_lap_target: Duration,
+    /// The `led` task's `watch::Sender` (`tartarus-status-leds` ticket 02 /
+    /// ADR-0006), handed in from `main.rs`. `push_status_leds` sends the
+    /// active Profile's triple on it on device (re)connect and — from
+    /// ticket 03 on — Profile switch. `Config` is the sole authoritative
+    /// triple; there is no cached `led_state` here.
+    led_tx: watch::Sender<Option<StatusLeds>>,
 }
 
 impl DispatchState {
@@ -126,6 +132,7 @@ impl DispatchState {
         actuation_tx: watch::Sender<HashMap<Input, ActuationPoint>>,
         capture_control_tx: mpsc::Sender<bool>,
         toggle_lap_target: Duration,
+        led_tx: watch::Sender<Option<StatusLeds>>,
     ) -> Self {
         DispatchState {
             toggles: HashMap::new(),
@@ -144,7 +151,27 @@ impl DispatchState {
             actuation_tx,
             capture_control_tx,
             toggle_lap_target,
+            led_tx,
         }
+    }
+
+    /// Sends the active Profile's Status LED assignment on the `led` watch
+    /// channel (`tartarus-status-leds` ticket 02 — CONTEXT.md: Status LED
+    /// assignment; ADR-0006). Reads the triple straight from the
+    /// just-committed `Config` — the sole authoritative source, no cached
+    /// copy in `DispatchState`. `send_replace` (not `send`) mirrors this
+    /// file's other `watch` publishers (`actuation_tx`, `depth_tx`) and
+    /// never errors on a dropped receiver during teardown; `watch`
+    /// coalescing collapses a burst to the final triple in the `led` task.
+    /// Two call sites of this one helper: the `rx_connection` arm (connect)
+    /// and — from ticket 03 — `run_effects` (`Effect::AssertStatusLeds`,
+    /// Profile switch / `SetStatusLeds`).
+    fn push_status_leds(&self, config: &Config) {
+        let leds = config
+            .active_profile()
+            .expect("load_or_seed validates active_profile names a real profile")
+            .status_leds;
+        self.led_tx.send_replace(Some(leds));
     }
 
     /// Resolves one `PhysicalEvent` against the active Profile/Layer. Returns
@@ -697,6 +724,13 @@ pub async fn run(
     // `rx_capture_mode`'s "supervisor tells dispatch about the device"
     // shape; this task owns the one canonical value `GetState()` reads.
     mut rx_device_info: mpsc::Receiver<Option<DeviceInfo>>,
+    // `tartarus-status-leds` ticket 02 / ADR-0006: the `led` task's
+    // `watch::Sender`, created in `main.rs`. Held on `DispatchState` and
+    // written by `push_status_leds` — the active Profile's Status LED triple
+    // pushed on every device (re)connect (and, from ticket 03, on Profile
+    // switch). The `led` task drives it to the hardware; a write failure
+    // there never reaches this task.
+    led_tx: watch::Sender<Option<StatusLeds>>,
 ) -> io::Result<()> {
     // Published once up front so the analog capture source's grid task
     // (ticket 22/23) has a correct snapshot to threshold against from the
@@ -717,6 +751,7 @@ pub async fn run(
         actuation_tx,
         capture_control_tx,
         toggle_lap_target,
+        led_tx,
     );
     // Pure `select!`-loop plumbing — the `rx_*` receivers stay `run` locals
     // (so no `select!` branch expression borrows `state`) and these liveness
@@ -761,12 +796,27 @@ pub async fn run(
             }
             connected = rx_connection.recv(), if connection_open => {
                 match connected {
-                    Some(connected) => handle_connection_change(
-                        &mut state.device_connected,
-                        &state.signal_emitter,
-                        connected,
-                    )
-                    .await,
+                    Some(connected) => {
+                        handle_connection_change(
+                            &mut state.device_connected,
+                            &state.signal_emitter,
+                            connected,
+                        )
+                        .await;
+                        // `tartarus-status-leds` ticket 02 / ADR-0006: the
+                        // firmware reclaims the Status LEDs to its orange-only
+                        // default on every USB enumeration, so re-assert the
+                        // active Profile's assignment on *every* `connected ==
+                        // true` — not on the connection *transition*.
+                        // `device_connected` starts optimistically `true` and
+                        // `handle_connection_change` early-returns on an
+                        // unchanged bool, so a transition-gated assert would
+                        // miss the present-at-startup case. Idempotent on the
+                        // hardware; a redundant `true` costs one ioctl.
+                        if connected {
+                            state.push_status_leds(&config);
+                        }
+                    }
                     None => connection_open = false,
                 }
             }
@@ -1075,7 +1125,7 @@ mod tests {
     use crate::capture::EventState;
     use crate::config::{
         Action, ActuationPoint, AxisTarget, DEFAULT_PROFILE_NAME, MacroStepDto, Modifiers, Profile,
-        StepDirection, StepperItem,
+        StatusLeds, StepDirection, StepperItem,
     };
     use crate::edit::{CommandError, CreatedId};
     use crate::injector::testing::RecordingSink;
@@ -1218,6 +1268,15 @@ mod tests {
         watch::channel(HashMap::new()).1
     }
 
+    /// A fresh Status-LED `Sender` for tests that don't assert on what
+    /// dispatch pushes to the `led` task (`tartarus-status-leds` ticket 02) —
+    /// `dispatch::run` / `DispatchState::new` require the `Sender` half
+    /// unconditionally. Tests that *do* check the pushed triple
+    /// (`CommandHarness`) keep their own paired `Receiver`.
+    fn led_channel() -> watch::Sender<Option<StatusLeds>> {
+        watch::channel(None).0
+    }
+
     /// The direct `DispatchState` seam (ticket 09): a `RecordingSink` injector
     /// plus an in-memory `Config`, no channels and no tempfile. Feed
     /// `PhysicalEvent`s (and `Command`s) straight into the handler methods and
@@ -1247,6 +1306,7 @@ mod tests {
                 actuation_channel(),
                 capture_control_channel(),
                 executor::MIN_TOGGLE_LAP,
+                led_channel(),
             );
             Seam {
                 state,
@@ -1745,6 +1805,7 @@ mod tests {
             executor::MIN_TOGGLE_LAP,
             depth_channel(),
             device_info_channel(),
+            led_channel(),
         ));
 
         for state in [EventState::Down, EventState::Repeat, EventState::Up] {
@@ -1802,6 +1863,7 @@ mod tests {
             executor::MIN_TOGGLE_LAP,
             depth_rx,
             device_info_channel(),
+            led_channel(),
         ));
 
         // A mid-travel Depth, comfortably between the deadzone and the
@@ -1906,6 +1968,7 @@ mod tests {
             executor::MIN_TOGGLE_LAP,
             depth_rx,
             device_info_channel(),
+            led_channel(),
         ));
 
         let depth: u8 = 100;
@@ -1984,6 +2047,7 @@ mod tests {
             executor::MIN_TOGGLE_LAP,
             depth_rx,
             device_info_channel(),
+            led_channel(),
         ));
 
         depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), u8::MAX)]));
@@ -2056,6 +2120,7 @@ mod tests {
             executor::MIN_TOGGLE_LAP,
             depth_channel(),
             device_info_channel(),
+            led_channel(),
         ));
 
         // Down starts a firing that immediately sends KeyDown, then sleeps
@@ -2219,6 +2284,11 @@ mod tests {
         actuation_rx: watch::Receiver<HashMap<Input, ActuationPoint>>,
         depth_tx: watch::Sender<HashMap<Input, u8>>,
         device_info_tx: mpsc::Sender<Option<DeviceInfo>>,
+        /// The `led`-task seam (`tartarus-status-leds` ticket 02): what
+        /// dispatch pushes here on device connect / Profile switch — the
+        /// real `led` task's `watch::Receiver`, read directly instead of
+        /// running the hardware-touching task.
+        led_rx: watch::Receiver<Option<StatusLeds>>,
         sink: RecordingSink,
         gamepad_sink: RecordingSink,
         dispatch_handle: tokio::task::JoinHandle<io::Result<()>>,
@@ -2253,6 +2323,7 @@ mod tests {
             let (actuation_tx, actuation_rx) = watch::channel(HashMap::new());
             let (depth_tx, depth_rx) = watch::channel(HashMap::new());
             let (device_info_tx, device_info_rx) = mpsc::channel(8);
+            let (led_tx, led_rx) = watch::channel(None);
             let dispatch_handle = tokio::spawn(run(
                 event_rx,
                 conn_rx,
@@ -2267,6 +2338,7 @@ mod tests {
                 executor::MIN_TOGGLE_LAP,
                 depth_rx,
                 device_info_rx,
+                led_tx,
             ));
 
             CommandHarness {
@@ -2277,6 +2349,7 @@ mod tests {
                 actuation_rx,
                 depth_tx,
                 device_info_tx,
+                led_rx,
                 conn_tx,
                 sink,
                 gamepad_sink,
@@ -2450,6 +2523,22 @@ mod tests {
         /// task's `watch::Receiver` would read `.borrow()` from.
         fn actuation_snapshot(&self) -> HashMap<Input, ActuationPoint> {
             self.actuation_rx.borrow().clone()
+        }
+
+        /// The latest Status-LED triple dispatch has pushed on the `led`
+        /// watch channel (`tartarus-status-leds` ticket 02), marking it seen
+        /// — `None` until the first connect edge asserts one. A burst
+        /// coalesces here exactly as it would for the real `led` task.
+        fn take_status_leds_pushed(&mut self) -> Option<StatusLeds> {
+            *self.led_rx.borrow_and_update()
+        }
+
+        /// Whether dispatch has pushed a fresh value on the `led` channel
+        /// since the last `take_status_leds_pushed` — true even for an
+        /// unchanged triple, so a test can assert every `connected == true`
+        /// re-asserts.
+        fn status_leds_re_pushed(&self) -> bool {
+            self.led_rx.has_changed().unwrap_or(false)
         }
 
         async fn press(&self, input: Input) {
@@ -2928,6 +3017,86 @@ mod tests {
         }
 
         assert!(harness.get_state().await.device_connected);
+        harness.shut_down().await;
+    }
+
+    // -- Status LEDs: dispatch pushes the active Profile's triple on the
+    // `led` watch channel on every device connect (`tartarus-status-leds`
+    // ticket 02). The `HIDIOCSFEATURE` write and the `led` task's own
+    // consume/coalesce behaviour are covered in `capture::analog` /
+    // `crate::led`. --------------------------------------------------------
+
+    fn config_with_status_leds(leds: StatusLeds) -> Config {
+        config_with_profile(Profile {
+            status_leds: leds,
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn a_device_connect_pushes_the_active_profiles_status_leds() {
+        let leds = StatusLeds {
+            orange: true,
+            green: false,
+            blue: true,
+        };
+        let mut harness = CommandHarness::spawn(config_with_status_leds(leds));
+
+        // No pre-loop assert — nothing on the channel until the connect edge.
+        assert_eq!(harness.take_status_leds_pushed(), None);
+
+        harness.set_device_connected(true).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(harness.take_status_leds_pushed(), Some(leds));
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn every_connected_true_re_pushes_the_triple_even_without_a_transition() {
+        let leds = StatusLeds {
+            orange: true,
+            ..Default::default()
+        };
+        let mut harness = CommandHarness::spawn(config_with_status_leds(leds));
+
+        harness.set_device_connected(true).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(harness.take_status_leds_pushed(), Some(leds));
+
+        // A second `true` with no intervening `false`:
+        // `handle_connection_change` early-returns on the unchanged bool, but
+        // the LED assert must still re-fire — the firmware reclaims the LEDs
+        // to orange-only on every USB enumeration.
+        harness.set_device_connected(true).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert!(harness.status_leds_re_pushed());
+        assert_eq!(harness.take_status_leds_pushed(), Some(leds));
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn a_reported_disconnect_pushes_no_status_leds() {
+        let leds = StatusLeds {
+            green: true,
+            ..Default::default()
+        };
+        let mut harness = CommandHarness::spawn(config_with_status_leds(leds));
+
+        harness.set_device_connected(false).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(!harness.status_leds_re_pushed());
+        assert_eq!(harness.take_status_leds_pushed(), None);
         harness.shut_down().await;
     }
 

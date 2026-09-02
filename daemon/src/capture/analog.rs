@@ -42,7 +42,7 @@ use tokio::task::JoinSet;
 
 use super::evdev_source::{self, interruptible_sleep, poll_readable};
 use super::{CaptureSource, EventState, PhysicalEvent};
-use crate::config::ActuationPoint;
+use crate::config::{ActuationPoint, StatusLeds};
 use crate::input::{Input, Node};
 
 // ---------------------------------------------------------------------------
@@ -70,6 +70,29 @@ const CMD_CLASS_STANDARD: u8 = 0x00;
 const CMD_SET_DEVICE_MODE: u8 = 0x04;
 const MODE_DRIVER: u8 = 0x03;
 const MODE_NORMAL: u8 = 0x00;
+
+/// The Status-LED write (`.scratch/tartarus-status-leds/spec.md` §"The wire
+/// frame"; ADR-0006) — a standard Razer extended-matrix static-effect
+/// command aimed at the dedicated side-stripe LED id, verified byte-for-byte
+/// on hardware by charting ticket 01 and cross-checked by
+/// `prototype/01-status-leds/prototype.py`'s `selftest`. Do not re-derive.
+/// `transaction_id 0x1F` is the Tartarus-Pro-specific id (as the lighting
+/// frame uses — *not* the unlock's `0x01`); `command_class 0x0F`,
+/// `command_id 0x02` (write). Independent of Capture mode: the `0x0F/0x02`
+/// frame works with `device_mode = 00 00`, so this never sends a driver-mode
+/// command (the normal→driver transition is the reset risk this effort
+/// avoids).
+const STATUS_LED_TXN: u8 = 0x1F;
+const STATUS_LED_CMD_CLASS: u8 = 0x0F;
+const STATUS_LED_CMD_ID: u8 = 0x02;
+/// LED id `SIDE_STRIPE_LED`.
+const STATUS_LED_ID: u8 = 0x0B;
+/// Effect id: static. Never `effect_none` (`0x00`) — it ACKs but does
+/// nothing to these fixed-colour LEDs (charting ticket 01).
+const STATUS_LED_EFFECT_STATIC: u8 = 0x01;
+/// One fixed-colour LED per channel byte: `0xFF` on, `0x00` off.
+const STATUS_LED_ON: u8 = 0xFF;
+const STATUS_LED_OFF: u8 = 0x00;
 
 /// Ticket 18 §3: prototype observed report `0x06` arriving ~3ms after
 /// unlock; 500ms is the generous upper bound before the fd is treated as
@@ -357,8 +380,28 @@ fn read_repeat_schedule() -> RepeatSchedule {
     }
 }
 
-fn send_unlock(control: &fs::File) -> io::Result<()> {
-    let mut buf = unlock_cmd();
+/// (Re)discover the Interface-2 control node and open it read+write on a
+/// fresh fd — the shared prelude of every standalone control-channel
+/// operation (`relock()`, `read_device_info()`, the Status-LED writes).
+/// Device absent ⇒ `Err(io::ErrorKind::NotFound)`. The grid task
+/// (`grid_task_blocking`) opens its own inline because it needs the analog
+/// node alongside and folds the failure into its absence-retry bucket.
+fn open_control_fd() -> io::Result<fs::File> {
+    let interfaces = discover_hidraw();
+    let control_path = interfaces
+        .get(&CONTROL_INTERFACE)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(control_path)
+}
+
+/// Send one already-built 91-byte command frame as a `HIDIOCSFEATURE`
+/// `SET_REPORT` on an open control fd — the write half shared by
+/// `send_unlock` / `send_relock` / the Status-LED frame. (`feature_exchange`
+/// does its own SET+GET pair with retries and doesn't route through here.)
+fn send_feature(control: &fs::File, buf: &mut [u8; RAZER_CMD_LEN]) -> io::Result<()> {
     let ret = unsafe {
         libc::ioctl(
             control.as_raw_fd(),
@@ -373,20 +416,12 @@ fn send_unlock(control: &fs::File) -> io::Result<()> {
     }
 }
 
+fn send_unlock(control: &fs::File) -> io::Result<()> {
+    send_feature(control, &mut unlock_cmd())
+}
+
 fn send_relock(control: &fs::File) -> io::Result<()> {
-    let mut buf = relock_cmd();
-    let ret = unsafe {
-        libc::ioctl(
-            control.as_raw_fd(),
-            hidiocsfeature(RAZER_CMD_LEN as u32) as libc::c_ulong,
-            buf.as_mut_ptr(),
-        )
-    };
-    if ret < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    send_feature(control, &mut relock_cmd())
 }
 
 /// Best-effort, standalone relock: (re)discovers the control interface and
@@ -400,15 +435,72 @@ fn send_relock(control: &fs::File) -> io::Result<()> {
 /// failure here (no udev access, device unplugged) is just reported, not
 /// fatal — there is nothing left to clean up in that case anyway.
 pub fn relock() -> io::Result<()> {
-    let interfaces = discover_hidraw();
-    let control_path = interfaces
-        .get(&CONTROL_INTERFACE)
-        .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-    let control_file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(control_path)?;
-    send_relock(&control_file)
+    send_relock(&open_control_fd()?)
+}
+
+// ---------------------------------------------------------------------------
+// Status-LED writes (`.scratch/tartarus-status-leds/`, ADR-0006). Siblings of
+// `relock()` / `read_device_info()`: one `HIDIOCSFEATURE` on a freshly-opened,
+// immediately-closed Interface-2 control fd. No read-back, no retry loop, no
+// driver-mode call, no unlock. `build_razer_cmd` / `discover_hidraw` unchanged.
+// ---------------------------------------------------------------------------
+
+/// The nine argument bytes of the Status-LED static-effect frame:
+/// `[storage, LED id, effect, arg3, arg4, colour count, r, g, b]`
+/// (`spec.md` §"The wire frame"). `arg0` (storage) is inert on this
+/// firmware — `0x00` for intent-clarity; `arg3`/`arg4` are unused for the
+/// static effect; the colour count is `1`.
+fn status_led_args(r: u8, g: u8, b: u8) -> [u8; 9] {
+    [
+        0x00,
+        STATUS_LED_ID,
+        STATUS_LED_EFFECT_STATIC,
+        0x00,
+        0x00,
+        0x01,
+        r,
+        g,
+        b,
+    ]
+}
+
+/// Open a fresh Interface-2 control fd, send one Status-LED frame via
+/// `HIDIOCSFEATURE`, drop the fd. Device absent ⇒ `Err(io::ErrorKind::NotFound)`,
+/// exactly like `relock()`.
+fn send_status_leds(r: u8, g: u8, b: u8) -> io::Result<()> {
+    send_feature(
+        &open_control_fd()?,
+        &mut build_razer_cmd(
+            STATUS_LED_TXN,
+            STATUS_LED_CMD_CLASS,
+            STATUS_LED_CMD_ID,
+            &status_led_args(r, g, b),
+        ),
+    )
+}
+
+/// Physically drive the three side Status LEDs to `leds` (CONTEXT.md: Status
+/// LED assignment). Orange←`r`, green←`g`, blue←`b`; each channel `0xFF` on
+/// / `0x00` off. Called by the `led` task (`crate::led`) on a `spawn_blocking`
+/// thread whenever dispatch pushes a new triple — Profile switch, device
+/// (re)connect, Daemon startup. Works identically in Analog and Digital
+/// Capture mode: it opens its own short-lived Interface-2 fd regardless of
+/// what capture is doing, and never sends a driver-mode command.
+pub fn assert_status_leds(leds: StatusLeds) -> io::Result<()> {
+    let channel = |on| if on { STATUS_LED_ON } else { STATUS_LED_OFF };
+    send_status_leds(
+        channel(leds.orange),
+        channel(leds.green),
+        channel(leds.blue),
+    )
+}
+
+/// Clear all three Status LEDs — the same frame with every channel byte
+/// `0x00`. Sent on a clean Daemon exit (`main.rs::relock_and_exit`, before
+/// `relock()`) so a stopped Acheron leaves no stale indicator lit. All-off
+/// `(0, 0, 0)` is hardware-reachable (charting ticket 01, criterion 5).
+pub fn clear_status_leds() -> io::Result<()> {
+    send_status_leds(STATUS_LED_OFF, STATUS_LED_OFF, STATUS_LED_OFF)
 }
 
 // ---------------------------------------------------------------------------
@@ -551,14 +643,7 @@ fn read_device_info_with(control: &fs::File, txn: u8) -> io::Result<DeviceInfo> 
 /// negligible (research §7). A failure here is non-fatal to the Daemon: the
 /// caller logs it once and leaves both `GetState()` keys absent.
 pub fn read_device_info() -> io::Result<DeviceInfo> {
-    let interfaces = discover_hidraw();
-    let control_path = interfaces
-        .get(&CONTROL_INTERFACE)
-        .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-    let control = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(control_path)?;
+    let control = open_control_fd()?;
 
     let mut last_err = io::Error::new(
         io::ErrorKind::InvalidData,
@@ -1155,6 +1240,41 @@ mod tests {
             cmd[89], 0x94,
             "crc = data_size ^ command_class ^ command_id"
         );
+    }
+
+    // -- Status-LED frame: ported, not recomputed (spec.md §"The wire frame",
+    // verified on hardware by charting ticket 01 / `prototype.py` selftest) --
+
+    #[test]
+    fn status_led_frame_matches_the_hardware_verified_bytes() {
+        // Orange on, green + blue off.
+        let cmd = build_razer_cmd(
+            STATUS_LED_TXN,
+            STATUS_LED_CMD_CLASS,
+            STATUS_LED_CMD_ID,
+            &status_led_args(STATUS_LED_ON, STATUS_LED_OFF, STATUS_LED_OFF),
+        );
+        assert_eq!(cmd[2], 0x1F, "transaction_id");
+        assert_eq!(cmd[6], 0x09, "data_size");
+        assert_eq!(cmd[7], 0x0F, "command_class");
+        assert_eq!(cmd[8], 0x02, "command_id");
+        assert_eq!(cmd[9], 0x00, "arg0 = storage (inert, 0x00 for clarity)");
+        assert_eq!(cmd[10], 0x0B, "arg1 = SIDE_STRIPE_LED id");
+        assert_eq!(cmd[11], 0x01, "arg2 = static effect");
+        assert_eq!(cmd[14], 0x01, "arg5 = colour count");
+        assert_eq!((cmd[15], cmd[16], cmd[17]), (0xFF, 0x00, 0x00), "r/g/b");
+    }
+
+    #[test]
+    fn status_led_all_off_frame_crc_matches_the_prototype_selftest() {
+        let off = build_razer_cmd(
+            STATUS_LED_TXN,
+            STATUS_LED_CMD_CLASS,
+            STATUS_LED_CMD_ID,
+            &status_led_args(STATUS_LED_OFF, STATUS_LED_OFF, STATUS_LED_OFF),
+        );
+        // `prototype/01-status-leds/prototype.py` selftest: "LED all-off crc == 0x0f".
+        assert_eq!(off[89], 0x0F, "all-off crc");
     }
 
     // -- pure response parsing (research §3.3/§3.4/§5) --------------------
