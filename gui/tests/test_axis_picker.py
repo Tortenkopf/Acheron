@@ -4,6 +4,7 @@
 from gi.repository import Gtk
 
 from acheron_gui.axis_picker import AXIS_LABEL_BY_TARGET, build_inline_axis_picker
+from acheron_gui.rules import AXIS_TARGETS
 
 from .widget_tree import button_labeled, find_all, find_one
 
@@ -16,8 +17,10 @@ def _button_with_tooltip(widget, tooltip: str) -> Gtk.Button:
     return find_one(widget, lambda w: isinstance(w, Gtk.Button) and w.get_tooltip_text() == tooltip)
 
 
-def test_catalog_has_exactly_17_entries():
-    assert len(AXIS_LABEL_BY_TARGET) == 17
+def test_catalog_contents_match_the_daemon_target_list():
+    # Contents, not just length — `rules.AXIS_TARGETS` is itself contract-
+    # tested against the Daemon's `AxisTarget::ALL` (test_rules_contract.py).
+    assert set(AXIS_LABEL_BY_TARGET) == AXIS_TARGETS
 
 
 def test_shows_the_current_targets_nice_label():

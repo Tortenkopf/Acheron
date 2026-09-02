@@ -8,9 +8,9 @@
 //! each `PhysicalEvent`'s `Input` against the active Profile's active Layer
 //! (ticket 18) and, per ticket 17, branches on `TriggerMode` — Fire-once
 //! fires once on `Down`, Hold-to-repeat fires on `Down` and every `Repeat`,
-//! Toggle starts/stops only on `Down`. Applies `Command`s (ticket 15) by
-//! mutating `Config` in place and rewriting `config.toml` immediately,
-//! atomically per call.
+//! Toggle starts/stops only on `Down`. Applies a `Command::Apply` (ticket
+//! 15/11) by handing its `edit::Edit` to `edit::apply` — mutating `Config` in
+//! place and rewriting `config.toml` immediately, atomically per call.
 //!
 //! Ticket 18: this task also owns the one piece of Layer runtime state —
 //! `active_layer` — since it's momentary (Mode-key-held) rather than
@@ -23,499 +23,631 @@
 //! instead flows through the exact same `(Layer, Input) -> Binding` lookup
 //! and Trigger-mode dispatch as any other Input.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use evdev::{AbsoluteAxisCode, KeyCode};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
-use tokio_util::sync::CancellationToken;
 use zbus::object_server::SignalEmitter;
 
+use crate::analog_repeat;
+use crate::axis;
 use crate::capture::analog::DeviceInfo;
 use crate::capture::{CaptureMode, EventState, PhysicalEvent};
-use crate::command::{Command, CommandError, State};
+use crate::chord;
+use crate::command::{Command, State};
 use crate::config::{
-    self, Action, ActuationPoint, AxisPolarity, AxisTarget, Binding, ChordKey, Config, Layer,
-    MacroDef, MacroId, ModeKeyRole, Profile, StepDirection, StepperDef, StepperId, StepperItem,
-    TriggerMode,
+    self, Action, ActuationPoint, Binding, ChordKey, Config, Layer, MacroDef, MacroId, ModeKeyRole,
+    StepperDef, StepperId, TriggerMode,
 };
 use crate::dbus::Daemon;
+use crate::edit;
 use crate::executor::{self, ActiveToggle, FiringHandle, MacroStep};
 use crate::injector::Injector;
 use crate::input::Input;
+use crate::stepper;
+use crate::trigger;
 
-/// The Digital Capture mode fallback's per-press step size (ticket 59 §6 /
-/// ticket 71): press/release step-increment in place of a continuous Depth
-/// stream, since Digital-sourced events carry no Depth at all. A build-time-
-/// tuned constant, same precedent as Analog-repeat's four TBD constants
-/// (ticket 20) — exact feel to be adjusted against real hardware in ticket
-/// 72, not designed here.
-const AXIS_DIGITAL_STEP: u8 = 64;
-
-/// The fixed simultaneity window between a Chord's first and last member
-/// going down (ticket 01's Answer, §"Simultaneity detection") — a Rust
-/// constant, deliberately not a persisted `Config` value or a v1.0 user
-/// setting.
-const CHORD_WINDOW: Duration = Duration::from_millis(50);
-
-/// The currently-developing press-combo a Chord may complete from (ticket
-/// 01/40): every chord-eligible Input pressed since the window opened, and
-/// the absolute instant it closes. At most one window is ever open at a
-/// time — a fresh chord-eligible Down either joins the existing window or,
-/// if none is open, starts a new one.
-struct ChordWindow {
-    // `BTreeSet`, not `HashSet`: compared directly against a `ChordKey`'s
-    // own `BTreeSet<Input>` membership via `is_subset` below, which requires
-    // the same set type on both sides.
-    down: BTreeSet<Input>,
-    deadline: Instant,
+/// Builds a `TriggerCtx` (below) from a `(firings, toggles)` pair plus the
+/// shared `config` view and the `DispatchState` fields it needs — a
+/// per-call-site borrow struct built from a macro, so the three
+/// `trigger::decide` + `perform_trigger` sites don't each spell the struct
+/// literal. Each site passes a disjoint `&mut self.<map>` borrow (`in_flight`
+/// on the individual path, `chord_runtime.{firings,toggles}` on the Chord
+/// path) — a `&mut self` method can't be generic over which map type `K`
+/// selects, so `perform_trigger<K>` stays a free function. Defined up here
+/// because `macro_rules!` is textually scoped and the first user
+/// (`handle_event`) precedes `TriggerCtx`'s own definition.
+macro_rules! trigger_ctx {
+    ($injector:expr, $config:expr, $firings:expr, $toggles:expr, $cursors:expr, $lap:expr $(,)?) => {
+        TriggerCtx {
+            injector: $injector,
+            firings: $firings,
+            toggles: $toggles,
+            macros: &$config.macros,
+            steppers: &$config.steppers,
+            cursors: $cursors,
+            toggle_lap_target: $lap,
+        }
+    };
 }
 
-/// Every piece of Daemon-owned runtime state the Chord-detection state
-/// machine needs (ticket 01/40), mirroring `toggles`/`in_flight`'s existing
-/// per-Input shapes but keyed by `ChordKey` — a Chord's own Trigger-mode
-/// dispatch is otherwise identical to an ordinary Binding's, just evaluated
-/// against a member *set* rather than one Input (see `fire_chord`).
+/// Every piece of Daemon-owned, `ChordKey`-keyed runtime state a Chord's own
+/// Trigger-mode dispatch touches (ticket 01/40) — the firing/toggle *handles*
+/// the pure `chord` state machine (post-release ticket 07) never holds. One
+/// nested `DispatchState` field, reset fresh per dispatch task start,
+/// mirroring how `axis::Engine` bundles its own two maps; the executor derives
+/// the `trigger::Slot` liveness snapshot `chord::feed` wants from it.
 #[derive(Default)]
-struct ChordState {
-    window: Option<ChordWindow>,
-    in_flight: HashMap<ChordKey, FiringHandle>,
+struct ChordRuntime {
+    firings: HashMap<ChordKey, FiringHandle>,
     toggles: HashMap<ChordKey, ActiveToggle>,
-    /// Every Input currently "owned" by the Chord machinery — either still
-    /// inside an open window, or physically held down as a member of a
-    /// Chord that has since fired. Routes that Input's later Repeat/Up
-    /// events back through the Chord path rather than the ordinary
-    /// per-Input one, even after `chords_containing_input` would otherwise
-    /// still call it chord-eligible (ticket 01: "the remaining member(s)
-    /// don't fall back to their individual Bindings until they're released
-    /// and re-pressed fresh").
-    claimed: HashSet<Input>,
 }
 
-/// Every piece of Daemon-owned runtime state Axis-assignment resolution
-/// needs (ticket 59/71), mirroring `toggles`/`chord_state`'s own per-Input
-/// runtime-state shape. `contributions` is the live, per-Input 0-255 output
-/// value every Axis-assigned Input currently wants to drive its target
-/// with — written by `handle_depth_update` (the continuous Analog half of
-/// ticket 59 §7's `(Depth, edge_event) -> axis_value` seam,
-/// `config::resolve_axis_value`) and by `handle_axis_edge_event` (the
-/// Digital-mode step-increment fallback, ticket 59 §6) alike, so both flows
-/// feed the exact same conflict-resolution/emit path
-/// (`recompute_and_emit_axes`) rather than two drifting copies of it.
-/// `owners` is which single Input currently "wins" each signed axis's
-/// opposite-half suppression (ticket 59 §5) — absent means neither half is
-/// currently outputting.
-#[derive(Default)]
-struct AxisState {
-    contributions: HashMap<Input, u8>,
-    owners: HashMap<AbsoluteAxisCode, Input>,
+/// Every piece of ephemeral runtime state the dispatch task owns — built
+/// fresh on every task start, the same lifetime as the loose `run` locals it
+/// replaces. NOT `Config` (committed state; stays a `run` local so the input
+/// path keeps only `&Config` — ticket 05). NOT the `rx_*` receivers or their
+/// `*_open` liveness flags (pure `select!`-loop plumbing; no handler touches
+/// them). No lifetime parameter — every handle below is owned and `'static`.
+/// Dispatch-internal: never part of any module's interface. Adding a new
+/// piece of dispatch runtime state means a field here, not a fresh `run`
+/// local or a new `handle_*` parameter (CONTRIBUTING.md).
+struct DispatchState {
+    toggles: HashMap<Input, ActiveToggle>,
+    in_flight: HashMap<Input, FiringHandle>,
+    stepper: stepper::Cursors,
+    active_layer: Layer,
+    chord_machine: chord::ChordMachine,
+    chord_runtime: ChordRuntime,
+    axis: axis::Engine,
+    analog_repeat: analog_repeat::Engine,
+    device_connected: bool,
+    capture_mode: CaptureMode,
+    device_info: Option<DeviceInfo>,
+    injector: Injector,
+    signal_emitter: Option<SignalEmitter<'static>>,
+    actuation_tx: watch::Sender<HashMap<Input, ActuationPoint>>,
+    capture_control_tx: mpsc::Sender<bool>,
+    toggle_lap_target: Duration,
 }
 
-/// The runtime-conflict half of ticket 59 §5, as a pure/unit-testable
-/// function: `positive`/`negative` are every currently-nonzero contributor
-/// sharing one `ABS_*` code, split by `AxisTarget::polarity` (an unsigned
-/// target's single contribution always lands in `positive` — there is no
-/// opposite half for it to conflict with, so this reduces to the same
-/// "greater Depth wins" rule ticket 59 §5 gives same-half sharing, with no
-/// special-casing needed). Two keys sharing one same-signed target take the
-/// greater of the two Depths (`positive`/`negative` are each reduced to
-/// their own max independently); two keys on opposite halves resolve by
-/// "whichever key is already actively outputting suppresses the other" —
-/// `current_owner` (persisted across calls in `AxisState::owners`) keeps the
-/// already-active half winning once both go nonzero, defaulting to the
-/// positive half only the first time both activate with no prior owner at
-/// all (an arbitrary but harmless tie-break: ticket 59 doesn't specify one
-/// for a genuinely simultaneous first activation, and live tuning against
-/// real hardware is ticket 72's job, not this one's).
-fn resolve_axis_contribution(
-    positive: &[(Input, u8)],
-    negative: &[(Input, u8)],
-    current_owner: Option<Input>,
-) -> (i32, Option<Input>) {
-    let pos = positive
-        .iter()
-        .copied()
-        .filter(|&(_, v)| v > 0)
-        .max_by_key(|&(_, v)| v);
-    let neg = negative
-        .iter()
-        .copied()
-        .filter(|&(_, v)| v > 0)
-        .max_by_key(|&(_, v)| v);
-    match (pos, neg) {
-        (Some(p), Some(n)) => {
-            if current_owner == Some(n.0) {
-                (-i32::from(n.1), Some(n.0))
-            } else {
-                (i32::from(p.1), Some(p.0))
+impl DispatchState {
+    /// Builds the struct with every ephemeral field at its task-start value;
+    /// the five owned collaborators come from `run`'s startup parameters (and
+    /// from stub channels in the test seam). `run` calls this once and then
+    /// only drives the `select!` loop.
+    fn new(
+        injector: Injector,
+        signal_emitter: Option<SignalEmitter<'static>>,
+        actuation_tx: watch::Sender<HashMap<Input, ActuationPoint>>,
+        capture_control_tx: mpsc::Sender<bool>,
+        toggle_lap_target: Duration,
+    ) -> Self {
+        DispatchState {
+            toggles: HashMap::new(),
+            in_flight: HashMap::new(),
+            stepper: stepper::Cursors::default(),
+            active_layer: Layer::Base,
+            chord_machine: chord::ChordMachine::default(),
+            chord_runtime: ChordRuntime::default(),
+            axis: axis::Engine::default(),
+            analog_repeat: analog_repeat::Engine::default(),
+            device_connected: true,
+            capture_mode: CaptureMode::Digital,
+            device_info: None,
+            injector,
+            signal_emitter,
+            actuation_tx,
+            capture_control_tx,
+            toggle_lap_target,
+        }
+    }
+
+    /// Resolves one `PhysicalEvent` against the active Profile/Layer. Returns
+    /// the `Edit`s (if any) the `run` loop must commit — in practice empty, or
+    /// a single `Edit::SwitchProfile` when a Fire-once `Action::ProfileSwitch`
+    /// binding fires on `Down` (ticket 05). Takes `&Config`, never `&mut` —
+    /// the `run` loop is the sole commit point.
+    async fn handle_event(
+        &mut self,
+        config: &Config,
+        event: PhysicalEvent,
+    ) -> io::Result<Vec<edit::Edit>> {
+        let profile = config
+            .active_profile()
+            .expect("load_or_seed validates active_profile names a real profile");
+
+        if event.input == Input::ModeKey && profile.mode_key_role == ModeKeyRole::LayerSwitch {
+            handle_layer_switch(
+                &self.injector,
+                &mut self.active_layer,
+                &self.signal_emitter,
+                &mut self.axis,
+                &mut self.analog_repeat,
+                event.state,
+            )
+            .await;
+            return Ok(Vec::new());
+        }
+
+        // A Down on an Input with an active Toggle always stops that Toggle
+        // first, regardless of what Binding the Input's current Layer nominally
+        // assigns — this press is consumed entirely by the stop, per spec.md's
+        // "Toggle behavior across Layer/Profile switches". Only a later press
+        // resumes normal evaluation.
+        if event.state == EventState::Down
+            && trigger::stop_toggle(&mut self.toggles, &event.input).await
+        {
+            return Ok(Vec::new());
+        }
+
+        // An Axis-assigned Input (ticket 59/71) is structurally excluded from
+        // both `bindings_*` and Chord membership on this Layer (enforced
+        // atomically by `SetAxisAssignment`/rejected up front by `SetBinding`/
+        // `SetChordBinding`), so it must never reach the ordinary Binding lookup
+        // or passthrough below. An Analog-sourced event (`event.depth` is
+        // `Some`) is swallowed here — the continuous `rx_depth` watch-channel
+        // path (`handle_depth_update`) already drives this Input's output on
+        // every report, not just on a Down/Up/Repeat transition; a Digital-
+        // sourced one (`None`) runs the press/release step-increment fallback
+        // (ticket 59 §6).
+        let axis_map = profile.axis_layer(self.active_layer);
+        if axis_map.contains_key(&event.input) {
+            if event.depth.is_none() {
+                for w in self.axis.step_digital(axis_map, event.input, event.state) {
+                    let _ = self.injector.set_axis_value(w.code, w.value).await;
+                }
+            }
+            return Ok(Vec::new());
+        }
+
+        // The Chord-detection state machine (ticket 01/40, post-release ticket
+        // 07) runs unconditionally, after the guards above and before ordinary
+        // Binding lookup — it owns the "is this event mine?" predicate now
+        // (`ChordOutcome::NotMine` when it isn't), rather than `handle_event`
+        // reaching into `claimed` / `chord_keys_containing` itself.
+        let live = chord_slots(&self.chord_runtime);
+        match chord::feed(
+            &mut self.chord_machine,
+            profile.chords(self.active_layer),
+            &live,
+            event,
+        ) {
+            chord::ChordOutcome::Handled(effects) => {
+                return self.run_chord_effects(config, effects).await;
+            }
+            chord::ChordOutcome::NotMine => {}
+        }
+
+        let bindings = profile.layer(self.active_layer);
+        let binding = bindings.get(&event.input).cloned();
+
+        // Real firing for an Analog-repeat Binding while Depth is available comes
+        // entirely from `update_analog_repeats`'s own depth-driven background task
+        // (ticket 20/39) — this Analog-sourced edge event (synthesized from the
+        // key's ordinary, *tunable* Actuation point) is swallowed outright rather
+        // than double-firing, mirroring the Axis-assignment swallow above. Never
+        // fires for the Chord machine's synthetic retroactive Down (`depth: None`).
+        if let Some(binding) = &binding
+            && binding.trigger == TriggerMode::AnalogRepeat
+            && event.depth.is_some()
+        {
+            return Ok(Vec::new());
+        }
+
+        match event.state {
+            EventState::Down => {
+                // The bound → `trigger::decide` + `perform_trigger` /
+                // `ProfileSwitch` → `Edit` / unbound → passthrough tail, shared
+                // verbatim with the Chord machine's `FireIndividual` executor so
+                // the retroactive-fire logic exists once.
+                self.dispatch_individual_down(config, event.input).await
+            }
+            EventState::Repeat | EventState::Up => {
+                let Some(binding) = binding else {
+                    self.injector
+                        .inject_physical(event)
+                        .await
+                        .map_err(io::Error::other)?;
+                    return Ok(Vec::new());
+                };
+                // A `ProfileSwitch` binding is validated Fire-once, so only its
+                // `Down` fires it (handled above) — a later Repeat/Up is inert.
+                if matches!(binding.action, Action::ProfileSwitch { .. }) {
+                    return Ok(Vec::new());
+                }
+                let slot = slot_for(&self.in_flight, &self.toggles, &event.input);
+                let decision = trigger::decide(&binding, event.state, slot);
+                let mut ctx = trigger_ctx!(
+                    &self.injector,
+                    config,
+                    &mut self.in_flight,
+                    &mut self.toggles,
+                    &mut self.stepper,
+                    self.toggle_lap_target,
+                );
+                perform_trigger(decision, event.input, &binding, &mut ctx).await?;
+                Ok(Vec::new())
             }
         }
-        (Some(p), None) => (i32::from(p.1), Some(p.0)),
-        (None, Some(n)) => (-i32::from(n.1), Some(n.0)),
-        (None, None) => (0, None),
     }
-}
 
-/// Recomputes and writes every `ABS_*` code `axis_map` (the active Layer's
-/// resolved Axis-assignment map) currently touches, from `axis_state`'s
-/// latest per-Input contributions — the shared tail end of both the
-/// continuous Analog path (`handle_depth_update`) and the Digital-mode edge
-/// path (`handle_axis_edge_event`), per `AxisState`'s own doc comment.
-async fn recompute_and_emit_axes(
-    injector: &Injector,
-    axis_state: &mut AxisState,
-    axis_map: &HashMap<Input, AxisTarget>,
-) -> io::Result<()> {
-    // Positive-polarity contributors, negative-polarity contributors, per
-    // `ABS_*` code — see `resolve_axis_contribution`'s own doc comment for
-    // why unsigned targets always land in the positive side.
-    type Contributors = (Vec<(Input, u8)>, Vec<(Input, u8)>);
-    let mut by_code: HashMap<AbsoluteAxisCode, Contributors> = HashMap::new();
-    for (&input, &target) in axis_map {
-        let value = axis_state.contributions.get(&input).copied().unwrap_or(0);
-        let (positive, negative) = by_code.entry(target.abs_code()).or_default();
-        match target.polarity() {
-            None | Some(AxisPolarity::Positive) => positive.push((input, value)),
-            Some(AxisPolarity::Negative) => negative.push((input, value)),
+    /// Performs each `chord::ChordEffect` the pure machine decided on, in
+    /// order, against the runtime state dispatch owns (ticket 07). Returns any
+    /// `edit::Edit`s a `FireIndividual` produced (a member's individual
+    /// Binding resolving to `Action::ProfileSwitch`) for the `run` loop to
+    /// commit, same as the old `handle_chord_event` / `handle_chord_timeout`
+    /// return.
+    async fn run_chord_effects(
+        &mut self,
+        config: &Config,
+        effects: Vec<chord::ChordEffect>,
+    ) -> io::Result<Vec<edit::Edit>> {
+        let mut edits = Vec::new();
+        for effect in effects {
+            match effect {
+                chord::ChordEffect::FireChord {
+                    key,
+                    binding,
+                    state,
+                } => {
+                    // The Chord path's own Trigger-mode dispatch — `trigger::
+                    // decide` (the same matrix the individual path runs) against
+                    // this Chord's `ChordKey`-keyed liveness, performed by the
+                    // generic `perform_trigger`. A Chord's Action is never
+                    // `AnalogRepeat` or `ProfileSwitch`, and `chord::feed` only
+                    // ever emits `Down` / `Repeat`, so those `decide` arms are
+                    // unreachable here.
+                    let slot = slot_for(
+                        &self.chord_runtime.firings,
+                        &self.chord_runtime.toggles,
+                        &key,
+                    );
+                    let decision = trigger::decide(&binding, state, slot);
+                    let mut ctx = trigger_ctx!(
+                        &self.injector,
+                        config,
+                        &mut self.chord_runtime.firings,
+                        &mut self.chord_runtime.toggles,
+                        &mut self.stepper,
+                        self.toggle_lap_target,
+                    );
+                    perform_trigger(decision, key, &binding, &mut ctx).await?;
+                }
+                chord::ChordEffect::ReleaseChordFiring { key } => {
+                    // Fire-once / Hold-to-repeat only — a Toggle Chord is
+                    // deliberately not stopped by a member's `Up` (ticket 67).
+                    trigger::force_release_stuck(&self.chord_runtime.firings, &key, &self.injector)
+                        .await;
+                }
+                chord::ChordEffect::StopChordToggle { key } => {
+                    trigger::stop_toggle(&mut self.chord_runtime.toggles, &key).await;
+                }
+                chord::ChordEffect::FireIndividual { input } => {
+                    edits.extend(self.dispatch_individual_down(config, input).await?);
+                }
+                chord::ChordEffect::ForceReleaseIndividual { input } => {
+                    trigger::force_release_stuck(&self.in_flight, &input, &self.injector).await;
+                }
+            }
+        }
+        Ok(edits)
+    }
+
+    /// The continuous Analog half of ticket 59 §7's `(Depth, edge_event) ->
+    /// axis_value` seam: reacts to every change of the live-Depth watch
+    /// channel (`capture::analog`'s grid task, ticket 26) by resolving
+    /// `config::resolve_axis_value` for every Input the active Layer currently
+    /// Axis-assigns, then running the shared conflict-resolution/emit path.
+    /// Every Grid key's raw depth is published on every incoming hidraw report
+    /// regardless of Binding/Axis status
+    /// (`capture::analog::relay_grid_blocking`), so this only ever *reads*
+    /// `depths` for the subset that's actually Axis-assigned right now — an
+    /// empty Axis map (the common case) short-circuits immediately, doing no
+    /// work on every ordinary depth tick.
+    async fn handle_depth_update(&mut self, config: &Config, depths: &HashMap<Input, u8>) {
+        let profile = config
+            .active_profile()
+            .expect("load_or_seed validates active_profile names a real profile");
+        let axis_map = profile.axis_layer(self.active_layer);
+        if axis_map.is_empty() {
+            return;
+        }
+        // Ticket 71 code-review finding: reads each relevant Input's own
+        // Actuation/Release point directly, rather than building
+        // `resolved_actuation_points()`'s full 20-entry `HashMap` just to read
+        // the 1-4 entries an Axis-assigned Profile actually needs — this runs on
+        // every live-Depth tick (sub-millisecond while a key is moving, per
+        // ticket 13), so the redundant O(20) rebuild was real hot-path waste.
+        // The `depth → value` ramp stays dispatch-side (it needs the per-Input
+        // Actuation point); the engine's inputs are already-resolved 0-255
+        // contributions.
+        let mut resolved: HashMap<Input, u8> = HashMap::new();
+        for &input in axis_map.keys() {
+            if let Some(&depth) = depths.get(&input) {
+                let point = profile.resolved_actuation_point(input);
+                resolved.insert(input, config::resolve_axis_value(depth, point));
+            }
+        }
+        for w in self.axis.resolve(axis_map, &resolved) {
+            let _ = self.injector.set_axis_value(w.code, w.value).await;
         }
     }
-    // A code this Input used to own but that no longer has *any* contributor
-    // at all in `axis_map` (its last remaining Input was cleared/retargeted
-    // to a different `ABS_*` code) would otherwise never be revisited by the
-    // loop below, which only ever iterates codes `axis_map` currently names
-    // — leaving its last-written value stuck (code-review finding).
-    let stale_codes: Vec<AbsoluteAxisCode> = axis_state
-        .owners
-        .keys()
-        .filter(|code| !by_code.contains_key(code))
-        .copied()
-        .collect();
-    for code in stale_codes {
-        axis_state.owners.remove(&code);
-        injector
-            .set_axis_value(code, 0)
-            .await
-            .map_err(io::Error::other)?;
-    }
 
-    for (code, (positive, negative)) in by_code {
-        let current_owner = axis_state.owners.get(&code).copied();
-        let (value, new_owner) = resolve_axis_contribution(&positive, &negative, current_owner);
-        match new_owner {
-            Some(owner) => {
-                axis_state.owners.insert(code, owner);
+    /// Dispatches a single fresh `Down` on `input` against the active Layer —
+    /// the `ProfileSwitch → Edit` / bound → `trigger::decide` +
+    /// `perform_trigger` / unbound → passthrough tail carved out of
+    /// `handle_event`, shared verbatim by the ordinary input path and the
+    /// Chord machine's `FireIndividual` executor (a member's individual
+    /// Binding firing retroactively — the window elapsed, or the member was
+    /// released before completing — per ticket 01's Answer: "the pending
+    /// member's individual Binding fires retroactively, delayed by the
+    /// window"). It is *not* a re-entry into `handle_event`: that would re-run
+    /// the layer-switch / toggle-stop / axis / chord guards against a
+    /// synthetic Down, which is wrong. Returns any `Edit::SwitchProfile` the
+    /// member's own Binding produces — a Chord member's individual Binding can
+    /// be any Action, unlike a Chord's own, which can never be `ProfileSwitch`.
+    async fn dispatch_individual_down(
+        &mut self,
+        config: &Config,
+        input: Input,
+    ) -> io::Result<Vec<edit::Edit>> {
+        let profile = config
+            .active_profile()
+            .expect("load_or_seed validates active_profile names a real profile");
+        let binding = profile.layer(self.active_layer).get(&input).cloned();
+        match binding {
+            Some(binding) => {
+                if let Action::ProfileSwitch { target } = binding.action {
+                    // The switch is an `Edit` for the `run` loop to commit
+                    // (ticket 05).
+                    return Ok(vec![edit::Edit::SwitchProfile { name: target }]);
+                }
+                // Accepted gap (ticket 39): a member's own individual Binding
+                // set to Analog-repeat fires once here through the ordinary
+                // one-shot path (`decide` treats `AnalogRepeat` as `HoldToRepeat`
+                // for a Down), rather than starting the depth-driven background
+                // task `update_analog_repeats` normally would — this retroactive
+                // Down is synthetic (no real live Depth to hand a task), and a
+                // grid key that's both a Chord member *and* individually
+                // Analog-repeat-triggered is a narrow combination this
+                // fast-follow doesn't specially engineer for.
+                let slot = slot_for(&self.in_flight, &self.toggles, &input);
+                let decision = trigger::decide(&binding, EventState::Down, slot);
+                let mut ctx = trigger_ctx!(
+                    &self.injector,
+                    config,
+                    &mut self.in_flight,
+                    &mut self.toggles,
+                    &mut self.stepper,
+                    self.toggle_lap_target,
+                );
+                perform_trigger(decision, input, &binding, &mut ctx).await?;
+                Ok(Vec::new())
             }
             None => {
-                axis_state.owners.remove(&code);
+                self.injector
+                    .inject_physical(PhysicalEvent {
+                        input,
+                        state: EventState::Down,
+                        depth: None,
+                    })
+                    .await
+                    .map_err(io::Error::other)?;
+                Ok(Vec::new())
             }
         }
-        injector
-            .set_axis_value(code, value)
-            .await
-            .map_err(io::Error::other)?;
-    }
-    Ok(())
-}
-
-/// Centers every `ABS_*` code `axis_state` currently has an owner for back
-/// to 0 and clears every piece of `AxisState`, so a Layer or Profile switch
-/// never leaves a stale axis value driving output for an Input that's no
-/// longer even Axis-assigned on the newly-active Layer/Profile — mirrors
-/// `stop_all_toggles`'s identical "force-stop on switch" precedent for
-/// Toggles. A true no-op (no injector writes at all) when no Axis
-/// assignment has ever driven output — the overwhelmingly common case for
-/// most Profiles/Layers — so an ordinary Layer/Profile switch that never
-/// touches Axis assignment stays exactly as write-free as it was before
-/// ticket 71.
-async fn reset_axis_outputs(injector: &Injector, axis_state: &mut AxisState) -> io::Result<()> {
-    if axis_state.owners.is_empty() {
-        axis_state.contributions.clear();
-        return Ok(());
-    }
-    let codes: Vec<AbsoluteAxisCode> = axis_state.owners.keys().copied().collect();
-    axis_state.contributions.clear();
-    axis_state.owners.clear();
-    for code in codes {
-        injector
-            .set_axis_value(code, 0)
-            .await
-            .map_err(io::Error::other)?;
-    }
-    Ok(())
-}
-
-/// Analog-repeat's fixed start/stop threshold (ticket 20/39) — deliberately
-/// not the key's own tunable Actuation point, so the rate curve gets the
-/// key's full physical travel to work with. Placeholder: left TBD by ticket
-/// 20's Answer, to be tuned live against the real device — no physical
-/// Tartarus Pro was available in the session that built this.
-const ANALOG_REPEAT_DEADZONE: u8 = 12;
-
-/// Analog-repeat's minimum/maximum re-fire rate (ticket 20/39), linearly
-/// interpolated across the key's full 0-255 Depth range. Placeholders, same
-/// live-tuning status as `ANALOG_REPEAT_DEADZONE`.
-const ANALOG_REPEAT_MIN_HZ: f64 = 2.0;
-const ANALOG_REPEAT_MAX_HZ: f64 = 20.0;
-
-/// Analog-repeat's fixed per-fire hold duration (ticket 20/39) — the same
-/// every tick regardless of Depth; only the tick-to-tick *rate* varies.
-/// Placeholder, same live-tuning status as `ANALOG_REPEAT_DEADZONE`. Used for
-/// every output Action except `Action::ControllerButton`, which selects
-/// `ANALOG_REPEAT_CONTROLLER_PULSE_HOLD` instead (ticket 78) — Keypress/
-/// mouse-button output is interrupt-driven on the receiving side, not subject
-/// to the per-frame-polling risk a gamepad read has.
-const ANALOG_REPEAT_PULSE_HOLD: Duration = Duration::from_millis(15);
-
-/// `Action::ControllerButton`'s own Analog-repeat pulse-hold floor (ticket
-/// 78): `ANALOG_REPEAT_MAX_HZ`'s 20Hz already yields a 50ms period at the
-/// fastest end of the rate curve, comfortably above this 35ms dwell — the
-/// same frame-safe floor ticket 76 already vetted for `Action::
-/// ControllerButton` output against a polled 60fps game read (the class of
-/// problem ticket 74 flagged as unaddressed for Analog-repeat's own
-/// pre-existing 15ms dwell). Deliberately its own constant, not shared with
-/// `ANALOG_REPEAT_PULSE_HOLD` or `executor::CONTROLLER_BUTTON_DIGITAL_PULSE_
-/// HOLD` — three dwells tuned for unrelated jobs.
-const ANALOG_REPEAT_CONTROLLER_PULSE_HOLD: Duration = Duration::from_millis(35);
-
-/// Analog-repeat's near-full-travel threshold (ticket 20/39) at or above
-/// which the key holds down solid instead of continuing to tap. Placeholder,
-/// same live-tuning status as `ANALOG_REPEAT_DEADZONE`.
-const ANALOG_REPEAT_HOLD_SOLID: u8 = 235;
-
-/// A running Analog-repeat background task (ticket 20/39), as tracked in
-/// dispatch's `HashMap<Input, ActiveAnalogRepeat>` — structurally closer to
-/// `ActiveToggle` than to a Fire-once/Hold-to-repeat `FiringHandle`, per
-/// ticket 20's Answer: its lifetime is driven by Depth crossing
-/// `ANALOG_REPEAT_DEADZONE` (see `update_analog_repeats`), not by a single
-/// physical press/release. Never touched from `fire()`, which swallows every
-/// Analog-sourced Down/Repeat/Up for an Analog-repeat Binding outright (see
-/// `handle_event`) — only a Digital-sourced one (no Depth at all) reaches
-/// `fire()`, which treats Analog-repeat exactly like Hold-to-repeat there
-/// (ticket 20's Digital Capture mode fallback).
-struct ActiveAnalogRepeat {
-    cancel: CancellationToken,
-    handle: tokio::task::JoinHandle<()>,
-}
-
-impl ActiveAnalogRepeat {
-    /// Spawns the task: `steps` is compiled once, here, from the Binding's
-    /// Action as of the moment Depth first crossed the deadzone (mirrors
-    /// `fire()`'s own once-per-press `compile_action` call) — not
-    /// recompiled per tick, so a Stepper Action's cursor advances once per
-    /// "press session" rather than auto-cycling at the tick rate. `depth_rx`
-    /// is the caller's own clone of the shared live-Depth watch channel
-    /// (ticket 26), read fresh on every tick to drive the rate curve.
-    fn spawn(
-        injector: Injector,
-        input: Input,
-        steps: Vec<MacroStep>,
-        pulse_hold: Duration,
-        depth_rx: watch::Receiver<HashMap<Input, u8>>,
-    ) -> Self {
-        let cancel = CancellationToken::new();
-        let handle = tokio::spawn(run_analog_repeat_loop(
-            injector,
-            input,
-            steps,
-            pulse_hold,
-            depth_rx,
-            cancel.clone(),
-        ));
-        ActiveAnalogRepeat { cancel, handle }
     }
 
-    /// Stops the task and waits for its force-release to complete, mirroring
-    /// `ActiveToggle::stop`'s exact contract.
-    async fn stop(self) {
-        self.cancel.cancel();
-        let _ = self.handle.await;
-    }
-}
-
-/// Fires `steps`' Down phase, holds for `pulse_hold` (`ANALOG_REPEAT_PULSE_
-/// HOLD`, or `ANALOG_REPEAT_CONTROLLER_PULSE_HOLD` for `Action::
-/// ControllerButton` output, per ticket 78), then fires the Up phase in
-/// reverse order — matching `keypress_steps`'s own down/up nesting (modifiers
-/// released in the reverse of how they were pressed). Deliberately ignores
-/// any `MacroStep::Delay` a Macro Action might embed: Analog-repeat's whole
-/// idea (ticket 20's Answer) is a single fixed-duration pulse, not a
-/// multi-step timed sequence.
-async fn fire_analog_repeat_pulse(
-    injector: &Injector,
-    steps: &[MacroStep],
-    pulse_hold: Duration,
-    held: &mut HashSet<KeyCode>,
-) {
-    for step in steps {
-        if let MacroStep::KeyDown(_) = step {
-            let _ = executor::execute_step(injector, held, *step).await;
+    /// Starts/stops every grid Input's Analog-repeat task from a fresh
+    /// `depth_tx` snapshot (ticket 20/39) — the depth-driven half of
+    /// Analog-repeat's firing, parallel to `handle_depth_update`'s own Axis
+    /// resolution off the same snapshot. A rising edge through
+    /// `ANALOG_REPEAT_DEADZONE` on an Input whose active-Layer Binding is
+    /// `TriggerMode::AnalogRepeat` spawns a task (compiling its steps once,
+    /// the same "once per fire" precedent `perform_trigger` follows); a
+    /// falling edge — or the Binding no longer being Analog-repeat,
+    /// best-effort only, see below — stops one. A Binding changed away from
+    /// Analog-repeat without an intervening depth-crossing (e.g. edited live
+    /// while the key stays physically pressed) is a known, accepted residual
+    /// gap: the stale task keeps running with the steps it compiled at spawn
+    /// time until Depth next crosses the deadzone — the same class of gap
+    /// ticket 71's Answer accepted for its own opposite-signed-halves
+    /// tie-break, not engineered around here.
+    async fn update_analog_repeats(
+        &mut self,
+        config: &Config,
+        depth_rx: &watch::Receiver<HashMap<Input, u8>>,
+        snapshot: &HashMap<Input, u8>,
+    ) {
+        let profile = config
+            .active_profile()
+            .expect("load_or_seed validates active_profile names a real profile");
+        let bindings = profile.layer(self.active_layer);
+        // The set of Inputs whose active-Layer Binding is Analog-repeat —
+        // computed dispatch-side from `Config`; the engine never sees a
+        // `Config`, `CaptureMode`, or `Layer`.
+        let repeat_inputs: HashSet<Input> = bindings
+            .iter()
+            .filter(|(_, b)| b.trigger == TriggerMode::AnalogRepeat)
+            .map(|(&input, _)| input)
+            .collect();
+        for input in self.analog_repeat.update(&repeat_inputs, snapshot).await {
+            let binding = bindings
+                .get(&input)
+                .expect("reconcile only returns Spawn for a repeat_inputs member");
+            // Compiled once, here, from the Binding's Action as of the moment
+            // Depth first crossed the deadzone (mirrors `perform_trigger`'s
+            // own once-per-fire `compile_action` call) — `compile_action`
+            // stays dispatch-side so the engine needn't depend on `dispatch`
+            // or drag `Config` + the `stepper::Cursors` in.
+            let steps = compile_action(
+                &binding.action,
+                &config.macros,
+                &config.steppers,
+                &mut self.stepper,
+            );
+            self.analog_repeat.spawn(
+                self.injector.clone(),
+                input,
+                steps,
+                analog_repeat::pulse_hold_for(&binding.action),
+                depth_rx.clone(),
+            );
         }
     }
-    tokio::time::sleep(pulse_hold).await;
-    for step in steps.iter().rev() {
-        if let MacroStep::KeyUp(_) = step {
-            let _ = executor::execute_step(injector, held, *step).await;
-        }
-    }
-}
 
-/// The task body `ActiveAnalogRepeat::spawn` runs. Two states, toggled by
-/// `depth_rx`'s own live snapshot on every loop iteration: below
-/// `ANALOG_REPEAT_HOLD_SOLID`, fires `fire_analog_repeat_pulse` at a rate
-/// linearly interpolated between `ANALOG_REPEAT_MIN_HZ`/`_MAX_HZ` across the
-/// full 0-255 Depth range (ticket 20's Answer: not renormalized to the key's
-/// own Actuation/Release band); at or above it, holds every Down step solid
-/// with no further tapping until Depth drops back below the threshold.
-/// Exits (force-releasing whatever it's still holding) only on external
-/// cancellation — `update_analog_repeats` is the sole owner of *when* that
-/// happens, driven by Depth crossing back down through the deadzone.
-async fn run_analog_repeat_loop(
-    injector: Injector,
-    input: Input,
-    steps: Vec<MacroStep>,
-    pulse_hold: Duration,
-    mut depth_rx: watch::Receiver<HashMap<Input, u8>>,
-    cancel: CancellationToken,
-) {
-    let mut held: HashSet<KeyCode> = HashSet::new();
-    let mut holding_solid = false;
-    loop {
-        let depth = *depth_rx.borrow().get(&input).unwrap_or(&0);
-        if depth >= ANALOG_REPEAT_HOLD_SOLID {
-            if !holding_solid {
-                for step in &steps {
-                    if let MacroStep::KeyDown(_) = step {
-                        let _ = executor::execute_step(&injector, &mut held, *step).await;
+    /// Runs each `edit::Effect` an `edit::plan` derived, in order, against the
+    /// `DispatchState` fields it touches (ticket 05). `config` is the
+    /// just-committed `Config` — every effect that reads the new state
+    /// (`RepublishActuation`, `RecomputeAxes`) reads it from here. Every axis
+    /// `ABS_*` write goes through one dispatch-side emit loop over the
+    /// engine's `Vec<AxisWrite>` with the injector error swallowed (`let _ =`)
+    /// — a deliberate unification (ticket 10) of the old inconsistent `?` /
+    /// `let _ =` on the axis-output path.
+    async fn run_effects(&mut self, effects: Vec<edit::Effect>, config: &Config) {
+        for effect in effects {
+            match effect {
+                edit::Effect::RepublishActuation => {
+                    publish_actuation_snapshot(config, &self.actuation_tx)
+                }
+                edit::Effect::RecomputeAxes { layer } => {
+                    // `RecomputeAxes` for a Layer that isn't the active one is a
+                    // no-op — the resulting `Config` already carries the edit,
+                    // but nothing is driving that Layer's axes right now.
+                    if layer == self.active_layer {
+                        let axis_map = config
+                            .active_profile()
+                            .expect("load_or_seed validates active_profile names a real profile")
+                            .axis_layer(layer)
+                            .clone();
+                        for w in self.axis.recompute(&axis_map) {
+                            let _ = self.injector.set_axis_value(w.code, w.value).await;
+                        }
                     }
                 }
-                holding_solid = true;
-            }
-            tokio::select! {
-                () = cancel.cancelled() => break,
-                _ = depth_rx.changed() => {}
-            }
-            continue;
-        }
-        if holding_solid {
-            for step in steps.iter().rev() {
-                if let MacroStep::KeyUp(_) = step {
-                    let _ = executor::execute_step(&injector, &mut held, *step).await;
+                edit::Effect::ForgetAxisContribution(input) => {
+                    self.axis.forget(input);
+                }
+                edit::Effect::SignalCaptureMode(force) => {
+                    // Only on a successful persist (which is where `run_effects`
+                    // runs) — the supervisor swaps the live capture source to
+                    // match `config.toml` on disk.
+                    let _ = self.capture_control_tx.send(force).await;
+                }
+                edit::Effect::StopToggle(input) => {
+                    if let Some(toggle) = self.toggles.remove(&input) {
+                        toggle.stop().await;
+                    }
+                }
+                edit::Effect::StopAllToggles => stop_all_toggles(&mut self.toggles).await,
+                edit::Effect::StopAllAnalogRepeats => self.analog_repeat.stop_all().await,
+                edit::Effect::ResetAxisOutputs => {
+                    for w in self.axis.reset() {
+                        let _ = self.injector.set_axis_value(w.code, w.value).await;
+                    }
+                }
+                edit::Effect::ReconcileStepperCursor(stepper_id) => {
+                    // Against the just-committed `Config`: `id` gone → drop
+                    // the cursor, list shorter → clamp, list empty → drop.
+                    self.stepper.reconcile(&config.steppers, &stepper_id);
+                }
+                edit::Effect::AnnounceProfileChange(name) => {
+                    if let Some(emitter) = &self.signal_emitter {
+                        let _ = Daemon::active_profile_changed(emitter, &name).await;
+                    }
                 }
             }
-            holding_solid = false;
         }
-        // Below the deadzone: `update_analog_repeats` is the sole owner of
-        // *stopping* this task and is about to (or a stale wakeup is racing
-        // it) — wait rather than firing a spurious pulse at the curve's own
-        // minimum rate. Without this check, a `depth_rx.changed()` wakeup
-        // that wins its `select!` against the hold-solid branch's own
-        // `cancel.cancelled()` above (both become ready around the same
-        // depth update that crosses back below the deadzone) would
-        // otherwise fall through into the tapping branch below and fire one
-        // extra Down/Up pulse before the external stop's cancellation ever
-        // lands — reproduced by this module's own `analog_repeat_holds_
-        // solid_above_the_hold_threshold` test, intermittently, before this
-        // check existed.
-        if depth < ANALOG_REPEAT_DEADZONE {
-            tokio::select! {
-                () = cancel.cancelled() => break,
-                _ = depth_rx.changed() => {}
-            }
-            continue;
-        }
-        let rate_hz = ANALOG_REPEAT_MIN_HZ
-            + (ANALOG_REPEAT_MAX_HZ - ANALOG_REPEAT_MIN_HZ) * (f64::from(depth) / 255.0);
-        let period = Duration::from_secs_f64(1.0 / rate_hz);
-        let tick_start = Instant::now();
-        let cancelled = tokio::select! {
-            () = cancel.cancelled() => true,
-            () = fire_analog_repeat_pulse(&injector, &steps, pulse_hold, &mut held) => false,
-        };
-        if cancelled {
-            break;
-        }
-        let elapsed = tick_start.elapsed();
-        if elapsed < period {
-            tokio::select! {
-                () = cancel.cancelled() => break,
-                () = tokio::time::sleep(period - elapsed) => {}
+    }
+
+    /// Commits each `Edit` the input path returned (an `Action::ProfileSwitch`
+    /// binding firing — empty or one in practice, only a Fire-once on `Down`),
+    /// in order: `edit::apply` then `run_effects`. The `run` loop is the sole
+    /// commit point for an input-originated `Config` mutation (ticket 05). For
+    /// several returned `Edit::SwitchProfile`s (a genuinely retroactive
+    /// multi-switch) last-write-wins order is unchanged. One narrow shift: when
+    /// a single retroactive chord miss fires a `ProfileSwitch` member
+    /// *alongside* non-switch members, every member's binding now resolves
+    /// against the pre-switch Profile and the switch's effects (stop Toggles,
+    /// reset axes, stop Analog-repeats) run after them, rather than interleaved
+    /// as the old inline `switch_profile` call did — an accepted consequence of
+    /// the input path no longer holding `&mut Config` (see ticket 05's Answer).
+    /// A failed apply is logged and ignored — a dangling `ProfileSwitch` target
+    /// is impossible post-`validate`, so this only ever absorbs a genuine
+    /// `config.toml` write failure.
+    async fn commit_input_edits(
+        &mut self,
+        edits: Vec<edit::Edit>,
+        config: &mut Config,
+        config_path: &Path,
+    ) {
+        for edit in edits {
+            match edit::apply(config, config_path, edit).await {
+                Ok(outcome) => self.run_effects(outcome.effects, config).await,
+                Err(err) => eprintln!(
+                    "acheron-daemon: dispatch: ignoring a failed input-path Config edit: {err:?}"
+                ),
             }
         }
     }
-    executor::force_release(&injector, held).await;
-}
 
-/// Force-stops every currently running Analog-repeat task — mirrors
-/// `stop_all_toggles`'s exact shape, called on Layer switch/Profile switch
-/// (an Analog-repeat task is tied to one specific Layer's Binding, closer to
-/// a continuous Axis output than to a Toggle's deliberately-persisted latch
-/// — same reasoning as `reset_axis_outputs`'s own call sites) and on an
-/// Analog-to-Digital capture-mode transition (the live-Depth stream driving
-/// every task's rate curve goes stale the moment that happens).
-async fn stop_all_analog_repeats(analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>) {
-    for (_, task) in analog_repeats.drain() {
-        task.stop().await;
-    }
-}
-
-/// Starts/stops every grid Input's Analog-repeat task from a fresh
-/// `depth_tx` snapshot (ticket 20/39) — the depth-driven half of
-/// Analog-repeat's firing, parallel to `handle_depth_update`'s own Axis
-/// resolution off the same snapshot. A rising edge through
-/// `ANALOG_REPEAT_DEADZONE` on an Input whose active-Layer Binding is
-/// `TriggerMode::AnalogRepeat` spawns a task (compiling its steps once, the
-/// same "once per press" precedent `fire()` already sets); a falling edge —
-/// or the Binding no longer being Analog-repeat, best-effort only, see below
-/// — stops one. A Binding changed away from Analog-repeat without an
-/// intervening depth-crossing (e.g. edited live while the key stays
-/// physically pressed) is a known, accepted residual gap: the stale task
-/// keeps running with the steps it compiled at spawn time until Depth next
-/// crosses the deadzone — the same class of gap ticket 71's Answer accepted
-/// for its own opposite-signed-halves tie-break, not engineered around here.
-#[allow(clippy::too_many_arguments)]
-async fn update_analog_repeats(
-    injector: &Injector,
-    config: &Config,
-    active_layer: Layer,
-    analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>,
-    stepper_cursors: &mut HashMap<StepperId, usize>,
-    depth_rx: &watch::Receiver<HashMap<Input, u8>>,
-    snapshot: &HashMap<Input, u8>,
-) {
-    let profile = config
-        .active_profile()
-        .expect("load_or_seed validates active_profile names a real profile");
-    let bindings = profile.layer(active_layer);
-    for (&input, &depth) in snapshot {
-        let binding = bindings.get(&input);
-        let is_analog_repeat = binding.is_some_and(|b| b.trigger == TriggerMode::AnalogRepeat);
-        if is_analog_repeat && depth >= ANALOG_REPEAT_DEADZONE {
-            analog_repeats.entry(input).or_insert_with(|| {
-                let action = &binding
-                    .expect("is_analog_repeat is only true for Some(binding)")
-                    .action;
-                let steps =
-                    compile_action(action, &config.macros, &config.steppers, stepper_cursors);
-                // Ticket 78: a gamepad button gets the 35ms frame-safe floor;
-                // every other output Action keeps the original 15ms dwell.
-                let pulse_hold = if matches!(action, Action::ControllerButton { .. }) {
-                    ANALOG_REPEAT_CONTROLLER_PULSE_HOLD
-                } else {
-                    ANALOG_REPEAT_PULSE_HOLD
-                };
-                ActiveAnalogRepeat::spawn(
-                    injector.clone(),
-                    input,
-                    steps,
-                    pulse_hold,
-                    depth_rx.clone(),
-                )
-            });
-        } else if let Some(task) = analog_repeats.remove(&input) {
-            task.stop().await;
+    /// Four arms (ticket 11): `GetConfig` / `GetState` / `StopAllToggles`
+    /// inline, and one `Apply` arm — the sole mutating path — that `edit::apply`s
+    /// the `Edit`, sends the reply (carrying `Outcome.created`) **before**
+    /// `run_effects`, and runs effects only on success. Reply-before-effects is
+    /// uniform, which is what deleted `SwitchProfile`'s old special-case
+    /// reply-before-signal reasoning: that ordering is now the default shape.
+    async fn handle_command(&mut self, config: &mut Config, config_path: &Path, cmd: Command) {
+        match cmd {
+            Command::GetConfig(reply) => {
+                let _ = reply.send(config.clone());
+            }
+            Command::GetState(reply) => {
+                // One reported cursor per library entry, `0` ("the list's
+                // first item") for one never yet stepped (ticket 03/54).
+                let stepper_cursors = self.stepper.snapshot(&config.steppers);
+                let _ = reply.send(State {
+                    profile: config.active_profile.clone(),
+                    layer: self.active_layer.as_str(),
+                    active_toggles: self.toggles.keys().copied().collect(),
+                    device_connected: self.device_connected,
+                    capture_mode: self.capture_mode.as_str(),
+                    daemon_version: crate::VERSION,
+                    firmware_version: self
+                        .device_info
+                        .as_ref()
+                        .map(|info| info.firmware_version.clone()),
+                    serial_number: self
+                        .device_info
+                        .as_ref()
+                        .map(|info| info.serial_number.clone()),
+                    stepper_cursors,
+                });
+            }
+            Command::StopAllToggles { reply } => {
+                stop_all_toggles(&mut self.toggles).await;
+                let _ = reply.send(());
+            }
+            Command::Apply { edit, reply } => {
+                // The sole mutating path (ticket 11): the old `commit!` body
+                // inlined once. `reply` carries `Outcome.created` — `None` for
+                // the 22 non-create edits, `Some` for `CreateMacro` /
+                // `CreateStepper` — and is sent before effects run.
+                match edit::apply(config, config_path, edit).await {
+                    Ok(outcome) => {
+                        let _ = reply.send(Ok(outcome.created));
+                        self.run_effects(outcome.effects, config).await;
+                    }
+                    Err(err) => {
+                        let _ = reply.send(Err(err));
+                    }
+                }
+            }
         }
     }
 }
@@ -526,10 +658,12 @@ async fn update_analog_repeats(
 /// silently. The command channel closing is not fatal: it only means the
 /// D-Bus server side has gone away, and this task's other job (capture ->
 /// injector passthrough/remapping) still has work to do.
-// Ticket 22 grew this by one parameter (`actuation_tx`) past clippy's
-// default arg-count threshold — every parameter here is a distinct channel
-// handle or piece of startup state this task needs for the process's whole
-// lifetime, not something a struct would meaningfully group.
+// The 13 startup parameters: the `rx_*` receivers (plus `config` /
+// `config_path`) stay `run` locals — pure `select!`-loop plumbing no handler
+// touches — and the rest are threaded once into `DispatchState` below.
+// Clippy's arg-count lint fires only here now (ticket 09): the struct literal
+// that consumes them trips nothing, and every `handle_*` helper is a
+// `&mut self` method.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut rx_events: mpsc::Receiver<PhysicalEvent>,
@@ -573,135 +707,78 @@ pub async fn run(
             .expect("load_or_seed validates active_profile names a real profile")
             .resolved_actuation_points(),
     );
-    // Sole owner of every currently-running Toggle (spec.md: "Active
-    // toggles: HashMap<Input, ActiveToggle>"), mutated only from this task —
-    // no Mutex, matching the rest of the dispatch task's state.
-    let mut toggles: HashMap<Input, ActiveToggle> = HashMap::new();
-    // Tracks the most recent Fire-once/Hold-to-repeat firing spawned per
-    // Input, so a fast HoldToRepeat autorepeat (or a rapid re-Down) can't
-    // spawn a second overlapping firing for the same Input while a slow
-    // Macro's raw uinput writes for the first are still in flight — two
-    // concurrent firings racing on the shared Injector channel could
-    // interleave their KeyDown/KeyUp steps out of order on the wire.
-    let mut in_flight: HashMap<Input, FiringHandle> = HashMap::new();
-    // Every Stepper library entry's Daemon-side-only runtime cursor (ticket
-    // 03/54), owned exclusively by this task — an absent entry means "at the
-    // list's first item," matching the always-resets-to-first-item-on-
-    // restart semantics for free rather than needing an explicit
-    // zero-fill-on-startup pass.
-    let mut stepper_cursors: HashMap<StepperId, usize> = HashMap::new();
-    // The one piece of momentary Layer runtime state (ticket 18) — not part
-    // of `Config`, reset to `Base` whenever this task starts.
-    let mut active_layer = Layer::Base;
-    // The dispatch task's live view of device connectivity (ticket 20),
-    // updated from `rx_connection` — the `CaptureSource`'s poll loop reports
-    // transitions there, this task owns the one canonical value `GetState()`
-    // reads and `DeviceConnectionChanged` fires from. Starts optimistic
-    // (matches the pre-ticket-20 hardcoded default): the real
-    // `EvdevCaptureSource` reports its actual initial view within
-    // milliseconds of this task starting, so this only briefly matters at
-    // startup.
-    let mut device_connected = true;
-    // The dispatch task's live view of which capture path is running
-    // (ticket 23), updated from `rx_capture_mode` — the supervisor pushes a
-    // value on every mode transition, mirroring `device_connected` above.
-    // Starts optimistic as `Digital` for the same reason `device_connected`
-    // starts `true`: the supervisor reports its real startup choice within
-    // milliseconds, so this only briefly matters before the first push.
-    let mut capture_mode = CaptureMode::Digital;
-    // The dispatch task's live view of the connected device's firmware/
-    // serial (ticket 101), updated from `rx_device_info` — `None` until the
-    // supervisor's first successful read after a connect, back to `None` on
-    // disconnect. Unlike `device_connected`/`capture_mode` there is no
-    // optimistic startup value: absent is the honest state until a read
-    // actually lands.
-    let mut device_info: Option<DeviceInfo> = None;
+    // Every piece of the dispatch task's ephemeral runtime state, built fresh
+    // on this task start (see `DispatchState` / `DispatchState::new` for the
+    // task-start values). Each `select!` arm's handler is a `&mut self` method
+    // on it.
+    let mut state = DispatchState::new(
+        injector,
+        signal_emitter,
+        actuation_tx,
+        capture_control_tx,
+        toggle_lap_target,
+    );
+    // Pure `select!`-loop plumbing — the `rx_*` receivers stay `run` locals
+    // (so no `select!` branch expression borrows `state`) and these liveness
+    // flags travel with them; no handler reads either.
     let mut commands_open = true;
     let mut connection_open = true;
     let mut capture_mode_open = true;
     let mut device_info_open = true;
-    // Owns the ~50ms Chord simultaneity window plus every currently-active
-    // Chord's Trigger-mode state (ticket 01/40) — reset fresh on every
-    // dispatch task start, same as `toggles`/`active_layer`.
-    let mut chord_state = ChordState::default();
-    // Owns every Axis-assigned Input's live contribution/opposite-half
-    // ownership (ticket 59/71) — reset fresh on every dispatch task start,
-    // same as `chord_state`.
-    let mut axis_state = AxisState::default();
-    // Every currently-running Analog-repeat task (ticket 20/39), keyed by
-    // grid Input — reset fresh on every dispatch task start, same as
-    // `axis_state`; started/stopped by `update_analog_repeats` off every
-    // `rx_depth` snapshot below.
-    let mut analog_repeats: HashMap<Input, ActiveAnalogRepeat> = HashMap::new();
     let mut depth_open = true;
     loop {
         tokio::select! {
             event = rx_events.recv() => {
                 let Some(event) = event else { break };
-                handle_event(
-                    &injector,
-                    &mut config,
-                    &config_path,
-                    &mut toggles,
-                    &mut in_flight,
-                    &mut stepper_cursors,
-                    &mut active_layer,
-                    &signal_emitter,
-                    &actuation_tx,
-                    &mut chord_state,
-                    &mut axis_state,
-                    &mut analog_repeats,
-                    toggle_lap_target,
-                    event,
-                )
-                .await?;
+                let edits = state.handle_event(&config, event).await?;
+                if !edits.is_empty() {
+                    state.commit_input_edits(edits, &mut config, &config_path).await;
+                }
             }
             changed = rx_depth.changed(), if depth_open => {
                 match changed {
                     Ok(()) => {
+                        // Two independent engines sharing only the snapshot
+                        // value — axis-assignment resolution and the
+                        // Analog-repeat spawn/stop policy.
                         let snapshot = rx_depth.borrow_and_update().clone();
-                        handle_depth_update(&injector, &config, active_layer, &mut axis_state, snapshot.clone()).await?;
-                        update_analog_repeats(
-                            &injector,
-                            &config,
-                            active_layer,
-                            &mut analog_repeats,
-                            &mut stepper_cursors,
-                            &rx_depth,
-                            &snapshot,
-                        )
-                        .await;
+                        state.handle_depth_update(&config, &snapshot).await;
+                        state.update_analog_repeats(&config, &rx_depth, &snapshot).await;
                     }
                     Err(_) => depth_open = false,
                 }
             }
-            () = chord_window_deadline(&chord_state.window) => {
-                handle_chord_timeout(
-                    &injector,
-                    &mut config,
-                    &config_path,
-                    active_layer,
-                    &mut toggles,
-                    &mut in_flight,
-                    &mut stepper_cursors,
-                    &actuation_tx,
-                    &signal_emitter,
-                    &mut chord_state,
-                    &mut axis_state,
-                    &mut analog_repeats,
-                    toggle_lap_target,
-                )
-                .await?;
+            () = wait_for_chord_deadline(chord::next_deadline(&state.chord_machine)) => {
+                let edits = match chord::tick(&mut state.chord_machine, Instant::now()) {
+                    chord::ChordOutcome::Handled(effects) => {
+                        state.run_chord_effects(&config, effects).await?
+                    }
+                    chord::ChordOutcome::NotMine => Vec::new(),
+                };
+                if !edits.is_empty() {
+                    state.commit_input_edits(edits, &mut config, &config_path).await;
+                }
             }
             connected = rx_connection.recv(), if connection_open => {
                 match connected {
-                    Some(connected) => handle_connection_change(&mut device_connected, &signal_emitter, connected).await,
+                    Some(connected) => handle_connection_change(
+                        &mut state.device_connected,
+                        &state.signal_emitter,
+                        connected,
+                    )
+                    .await,
                     None => connection_open = false,
                 }
             }
             mode = rx_capture_mode.recv(), if capture_mode_open => {
                 match mode {
-                    Some(mode) => handle_capture_mode_change(&mut capture_mode, &signal_emitter, &mut analog_repeats, mode).await,
+                    Some(mode) => handle_capture_mode_change(
+                        &mut state.capture_mode,
+                        &state.signal_emitter,
+                        &mut state.analog_repeat,
+                        mode,
+                    )
+                    .await,
                     None => capture_mode_open = false,
                 }
             }
@@ -712,13 +789,13 @@ pub async fn run(
                     // when it opens, and they never change within a
                     // connection. `Some(None)` is the disconnect case
                     // clearing the cache.
-                    Some(update) => device_info = update,
+                    Some(update) => state.device_info = update,
                     None => device_info_open = false,
                 }
             }
             cmd = rx_commands.recv(), if commands_open => {
                 match cmd {
-                    Some(cmd) => handle_command(&injector, &mut config, &config_path, &mut toggles, &mut stepper_cursors, &mut axis_state, &mut analog_repeats, &active_layer, device_connected, capture_mode, device_info.as_ref(), &signal_emitter, &actuation_tx, &capture_control_tx, cmd).await,
+                    Some(cmd) => state.handle_command(&mut config, &config_path, cmd).await,
                     None => commands_open = false,
                 }
             }
@@ -727,167 +804,129 @@ pub async fn run(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn handle_event(
-    injector: &Injector,
-    config: &mut Config,
-    config_path: &Path,
-    toggles: &mut HashMap<Input, ActiveToggle>,
-    in_flight: &mut HashMap<Input, FiringHandle>,
-    stepper_cursors: &mut HashMap<StepperId, usize>,
-    active_layer: &mut Layer,
-    signal_emitter: &Option<SignalEmitter<'static>>,
-    actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
-    chord_state: &mut ChordState,
-    axis_state: &mut AxisState,
-    analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>,
-    toggle_lap_target: Duration,
-    event: PhysicalEvent,
-) -> io::Result<()> {
-    let profile = config
-        .active_profile()
-        .expect("load_or_seed validates active_profile names a real profile");
-
-    if event.input == Input::ModeKey && profile.mode_key_role == ModeKeyRole::LayerSwitch {
-        handle_layer_switch(
-            injector,
-            active_layer,
-            signal_emitter,
-            axis_state,
-            analog_repeats,
-            event.state,
-        )
-        .await?;
-        return Ok(());
-    }
-
-    // A Down on an Input with an active Toggle always stops that Toggle
-    // first, regardless of what Binding the Input's current Layer nominally
-    // assigns — this press is consumed entirely by the stop, per spec.md's
-    // "Toggle behavior across Layer/Profile switches". Only a later press
-    // resumes normal evaluation.
-    if event.state == EventState::Down
-        && let Some(toggle) = toggles.remove(&event.input)
-    {
-        toggle.stop().await;
-        return Ok(());
-    }
-
-    // An Axis-assigned Input (ticket 59/71) is structurally excluded from
-    // both `bindings_*` and Chord membership on this Layer (enforced
-    // atomically by `SetAxisAssignment`/rejected up front by `SetBinding`/
-    // `SetChordBinding`), so it must never reach the ordinary Binding lookup
-    // or passthrough below. An Analog-sourced event (`event.depth` is
-    // `Some`) is swallowed here — the continuous `rx_depth` watch-channel
-    // path (`handle_depth_update`) already drives this Input's output on
-    // every report, not just on a Down/Up/Repeat transition; a Digital-
-    // sourced one (`None`) runs the press/release step-increment fallback
-    // (ticket 59 §6).
-    let axis_map = profile.axis_layer(*active_layer);
-    if axis_map.contains_key(&event.input) {
-        return if event.depth.is_some() {
-            Ok(())
+/// Builds the `trigger::Slot` liveness snapshot `chord::feed` wants from
+/// dispatch's `ChordRuntime` — `toggles` → `Toggle`, `firings` →
+/// `FiringUnfinished` / `FiringFinished` by `handle.is_finished()`. Firings
+/// are inserted first so a `Toggle` entry wins if a live re-bind ever left
+/// both (matching the old `starting`/`stopping` filters, which checked the
+/// toggle map first). `slot_for` reads the same three states for a single key
+/// on the executor paths, but with the opposite tie-break — see its doc.
+fn chord_slots(runtime: &ChordRuntime) -> HashMap<ChordKey, trigger::Slot> {
+    let mut live = HashMap::new();
+    for (key, handle) in &runtime.firings {
+        let slot = if handle.is_finished() {
+            trigger::Slot::FiringFinished
         } else {
-            handle_axis_edge_event(injector, axis_state, axis_map, event.input, event.state).await
+            trigger::Slot::FiringUnfinished
         };
+        live.insert(key.clone(), slot);
     }
-
-    // The Chord-detection machinery (ticket 01/40) takes priority over
-    // ordinary Binding lookup for any Input currently "owned" by it —
-    // either a fresh chord-eligible Down, or any later Repeat/Up for an
-    // Input already claimed by an open window or an active fired Chord
-    // (`chord_state.claimed`, not a fresh membership check, so a member
-    // that already resolved individually via `fire_individual_retroactively`
-    // is never routed back here).
-    let owned = chord_state.claimed.contains(&event.input);
-    if owned
-        || (event.state == EventState::Down
-            && !chord_keys_containing(profile.chords(*active_layer), event.input).is_empty())
-    {
-        return handle_chord_event(
-            injector,
-            config,
-            config_path,
-            toggles,
-            in_flight,
-            stepper_cursors,
-            *active_layer,
-            signal_emitter,
-            actuation_tx,
-            chord_state,
-            axis_state,
-            analog_repeats,
-            toggle_lap_target,
-            event,
-        )
-        .await;
+    for key in runtime.toggles.keys() {
+        live.insert(key.clone(), trigger::Slot::Toggle);
     }
+    live
+}
 
-    // Cloned rather than matched by reference: an `Action::ProfileSwitch`
-    // Binding needs `config` mutably below, and `binding` would otherwise
-    // still be borrowing it immutably through `profile`/`bindings` (ticket
-    // 34).
-    let bindings = profile.layer(*active_layer);
-    let binding = bindings.get(&event.input).cloned();
-    match binding {
-        Some(binding) => {
-            if let Action::ProfileSwitch { target } = binding.action {
-                // Validated (`SetBinding`/`load_or_seed`) to only ever pair
-                // with Fire-once, so only `Down` fires it — mirrors `fire`'s
-                // own `(FireOnce, Down)` arm, but this Action has no
-                // `MacroStep` form to compile/spawn, so it's handled here
-                // instead of reaching `fire`/`executor::compile` at all.
-                if event.state == EventState::Down {
-                    let succeeded = switch_profile(
-                        injector,
-                        config,
-                        config_path,
-                        toggles,
-                        actuation_tx,
-                        axis_state,
-                        analog_repeats,
-                        target.clone(),
-                    )
-                    .await
-                    .is_ok();
-                    if succeeded && let Some(emitter) = signal_emitter {
-                        let _ = Daemon::active_profile_changed(emitter, &target).await;
-                    }
-                }
-                return Ok(());
-            }
-            // Real firing for Analog-repeat while Depth is available comes
-            // entirely from `update_analog_repeats`'s own depth-driven
-            // background task (ticket 20/39) — this Analog-sourced
-            // Down/Repeat/Up (synthesized from the key's ordinary, *tunable*
-            // Actuation/Release points, a different threshold pair than
-            // Analog-repeat's own fixed deadzone) is swallowed outright
-            // rather than double-firing through `fire()`, mirroring the
-            // Axis-assignment swallow above. A Digital-sourced event (no
-            // Depth at all) falls through to `fire()`, which treats
-            // Analog-repeat exactly like Hold-to-repeat (ticket 20's
-            // Digital Capture mode fallback).
-            if binding.trigger == TriggerMode::AnalogRepeat && event.depth.is_some() {
-                return Ok(());
-            }
-            fire(
-                injector,
-                toggles,
-                in_flight,
-                event.input,
-                &binding,
-                event.state,
-                &config.macros,
-                &config.steppers,
-                stepper_cursors,
-                toggle_lap_target,
-            )
-            .await
+/// The single-key liveness read `trigger::decide`'s overlap guard needs, over
+/// a `(firings, toggles)` pair — `Input`-keyed on the individual path,
+/// `ChordKey`-keyed on the Chord `FireChord` path. Replaces the old `fire` /
+/// `execute_chord_fire` inline `firings.get(&key).is_finished()` checks, which
+/// consulted *only* the firings map — so a firing entry wins here (the guard
+/// `decide` makes is purely `Some(FiringUnfinished)`), and `Toggle` is only
+/// reported as a fallback when no firing exists. This differs deliberately
+/// from `chord_slots`' toggle-wins tie-break, which serves `chord::feed`'s
+/// completion logic, not this guard.
+fn slot_for<K: Eq + Hash>(
+    firings: &HashMap<K, FiringHandle>,
+    toggles: &HashMap<K, ActiveToggle>,
+    key: &K,
+) -> Option<trigger::Slot> {
+    if let Some(handle) = firings.get(key) {
+        return Some(if handle.is_finished() {
+            trigger::Slot::FiringFinished
+        } else {
+            trigger::Slot::FiringUnfinished
+        });
+    }
+    toggles.contains_key(key).then_some(trigger::Slot::Toggle)
+}
+
+/// The runtime state `perform_trigger` performs a `trigger::TriggerDecision`
+/// against, generic over the slot key (`Input` for the individual path,
+/// `ChordKey` for the Chord path). Built fresh per call site from a disjoint
+/// `&mut self.<map>` borrow plus `&config` (ticket 05/08) — never held across
+/// a `select!` poll. It survives the ticket-09 `DispatchState` reshape
+/// precisely because a `&mut self` method can't be generic over which map
+/// type `K` selects, so `perform_trigger<K>` stays a free function.
+/// Dispatch-internal: never part of `trigger`'s interface.
+struct TriggerCtx<'a, K> {
+    injector: &'a Injector,
+    firings: &'a mut HashMap<K, FiringHandle>,
+    toggles: &'a mut HashMap<K, ActiveToggle>,
+    macros: &'a HashMap<MacroId, MacroDef>,
+    steppers: &'a HashMap<StepperId, StepperDef>,
+    cursors: &'a mut stepper::Cursors,
+    toggle_lap_target: Duration,
+}
+
+/// Performs `decision` against `ctx` — `compile_action` (behind the overlap
+/// guard `trigger::decide` already cleared, so a dropped Fire-once /
+/// Hold-to-repeat `Step` firing never advances the cursor) + `executor::
+/// spawn_fire_once` / `ActiveToggle::spawn{,_held}` + map insert, or
+/// `trigger::force_release_stuck`. Never produces an `edit::Edit`
+/// (`ProfileSwitch` is handled before this is ever reached). The old `fire` /
+/// `execute_chord_fire` executor halves, now one generic function.
+async fn perform_trigger<K: Eq + Hash + Clone>(
+    decision: trigger::TriggerDecision,
+    key: K,
+    binding: &Binding,
+    ctx: &mut TriggerCtx<'_, K>,
+) -> io::Result<()> {
+    use trigger::TriggerDecision as D;
+    match decision {
+        D::Nothing => {}
+        D::SpawnFireOnce => {
+            let steps = compile_action(&binding.action, ctx.macros, ctx.steppers, ctx.cursors);
+            let handle = executor::spawn_fire_once(ctx.injector.clone(), steps);
+            ctx.firings.insert(key, handle);
         }
-        None => injector
-            .inject_physical(event)
-            .await
-            .map_err(io::Error::other),
+        D::HoldKeyDown(code) => {
+            // A bare, unbalanced `KeyDown` mirroring the physical hold —
+            // released by a `ForceReleaseStuck` (individual) or
+            // `ChordEffect::ReleaseChordFiring` (Chord) later, reusing ticket
+            // 33's force-release path rather than inventing new architecture.
+            let handle =
+                executor::spawn_fire_once(ctx.injector.clone(), vec![MacroStep::KeyDown(code)]);
+            ctx.firings.insert(key, handle);
+        }
+        D::StartToggleLoop => {
+            let steps = compile_action(&binding.action, ctx.macros, ctx.steppers, ctx.cursors);
+            ctx.toggles.insert(
+                key,
+                ActiveToggle::spawn(ctx.injector.clone(), steps, ctx.toggle_lap_target),
+            );
+        }
+        D::StartToggleHeld(code) => {
+            ctx.toggles
+                .insert(key, ActiveToggle::spawn_held(ctx.injector.clone(), code));
+        }
+        D::ForceReleaseStuck => {
+            trigger::force_release_stuck(ctx.firings, &key, ctx.injector).await;
+        }
+    }
+    Ok(())
+}
+
+/// Awaits the active Chord window's deadline, or never resolves if none is
+/// open — the `select!` branch in `run` re-creates this future every loop
+/// iteration, so a window opened, extended, or cleared by `handle_event` in
+/// between is always picked up on the very next iteration (recreating a
+/// `sleep_until` against the same absolute `Instant` doesn't lose progress).
+/// Replaces the old `chord_window_deadline`.
+async fn wait_for_chord_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -907,25 +946,26 @@ async fn handle_layer_switch(
     injector: &Injector,
     active_layer: &mut Layer,
     signal_emitter: &Option<SignalEmitter<'static>>,
-    axis_state: &mut AxisState,
-    analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>,
+    axis: &mut axis::Engine,
+    analog_repeat: &mut analog_repeat::Engine,
     state: EventState,
-) -> io::Result<()> {
+) {
     let new_layer = match state {
         EventState::Down => Layer::Held,
         EventState::Up => Layer::Base,
-        EventState::Repeat => return Ok(()),
+        EventState::Repeat => return,
     };
     if new_layer == *active_layer {
-        return Ok(());
+        return;
     }
     *active_layer = new_layer;
-    reset_axis_outputs(injector, axis_state).await?;
-    stop_all_analog_repeats(analog_repeats).await;
+    for w in axis.reset() {
+        let _ = injector.set_axis_value(w.code, w.value).await;
+    }
+    analog_repeat.stop_all().await;
     if let Some(emitter) = signal_emitter {
         let _ = Daemon::active_layer_changed(emitter, new_layer.as_str()).await;
     }
-    Ok(())
 }
 
 /// Updates the dispatch task's view of device connectivity (ticket 20) and
@@ -955,12 +995,13 @@ async fn handle_connection_change(
 /// Digital (ticket 39): the live-Depth stream every task's rate curve reads
 /// goes stale the moment analog capture stops, and Digital-sourced
 /// Down/Repeat/Up events for the same Bindings are about to start reaching
-/// `fire()`'s own Hold-to-repeat-equivalent fallback instead — a still-
-/// running task would otherwise double-fire alongside it.
+/// the individual Trigger-mode path's own Hold-to-repeat-equivalent fallback
+/// instead (`trigger::decide` treats Analog-repeat as Hold-to-repeat) — a
+/// still-running task would otherwise double-fire alongside it.
 async fn handle_capture_mode_change(
     capture_mode: &mut CaptureMode,
     signal_emitter: &Option<SignalEmitter<'static>>,
-    analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>,
+    analog_repeat: &mut analog_repeat::Engine,
     mode: CaptureMode,
 ) {
     if mode == *capture_mode {
@@ -968,1023 +1009,46 @@ async fn handle_capture_mode_change(
     }
     *capture_mode = mode;
     if mode == CaptureMode::Digital {
-        stop_all_analog_repeats(analog_repeats).await;
+        analog_repeat.stop_all().await;
     }
     if let Some(emitter) = signal_emitter {
         let _ = Daemon::capture_mode_changed(emitter, mode.as_str()).await;
     }
 }
 
-/// The Digital Capture mode fallback (ticket 59 §6/71): press/release
-/// step-increment for an Axis-assigned Input carrying no Depth at all —
-/// `handle_event` only ever routes a genuinely Digital-sourced event here
-/// (`event.depth` is `None`); an Analog-sourced one is fully handled by the
-/// continuous `handle_depth_update` path instead. Reuses the kernel's own
-/// autorepeat cadence (the same `Repeat` stream Hold-to-repeat rides) to
-/// ramp up by `AXIS_DIGITAL_STEP` on every Down/Repeat, saturating at 255;
-/// `Up` resets to 0 — the closest digital emulation of "Depth rises while
-/// held, drops to 0 on release" ticket 59 §6 asks for.
-async fn handle_axis_edge_event(
-    injector: &Injector,
-    axis_state: &mut AxisState,
-    axis_map: &HashMap<Input, AxisTarget>,
-    input: Input,
-    state: EventState,
-) -> io::Result<()> {
-    let current = axis_state.contributions.get(&input).copied().unwrap_or(0);
-    let next = match state {
-        EventState::Down | EventState::Repeat => current.saturating_add(AXIS_DIGITAL_STEP),
-        EventState::Up => 0,
-    };
-    axis_state.contributions.insert(input, next);
-    recompute_and_emit_axes(injector, axis_state, axis_map).await
-}
-
-/// The continuous Analog half of ticket 59 §7's `(Depth, edge_event) ->
-/// axis_value` seam: reacts to every change of the live-Depth watch channel
-/// (`capture::analog`'s grid task, ticket 26) by resolving
-/// `config::resolve_axis_value` for every Input the active Layer currently
-/// Axis-assigns, then running the shared conflict-resolution/emit path.
-/// Every Grid key's raw depth is published on every incoming hidraw report
-/// regardless of Binding/Axis status (`capture::analog::relay_grid_blocking`),
-/// so this only ever *reads* `depths` for the subset that's actually
-/// Axis-assigned right now — an empty Axis map (the common case) short-
-/// circuits immediately, doing no work on every ordinary depth tick.
-async fn handle_depth_update(
-    injector: &Injector,
-    config: &Config,
-    active_layer: Layer,
-    axis_state: &mut AxisState,
-    depths: HashMap<Input, u8>,
-) -> io::Result<()> {
-    let profile = config
-        .active_profile()
-        .expect("load_or_seed validates active_profile names a real profile");
-    let axis_map = profile.axis_layer(active_layer);
-    if axis_map.is_empty() {
-        return Ok(());
-    }
-    // Ticket 71 code-review finding: reads each relevant Input's own
-    // Actuation/Release point directly, rather than building
-    // `resolved_actuation_points()`'s full 20-entry `HashMap` just to read
-    // the 1-4 entries an Axis-assigned Profile actually needs — this runs on
-    // every live-Depth tick (sub-millisecond while a key is moving, per
-    // ticket 13), so the redundant O(20) rebuild was real hot-path waste.
-    for &input in axis_map.keys() {
-        if let Some(&depth) = depths.get(&input) {
-            let point = profile.resolved_actuation_point(input);
-            axis_state
-                .contributions
-                .insert(input, config::resolve_axis_value(depth, point));
-        }
-    }
-    recompute_and_emit_axes(injector, axis_state, axis_map).await
-}
-
-/// Every `ChordKey` in `chords` that contains `input` among its members
-/// (ticket 01's amended Answer: an Input may belong to any number of
-/// Chords, so this can return more than one).
-fn chord_keys_containing(chords: &HashMap<ChordKey, Binding>, input: Input) -> Vec<ChordKey> {
-    chords
-        .keys()
-        .filter(|key| key.members().contains(&input))
-        .cloned()
-        .collect()
-}
-
-/// Resolves to the active Chord window's deadline, or never resolves if no
-/// window is open — the `tokio::select!` branch in `run` that drives
-/// `handle_chord_timeout` evaluates this fresh every loop iteration, so a
-/// window opened, extended, or cleared by `handle_event` in between is
-/// always picked up on the very next iteration (mirrors `run_depth_stream`'s
-/// own `interval_at` reasoning against a similarly-recreated-per-iteration
-/// future — recreating a `sleep_until` against the same absolute `Instant`
-/// every iteration doesn't lose or reset progress).
-async fn chord_window_deadline(window: &Option<ChordWindow>) {
-    match window {
-        Some(window) => tokio::time::sleep_until(window.deadline).await,
-        None => std::future::pending().await,
-    }
-}
-
-/// `fire`'s exact mirror for a Chord's own Trigger-mode dispatch (ticket
-/// 01/40): Fire-once/Hold-to-repeat share one Chord-scoped `FiringHandle`
-/// slot per `ChordKey`, Toggle spawns/tracks one `ActiveToggle` per
-/// `ChordKey`, both keyed by the Chord's member set rather than by a single
-/// Input. `ProfileSwitch` never reaches here — `SetChordBinding`/`parse`
-/// both refuse to let a Chord's Action be `ProfileSwitch` (see
-/// `ConfigError::InvalidChordProfileSwitch`), since `compile_action` panics
-/// on it (it has no `MacroStep` form, only `handle_event`'s single-Input
-/// path ever specially handles it).
-#[allow(clippy::too_many_arguments)]
-async fn fire_chord(
-    injector: &Injector,
-    chord_toggles: &mut HashMap<ChordKey, ActiveToggle>,
-    chord_in_flight: &mut HashMap<ChordKey, FiringHandle>,
-    key: ChordKey,
-    binding: &Binding,
-    state: EventState,
-    macros: &HashMap<MacroId, MacroDef>,
-    steppers: &HashMap<StepperId, StepperDef>,
-    stepper_cursors: &mut HashMap<StepperId, usize>,
-    toggle_lap_target: Duration,
-) -> io::Result<()> {
-    match (binding.trigger, state) {
-        (TriggerMode::HoldToRepeat, EventState::Repeat)
-            if matches!(binding.action, Action::ControllerButton { .. }) =>
-        {
-            // Mirrors `fire`'s own ControllerButton/HoldToRepeat Repeat
-            // arm (ticket 75/76) — the Chord's leader member's Repeat is
-            // ignored outright rather than re-firing.
-            Ok(())
-        }
-        (TriggerMode::HoldToRepeat, EventState::Down)
-            if matches!(binding.action, Action::ControllerButton { .. }) =>
-        {
-            if let Some(handle) = chord_in_flight.get(&key)
-                && !handle.is_finished()
-            {
-                return Ok(());
-            }
-            let Action::ControllerButton { button } = binding.action else {
-                unreachable!("guarded by this arm's own match guard above")
-            };
-            // Mirrors `fire`'s own bare-KeyDown ControllerButton hold —
-            // released by `release_chord_firing` on a member's physical Up.
-            let steps = vec![MacroStep::KeyDown(button)];
-            let handle = executor::spawn_fire_once(injector.clone(), steps);
-            chord_in_flight.insert(key, handle);
-            Ok(())
-        }
-        (TriggerMode::HoldToRepeat, EventState::Repeat)
-            if matches!(
-                binding.action,
-                Action::Keypress { key, .. } if crate::input::is_mouse_button(key)
-            ) =>
-        {
-            // Mirrors `fire`'s own mouse-button/HoldToRepeat Repeat arm
-            // (ticket 79/80) — the Chord's leader member's Repeat is
-            // ignored outright rather than re-firing.
-            Ok(())
-        }
-        (TriggerMode::HoldToRepeat, EventState::Down)
-            if matches!(
-                binding.action,
-                Action::Keypress { key, .. } if crate::input::is_mouse_button(key)
-            ) =>
-        {
-            if let Some(handle) = chord_in_flight.get(&key)
-                && !handle.is_finished()
-            {
-                return Ok(());
-            }
-            let Action::Keypress { key: button, .. } = binding.action else {
-                unreachable!("guarded by this arm's own match guard above")
-            };
-            // Mirrors `fire`'s own bare-KeyDown mouse-button hold —
-            // released by `release_chord_firing` on a member's physical Up.
-            let steps = vec![MacroStep::KeyDown(button)];
-            let handle = executor::spawn_fire_once(injector.clone(), steps);
-            chord_in_flight.insert(key, handle);
-            Ok(())
-        }
-        (TriggerMode::FireOnce, EventState::Down)
-        | (TriggerMode::HoldToRepeat, EventState::Down | EventState::Repeat) => {
-            if let Some(handle) = chord_in_flight.get(&key)
-                && !handle.is_finished()
-            {
-                return Ok(());
-            }
-            let steps = compile_action(&binding.action, macros, steppers, stepper_cursors);
-            let handle = executor::spawn_fire_once(injector.clone(), steps);
-            chord_in_flight.insert(key, handle);
-            Ok(())
-        }
-        (TriggerMode::Toggle, EventState::Down)
-            if matches!(
-                binding.action,
-                Action::Keypress { key, .. } if crate::input::is_mouse_button(key)
-            ) =>
-        {
-            let Action::Keypress { key: button, .. } = binding.action else {
-                unreachable!("guarded by this arm's own match guard above")
-            };
-            // Ticket 82: a mouse-button Chord Toggle gets the same
-            // sustained-hold treatment as a plain Input's own Toggle below
-            // — a single held KeyDown rather than a repeat-tap loop.
-            chord_toggles.insert(key, ActiveToggle::spawn_held(injector.clone(), button));
-            Ok(())
-        }
-        (TriggerMode::Toggle, EventState::Down)
-            if matches!(binding.action, Action::ControllerButton { .. }) =>
-        {
-            let Action::ControllerButton { button } = binding.action else {
-                unreachable!("guarded by this arm's own match guard above")
-            };
-            // Ticket 78: a gamepad button Chord Toggle gets the same
-            // sustained-hold treatment as a plain Input's own ControllerButton
-            // Toggle above, and as the mouse-button Chord Toggle carve-out
-            // above it.
-            chord_toggles.insert(key, ActiveToggle::spawn_held(injector.clone(), button));
-            Ok(())
-        }
-        (TriggerMode::Toggle, EventState::Down) => {
-            let steps = compile_action(&binding.action, macros, steppers, stepper_cursors);
-            chord_toggles.insert(
-                key,
-                ActiveToggle::spawn(injector.clone(), steps, toggle_lap_target),
-            );
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-/// Force-releases a Chord's in-flight Fire-once/Hold-to-repeat firing, if
-/// any, on a member's `Up` — those Trigger modes are tied to the physical
-/// keys staying down, same as `fire`'s own Up handling. A Chord that never
-/// actually fired (still pending, or a FireOnce whose firing already
-/// finished on its own) has nothing to release here; the check is a no-op
-/// in that case.
-///
-/// **Toggle-mode Chords are deliberately not touched here** (correction,
-/// hardware-verified live in ticket 67): ticket 01's original Answer had
-/// any member's `Up` also stop an active Toggle, but that felt wrong on the
-/// real device — a Toggle should behave like a toggle, staying on past a
-/// release. A Toggle Chord now stops only when its full member set
-/// completes again, mirroring how a single Input's own Toggle stops on a
-/// second `Down`, never on `Up` — see the `Down` arm of
-/// `handle_chord_event`.
-async fn release_chord_firing(
-    injector: &Injector,
-    chord_in_flight: &HashMap<ChordKey, FiringHandle>,
-    key: &ChordKey,
-) {
-    if let Some(firing) = chord_in_flight.get(key) {
-        firing.force_release_stuck(injector).await;
-    }
-}
-
-/// Fires `input`'s own individual Binding as if its Down had just landed
-/// fresh — used once a chord-eligible Down never actually completes a Chord
-/// (the window elapsed, or the key was released early), per ticket 01's
-/// Answer: "the pending member's individual Binding fires retroactively
-/// (delayed by the window)". Mirrors `handle_event`'s own ordinary dispatch
-/// exactly, including the `ProfileSwitch`/passthrough branches — it must,
-/// since a Chord member's *own* individual Binding can be any ordinary
-/// Action (unlike a Chord's own Action, which can never be `ProfileSwitch`).
-#[allow(clippy::too_many_arguments)]
-async fn fire_individual_retroactively(
-    injector: &Injector,
-    config: &mut Config,
-    config_path: &Path,
-    toggles: &mut HashMap<Input, ActiveToggle>,
-    in_flight: &mut HashMap<Input, FiringHandle>,
-    stepper_cursors: &mut HashMap<StepperId, usize>,
-    actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
-    axis_state: &mut AxisState,
-    analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>,
-    signal_emitter: &Option<SignalEmitter<'static>>,
-    layer: Layer,
-    input: Input,
-    toggle_lap_target: Duration,
-) -> io::Result<()> {
-    let profile = config
-        .active_profile()
-        .expect("load_or_seed validates active_profile names a real profile");
-    let binding = profile.layer(layer).get(&input).cloned();
-    match binding {
-        Some(binding) => {
-            if let Action::ProfileSwitch { target } = binding.action {
-                if switch_profile(
-                    injector,
-                    config,
-                    config_path,
-                    toggles,
-                    actuation_tx,
-                    axis_state,
-                    analog_repeats,
-                    target.clone(),
-                )
-                .await
-                .is_ok()
-                    && let Some(emitter) = signal_emitter
-                {
-                    let _ = Daemon::active_profile_changed(emitter, &target).await;
-                }
-                return Ok(());
-            }
-            // Accepted gap (ticket 39): a member's own individual Binding
-            // set to Analog-repeat fires once here through `fire()`'s
-            // ordinary one-shot path, rather than starting the depth-driven
-            // background task `update_analog_repeats` normally would — this
-            // retroactive Down is synthetic (no real live Depth to hand a
-            // task), and a grid key that's both a Chord member *and*
-            // individually Analog-repeat-triggered is a narrow combination
-            // this fast-follow doesn't specially engineer for.
-            fire(
-                injector,
-                toggles,
-                in_flight,
-                input,
-                &binding,
-                EventState::Down,
-                &config.macros,
-                &config.steppers,
-                stepper_cursors,
-                toggle_lap_target,
-            )
-            .await
-        }
-        None => injector
-            .inject_physical(PhysicalEvent {
-                input,
-                state: EventState::Down,
-                depth: None,
-            })
-            .await
-            .map_err(io::Error::other),
-    }
-}
-
-/// The Chord-detection state machine's own event routing (ticket 01/40) —
-/// `handle_event` diverts here for any Input currently "owned" by it. See
-/// the module's `ChordState`/`ChordWindow` doc comments and ticket 01's
-/// Answer for the model this implements.
-#[allow(clippy::too_many_arguments)]
-async fn handle_chord_event(
-    injector: &Injector,
-    config: &mut Config,
-    config_path: &Path,
-    toggles: &mut HashMap<Input, ActiveToggle>,
-    in_flight: &mut HashMap<Input, FiringHandle>,
-    stepper_cursors: &mut HashMap<StepperId, usize>,
-    active_layer: Layer,
-    signal_emitter: &Option<SignalEmitter<'static>>,
-    actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
-    chord_state: &mut ChordState,
-    axis_state: &mut AxisState,
-    analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>,
-    toggle_lap_target: Duration,
-    event: PhysicalEvent,
-) -> io::Result<()> {
-    match event.state {
-        EventState::Down => {
-            chord_state.claimed.insert(event.input);
-            let window = chord_state.window.get_or_insert_with(|| ChordWindow {
-                down: BTreeSet::new(),
-                deadline: Instant::now() + CHORD_WINDOW,
-            });
-            window.down.insert(event.input);
-
-            // Every Chord whose full member set is now down, in one pass —
-            // firing one can only ever *shrink* `down` (its own members are
-            // removed below), never grow it, so a single completion pass is
-            // enough; a single Down can complete more than one Chord at once
-            // when an Input belongs to several of them (ticket 01's amended
-            // Answer — the thumbstick-diagonal worked example).
-            let profile = config
-                .active_profile()
-                .expect("load_or_seed validates active_profile names a real profile");
-            let chords = profile.chords(active_layer);
-            let down_snapshot = chord_state
-                .window
-                .as_ref()
-                .expect("just inserted above")
-                .down
-                .clone();
-            let starting: Vec<(ChordKey, Binding)> = chords
-                .iter()
-                .filter(|(key, _)| {
-                    // A stale-but-*finished* `chord_in_flight` entry must
-                    // not permanently exclude a FireOnce/HoldToRepeat Chord
-                    // from ever completing again — `release_chord_firing`
-                    // only force-releases it, it never removes the map
-                    // entry (mirroring `fire`'s own single-Input
-                    // `in_flight`, which is never cleaned up either), so
-                    // this must check `is_finished()` itself rather than
-                    // bare presence (code-review finding: an earlier
-                    // version of this filter treated any entry as
-                    // still-active forever).
-                    !chord_state.toggles.contains_key(*key)
-                        && !chord_state
-                            .in_flight
-                            .get(*key)
-                            .is_some_and(|handle| !handle.is_finished())
-                        && key.members().is_subset(&down_snapshot)
-                })
-                .map(|(key, binding)| (key.clone(), binding.clone()))
-                .collect();
-
-            // A Toggle Chord that's already active and whose full member set
-            // just completed *again* is the Toggle's own "second Down" —
-            // stops it, mirroring a single Input's own Toggle (ticket 67
-            // correction; see `release_chord_firing`'s doc comment).
-            let stopping: Vec<ChordKey> = chords
-                .keys()
-                .filter(|key| {
-                    chord_state.toggles.contains_key(*key)
-                        && key.members().is_subset(&down_snapshot)
-                })
-                .cloned()
-                .collect();
-
-            for (key, binding) in starting {
-                fire_chord(
-                    injector,
-                    &mut chord_state.toggles,
-                    &mut chord_state.in_flight,
-                    key.clone(),
-                    &binding,
-                    EventState::Down,
-                    &config.macros,
-                    &config.steppers,
-                    stepper_cursors,
-                    toggle_lap_target,
-                )
-                .await?;
-                if let Some(window) = chord_state.window.as_mut() {
-                    for member in key.members() {
-                        window.down.remove(member);
-                    }
-                }
-            }
-            for key in stopping {
-                if let Some(toggle) = chord_state.toggles.remove(&key) {
-                    toggle.stop().await;
-                }
-                if let Some(window) = chord_state.window.as_mut() {
-                    for member in key.members() {
-                        window.down.remove(member);
-                    }
-                }
-            }
-            if chord_state
-                .window
-                .as_ref()
-                .is_some_and(|w| w.down.is_empty())
-            {
-                chord_state.window = None;
-            }
-            Ok(())
-        }
-        EventState::Repeat => {
-            // A still-pending (not yet completed) member is "held, not
-            // fired" — Repeat is a no-op for it, mirroring `fire`'s own
-            // FireOnce/Toggle handling of Repeat. Only a member of an
-            // already-ACTIVE Hold-to-repeat Chord re-fires.
-            //
-            // While a Chord is active every member is still physically down
-            // (any member's Up would already have ended it via the release
-            // path below), so the kernel independently autorepeats *each*
-            // member at the same cadence — an N-member Chord otherwise sees
-            // up to N interleaved Repeat streams landing on one
-            // `chord_in_flight` slot, re-firing N times as fast as a single
-            // Input ever would (hardware-verified regression, ticket 67).
-            // Only the member sorted first by `ChordKey`'s `BTreeSet`
-            // ordering drives the re-fire, so exactly one kernel repeat
-            // stream reaches it, matching a single Input's own cadence.
-            let profile = config
-                .active_profile()
-                .expect("load_or_seed validates active_profile names a real profile");
-            let chords = profile.chords(active_layer);
-            let due: Vec<(ChordKey, Binding)> = chord_keys_containing(chords, event.input)
-                .into_iter()
-                .filter(|key| key.members().iter().next() == Some(&event.input))
-                .filter(|key| chord_state.in_flight.contains_key(key))
-                .filter_map(|key| chords.get(&key).cloned().map(|b| (key, b)))
-                .filter(|(_, binding)| binding.trigger == TriggerMode::HoldToRepeat)
-                .collect();
-            for (key, binding) in due {
-                fire_chord(
-                    injector,
-                    &mut chord_state.toggles,
-                    &mut chord_state.in_flight,
-                    key,
-                    &binding,
-                    EventState::Repeat,
-                    &config.macros,
-                    &config.steppers,
-                    stepper_cursors,
-                    toggle_lap_target,
-                )
-                .await?;
-            }
-            Ok(())
-        }
-        EventState::Up => {
-            chord_state.claimed.remove(&event.input);
-
-            // Released before ever completing or timing out: resolves right
-            // now rather than waiting out the rest of the window on a key
-            // that's no longer even down (ticket 01: a pending member always
-            // eventually fires retroactively — an early release just means
-            // "now" instead of "at the deadline"), then immediately runs
-            // this same Up through the ordinary path to force-release
-            // whatever that retroactive Down just started.
-            let was_pending = chord_state
-                .window
-                .as_mut()
-                .is_some_and(|window| window.down.remove(&event.input));
-            if was_pending {
-                if chord_state
-                    .window
-                    .as_ref()
-                    .is_some_and(|w| w.down.is_empty())
-                {
-                    chord_state.window = None;
-                }
-                fire_individual_retroactively(
-                    injector,
-                    config,
-                    config_path,
-                    toggles,
-                    in_flight,
-                    stepper_cursors,
-                    actuation_tx,
-                    axis_state,
-                    analog_repeats,
-                    signal_emitter,
-                    active_layer,
-                    event.input,
-                    toggle_lap_target,
-                )
-                .await?;
-                if let Some(firing) = in_flight.get(&event.input) {
-                    firing.force_release_stuck(injector).await;
-                }
-                return Ok(());
-            }
-
-            let profile = config
-                .active_profile()
-                .expect("load_or_seed validates active_profile names a real profile");
-            let keys = chord_keys_containing(profile.chords(active_layer), event.input);
-            for key in keys {
-                release_chord_firing(injector, &chord_state.in_flight, &key).await;
-            }
-            Ok(())
-        }
-    }
-}
-
-/// Runs when the active Chord window's deadline elapses with members still
-/// unresolved (ticket 01's Answer): every Input still in `down` never
-/// completed a Chord, so each fires its own individual Binding retroactively
-/// — delayed by the window, exactly as designed, not a bug. Members already
-/// claimed by a fired Chord were removed from `down` when they fired (see
-/// `handle_chord_event`'s `Down` arm), so this only ever touches ones that
-/// are genuinely still pending.
-#[allow(clippy::too_many_arguments)]
-async fn handle_chord_timeout(
-    injector: &Injector,
-    config: &mut Config,
-    config_path: &Path,
-    active_layer: Layer,
-    toggles: &mut HashMap<Input, ActiveToggle>,
-    in_flight: &mut HashMap<Input, FiringHandle>,
-    stepper_cursors: &mut HashMap<StepperId, usize>,
-    actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
-    signal_emitter: &Option<SignalEmitter<'static>>,
-    chord_state: &mut ChordState,
-    axis_state: &mut AxisState,
-    analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>,
-    toggle_lap_target: Duration,
-) -> io::Result<()> {
-    let Some(window) = chord_state.window.take() else {
-        return Ok(());
-    };
-    for input in window.down {
-        chord_state.claimed.remove(&input);
-        fire_individual_retroactively(
-            injector,
-            config,
-            config_path,
-            toggles,
-            in_flight,
-            stepper_cursors,
-            actuation_tx,
-            axis_state,
-            analog_repeats,
-            signal_emitter,
-            active_layer,
-            input,
-            toggle_lap_target,
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-/// Compiles a Binding's `Action` into the flat step sequence `fire` spawns —
-/// `executor::compile` for every ordinary Action, or `resolve_step` for
-/// `Action::Step`, whose steps depend on Daemon-owned runtime cursor state
-/// `executor::compile` has no access to (ticket 03/54).
+/// Compiles a Binding's `Action` into the flat step sequence
+/// `perform_trigger` spawns — `executor::compile` for every ordinary Action,
+/// or, for `Action::Step`, `stepper::Cursors::step` (which advances the
+/// Daemon-owned per-list cursor `executor::compile` has no access to, ticket
+/// 03/54) followed by `executor::compile_stepper_item`. A zero-item list
+/// steps to nothing.
 fn compile_action(
     action: &Action,
     macros: &HashMap<MacroId, MacroDef>,
     steppers: &HashMap<StepperId, StepperDef>,
-    stepper_cursors: &mut HashMap<StepperId, usize>,
+    cursors: &mut stepper::Cursors,
 ) -> Vec<executor::MacroStep> {
     match action {
-        Action::Step { stepper, direction } => {
-            resolve_step(steppers, stepper_cursors, stepper, *direction)
-        }
+        Action::Step {
+            stepper: id,
+            direction,
+        } => cursors
+            .step(steppers, id, *direction)
+            .map(executor::compile_stepper_item)
+            .unwrap_or_default(),
         other => executor::compile(other, macros),
     }
 }
 
-/// Advances/retreats a Stepper's per-list cursor (Daemon-side-only runtime
-/// state, ticket 03/54 — CONTEXT.md: Stepper) and compiles the
-/// newly-selected item — "one motion moves the cursor and fires," ticket
-/// 03's Answer's firing semantics. A `Key` item reuses `Action::Keypress`'s
-/// mods-down/key/mods-up compile path, carrying its own modifier
-/// combination if it has one (ticket 62); a `ControllerButton` item (ticket
-/// 92) reuses `Action::ControllerButton`'s down/dwell/up triple. A missing
-/// cursor entry
-/// means "at the list's first item" (index 0), matching `stepper_cursors`'s
-/// own always-resets-to-first-item-on-restart convention. Wraps at either
-/// end. A `stepper` with zero items compiles to no steps at all — nothing to
-/// select, nothing to fire, cursor left untouched.
-fn resolve_step(
-    steppers: &HashMap<StepperId, StepperDef>,
-    stepper_cursors: &mut HashMap<StepperId, usize>,
-    stepper: &StepperId,
-    direction: StepDirection,
-) -> Vec<executor::MacroStep> {
-    let def = steppers.get(stepper).expect(
-        "SetBinding/config::parse validate every Action::Step references an existing StepperDef",
-    );
-    let len = def.items.len();
-    if len == 0 {
-        return Vec::new();
-    }
-    let current = stepper_cursors
-        .get(stepper)
-        .copied()
-        .unwrap_or(0)
-        .min(len - 1);
-    let next = match direction {
-        StepDirection::Forward => (current + 1) % len,
-        StepDirection::Backward => (current + len - 1) % len,
-    };
-    stepper_cursors.insert(stepper.clone(), next);
-    match def.items[next] {
-        // A keyboard/mouse item: the item's own modifier combination
-        // (ticket 62) through `Action::Keypress`'s canned compile path.
-        StepperItem::Key { key, modifiers } => executor::keypress_steps(modifiers, key),
-        // A gamepad-button item (ticket 92): the same atomic down/dwell/up
-        // triple as `Action::ControllerButton`'s digital path, routed to
-        // the gamepad `uinput` device by the injector's own
-        // `input::is_gamepad_button` check.
-        StepperItem::ControllerButton { button } => executor::controller_button_steps(button),
-    }
-}
-
-/// Branches on `TriggerMode` x event state, per ticket 17: Fire-once fires
-/// only on `Down`; Hold-to-repeat fires on `Down` and every subsequent
-/// `Repeat` (the device's own evdev autorepeat, no separate repeat-interval
-/// config); Toggle starts its own looping task on `Down` (stopping is
-/// handled earlier, in `handle_event`, before a Binding is even looked up).
-/// `Repeat` for Fire-once/Toggle is ignored outright — no passthrough of the
-/// original key for a bound Input, matching the pre-ticket-17 Fire-once
-/// behavior. `Up` for Fire-once/Hold-to-repeat is ticket 33's stuck-key fix:
-/// force-releases anything that Input's most recent firing left down (a
-/// no-op for an already-self-released, balanced Macro); Toggle's own `Up` is
-/// still a no-op, since a Toggle's stop is a second `Down`, not a release.
-/// Analog-repeat rides the exact same Down/Repeat/Up arms as Hold-to-repeat
-/// (ticket 20's Digital Capture mode fallback) — the only way this function
-/// ever sees an Analog-repeat Binding at all, since `handle_event` swallows
-/// every Analog-*sourced* Down/Repeat/Up for one outright, before `fire` is
-/// ever called (real Analog-mode firing is `update_analog_repeats`'s own
-/// depth-driven background task).
-///
-/// `Action::ControllerButton` + Hold-to-repeat is a carved-out exception
-/// (ticket 75/76): a real gamepad button doesn't autorepeat in hardware, so
-/// `Down` fires a bare, unbalanced `KeyDown` (not `compile_action`'s own
-/// pulse) that mirrors the physical hold, every `Repeat` is ignored outright
-/// (no re-fire), and the existing `Up` arm below force-releases it — the
-/// same "held until the physical Up force-releases it" shape ticket 33
-/// already relies on for an unbalanced Macro, reused rather than invented
-/// fresh. `Action::ControllerButton` + Toggle gets the analogous carve-out
-/// (ticket 78): `spawn_held`'s single sustained KeyDown rather than
-/// `compile_action`'s repeat-tap loop, mirroring the mouse-button Toggle fix
-/// (ticket 82/83) below — a real gamepad button doesn't have a "turbo" Toggle
-/// mode any more than it autorepeats, so a latched Toggle should just hold it
-/// down. Fire-once is disallowed for `Action::ControllerButton` entirely
-/// (ticket 78, enforced at config-load/write time, not here).
-#[allow(clippy::too_many_arguments)]
-async fn fire(
-    injector: &Injector,
-    toggles: &mut HashMap<Input, ActiveToggle>,
-    in_flight: &mut HashMap<Input, FiringHandle>,
-    input: Input,
-    binding: &Binding,
-    state: EventState,
-    macros: &HashMap<MacroId, MacroDef>,
-    steppers: &HashMap<StepperId, StepperDef>,
-    stepper_cursors: &mut HashMap<StepperId, usize>,
-    toggle_lap_target: Duration,
-) -> io::Result<()> {
-    match (binding.trigger, state) {
-        (TriggerMode::HoldToRepeat, EventState::Repeat)
-            if matches!(binding.action, Action::ControllerButton { .. }) =>
-        {
-            // Ticket 75/76: a real gamepad button doesn't autorepeat in
-            // hardware — held down, it just stays down — so once the
-            // physical Down's own KeyDown below is holding it, every
-            // intervening kernel-autorepeat Repeat is ignored outright, no
-            // re-fire.
-            Ok(())
-        }
-        (TriggerMode::HoldToRepeat, EventState::Down)
-            if matches!(binding.action, Action::ControllerButton { .. }) =>
-        {
-            // Same overlap guard as the ordinary arm below.
-            if let Some(handle) = in_flight.get(&input)
-                && !handle.is_finished()
-            {
-                return Ok(());
-            }
-            let Action::ControllerButton { button } = binding.action else {
-                unreachable!("guarded by this arm's own match guard above")
-            };
-            // Deliberately not `compile_action`'s own KeyDown/Delay/KeyUp
-            // pulse (that's Fire-once's shape): a bare, unbalanced `KeyDown`
-            // that mirrors the physical press for as long as it's actually
-            // held, released by the physical Up's own arm below — reusing
-            // the same "leaves a key held, a later force-release cleans it
-            // up" mechanism ticket 33 already relies on, rather than
-            // inventing new architecture.
-            let steps = vec![MacroStep::KeyDown(button)];
-            let handle = executor::spawn_fire_once(injector.clone(), steps);
-            in_flight.insert(input, handle);
-            Ok(())
-        }
-        (TriggerMode::HoldToRepeat, EventState::Repeat)
-            if matches!(
-                binding.action,
-                Action::Keypress { key, .. } if crate::input::is_mouse_button(key)
-            ) =>
-        {
-            // Ticket 79/80: a mouse-button Keypress gets the same
-            // sustained-hold treatment as ControllerButton above, so a
-            // Hold-to-repeat mouse Binding supports click-and-drag instead
-            // of a repeat-tap train — once the physical Down's own KeyDown
-            // below is holding it, every intervening kernel-autorepeat
-            // Repeat is ignored outright, no re-fire.
-            Ok(())
-        }
-        (TriggerMode::HoldToRepeat, EventState::Down)
-            if matches!(
-                binding.action,
-                Action::Keypress { key, .. } if crate::input::is_mouse_button(key)
-            ) =>
-        {
-            // Same overlap guard as the ordinary arm below.
-            if let Some(handle) = in_flight.get(&input)
-                && !handle.is_finished()
-            {
-                return Ok(());
-            }
-            let Action::Keypress { key, .. } = binding.action else {
-                unreachable!("guarded by this arm's own match guard above")
-            };
-            // Deliberately not `compile_action`'s own KeyDown/Delay/KeyUp
-            // pulse: a bare, unbalanced `KeyDown` that mirrors the physical
-            // press for as long as it's actually held, released by the
-            // physical Up's own arm below (ticket 33's force-release path).
-            let steps = vec![MacroStep::KeyDown(key)];
-            let handle = executor::spawn_fire_once(injector.clone(), steps);
-            in_flight.insert(input, handle);
-            Ok(())
-        }
-        (TriggerMode::FireOnce, EventState::Down)
-        | (
-            TriggerMode::HoldToRepeat | TriggerMode::AnalogRepeat,
-            EventState::Down | EventState::Repeat,
-        ) => {
-            // Same-Input firings must never run concurrently — their raw
-            // steps share one Injector channel, and two interleaved firings
-            // could land their KeyDown/KeyUp writes out of order. A still-
-            // running previous firing (a slow Macro outlasting a fast
-            // HoldToRepeat autorepeat) means this one is dropped rather than
-            // queued: the previous firing already reproduces the intended
-            // effect, and queuing would only build an ever-growing backlog
-            // while the key stays held. For a Stepper Binding this also
-            // means a dropped firing must never advance the cursor — nothing
-            // fired, so nothing moved — which is exactly what falls out of
-            // `compile_action` only running once this guard has passed.
-            if let Some(handle) = in_flight.get(&input)
-                && !handle.is_finished()
-            {
-                return Ok(());
-            }
-            let steps = compile_action(&binding.action, macros, steppers, stepper_cursors);
-            let handle = executor::spawn_fire_once(injector.clone(), steps);
-            in_flight.insert(input, handle);
-            Ok(())
-        }
-        (TriggerMode::Toggle, EventState::Down)
-            if matches!(
-                binding.action,
-                Action::Keypress { key, .. } if crate::input::is_mouse_button(key)
-            ) =>
-        {
-            let Action::Keypress { key, .. } = binding.action else {
-                unreachable!("guarded by this arm's own match guard above")
-            };
-            // Ticket 82: a mouse-button Toggle gets the same sustained-hold
-            // treatment as HoldToRepeat's own mouse-button carve-out above —
-            // a single held KeyDown rather than a repeat-tap loop.
-            toggles.insert(input, ActiveToggle::spawn_held(injector.clone(), key));
-            Ok(())
-        }
-        (TriggerMode::Toggle, EventState::Down)
-            if matches!(binding.action, Action::ControllerButton { .. }) =>
-        {
-            let Action::ControllerButton { button } = binding.action else {
-                unreachable!("guarded by this arm's own match guard above")
-            };
-            // Ticket 78: a gamepad button Toggle gets the same sustained-hold
-            // treatment as the mouse-button carve-out above (and as
-            // ControllerButton's own Hold-to-repeat carve-out, ticket 75/76)
-            // — a single held KeyDown rather than a repeat-tap loop, matching
-            // a real held gamepad button (e.g. a latched sprint/aim).
-            toggles.insert(input, ActiveToggle::spawn_held(injector.clone(), button));
-            Ok(())
-        }
-        (TriggerMode::Toggle, EventState::Down) => {
-            let steps = compile_action(&binding.action, macros, steppers, stepper_cursors);
-            toggles.insert(
-                input,
-                ActiveToggle::spawn(injector.clone(), steps, toggle_lap_target),
-            );
-            Ok(())
-        }
-        (
-            TriggerMode::FireOnce | TriggerMode::HoldToRepeat | TriggerMode::AnalogRepeat,
-            EventState::Up,
-        ) => {
-            if let Some(firing) = in_flight.get(&input) {
-                firing.force_release_stuck(injector).await;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-/// Shared by `SetActuationPoint`/`ClearActuationPoint` (ticket 17 §3) and
-/// `SetAxisAssignment` (ticket 59 §1): both an actuation point and an Axis
-/// assignment are properties of a physical Grid key's Depth, so setting or
-/// clearing either on any other `Input` variant is rejected. `what` names
-/// the caller's own concept (e.g. `"actuation points"`, `"Axis assignments"`)
-/// so the error text stays specific to what was actually being set, rather
-/// than every caller sharing one hardcoded noun.
-fn reject_non_grid_input(input: Input, what: &str) -> Result<(), CommandError> {
-    if matches!(input, Input::Grid(_, _)) {
-        Ok(())
-    } else {
-        Err(CommandError::InvalidRequest(format!(
-            "{what} can only be set on Grid Inputs"
-        )))
-    }
-}
-
-/// Shared by `SetActuationPoint`/`SetDefaultActuation`: the hysteresis
-/// invariant ticket 17 §2 asks for — a Release point at or above its
-/// Actuation point defeats hysteresis entirely rather than merely
-/// narrowing it. Ticket 22's `capture::analog::observe` is what actually
-/// consumes these points against a live Depth stream: at `release ==
-/// actuation`, a key held at a perfectly steady Depth crosses both
-/// thresholds on every single report, chattering Down/Up forever on a
-/// motionless key (code-review finding on ticket 22 — this check
-/// pre-existed from ticket 21, but only became exploitable once ticket 22
-/// gave it a real consumer).
-fn reject_release_above_actuation(actuation: u8, release: u8) -> Result<(), CommandError> {
-    if release < actuation {
-        Ok(())
-    } else {
-        Err(CommandError::InvalidRequest(
-            "release point must be strictly below the actuation point".to_string(),
-        ))
-    }
-}
-
-/// Shared by `SetBinding`/`SetChordBinding` (ticket 40): rejects a Binding
-/// whose Action/Trigger combination is structurally disallowed —
-/// `ProfileSwitch` paired with anything but Fire-once, a `ControllerButton`
-/// naming a non-gamepad code, a `Macro`/`Step` naming an unknown library
-/// entry, or a `Step` paired with Toggle. A Chord Binding is "just a Binding
-/// keyed by a Set<Input>" (ticket 01's Answer), so it's held to the exact
-/// same rules rather than a second, drifting copy of them.
-fn validate_binding(binding: &Binding, config: &Config) -> Result<(), CommandError> {
-    if matches!(binding.action, Action::ProfileSwitch { .. })
-        && binding.trigger != TriggerMode::FireOnce
-    {
-        return Err(CommandError::InvalidRequest(
-            "a Profile Switch Binding must use Fire-once".to_string(),
-        ));
-    }
-    if let Action::ControllerButton { button } = binding.action {
-        if !crate::input::is_gamepad_button(button) {
-            return Err(CommandError::InvalidRequest(format!(
-                "{button:?} is not a valid gamepad button"
-            )));
-        }
-        if binding.trigger == TriggerMode::FireOnce {
-            return Err(CommandError::InvalidRequest(
-                "Fire-once is not allowed for a Controller Button Binding".to_string(),
-            ));
-        }
-    }
-    if let Action::Macro { macro_id } = &binding.action
-        && !config.macros.contains_key(macro_id)
-    {
-        return Err(CommandError::InvalidRequest(format!(
-            "{macro_id:?} does not name a Macro in the library"
-        )));
-    }
-    if let Action::Step { stepper, .. } = &binding.action {
-        if !config.steppers.contains_key(stepper) {
-            return Err(CommandError::InvalidRequest(format!(
-                "{stepper:?} does not name a Stepper in the library"
-            )));
-        }
-        if binding.trigger == TriggerMode::Toggle {
-            return Err(CommandError::InvalidRequest(
-                "Toggle is not allowed for a Stepper Binding".to_string(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Rejects a `StepperItem::ControllerButton` list item naming a non-gamepad
-/// code (ticket 92) — the `CreateStepper`/`SetStepperItems` counterpart of
-/// `validate_binding`'s `Action::ControllerButton` allowlist guard, and of
-/// `config::parse`'s `InvalidControllerButtonStepperItem` check for a
-/// hand-edited `config.toml`. A GUI-emitted item is always valid (the
-/// picker only ever produces allowlist codes); this catches a hand-crafted
-/// D-Bus call, mirroring the two-place enforcement `Action::ControllerButton`
-/// already has (ticket 43).
-fn validate_stepper_items(items: &[StepperItem]) -> Result<(), CommandError> {
-    for item in items {
-        if let StepperItem::ControllerButton { button } = item
-            && !crate::input::is_gamepad_button(*button)
-        {
-            return Err(CommandError::InvalidRequest(format!(
-                "{button:?} is not a valid gamepad button"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Whether `key`'s member set is a subset or superset of any *other*
-/// existing Chord's on `chords` (ticket 01's amended Answer) — the only
-/// case that stays genuinely ambiguous once an Input may belong to any
-/// number of Chords: completing the smaller one is indistinguishable from
-/// being partway into the larger one. Editing the exact same member set
-/// back (`key` already present in `chords`) is not a conflict with itself.
-fn chord_conflict(chords: &HashMap<ChordKey, Binding>, key: &ChordKey) -> Option<ChordKey> {
-    chords
-        .keys()
-        .find(|other| {
-            *other != key
-                && (key.members().is_subset(other.members())
-                    || other.members().is_subset(key.members()))
-        })
-        .cloned()
-}
-
-/// Whether `input` already carries an Axis assignment on `layer` (ticket
-/// 59 §2's mutual exclusion) — `SetBinding`/`SetChordBinding` both reject a
-/// grid key already Axis-assigned there with a specific error rather than
-/// silently overwriting it, the mirror image of `SetAxisAssignment`'s own
-/// atomic steal-from-Binding/Chord-membership behavior.
-fn axis_conflict(profile: &Profile, layer: Layer, input: Input) -> bool {
-    profile.axis_layer(layer).contains_key(&input)
-}
-
-/// The `Default` Profile always exists — `load_or_seed` (issue 11) refuses
-/// to start a `Config` whose `active_profile` doesn't name a real Profile.
-fn active_profile_mut(config: &mut Config) -> &mut Profile {
-    config
-        .active_profile_mut()
-        .expect("load_or_seed validates active_profile names a real profile")
-}
-
 /// Republishes the active Profile's resolved Actuation-point snapshot
-/// (ticket 18 §5) — called after every successful mutation that can change
-/// it: `SetActuationPoint`/`ClearActuationPoint`/`SetDefaultActuation`/
-/// `ResetActuationPoints` (all touch the active Profile's own
-/// `actuation_overrides`/`default_actuation`) and `SwitchProfile` (changes
-/// which Profile is active). `send_replace` rather than `send`: this must
-/// not fail just because no `AnalogCaptureSource` grid task has subscribed
-/// yet (ticket 23 wires the real receiver; today's tests hold one only to
-/// keep the channel open).
+/// (ticket 18 §5) — `run_effects`'s handler for `edit::Effect::RepublishActuation`,
+/// which `edit::plan` emits from `SetActuationPoint` / `ClearActuationPoint` /
+/// `SetDefaultActuation` / `ResetActuationPoints` (all touch the active
+/// Profile's own `actuation_overrides`/`default_actuation`) and
+/// `SwitchProfile` (changes which Profile is active). `send_replace` rather
+/// than `send`: this must not fail just because no `AnalogCaptureSource` grid
+/// task has subscribed yet (ticket 23 wires the real receiver; today's tests
+/// hold one only to keep the channel open).
 fn publish_actuation_snapshot(
     config: &Config,
     actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
@@ -1995,1038 +1059,40 @@ fn publish_actuation_snapshot(
     actuation_tx.send_replace(profile.resolved_actuation_points());
 }
 
-/// Shared by `Command::SwitchProfile` and firing an `Action::ProfileSwitch`
-/// Binding (ticket 34): switches `config.active_profile`, persists, and (on
-/// success) force-stops every active Toggle and republishes the new
-/// Profile's Actuation-point snapshot — the same effects `SwitchProfile`
-/// always had. Reply/`ActiveProfileChanged` handling deliberately stays with
-/// each caller: `Command::SwitchProfile` has a D-Bus reply to send (and its
-/// own reply-before-signal reentrancy-hazard ordering), while a Binding
-/// firing has no reply at all. Self-reference (`name` already active) is not
-/// special-cased — it still persists, force-stops Toggles, and republishes,
-/// an intentional no-op-except-for-Toggles per ticket 05's design.
-#[allow(clippy::too_many_arguments)]
-async fn switch_profile(
-    injector: &Injector,
-    config: &mut Config,
-    config_path: &Path,
-    toggles: &mut HashMap<Input, ActiveToggle>,
-    actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
-    axis_state: &mut AxisState,
-    analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>,
-    name: String,
-) -> Result<(), CommandError> {
-    if !config.profiles.contains_key(&name) {
-        return Err(CommandError::NotFound);
-    }
-    let previous = std::mem::replace(&mut config.active_profile, name);
-    let result = persist(config, config_path).await;
-    if result.is_err() {
-        config.active_profile = previous;
-    } else {
-        stop_all_toggles(toggles).await;
-        publish_actuation_snapshot(config, actuation_tx);
-        // Ticket 71: the new Profile's Axis-assignment map generally
-        // differs from the old one — same reset-on-switch reasoning as
-        // `handle_layer_switch`'s own call, just for a Profile switch
-        // instead of a Layer one.
-        let _ = reset_axis_outputs(injector, axis_state).await;
-        // Ticket 39: same reasoning, for the same reason, for every
-        // Analog-repeat task — the new Profile's Bindings generally differ
-        // from the old one's.
-        stop_all_analog_repeats(analog_repeats).await;
-    }
-    result
-}
-
-/// Every `Action::ProfileSwitch { target }` across every Profile's Base/Held
-/// Binding map that targets `old_name` is repointed at `new_name` (ticket
-/// 34) — a rename must not silently leave a dangling or wrong reference
-/// behind. Chords don't exist in code yet (ticket 01 is still a design
-/// ticket, not built), so only `base`/`held` are scanned.
-fn cascade_rename_profile_switch_targets(config: &mut Config, old_name: &str, new_name: &str) {
-    for profile in config.profiles.values_mut() {
-        for bindings in [&mut profile.base, &mut profile.held] {
-            for binding in bindings.values_mut() {
-                if let Action::ProfileSwitch { target } = &mut binding.action
-                    && target == old_name
-                {
-                    *target = new_name.to_string();
-                }
-            }
-        }
-    }
-}
-
-/// Whether any Profile's Base/Held Binding map contains an
-/// `Action::ProfileSwitch { target }` naming `name` — `DeleteProfile`
-/// refuses while this is true, so a dangling reference can never exist
-/// (ticket 34).
-fn profile_switch_references(config: &Config, name: &str) -> bool {
-    config.profiles.values().any(|profile| {
-        [&profile.base, &profile.held].into_iter().any(|bindings| {
-            bindings.values().any(|binding| {
-                matches!(&binding.action, Action::ProfileSwitch { target } if target == name)
-            })
-        })
-    })
-}
-
-/// Whether any Profile's Base/Held *or Chord* Binding contains an
-/// `Action::Macro { macro_id }` naming `macro_id` — `DeleteMacro` refuses
-/// while this is true, so a dangling reference can never exist (ticket 15/
-/// 51/40), mirroring `profile_switch_references`'s identical shape.
-/// `profile_switch_references` itself doesn't need this same widening:
-/// `chords_base`/`chords_held` can never contain a `ProfileSwitch` Action
-/// at all (`SetChordBinding`/`parse` both refuse it — see
-/// `ConfigError::InvalidChordProfileSwitch`), but Macro/Step Actions are
-/// fully allowed on a Chord, so a Chord referencing a since-deleted library
-/// entry is exactly as reachable as an ordinary Binding's (code-review
-/// finding: the original version of this function only scanned `base`/
-/// `held`, letting `DeleteMacro`/`DeleteStepper` leave a dangling Chord
-/// reference that then failed `load_or_seed`'s own validation — which does
-/// scan Chords — on the next Daemon restart).
-fn macro_references(config: &Config, macro_id: &MacroId) -> bool {
-    config.profiles.values().any(|profile| {
-        config::profile_all_bindings(profile).any(
-            |binding| matches!(&binding.action, Action::Macro { macro_id: id } if id == macro_id),
-        )
-    })
-}
-
-/// `macro_references`'s exact mirror for the Stepper library — whether any
-/// Profile's Base/Held *or Chord* Binding contains an `Action::Step {
-/// stepper }` naming `stepper_id` (either direction). `DeleteStepper`
-/// refuses while this is true, so a dangling reference can never exist
-/// (ticket 03/54/40).
-fn stepper_references(config: &Config, stepper_id: &StepperId) -> bool {
-    config.profiles.values().any(|profile| {
-        config::profile_all_bindings(profile)
-            .any(|binding| matches!(&binding.action, Action::Step { stepper, .. } if stepper == stepper_id))
-    })
-}
-
-/// Removes every other Binding, across every Profile/Layer, whose `Action`
-/// is `Action::Step { stepper, direction }` matching the one `SetBinding` is
-/// about to set — ticket 03's Answer: "assigning it to a new pair silently
-/// moves it off its old one," no reject-at-save step, since at most one
-/// Input may ever carry a given (stepper, direction) at a time. `except`
-/// (the Input `SetBinding` is currently writing) is left untouched even if
-/// it already matches, so re-saving the same Input's own trigger mode isn't
-/// mistaken for a conflicting second owner — `None` (used by
-/// `SetChordBinding`, which has no ordinary-Input identity of its own to
-/// exclude) steals from every matching Input unconditionally. Returns what
-/// was removed so the caller can restore it if the persist that follows
-/// fails, mirroring every other mutating Command's rollback-on-failure
-/// discipline. `take_stepper_direction_elsewhere_from_chords` is this
-/// function's exact mirror for a Chord's own Step action (ticket 40) — a
-/// Chord is exactly as exclusive an owner of (stepper, direction) as an
-/// ordinary Binding, so both keyspaces must be swept together whenever
-/// either kind of caller claims one.
-fn take_stepper_direction_elsewhere(
-    config: &mut Config,
-    stepper: &StepperId,
-    direction: StepDirection,
-    except: Option<(&str, Layer, Input)>,
-) -> Vec<(String, Layer, Input, Binding)> {
-    let mut removed = Vec::new();
-    for (profile_name, profile) in config.profiles.iter_mut() {
-        for layer in [Layer::Base, Layer::Held] {
-            let bindings = profile.layer_mut(layer);
-            let matching: Vec<Input> = bindings
-                .iter()
-                .filter(|(input, binding)| {
-                    except != Some((profile_name.as_str(), layer, **input))
-                        && matches!(
-                            &binding.action,
-                            Action::Step { stepper: s, direction: d }
-                                if s == stepper && *d == direction
-                        )
-                })
-                .map(|(&input, _)| input)
-                .collect();
-            for input in matching {
-                if let Some(binding) = bindings.remove(&input) {
-                    removed.push((profile_name.clone(), layer, input, binding));
-                }
-            }
-        }
-    }
-    removed
-}
-
-/// `take_stepper_direction_elsewhere`'s exact mirror for a Profile's Chord
-/// Bindings (ticket 40) — see its doc comment. `except` is the `ChordKey`
-/// `SetChordBinding` is currently writing, left untouched even if it
-/// already matches (re-saving an existing Step-action Chord's own Trigger
-/// mode isn't a conflicting second owner); `None` (used by `SetBinding`,
-/// which has no `ChordKey` identity of its own to exclude) steals from
-/// every matching Chord unconditionally.
-fn take_stepper_direction_elsewhere_from_chords(
-    config: &mut Config,
-    stepper: &StepperId,
-    direction: StepDirection,
-    except: Option<(&str, Layer, &ChordKey)>,
-) -> Vec<(String, Layer, ChordKey, Binding)> {
-    let mut removed = Vec::new();
-    for (profile_name, profile) in config.profiles.iter_mut() {
-        for layer in [Layer::Base, Layer::Held] {
-            let chords = profile.chords_mut(layer);
-            let matching: Vec<ChordKey> = chords
-                .iter()
-                .filter(|(key, binding)| {
-                    except != Some((profile_name.as_str(), layer, key))
-                        && matches!(
-                            &binding.action,
-                            Action::Step { stepper: s, direction: d }
-                                if s == stepper && *d == direction
-                        )
-                })
-                .map(|(key, _)| key.clone())
-                .collect();
-            for key in matching {
-                if let Some(binding) = chords.remove(&key) {
-                    removed.push((profile_name.clone(), layer, key, binding));
-                }
-            }
-        }
-    }
-    removed
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_command(
-    injector: &Injector,
-    config: &mut Config,
-    config_path: &Path,
-    toggles: &mut HashMap<Input, ActiveToggle>,
-    stepper_cursors: &mut HashMap<StepperId, usize>,
-    axis_state: &mut AxisState,
-    analog_repeats: &mut HashMap<Input, ActiveAnalogRepeat>,
-    active_layer: &Layer,
-    device_connected: bool,
-    capture_mode: CaptureMode,
-    device_info: Option<&DeviceInfo>,
-    signal_emitter: &Option<SignalEmitter<'static>>,
-    actuation_tx: &watch::Sender<HashMap<Input, ActuationPoint>>,
-    capture_control_tx: &mpsc::Sender<bool>,
-    cmd: Command,
-) {
-    match cmd {
-        Command::GetConfig(reply) => {
-            let _ = reply.send(config.clone());
-        }
-        Command::GetState(reply) => {
-            // Every library entry gets a reported cursor, defaulting to `0`
-            // ("the list's first item") for one never yet stepped — richer
-            // for the GUI than only reporting entries this task has actually
-            // touched (ticket 03/54).
-            let stepper_cursors = config
-                .steppers
-                .keys()
-                .map(|id| (id.clone(), stepper_cursors.get(id).copied().unwrap_or(0)))
-                .collect();
-            let _ = reply.send(State {
-                profile: config.active_profile.clone(),
-                layer: active_layer.as_str(),
-                active_toggles: toggles.keys().copied().collect(),
-                device_connected,
-                capture_mode: capture_mode.as_str(),
-                daemon_version: crate::VERSION,
-                firmware_version: device_info.map(|info| info.firmware_version.clone()),
-                serial_number: device_info.map(|info| info.serial_number.clone()),
-                stepper_cursors,
-            });
-        }
-        Command::SetBinding {
-            input,
-            layer,
-            binding,
-            reply,
-        } => {
-            if let Err(err) = validate_binding(&binding, config) {
-                let _ = reply.send(Err(err));
-                return;
-            }
-            if binding.trigger == TriggerMode::AnalogRepeat && !matches!(input, Input::Grid(_, _)) {
-                let _ = reply.send(Err(CommandError::InvalidRequest(
-                    "Analog-repeat is only valid on Grid Inputs".to_string(),
-                )));
-                return;
-            }
-            let profile = config
-                .active_profile()
-                .expect("load_or_seed validates active_profile names a real profile");
-            if axis_conflict(profile, layer, input) {
-                let _ = reply.send(Err(CommandError::InvalidRequest(format!(
-                    "{input} already has an Axis assignment on this Layer — clear it first"
-                ))));
-                return;
-            }
-            // Ticket 03's Answer: assigning a Stepper list to a new Input
-            // silently moves it off its old one — no reject-at-save step,
-            // since at most one Input *or Chord* may carry a given
-            // (stepper, direction) at a time (ticket 40 widened this
-            // invariant to cover Chords too — a Step-action Chord is just
-            // as exclusive an owner). Collected before the target insert
-            // below so all three can roll back together on a persist
-            // failure.
-            let (moved_stepper_bindings, moved_stepper_chord_bindings) =
-                if let Action::Step { stepper, direction } = &binding.action {
-                    let active_profile = config.active_profile.clone();
-                    (
-                        take_stepper_direction_elsewhere(
-                            config,
-                            stepper,
-                            *direction,
-                            Some((&active_profile, layer, input)),
-                        ),
-                        take_stepper_direction_elsewhere_from_chords(
-                            config, stepper, *direction, None,
-                        ),
-                    )
-                } else {
-                    (Vec::new(), Vec::new())
-                };
-            let previous = active_profile_mut(config)
-                .layer_mut(layer)
-                .insert(input, binding);
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                // config.toml on disk must always match in-memory state
-                // (spec.md's config lifecycle) — roll the in-memory edit
-                // back rather than let GetConfig lie about what's saved.
-                let bindings = active_profile_mut(config).layer_mut(layer);
-                match previous {
-                    Some(prev) => {
-                        bindings.insert(input, prev);
-                    }
-                    None => {
-                        bindings.remove(&input);
-                    }
-                }
-                for (profile_name, moved_layer, moved_input, moved_binding) in
-                    moved_stepper_bindings
-                {
-                    if let Some(profile) = config.profiles.get_mut(&profile_name) {
-                        profile
-                            .layer_mut(moved_layer)
-                            .insert(moved_input, moved_binding);
-                    }
-                }
-                for (profile_name, moved_layer, moved_key, moved_binding) in
-                    moved_stepper_chord_bindings
-                {
-                    if let Some(profile) = config.profiles.get_mut(&profile_name) {
-                        profile
-                            .chords_mut(moved_layer)
-                            .insert(moved_key, moved_binding);
-                    }
-                }
-            }
-            let _ = reply.send(result);
-        }
-        Command::ClearBinding {
-            input,
-            layer,
-            reply,
-        } => {
-            let Some(previous) = active_profile_mut(config).layer_mut(layer).remove(&input) else {
-                let _ = reply.send(Err(CommandError::NotFound));
-                return;
-            };
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                active_profile_mut(config)
-                    .layer_mut(layer)
-                    .insert(input, previous);
-            }
-            let _ = reply.send(result);
-        }
-        Command::SetModeKeyRole { role, reply } => {
-            let previous = std::mem::replace(&mut active_profile_mut(config).mode_key_role, role);
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                active_profile_mut(config).mode_key_role = previous;
-            } else if role == ModeKeyRole::LayerSwitch {
-                // Leaving `Bound`: a Toggle can only ever have been started
-                // on the Mode key while `Bound` (it's the only role that
-                // ever runs it through Trigger-mode dispatch). Once
-                // `LayerSwitch` takes over, `handle_event` intercepts every
-                // `Input::ModeKey` press before it ever reaches the
-                // stop-toggle check — so without this, a still-running
-                // Toggle on the Mode key would become permanently
-                // unstoppable via that key (code review finding).
-                if let Some(toggle) = toggles.remove(&Input::ModeKey) {
-                    toggle.stop().await;
-                }
-            }
-            let _ = reply.send(result);
-        }
-        Command::CreateProfile { name, reply } => {
-            if name.trim().is_empty() {
-                let _ = reply.send(Err(CommandError::InvalidRequest(
-                    "Profile name can't be empty".to_string(),
-                )));
-                return;
-            }
-            if config.profiles.contains_key(&name) {
-                let _ = reply.send(Err(CommandError::AlreadyExists));
-                return;
-            }
-            config.profiles.insert(name.clone(), Profile::default());
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config.profiles.remove(&name);
-            }
-            let _ = reply.send(result);
-        }
-        Command::DeleteProfile { name, reply } => {
-            if name == config.active_profile {
-                let _ = reply.send(Err(CommandError::InvalidRequest(
-                    "cannot delete the active Profile".to_string(),
-                )));
-                return;
-            }
-            if profile_switch_references(config, &name) {
-                let _ = reply.send(Err(CommandError::InvalidRequest(format!(
-                    "Profile {name:?} is still referenced by a Profile Switch Binding"
-                ))));
-                return;
-            }
-            let Some(previous) = config.profiles.remove(&name) else {
-                let _ = reply.send(Err(CommandError::NotFound));
-                return;
-            };
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config.profiles.insert(name, previous);
-            }
-            let _ = reply.send(result);
-        }
-        Command::RenameProfile {
-            old_name,
-            new_name,
-            reply,
-        } => {
-            if new_name.trim().is_empty() {
-                let _ = reply.send(Err(CommandError::InvalidRequest(
-                    "Profile name can't be empty".to_string(),
-                )));
-                return;
-            }
-            if !config.profiles.contains_key(&old_name) {
-                let _ = reply.send(Err(CommandError::NotFound));
-                return;
-            }
-            if old_name != new_name && config.profiles.contains_key(&new_name) {
-                let _ = reply.send(Err(CommandError::AlreadyExists));
-                return;
-            }
-            if old_name == new_name {
-                let _ = reply.send(Ok(()));
-                return;
-            }
-            // Snapshotting the whole map (rather than just the renamed
-            // Profile, as before ticket 34) is what makes the cascade below
-            // cleanly reversible on a persist failure — any other Profile's
-            // Bindings can now change too, not just the renamed entry.
-            let previous_profiles = config.profiles.clone();
-            let previous_active = config.active_profile.clone();
-
-            let profile = config
-                .profiles
-                .remove(&old_name)
-                .expect("just checked old_name exists");
-            config.profiles.insert(new_name.clone(), profile);
-            if config.active_profile == old_name {
-                config.active_profile = new_name.clone();
-            }
-            cascade_rename_profile_switch_targets(config, &old_name, &new_name);
-
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config.profiles = previous_profiles;
-                config.active_profile = previous_active;
-            }
-            let _ = reply.send(result);
-        }
-        Command::SwitchProfile { name, reply } => {
-            let result = switch_profile(
-                injector,
-                config,
-                config_path,
-                toggles,
-                actuation_tx,
-                axis_state,
-                analog_repeats,
-                name.clone(),
-            )
-            .await;
-            let succeeded = result.is_ok();
-            // The reply is sent *before* the signal, deliberately: the
-            // caller's own SwitchProfile call is typically a blocking D-Bus
-            // round-trip (e.g. the GUI's `call_sync`) still waiting on this
-            // very reply. Emitting ActiveProfileChanged first would let that
-            // caller's own subscribed signal handler fire while its
-            // SwitchProfile call is still unresolved, on the same
-            // connection — a reentrancy hazard (a synchronous callback
-            // nested inside a synchronous call already in flight) that
-            // doesn't exist for ActiveLayerChanged, since nothing there is
-            // emitted as the direct, immediate side effect of the very call
-            // that's still awaiting its own reply.
-            let _ = reply.send(result);
-            if succeeded && let Some(emitter) = signal_emitter {
-                let _ = Daemon::active_profile_changed(emitter, &name).await;
-            }
-        }
-        Command::StopAllToggles { reply } => {
-            stop_all_toggles(toggles).await;
-            let _ = reply.send(());
-        }
-        Command::SetActuationPoint {
-            input,
-            actuation,
-            release,
-            reply,
-        } => {
-            if let Err(err) = reject_non_grid_input(input, "actuation points") {
-                let _ = reply.send(Err(err));
-                return;
-            }
-            if let Err(err) = reject_release_above_actuation(actuation, release) {
-                let _ = reply.send(Err(err));
-                return;
-            }
-            let point = ActuationPoint { actuation, release };
-            let previous = active_profile_mut(config)
-                .actuation_overrides
-                .insert(input, point);
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                let overrides = &mut active_profile_mut(config).actuation_overrides;
-                match previous {
-                    Some(prev) => {
-                        overrides.insert(input, prev);
-                    }
-                    None => {
-                        overrides.remove(&input);
-                    }
-                }
-            } else {
-                publish_actuation_snapshot(config, actuation_tx);
-            }
-            let _ = reply.send(result);
-        }
-        Command::ClearActuationPoint { input, reply } => {
-            if let Err(err) = reject_non_grid_input(input, "actuation points") {
-                let _ = reply.send(Err(err));
-                return;
-            }
-            let previous = active_profile_mut(config)
-                .actuation_overrides
-                .remove(&input);
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                if let Some(prev) = previous {
-                    active_profile_mut(config)
-                        .actuation_overrides
-                        .insert(input, prev);
-                }
-            } else {
-                publish_actuation_snapshot(config, actuation_tx);
-            }
-            let _ = reply.send(result);
-        }
-        Command::SetDefaultActuation {
-            actuation,
-            release,
-            reply,
-        } => {
-            if let Err(err) = reject_release_above_actuation(actuation, release) {
-                let _ = reply.send(Err(err));
-                return;
-            }
-            let previous = std::mem::replace(
-                &mut active_profile_mut(config).default_actuation,
-                ActuationPoint { actuation, release },
-            );
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                active_profile_mut(config).default_actuation = previous;
-            } else {
-                publish_actuation_snapshot(config, actuation_tx);
-            }
-            let _ = reply.send(result);
-        }
-        Command::ResetActuationPoints { reply } => {
-            let previous = std::mem::take(&mut active_profile_mut(config).actuation_overrides);
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                active_profile_mut(config).actuation_overrides = previous;
-            } else {
-                publish_actuation_snapshot(config, actuation_tx);
-            }
-            let _ = reply.send(result);
-        }
-        Command::SetForceDigital { force, reply } => {
-            let previous = std::mem::replace(&mut config.force_digital, force);
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config.force_digital = previous;
-            } else {
-                // Tells the supervisor (ticket 23) to actually swap the live
-                // capture source — only on a successful persist, matching
-                // every other mutating Command's "config.toml on disk always
-                // matches in-memory state" discipline.
-                let _ = capture_control_tx.send(force).await;
-            }
-            let _ = reply.send(result);
-        }
-        Command::CreateMacro { name, steps, reply } => {
-            if name.trim().is_empty() {
-                let _ = reply.send(Err(CommandError::InvalidRequest(
-                    "Macro name can't be empty".to_string(),
-                )));
-                return;
-            }
-            let macro_id = config::unique_macro_id(config, &name);
-            config
-                .macros
-                .insert(macro_id.clone(), config::MacroDef { name, steps });
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config.macros.remove(&macro_id);
-            }
-            let _ = reply.send(result.map(|()| macro_id));
-        }
-        Command::RenameMacro {
-            macro_id,
-            new_name,
-            reply,
-        } => {
-            if new_name.trim().is_empty() {
-                let _ = reply.send(Err(CommandError::InvalidRequest(
-                    "Macro name can't be empty".to_string(),
-                )));
-                return;
-            }
-            let Some(def) = config.macros.get_mut(&macro_id) else {
-                let _ = reply.send(Err(CommandError::NotFound));
-                return;
-            };
-            let previous = std::mem::replace(&mut def.name, new_name);
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config
-                    .macros
-                    .get_mut(&macro_id)
-                    .expect("just written above")
-                    .name = previous;
-            }
-            let _ = reply.send(result);
-        }
-        Command::DeleteMacro { macro_id, reply } => {
-            if macro_references(config, &macro_id) {
-                let _ = reply.send(Err(CommandError::InvalidRequest(format!(
-                    "{macro_id:?} is still referenced by a Macro Binding"
-                ))));
-                return;
-            }
-            let Some(previous) = config.macros.remove(&macro_id) else {
-                let _ = reply.send(Err(CommandError::NotFound));
-                return;
-            };
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config.macros.insert(macro_id, previous);
-            }
-            let _ = reply.send(result);
-        }
-        Command::SetMacroSteps {
-            macro_id,
-            steps,
-            reply,
-        } => {
-            let Some(def) = config.macros.get_mut(&macro_id) else {
-                let _ = reply.send(Err(CommandError::NotFound));
-                return;
-            };
-            let previous = std::mem::replace(&mut def.steps, steps);
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config
-                    .macros
-                    .get_mut(&macro_id)
-                    .expect("just written above")
-                    .steps = previous;
-            }
-            let _ = reply.send(result);
-        }
-        Command::CreateStepper { name, items, reply } => {
-            if name.trim().is_empty() {
-                let _ = reply.send(Err(CommandError::InvalidRequest(
-                    "Stepper name can't be empty".to_string(),
-                )));
-                return;
-            }
-            if let Err(err) = validate_stepper_items(&items) {
-                let _ = reply.send(Err(err));
-                return;
-            }
-            let stepper_id = config::unique_stepper_id(config, &name);
-            config
-                .steppers
-                .insert(stepper_id.clone(), config::StepperDef { name, items });
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config.steppers.remove(&stepper_id);
-            }
-            let _ = reply.send(result.map(|()| stepper_id));
-        }
-        Command::RenameStepper {
-            stepper_id,
-            new_name,
-            reply,
-        } => {
-            if new_name.trim().is_empty() {
-                let _ = reply.send(Err(CommandError::InvalidRequest(
-                    "Stepper name can't be empty".to_string(),
-                )));
-                return;
-            }
-            let Some(def) = config.steppers.get_mut(&stepper_id) else {
-                let _ = reply.send(Err(CommandError::NotFound));
-                return;
-            };
-            let previous = std::mem::replace(&mut def.name, new_name);
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config
-                    .steppers
-                    .get_mut(&stepper_id)
-                    .expect("just written above")
-                    .name = previous;
-            }
-            let _ = reply.send(result);
-        }
-        Command::DeleteStepper { stepper_id, reply } => {
-            if stepper_references(config, &stepper_id) {
-                let _ = reply.send(Err(CommandError::InvalidRequest(format!(
-                    "{stepper_id:?} is still referenced by a Step Binding"
-                ))));
-                return;
-            }
-            let Some(previous) = config.steppers.remove(&stepper_id) else {
-                let _ = reply.send(Err(CommandError::NotFound));
-                return;
-            };
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config.steppers.insert(stepper_id, previous);
-            } else {
-                // The runtime cursor is Daemon-side-only state, not part of
-                // `config`/`persist` — dropped here, on a successful delete,
-                // so a later `CreateStepper` that happens to land on the
-                // same freed slug (`unique_stepper_id` reassigns it once
-                // nothing occupies it) starts at the list's first item
-                // rather than inheriting a stale position from the deleted
-                // entry (code-review finding).
-                stepper_cursors.remove(&stepper_id);
-            }
-            let _ = reply.send(result);
-        }
-        Command::SetStepperItems {
-            stepper_id,
-            items,
-            reply,
-        } => {
-            if let Err(err) = validate_stepper_items(&items) {
-                let _ = reply.send(Err(err));
-                return;
-            }
-            let Some(def) = config.steppers.get_mut(&stepper_id) else {
-                let _ = reply.send(Err(CommandError::NotFound));
-                return;
-            };
-            let previous = std::mem::replace(&mut def.items, items);
-            let new_len = config.steppers[&stepper_id].items.len();
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                config
-                    .steppers
-                    .get_mut(&stepper_id)
-                    .expect("just written above")
-                    .items = previous;
-            } else if new_len == 0 {
-                // Nothing left to point at — dropping the entry lets
-                // `resolve_step`'s zero-items short-circuit and `GetState`'s
-                // own default both agree on "index 0" for free, the same
-                // convention a never-yet-stepped cursor already uses.
-                stepper_cursors.remove(&stepper_id);
-            } else {
-                // A shrink can leave a stored cursor pointing past the new
-                // end — clamped here (mirroring `resolve_step`'s own
-                // `.min(len - 1)` guard) so `GetState`'s reported position
-                // never outruns the list it's a position *in*, even before
-                // this Stepper is next fired (code-review finding).
-                if let Some(cursor) = stepper_cursors.get_mut(&stepper_id) {
-                    *cursor = (*cursor).min(new_len - 1);
-                }
-            }
-            let _ = reply.send(result);
-        }
-        Command::SetChordBinding {
-            inputs,
-            layer,
-            binding,
-            reply,
-        } => {
-            if inputs.len() < 2 {
-                let _ = reply.send(Err(CommandError::InvalidRequest(
-                    "a Chord needs at least two member Inputs".to_string(),
-                )));
-                return;
-            }
-            if matches!(binding.action, Action::ProfileSwitch { .. }) {
-                // See `ConfigError::InvalidChordProfileSwitch` — a Chord's
-                // own Action can never be ProfileSwitch, since
-                // `fire_chord`/`compile_action` have no `&mut Config` to
-                // actually run a switch through (unlike a Chord *member*'s
-                // own individual Binding, which can be anything — see
-                // `fire_individual_retroactively`).
-                let _ = reply.send(Err(CommandError::InvalidRequest(
-                    "a Chord's Binding can't be a Profile Switch".to_string(),
-                )));
-                return;
-            }
-            if binding.trigger == TriggerMode::AnalogRepeat {
-                // See `ConfigError::InvalidChordAnalogRepeat` — a Chord
-                // fires on a discrete member-set completion, not a single
-                // grid key's continuous Depth, same "no coherent runtime
-                // owner" reasoning as the Profile Switch rejection above.
-                let _ = reply.send(Err(CommandError::InvalidRequest(
-                    "a Chord's Binding can't use Analog-repeat".to_string(),
-                )));
-                return;
-            }
-            if let Err(err) = validate_binding(&binding, config) {
-                let _ = reply.send(Err(err));
-                return;
-            }
-            let profile = config
-                .active_profile()
-                .expect("load_or_seed validates active_profile names a real profile");
-            if let Some(&axis_input) = inputs.iter().find(|&&i| axis_conflict(profile, layer, i)) {
-                let _ = reply.send(Err(CommandError::InvalidRequest(format!(
-                    "{axis_input} already has an Axis assignment on this Layer — clear it first"
-                ))));
-                return;
-            }
-            let key = ChordKey::new(inputs);
-            if let Some(conflicting) =
-                chord_conflict(active_profile_mut(config).chords(layer), &key)
-            {
-                let _ = reply.send(Err(CommandError::InvalidRequest(format!(
-                    "conflicts with the existing Chord {conflicting}: one member set fully contains the other"
-                ))));
-                return;
-            }
-            // Ticket 40: a Step-action Chord is exactly as exclusive an
-            // owner of (stepper, direction) as an ordinary Binding's
-            // (ticket 03's Answer) — steal it from wherever else it
-            // currently lives, in either keyspace, mirroring `SetBinding`'s
-            // own handler.
-            let (moved_stepper_bindings, moved_stepper_chord_bindings) =
-                if let Action::Step { stepper, direction } = &binding.action {
-                    let active_profile = config.active_profile.clone();
-                    (
-                        take_stepper_direction_elsewhere(config, stepper, *direction, None),
-                        take_stepper_direction_elsewhere_from_chords(
-                            config,
-                            stepper,
-                            *direction,
-                            Some((&active_profile, layer, &key)),
-                        ),
-                    )
-                } else {
-                    (Vec::new(), Vec::new())
-                };
-            let previous = active_profile_mut(config)
-                .chords_mut(layer)
-                .insert(key.clone(), binding);
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                let chords = active_profile_mut(config).chords_mut(layer);
-                match previous {
-                    Some(prev) => {
-                        chords.insert(key, prev);
-                    }
-                    None => {
-                        chords.remove(&key);
-                    }
-                }
-                for (profile_name, moved_layer, moved_input, moved_binding) in
-                    moved_stepper_bindings
-                {
-                    if let Some(profile) = config.profiles.get_mut(&profile_name) {
-                        profile
-                            .layer_mut(moved_layer)
-                            .insert(moved_input, moved_binding);
-                    }
-                }
-                for (profile_name, moved_layer, moved_key, moved_binding) in
-                    moved_stepper_chord_bindings
-                {
-                    if let Some(profile) = config.profiles.get_mut(&profile_name) {
-                        profile
-                            .chords_mut(moved_layer)
-                            .insert(moved_key, moved_binding);
-                    }
-                }
-            }
-            let _ = reply.send(result);
-        }
-        Command::ClearChordBinding {
-            inputs,
-            layer,
-            reply,
-        } => {
-            let key = ChordKey::new(inputs);
-            let Some(previous) = active_profile_mut(config).chords_mut(layer).remove(&key) else {
-                let _ = reply.send(Err(CommandError::NotFound));
-                return;
-            };
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                active_profile_mut(config)
-                    .chords_mut(layer)
-                    .insert(key, previous);
-            }
-            let _ = reply.send(result);
-        }
-        Command::SetAxisAssignment {
-            input,
-            layer,
-            target,
-            reply,
-        } => {
-            if let Err(err) = reject_non_grid_input(input, "Axis assignments") {
-                let _ = reply.send(Err(err));
-                return;
-            }
-            // Ticket 59 §2's mutual exclusion: atomically clears any
-            // existing Binding *and* any Chord membership for (layer,
-            // input) alongside the insert, mirroring `SetBinding`'s own
-            // atomic-persist precedent — unlike `SetBinding`/
-            // `SetChordBinding` (see `axis_conflict` below), which reject
-            // rather than silently steal from an existing Axis assignment.
-            let previous_binding = active_profile_mut(config).layer_mut(layer).remove(&input);
-            let removed_chords: Vec<(ChordKey, Binding)> = {
-                let chords = active_profile_mut(config).chords_mut(layer);
-                let keys: Vec<ChordKey> = chords
-                    .keys()
-                    .filter(|key| key.members().contains(&input))
-                    .cloned()
-                    .collect();
-                keys.into_iter()
-                    .filter_map(|key| chords.remove(&key).map(|binding| (key, binding)))
-                    .collect()
-            };
-            let previous_axis = active_profile_mut(config)
-                .axis_layer_mut(layer)
-                .insert(input, target);
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                let axis_map = active_profile_mut(config).axis_layer_mut(layer);
-                match previous_axis {
-                    Some(prev) => {
-                        axis_map.insert(input, prev);
-                    }
-                    None => {
-                        axis_map.remove(&input);
-                    }
-                }
-                let chords = active_profile_mut(config).chords_mut(layer);
-                for (key, binding) in removed_chords {
-                    chords.insert(key, binding);
-                }
-                if let Some(binding) = previous_binding {
-                    active_profile_mut(config)
-                        .layer_mut(layer)
-                        .insert(input, binding);
-                }
-            } else if layer == *active_layer {
-                let axis_map = active_profile_mut(config).axis_layer(layer).clone();
-                let _ = recompute_and_emit_axes(injector, axis_state, &axis_map).await;
-            }
-            let _ = reply.send(result);
-        }
-        Command::ClearAxisAssignment {
-            input,
-            layer,
-            reply,
-        } => {
-            let Some(previous) = active_profile_mut(config)
-                .axis_layer_mut(layer)
-                .remove(&input)
-            else {
-                let _ = reply.send(Err(CommandError::NotFound));
-                return;
-            };
-            let result = persist(config, config_path).await;
-            if result.is_err() {
-                active_profile_mut(config)
-                    .axis_layer_mut(layer)
-                    .insert(input, previous);
-            } else {
-                axis_state.contributions.remove(&input);
-                if layer == *active_layer {
-                    let axis_map = active_profile_mut(config).axis_layer(layer).clone();
-                    let _ = recompute_and_emit_axes(injector, axis_state, &axis_map).await;
-                }
-            }
-            let _ = reply.send(result);
-        }
-    }
-}
-
-/// Force-stops every currently running Toggle — shared by `SwitchProfile`
-/// (as part of switching) and `StopAllToggles` (ticket 25, on its own,
-/// GUI-focus-gain triggered) so the drain-and-stop loop has exactly one
-/// implementation.
+/// Force-stops every currently running Toggle — shared by `SwitchProfile`'s
+/// `StopAllToggles` effect and the `StopAllToggles` command (ticket 25, on
+/// its own, GUI-focus-gain triggered) so the drain-and-stop loop has exactly
+/// one implementation.
 async fn stop_all_toggles(toggles: &mut HashMap<Input, ActiveToggle>) {
     for (_, toggle) in toggles.drain() {
         toggle.stop().await;
     }
 }
 
-/// Rewrites `config.toml` off the async worker pool: `config::write` is a
-/// synchronous `std::fs` call, and running it inline on the dispatch task
-/// would stall every queued `PhysicalEvent` behind it for the write's
-/// duration — perceptible input lag in a daemon whose whole job is
-/// low-latency key remapping.
-async fn persist(config: &Config, config_path: &Path) -> Result<(), CommandError> {
-    let config = config.clone();
-    let config_path = config_path.to_path_buf();
-    tokio::task::spawn_blocking(move || config::write(&config_path, &config))
-        .await
-        .expect("the config::write blocking task must not panic")
-        .map_err(CommandError::from)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::fake::FakeCaptureSource;
-    use crate::capture::{CaptureSource, EventState};
-    use crate::config::{Action, ActuationPoint, DEFAULT_PROFILE_NAME, MacroStepDto, Modifiers};
+    use crate::capture::EventState;
+    use crate::config::{
+        Action, ActuationPoint, AxisTarget, DEFAULT_PROFILE_NAME, MacroStepDto, Modifiers, Profile,
+        StepDirection, StepperItem,
+    };
+    use crate::edit::{CommandError, CreatedId};
     use crate::injector::testing::RecordingSink;
     use crate::injector::{self};
     use crate::input::{Direction, WheelEvent};
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::time::Duration;
     use tokio::sync::oneshot;
+
+    /// Mirrors of `analog_repeat`'s documented per-fire hold dwells — its
+    /// constants are private, and the values themselves are pinned by
+    /// `analog_repeat::tests::pulse_hold_for_*`. The kept integration tests
+    /// below only check that the engine's spawned task actually drives uinput
+    /// on that cadence across the module boundary.
+    const AR_PULSE_HOLD: Duration = Duration::from_millis(15);
+    const AR_CONTROLLER_PULSE_HOLD: Duration = Duration::from_millis(35);
 
     /// Same helper as `executor`'s own test module — used by the newer,
     /// terser ControllerButton Hold-to-repeat tests (ticket 75/76) rather
@@ -3152,42 +1218,121 @@ mod tests {
         watch::channel(HashMap::new()).1
     }
 
-    async fn run_scripted(
-        scripted: Vec<PhysicalEvent>,
-        bindings: HashMap<Input, Binding>,
-    ) -> Vec<Vec<evdev::InputEvent>> {
-        let sink = RecordingSink::new();
-        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
+    /// The direct `DispatchState` seam (ticket 09): a `RecordingSink` injector
+    /// plus an in-memory `Config`, no channels and no tempfile. Feed
+    /// `PhysicalEvent`s (and `Command`s) straight into the handler methods and
+    /// read the injected batches back — it replaces the old `run`-plus-
+    /// `FakeCaptureSource` `run_scripted` helper for the per-handler-logic
+    /// tests that never needed the `select!` plumbing. Tests that genuinely
+    /// exercise channel-close, persist-failure rollback, `select!` arm
+    /// interleaving, or the D-Bus round trip keep the full `CommandHarness`
+    /// rig.
+    struct Seam {
+        state: DispatchState,
+        config: Config,
+        sink: RecordingSink,
+        gamepad_sink: RecordingSink,
+        inj: Injector,
+        inj_handle: tokio::task::JoinHandle<io::Result<()>>,
+    }
 
-        let (tx, rx) = mpsc::channel(8);
-        let (conn_tx, conn_rx) = mpsc::channel(8);
-        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
-        let dispatch_handle = tokio::spawn(run(
-            rx,
-            conn_rx,
-            cmd_rx,
-            inj.clone(),
-            config_with_bindings(bindings),
-            unused_config_path(),
-            None,
-            actuation_channel(),
-            capture_mode_channel(),
-            capture_control_channel(),
-            executor::MIN_TOGGLE_LAP,
-            depth_channel(),
-            device_info_channel(),
-        ));
+    impl Seam {
+        fn new(config: Config) -> Self {
+            let sink = RecordingSink::new();
+            let gamepad_sink = RecordingSink::new();
+            let (inj, inj_handle) = injector::spawn(sink.clone(), gamepad_sink.clone());
+            let state = DispatchState::new(
+                inj.clone(),
+                None,
+                actuation_channel(),
+                capture_control_channel(),
+                executor::MIN_TOGGLE_LAP,
+            );
+            Seam {
+                state,
+                config,
+                sink,
+                gamepad_sink,
+                inj,
+                inj_handle,
+            }
+        }
 
-        FakeCaptureSource::new(scripted)
-            .run(tx, conn_tx)
-            .await
-            .unwrap();
+        fn with_bindings(bindings: HashMap<Input, Binding>) -> Self {
+            Self::new(config_with_bindings(bindings))
+        }
 
-        drop(inj);
-        dispatch_handle.await.unwrap().unwrap();
-        inj_handle.await.unwrap().unwrap();
+        /// Feeds one event through `handle_event`, then yields a handful of
+        /// times so any firing it spawned gets to run — the same
+        /// `yield_now` spacing the `CommandHarness` tests put between presses.
+        async fn feed(&mut self, event: PhysicalEvent) -> Vec<edit::Edit> {
+            let edits = self.state.handle_event(&self.config, event).await.unwrap();
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            edits
+        }
 
-        sink.batches()
+        async fn press(&mut self, input: Input) {
+            let edits = self
+                .feed(PhysicalEvent {
+                    input,
+                    state: EventState::Down,
+                    depth: None,
+                })
+                .await;
+            assert!(edits.is_empty(), "unexpected input-path Edits: {edits:?}");
+        }
+
+        async fn repeat(&mut self, input: Input) {
+            let edits = self
+                .feed(PhysicalEvent {
+                    input,
+                    state: EventState::Repeat,
+                    depth: None,
+                })
+                .await;
+            assert!(edits.is_empty(), "unexpected input-path Edits: {edits:?}");
+        }
+
+        async fn release(&mut self, input: Input) {
+            let edits = self
+                .feed(PhysicalEvent {
+                    input,
+                    state: EventState::Up,
+                    depth: None,
+                })
+                .await;
+            assert!(edits.is_empty(), "unexpected input-path Edits: {edits:?}");
+        }
+
+        async fn get_state(&mut self) -> State {
+            let (reply, rx) = oneshot::channel();
+            self.state
+                .handle_command(
+                    &mut self.config,
+                    &unused_config_path(),
+                    Command::GetState(reply),
+                )
+                .await;
+            rx.await.unwrap()
+        }
+
+        fn gamepad_batches(&self) -> Vec<Vec<evdev::InputEvent>> {
+            self.gamepad_sink.batches()
+        }
+
+        /// Stops every background task the state still owns, then drains the
+        /// injector — mirrors `run` returning and the drop-and-join tail the
+        /// full-rig helpers use.
+        async fn finish(mut self) -> Vec<Vec<evdev::InputEvent>> {
+            stop_all_toggles(&mut self.state.toggles).await;
+            self.state.analog_repeat.stop_all().await;
+            drop(self.state);
+            drop(self.inj);
+            self.inj_handle.await.unwrap().unwrap();
+            self.sink.batches()
+        }
     }
 
     #[tokio::test]
@@ -3219,7 +1364,11 @@ mod tests {
             },
         ];
 
-        let batches = run_scripted(scripted.clone(), HashMap::new()).await;
+        let mut seam = Seam::with_bindings(HashMap::new());
+        for event in &scripted {
+            seam.feed(*event).await;
+        }
+        let batches = seam.finish().await;
         assert_eq!(batches.len(), scripted.len());
 
         // Grid(2,3) -> KEY_W, value 2 (Repeat).
@@ -3254,13 +1403,9 @@ mod tests {
             },
         );
 
-        let scripted = vec![PhysicalEvent {
-            input: Input::Grid(1, 1),
-            state: EventState::Down,
-            depth: None,
-        }];
-
-        let batches = run_scripted(scripted, bindings).await;
+        let mut seam = Seam::with_bindings(bindings);
+        seam.press(Input::Grid(1, 1)).await;
+        let batches = seam.finish().await;
 
         // One press batch + one release batch of KEY_F1 — not the grid
         // key's own passthrough code (KEY_1).
@@ -3275,127 +1420,6 @@ mod tests {
         };
         assert_eq!(code, evdev::KeyCode::KEY_F1);
         assert_eq!(value, 0);
-    }
-
-    #[tokio::test]
-    async fn fire_once_binding_ignores_repeat_and_up_fires_only_on_down() {
-        let mut bindings = HashMap::new();
-        bindings.insert(
-            Input::Grid(1, 1),
-            Binding {
-                trigger: TriggerMode::FireOnce,
-                action: Action::Keypress {
-                    modifiers: Modifiers::default(),
-                    key: evdev::KeyCode::KEY_F1,
-                },
-            },
-        );
-
-        let scripted = vec![
-            PhysicalEvent {
-                input: Input::Grid(1, 1),
-                state: EventState::Down,
-                depth: None,
-            },
-            PhysicalEvent {
-                input: Input::Grid(1, 1),
-                state: EventState::Repeat,
-                depth: None,
-            },
-            PhysicalEvent {
-                input: Input::Grid(1, 1),
-                state: EventState::Up,
-                depth: None,
-            },
-        ];
-
-        let batches = run_scripted(scripted, bindings).await;
-
-        // Only the Down produced output: one press batch + one release batch.
-        assert_eq!(batches.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn hold_to_repeat_fires_on_down_and_every_repeat_but_not_up() {
-        let mut bindings = HashMap::new();
-        bindings.insert(
-            Input::Grid(1, 1),
-            Binding {
-                trigger: TriggerMode::HoldToRepeat,
-                action: Action::Keypress {
-                    modifiers: Modifiers::default(),
-                    key: evdev::KeyCode::KEY_F1,
-                },
-            },
-        );
-
-        let sink = RecordingSink::new();
-        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
-        let (tx, rx) = mpsc::channel(8);
-        let (_conn_tx, conn_rx) = mpsc::channel(8);
-        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
-        let dispatch_handle = tokio::spawn(run(
-            rx,
-            conn_rx,
-            cmd_rx,
-            inj.clone(),
-            config_with_bindings(bindings),
-            unused_config_path(),
-            None,
-            actuation_channel(),
-            capture_mode_channel(),
-            capture_control_channel(),
-            executor::MIN_TOGGLE_LAP,
-            depth_channel(),
-            device_info_channel(),
-        ));
-
-        // Real evdev autorepeat events land tens of milliseconds apart —
-        // comfortably enough for a same-Input firing's steps to finish. Send
-        // each event with yields in between so the previous firing's spawned
-        // task runs to completion first, exercising the code review fix
-        // (ticket 17): overlapping same-Input firings are dropped, not
-        // queued, so back-to-back events with no gap would otherwise only
-        // produce the first firing's output.
-        for state in [
-            EventState::Down,
-            EventState::Repeat,
-            EventState::Repeat,
-            EventState::Up,
-        ] {
-            tx.send(PhysicalEvent {
-                input: Input::Grid(1, 1),
-                state,
-                depth: None,
-            })
-            .await
-            .unwrap();
-            for _ in 0..5 {
-                tokio::task::yield_now().await;
-            }
-        }
-
-        drop(tx);
-        dispatch_handle.await.unwrap().unwrap();
-        drop(inj);
-        inj_handle.await.unwrap().unwrap();
-
-        let batches = sink.batches();
-
-        // Down + two Repeats = three firings, each a KeyDown/KeyUp pair; the
-        // trailing Up produced nothing.
-        assert_eq!(batches.len(), 6);
-        for pair in batches.chunks(2) {
-            let evdev::EventSummary::Key(_, down_code, down_value) = pair[0][0].destructure()
-            else {
-                panic!("expected a key event");
-            };
-            let evdev::EventSummary::Key(_, up_code, up_value) = pair[1][0].destructure() else {
-                panic!("expected a key event");
-            };
-            assert_eq!((down_code, down_value), (evdev::KeyCode::KEY_F1, 1));
-            assert_eq!((up_code, up_value), (evdev::KeyCode::KEY_F1, 0));
-        }
     }
 
     #[tokio::test]
@@ -3417,54 +1441,15 @@ mod tests {
             },
         );
 
-        let sink = RecordingSink::new();
-        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
-        let (tx, rx) = mpsc::channel(8);
-        let (_conn_tx, conn_rx) = mpsc::channel(8);
-        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
-        let dispatch_handle = tokio::spawn(run(
-            rx,
-            conn_rx,
-            cmd_rx,
-            inj.clone(),
-            config_with_bindings_and_macros(bindings, macros),
-            unused_config_path(),
-            None,
-            actuation_channel(),
-            capture_mode_channel(),
-            capture_control_channel(),
-            executor::MIN_TOGGLE_LAP,
-            depth_channel(),
-            device_info_channel(),
-        ));
+        let mut seam = Seam::new(config_with_bindings_and_macros(bindings, macros));
 
-        tx.send(PhysicalEvent {
-            input: Input::Grid(1, 1),
-            state: EventState::Down,
-            depth: None,
-        })
-        .await
-        .unwrap();
-        // Let the one-step firing (no Delay) finish before the physical
-        // release lands — the realistic case, since a physical press/release
-        // cycle vastly outlasts an instant single-step Macro.
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        tx.send(PhysicalEvent {
-            input: Input::Grid(1, 1),
-            state: EventState::Up,
-            depth: None,
-        })
-        .await
-        .unwrap();
-
-        drop(tx);
-        dispatch_handle.await.unwrap().unwrap();
-        drop(inj);
-        inj_handle.await.unwrap().unwrap();
-
-        let batches = sink.batches();
+        // The `press` helper's own `yield_now` spacing lets the one-step
+        // firing (no Delay) finish before the physical release lands — the
+        // realistic case, since a physical press/release cycle vastly
+        // outlasts an instant single-step Macro.
+        seam.press(Input::Grid(1, 1)).await;
+        seam.release(Input::Grid(1, 1)).await;
+        let batches = seam.finish().await;
 
         // The firing's own KeyDown, then a force-released KeyUp triggered by
         // the physical Up — no stuck key, no reboot needed.
@@ -3486,87 +1471,29 @@ mod tests {
         // `Action::ControllerButton` fires exactly one KeyDown on the
         // physical Down, ignores every kernel-autorepeat Repeat outright
         // (no re-fire), and only releases on the physical Up.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::HoldToRepeat,
-                    action: Action::ControllerButton {
-                        button: evdev::KeyCode::BTN_SOUTH,
-                    },
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::HoldToRepeat,
+                action: Action::ControllerButton {
+                    button: evdev::KeyCode::BTN_SOUTH,
                 },
-            )
-            .await
-            .unwrap();
+            },
+        );
+        let mut seam = Seam::with_bindings(bindings);
 
-        harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.press(Input::Grid(1, 1)).await;
         for _ in 0..3 {
-            harness.repeat(Input::Grid(1, 1)).await;
-            for _ in 0..5 {
-                tokio::task::yield_now().await;
-            }
+            seam.repeat(Input::Grid(1, 1)).await;
         }
-        harness.release(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.release(Input::Grid(1, 1)).await;
 
-        let batches = harness.gamepad_batches();
-        harness.shut_down().await;
+        let batches = seam.gamepad_batches();
+        seam.finish().await;
 
         // Exactly one KeyDown (the physical Down) and one KeyUp (the
         // physical Up) — the three Repeats produced nothing.
-        assert_eq!(batches.len(), 2);
-        assert_eq!(key_and_value(batches[0][0]), (evdev::KeyCode::BTN_SOUTH, 1));
-        assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::BTN_SOUTH, 0));
-    }
-
-    #[tokio::test]
-    async fn hold_to_repeat_chord_controller_button_ignores_repeat_and_releases_on_member_up() {
-        // Ticket 75/76's Chord blast radius: the same treatment applies
-        // uniformly when a Chord's own Action is `ControllerButton`, mirrors
-        // `hold_to_repeat_chord_refires_only_on_the_leader_members_repeat`.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_chord_binding(
-                [Input::Grid(1, 1), Input::Grid(1, 2)],
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::HoldToRepeat,
-                    action: Action::ControllerButton {
-                        button: evdev::KeyCode::BTN_SOUTH,
-                    },
-                },
-            )
-            .await
-            .unwrap();
-
-        harness.press(Input::Grid(1, 1)).await;
-        harness.press(Input::Grid(1, 2)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        harness.repeat(Input::Grid(1, 1)).await;
-        harness.repeat(Input::Grid(1, 2)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        harness.release(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-
-        let batches = harness.gamepad_batches();
-        harness.shut_down().await;
-
-        // Exactly one KeyDown (the completing Down) and one KeyUp (the
-        // first member's physical Up) — both members' Repeats produced
-        // nothing.
         assert_eq!(batches.len(), 2);
         assert_eq!(key_and_value(batches[0][0]), (evdev::KeyCode::BTN_SOUTH, 1));
         assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::BTN_SOUTH, 0));
@@ -3581,88 +1508,29 @@ mod tests {
         // Repeat outright (no re-fire), and only releases on the physical
         // Up — the same sustained-hold treatment ticket 75/76 gave
         // `ControllerButton`, now supporting click-and-drag.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::HoldToRepeat,
-                    action: Action::Keypress {
-                        modifiers: Modifiers::default(),
-                        key: evdev::KeyCode::BTN_LEFT,
-                    },
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::HoldToRepeat,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: evdev::KeyCode::BTN_LEFT,
                 },
-            )
-            .await
-            .unwrap();
+            },
+        );
+        let mut seam = Seam::with_bindings(bindings);
 
-        harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.press(Input::Grid(1, 1)).await;
         for _ in 0..3 {
-            harness.repeat(Input::Grid(1, 1)).await;
-            for _ in 0..5 {
-                tokio::task::yield_now().await;
-            }
+            seam.repeat(Input::Grid(1, 1)).await;
         }
-        harness.release(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.release(Input::Grid(1, 1)).await;
 
-        let batches = harness.shut_down().await;
+        let batches = seam.finish().await;
 
         // Exactly one KeyDown (the physical Down) and one KeyUp (the
         // physical Up) — the three Repeats produced nothing.
-        assert_eq!(batches.len(), 2);
-        assert_eq!(key_and_value(batches[0][0]), (evdev::KeyCode::BTN_LEFT, 1));
-        assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::BTN_LEFT, 0));
-    }
-
-    #[tokio::test]
-    async fn hold_to_repeat_chord_mouse_button_ignores_repeat_and_releases_on_member_up() {
-        // Ticket 79/80's Chord blast radius: the same treatment applies
-        // uniformly when a Chord's own Action is a mouse-button Keypress,
-        // mirrors `hold_to_repeat_chord_controller_button_ignores_repeat_
-        // and_releases_on_member_up`.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_chord_binding(
-                [Input::Grid(1, 1), Input::Grid(1, 2)],
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::HoldToRepeat,
-                    action: Action::Keypress {
-                        modifiers: Modifiers::default(),
-                        key: evdev::KeyCode::BTN_LEFT,
-                    },
-                },
-            )
-            .await
-            .unwrap();
-
-        harness.press(Input::Grid(1, 1)).await;
-        harness.press(Input::Grid(1, 2)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        harness.repeat(Input::Grid(1, 1)).await;
-        harness.repeat(Input::Grid(1, 2)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        harness.release(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-
-        let batches = harness.shut_down().await;
-
-        // Exactly one KeyDown (the completing Down) and one KeyUp (the
-        // first member's physical Up) — both members' Repeats produced
-        // nothing.
         assert_eq!(batches.len(), 2);
         assert_eq!(key_and_value(batches[0][0]), (evdev::KeyCode::BTN_LEFT, 1));
         assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::BTN_LEFT, 0));
@@ -3676,36 +1544,24 @@ mod tests {
         // Hold-to-repeat arm still applies. Mirrors ticket 76's own
         // `hold_to_repeat_mouse_button_still_refires_on_every_repeat`
         // negative test, but in the other direction.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::HoldToRepeat,
-                    action: Action::Keypress {
-                        modifiers: Modifiers::default(),
-                        key: evdev::KeyCode::KEY_A,
-                    },
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::HoldToRepeat,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: evdev::KeyCode::KEY_A,
                 },
-            )
-            .await
-            .unwrap();
+            },
+        );
+        let mut seam = Seam::with_bindings(bindings);
 
-        harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        harness.repeat(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        harness.release(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.press(Input::Grid(1, 1)).await;
+        seam.repeat(Input::Grid(1, 1)).await;
+        seam.release(Input::Grid(1, 1)).await;
 
-        let batches = harness.shut_down().await;
+        let batches = seam.finish().await;
 
         // Down + one Repeat = two firings, each a KeyDown/KeyUp pair; the
         // trailing Up produced nothing — unchanged from before ticket 79/80.
@@ -3722,26 +1578,20 @@ mod tests {
         // sustained hold instead of the ordinary repeat-tap loop — one
         // KeyDown while toggled on, no matter how long, released by exactly
         // one KeyUp when the same key stops it.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::Toggle,
-                    action: Action::Keypress {
-                        modifiers: Modifiers::default(),
-                        key: evdev::KeyCode::BTN_LEFT,
-                    },
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::Toggle,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: evdev::KeyCode::BTN_LEFT,
                 },
-            )
-            .await
-            .unwrap();
+            },
+        );
+        let mut seam = Seam::with_bindings(bindings);
 
-        harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.press(Input::Grid(1, 1)).await;
 
         // Advance well past several ordinary Toggle laps' worth of time —
         // a looping Toggle would have re-pressed several times by now.
@@ -3750,17 +1600,14 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        let state = harness.get_state().await;
+        let state = seam.get_state().await;
         assert_eq!(state.active_toggles, vec![Input::Grid(1, 1)]);
 
         // Same physical key, still toggled on: stops it rather than
         // starting a second one.
-        harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.press(Input::Grid(1, 1)).await;
 
-        let batches = harness.shut_down().await;
+        let batches = seam.finish().await;
 
         assert_eq!(
             batches.len(),
@@ -3780,25 +1627,19 @@ mod tests {
         // released by exactly one KeyUp when the same key stops it. Before
         // this ticket, this fell through to the ordinary looping Toggle arm
         // instead.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::Toggle,
-                    action: Action::ControllerButton {
-                        button: evdev::KeyCode::BTN_SOUTH,
-                    },
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::Toggle,
+                action: Action::ControllerButton {
+                    button: evdev::KeyCode::BTN_SOUTH,
                 },
-            )
-            .await
-            .unwrap();
+            },
+        );
+        let mut seam = Seam::with_bindings(bindings);
 
-        harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.press(Input::Grid(1, 1)).await;
 
         // Advance well past several ordinary Toggle laps' worth of time —
         // a looping Toggle would have re-pressed several times by now.
@@ -3807,18 +1648,15 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        let state = harness.get_state().await;
+        let state = seam.get_state().await;
         assert_eq!(state.active_toggles, vec![Input::Grid(1, 1)]);
 
         // Same physical key, still toggled on: stops it rather than
         // starting a second one.
-        harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.press(Input::Grid(1, 1)).await;
 
-        let batches = harness.gamepad_batches();
-        harness.shut_down().await;
+        let batches = seam.gamepad_batches();
+        seam.finish().await;
 
         assert_eq!(
             batches.len(),
@@ -3835,37 +1673,28 @@ mod tests {
         // carve-out must not bleed onto keyboard-key output — `is_mouse_
         // button` rejects an ordinary keyboard `KeyCode`, so the ordinary
         // looping Toggle arm still applies.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::Toggle,
-                    action: Action::Keypress {
-                        modifiers: Modifiers::default(),
-                        key: evdev::KeyCode::KEY_A,
-                    },
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::Toggle,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: evdev::KeyCode::KEY_A,
                 },
-            )
-            .await
-            .unwrap();
+            },
+        );
+        let mut seam = Seam::with_bindings(bindings);
 
-        harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.press(Input::Grid(1, 1)).await;
         for _ in 0..7 {
             tokio::time::advance(executor::MIN_TOGGLE_LAP).await;
             tokio::task::yield_now().await;
         }
 
-        harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.press(Input::Grid(1, 1)).await;
 
-        let batches = harness.shut_down().await;
+        let batches = seam.finish().await;
 
         assert!(
             batches.len() > 2,
@@ -3874,94 +1703,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn analog_repeat_digital_sourced_behaves_like_hold_to_repeat() {
-        // Ticket 20's Digital Capture mode fallback: with no Depth at all
-        // (`event.depth: None`, exactly mirroring `hold_to_repeat_fires_on_
-        // down_and_every_repeat_but_not_up` above), Analog-repeat fires on
-        // Down/Repeat and force-releases on Up, identically to Hold-to-repeat.
-        let mut bindings = HashMap::new();
-        bindings.insert(
-            Input::Grid(1, 1),
-            Binding {
-                trigger: TriggerMode::AnalogRepeat,
-                action: Action::Keypress {
-                    modifiers: Modifiers::default(),
-                    key: evdev::KeyCode::KEY_F1,
-                },
-            },
-        );
-
-        let sink = RecordingSink::new();
-        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
-        let (tx, rx) = mpsc::channel(8);
-        let (_conn_tx, conn_rx) = mpsc::channel(8);
-        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
-        let dispatch_handle = tokio::spawn(run(
-            rx,
-            conn_rx,
-            cmd_rx,
-            inj.clone(),
-            config_with_bindings(bindings),
-            unused_config_path(),
-            None,
-            actuation_channel(),
-            capture_mode_channel(),
-            capture_control_channel(),
-            executor::MIN_TOGGLE_LAP,
-            depth_channel(),
-            device_info_channel(),
-        ));
-
-        for state in [
-            EventState::Down,
-            EventState::Repeat,
-            EventState::Repeat,
-            EventState::Up,
-        ] {
-            tx.send(PhysicalEvent {
-                input: Input::Grid(1, 1),
-                state,
-                depth: None,
-            })
-            .await
-            .unwrap();
-            for _ in 0..5 {
-                tokio::task::yield_now().await;
-            }
-        }
-
-        drop(tx);
-        dispatch_handle.await.unwrap().unwrap();
-        drop(inj);
-        inj_handle.await.unwrap().unwrap();
-
-        let batches = sink.batches();
-        assert_eq!(batches.len(), 6);
-        for pair in batches.chunks(2) {
-            let evdev::EventSummary::Key(_, down_code, down_value) = pair[0][0].destructure()
-            else {
-                panic!("expected a key event");
-            };
-            let evdev::EventSummary::Key(_, up_code, up_value) = pair[1][0].destructure() else {
-                panic!("expected a key event");
-            };
-            assert_eq!((down_code, down_value), (evdev::KeyCode::KEY_F1, 1));
-            assert_eq!((up_code, up_value), (evdev::KeyCode::KEY_F1, 0));
-        }
-    }
-
-    #[tokio::test]
     async fn analog_repeat_analog_sourced_events_are_swallowed() {
         // The opposite case from the test above: an Analog-*sourced* Down/
         // Repeat/Up (`event.depth: Some(_)`, synthesized from the key's
-        // ordinary Actuation/Release points) must never reach `fire()` at
-        // all for an Analog-repeat Binding — real firing is
-        // `update_analog_repeats`'s own depth-driven background task,
+        // ordinary Actuation/Release points) must never reach the individual
+        // Trigger-mode path at all for an Analog-repeat Binding — real firing
+        // is `update_analog_repeats`'s own depth-driven background task,
         // exercised separately below. No depth-watch crossing is ever
         // published here (`depth_channel()`'s Sender is dropped
-        // immediately), so if this Binding fell through to `fire()` instead
-        // of being swallowed, it would produce ordinary Hold-to-repeat
-        // output — this asserts zero output instead.
+        // immediately), so if this Binding fell through to `trigger::decide`
+        // instead of being swallowed, it would produce ordinary
+        // Hold-to-repeat output — this asserts zero output instead.
         let mut bindings = HashMap::new();
         bindings.insert(
             Input::Grid(1, 1),
@@ -4053,22 +1805,30 @@ mod tests {
         ));
 
         // A mid-travel Depth, comfortably between the deadzone and the
-        // hold-solid threshold — the rising edge spawns the task.
-        let depth: u8 = 100;
-        let rate_hz = ANALOG_REPEAT_MIN_HZ
-            + (ANALOG_REPEAT_MAX_HZ - ANALOG_REPEAT_MIN_HZ) * (f64::from(depth) / 255.0);
-        let period = Duration::from_secs_f64(1.0 / rate_hz);
-        depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), depth)]));
+        // hold-solid threshold — the rising edge spawns the task. The exact
+        // rate curve is pinned by `analog_repeat::tests::rate_period_*`; this
+        // test only checks the spawned task drives repeated pulses and then
+        // genuinely stops.
+        depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), 100u8)]));
         tokio::task::yield_now().await;
 
-        // Two full ticks: each is a KeyDown, a PULSE_HOLD sleep, a KeyUp,
-        // then the rest of the tick's own period.
-        for _ in 0..2 {
-            tokio::time::advance(ANALOG_REPEAT_PULSE_HOLD).await;
-            tokio::task::yield_now().await;
-            tokio::time::advance(period - ANALOG_REPEAT_PULSE_HOLD).await;
+        // Advance ~1s of paused time in small steps so the clock drives each
+        // pulse's KeyDown / dwell / KeyUp / period sleep in turn. Depth 100
+        // resolves to ≈ 9 Hz (pinned exactly by
+        // `analog_repeat::tests::rate_period_*`), so ~1s is ≈ 9 pulses ≈ 18
+        // batches. The bound is wide enough for scheduler jitter but still
+        // catches a roughly-doubled rate, a halved pulse-hold, or an extra
+        // Down/Up pair per tick — the assembled-loop cadence the pure tables
+        // can't see.
+        for _ in 0..40 {
+            tokio::time::advance(Duration::from_millis(25)).await;
             tokio::task::yield_now().await;
         }
+        let while_active = sink.batches().len();
+        assert!(
+            (12..=28).contains(&while_active),
+            "expected ≈ 18 Down/Up batches over the 1s window, got {while_active}"
+        );
 
         // Falling back below the deadzone stops the task — a no-op
         // force-release here, since every pulse above already self-released.
@@ -4076,11 +1836,12 @@ mod tests {
         tokio::task::yield_now().await;
         let after_stop = sink.batches().len();
 
-        // Advancing well past another tick's worth of time produces
-        // nothing further — the task is genuinely gone, not just paused
-        // between ticks.
-        tokio::time::advance(period * 3).await;
-        tokio::task::yield_now().await;
+        // Advancing well past several ticks' worth of time produces nothing
+        // further — the task is genuinely gone, not just paused between ticks.
+        for _ in 0..40 {
+            tokio::time::advance(Duration::from_millis(25)).await;
+            tokio::task::yield_now().await;
+        }
         assert_eq!(sink.batches().len(), after_stop);
 
         drop(tx);
@@ -4090,8 +1851,12 @@ mod tests {
         inj_handle.await.unwrap().unwrap();
 
         let batches = sink.batches();
-        assert_eq!(batches.len(), 4);
-        for pair in batches.chunks(2) {
+        assert!(
+            batches.len() >= 4 && batches.len().is_multiple_of(2),
+            "expected an even run of Down/Up pulses, got {}",
+            batches.len()
+        );
+        for pair in batches.chunks_exact(2) {
             let evdev::EventSummary::Key(_, down_code, down_value) = pair[0][0].destructure()
             else {
                 panic!("expected a key event");
@@ -4149,7 +1914,7 @@ mod tests {
 
         assert_eq!(sink.batches().len(), 1, "the Down must fire immediately");
 
-        tokio::time::advance(ANALOG_REPEAT_PULSE_HOLD).await;
+        tokio::time::advance(AR_PULSE_HOLD).await;
         tokio::task::yield_now().await;
         assert_eq!(
             sink.batches().len(),
@@ -4157,7 +1922,7 @@ mod tests {
             "the ordinary 15ms dwell must not release a ControllerButton pulse"
         );
 
-        tokio::time::advance(ANALOG_REPEAT_CONTROLLER_PULSE_HOLD - ANALOG_REPEAT_PULSE_HOLD).await;
+        tokio::time::advance(AR_CONTROLLER_PULSE_HOLD - AR_PULSE_HOLD).await;
         tokio::task::yield_now().await;
 
         // Fall back below the deadzone to let `update_analog_repeats` stop
@@ -4410,24 +2175,23 @@ mod tests {
                 action,
             },
         );
-        let harness = CommandHarness::spawn(config_with_bindings_and_macros(bindings, macros));
+        let mut seam = Seam::new(config_with_bindings_and_macros(bindings, macros));
 
-        harness.press(Input::Grid(1, 1)).await;
+        seam.press(Input::Grid(1, 1)).await;
         tokio::time::advance(Duration::from_millis(10)).await;
         tokio::task::yield_now().await;
 
-        let state = harness.get_state().await;
+        let state = seam.get_state().await;
         assert_eq!(state.active_toggles, vec![Input::Grid(1, 1)]);
 
         // Same physical key, still Down: stops the Toggle instead of
         // starting a second one — this press is consumed entirely by the
-        // stop, no re-fire. `shut_down` closes the event channel right
-        // after this send and awaits dispatch to drain it, which only
-        // happens once this stop (including its force-release) has fully
-        // run, so there's nothing racy left to synchronize on here.
-        harness.press(Input::Grid(1, 1)).await;
+        // stop, no re-fire. `Seam::press` awaits `handle_event` to
+        // completion, which includes the stop's own force-release, so
+        // there's nothing racy left to synchronize on here.
+        seam.press(Input::Grid(1, 1)).await;
 
-        let batches = harness.shut_down().await;
+        let batches = seam.finish().await;
 
         // One KeyDown from the loop's single lap, then a force-released
         // KeyUp for exactly that key on stop — no stuck key, no extra output.
@@ -4466,7 +2230,20 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let config_path = dir.path().join("config.toml");
             config::write(&config_path, &config).unwrap();
+            Self::spawn_at(config, dir, config_path)
+        }
 
+        /// Spawns the dispatch task pointed at an unwritable `config_path`
+        /// (`/nonexistent/...`) so every `config::persist_edit` call fails at
+        /// the write — the seam for exercising a persist-failure rollback
+        /// through the full dispatch harness (ticket 03). The in-memory
+        /// `Config` still starts correct; only the disk write is broken.
+        fn spawn_with_failing_persist(config: Config) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            Self::spawn_at(config, dir, unused_config_path())
+        }
+
+        fn spawn_at(config: Config, dir: tempfile::TempDir, config_path: PathBuf) -> Self {
             let sink = RecordingSink::new();
             let gamepad_sink = RecordingSink::new();
             let (inj, inj_handle) = injector::spawn(sink.clone(), gamepad_sink.clone());
@@ -4508,36 +2285,38 @@ mod tests {
             }
         }
 
+        /// Sends an `Edit` through the `Command::Apply` channel and awaits the
+        /// dispatch task's verdict — the round-trip every typed helper below
+        /// shares (ticket 11). Signatures and return types are unchanged; only
+        /// the message this builds internally is.
+        async fn apply(&self, edit: edit::Edit) -> Result<Option<CreatedId>, CommandError> {
+            let (reply, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::Apply { edit, reply })
+                .await
+                .unwrap();
+            rx.await.unwrap()
+        }
+
         async fn set_binding(
             &self,
             input: Input,
             layer: Layer,
             binding: Binding,
         ) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::SetBinding {
-                    input,
-                    layer,
-                    binding,
-                    reply,
-                })
-                .await
-                .unwrap();
-            rx.await.unwrap()
+            self.apply(edit::Edit::SetBinding {
+                input,
+                layer,
+                binding,
+            })
+            .await
+            .map(|_| ())
         }
 
         async fn clear_binding(&self, input: Input, layer: Layer) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::ClearBinding {
-                    input,
-                    layer,
-                    reply,
-                })
+            self.apply(edit::Edit::ClearBinding { input, layer })
                 .await
-                .unwrap();
-            rx.await.unwrap()
+                .map(|_| ())
         }
 
         async fn set_chord_binding(
@@ -4546,140 +2325,19 @@ mod tests {
             layer: Layer,
             binding: Binding,
         ) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::SetChordBinding {
-                    inputs: inputs.into_iter().collect(),
-                    layer,
-                    binding,
-                    reply,
-                })
-                .await
-                .unwrap();
-            rx.await.unwrap()
-        }
-
-        async fn clear_chord_binding(
-            &self,
-            inputs: impl IntoIterator<Item = Input>,
-            layer: Layer,
-        ) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::ClearChordBinding {
-                    inputs: inputs.into_iter().collect(),
-                    layer,
-                    reply,
-                })
-                .await
-                .unwrap();
-            rx.await.unwrap()
+            self.apply(edit::Edit::SetChordBinding {
+                inputs: inputs.into_iter().collect(),
+                layer,
+                binding,
+            })
+            .await
+            .map(|_| ())
         }
 
         async fn set_mode_key_role(&self, role: ModeKeyRole) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::SetModeKeyRole { role, reply })
+            self.apply(edit::Edit::SetModeKeyRole { role })
                 .await
-                .unwrap();
-            rx.await.unwrap()
-        }
-
-        async fn create_profile(&self, name: &str) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::CreateProfile {
-                    name: name.to_string(),
-                    reply,
-                })
-                .await
-                .unwrap();
-            rx.await.unwrap()
-        }
-
-        async fn delete_profile(&self, name: &str) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::DeleteProfile {
-                    name: name.to_string(),
-                    reply,
-                })
-                .await
-                .unwrap();
-            rx.await.unwrap()
-        }
-
-        async fn rename_profile(&self, old_name: &str, new_name: &str) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::RenameProfile {
-                    old_name: old_name.to_string(),
-                    new_name: new_name.to_string(),
-                    reply,
-                })
-                .await
-                .unwrap();
-            rx.await.unwrap()
-        }
-
-        async fn create_macro(
-            &self,
-            name: &str,
-            steps: Vec<MacroStepDto>,
-        ) -> Result<MacroId, CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::CreateMacro {
-                    name: name.to_string(),
-                    steps,
-                    reply,
-                })
-                .await
-                .unwrap();
-            rx.await.unwrap()
-        }
-
-        async fn rename_macro(
-            &self,
-            macro_id: MacroId,
-            new_name: &str,
-        ) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::RenameMacro {
-                    macro_id,
-                    new_name: new_name.to_string(),
-                    reply,
-                })
-                .await
-                .unwrap();
-            rx.await.unwrap()
-        }
-
-        async fn delete_macro(&self, macro_id: MacroId) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::DeleteMacro { macro_id, reply })
-                .await
-                .unwrap();
-            rx.await.unwrap()
-        }
-
-        async fn set_macro_steps(
-            &self,
-            macro_id: MacroId,
-            steps: Vec<MacroStepDto>,
-        ) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::SetMacroSteps {
-                    macro_id,
-                    steps,
-                    reply,
-                })
-                .await
-                .unwrap();
-            rx.await.unwrap()
+                .map(|_| ())
         }
 
         async fn create_stepper(
@@ -4687,42 +2345,22 @@ mod tests {
             name: &str,
             items: Vec<crate::config::StepperItem>,
         ) -> Result<StepperId, CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::CreateStepper {
+            match self
+                .apply(edit::Edit::CreateStepper {
                     name: name.to_string(),
                     items,
-                    reply,
                 })
-                .await
-                .unwrap();
-            rx.await.unwrap()
-        }
-
-        async fn rename_stepper(
-            &self,
-            stepper_id: StepperId,
-            new_name: &str,
-        ) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::RenameStepper {
-                    stepper_id,
-                    new_name: new_name.to_string(),
-                    reply,
-                })
-                .await
-                .unwrap();
-            rx.await.unwrap()
+                .await?
+            {
+                Some(CreatedId::Stepper(id)) => Ok(id),
+                other => unreachable!("CreateStepper must mint a Stepper id, got {other:?}"),
+            }
         }
 
         async fn delete_stepper(&self, stepper_id: StepperId) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::DeleteStepper { stepper_id, reply })
+            self.apply(edit::Edit::DeleteStepper { stepper_id })
                 .await
-                .unwrap();
-            rx.await.unwrap()
+                .map(|_| ())
         }
 
         async fn set_stepper_items(
@@ -4730,28 +2368,17 @@ mod tests {
             stepper_id: StepperId,
             items: Vec<crate::config::StepperItem>,
         ) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::SetStepperItems {
-                    stepper_id,
-                    items,
-                    reply,
-                })
+            self.apply(edit::Edit::SetStepperItems { stepper_id, items })
                 .await
-                .unwrap();
-            rx.await.unwrap()
+                .map(|_| ())
         }
 
         async fn switch_profile(&self, name: &str) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::SwitchProfile {
-                    name: name.to_string(),
-                    reply,
-                })
-                .await
-                .unwrap();
-            rx.await.unwrap()
+            self.apply(edit::Edit::SwitchProfile {
+                name: name.to_string(),
+            })
+            .await
+            .map(|_| ())
         }
 
         async fn stop_all_toggles(&self) {
@@ -4769,26 +2396,19 @@ mod tests {
             actuation: u8,
             release: u8,
         ) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::SetActuationPoint {
-                    input,
-                    actuation,
-                    release,
-                    reply,
-                })
-                .await
-                .unwrap();
-            rx.await.unwrap()
+            self.apply(edit::Edit::SetActuationPoint {
+                input,
+                actuation,
+                release,
+            })
+            .await
+            .map(|_| ())
         }
 
         async fn clear_actuation_point(&self, input: Input) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::ClearActuationPoint { input, reply })
+            self.apply(edit::Edit::ClearActuationPoint { input })
                 .await
-                .unwrap();
-            rx.await.unwrap()
+                .map(|_| ())
         }
 
         async fn set_default_actuation(
@@ -4796,34 +2416,21 @@ mod tests {
             actuation: u8,
             release: u8,
         ) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::SetDefaultActuation {
-                    actuation,
-                    release,
-                    reply,
-                })
+            self.apply(edit::Edit::SetDefaultActuation { actuation, release })
                 .await
-                .unwrap();
-            rx.await.unwrap()
+                .map(|_| ())
         }
 
         async fn reset_actuation_points(&self) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::ResetActuationPoints { reply })
+            self.apply(edit::Edit::ResetActuationPoints)
                 .await
-                .unwrap();
-            rx.await.unwrap()
+                .map(|_| ())
         }
 
         async fn set_force_digital(&self, force: bool) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::SetForceDigital { force, reply })
+            self.apply(edit::Edit::SetForceDigital { force })
                 .await
-                .unwrap();
-            rx.await.unwrap()
+                .map(|_| ())
         }
 
         async fn get_config(&self) -> Config {
@@ -4902,40 +2509,14 @@ mod tests {
             self.depth_tx.send_replace(values.into_iter().collect());
         }
 
-        async fn set_axis_assignment(
-            &self,
-            input: Input,
-            layer: Layer,
-            target: AxisTarget,
-        ) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::SetAxisAssignment {
-                    input,
-                    layer,
-                    target,
-                    reply,
-                })
-                .await
-                .unwrap();
-            rx.await.unwrap()
-        }
-
         async fn clear_axis_assignment(
             &self,
             input: Input,
             layer: Layer,
         ) -> Result<(), CommandError> {
-            let (reply, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::ClearAxisAssignment {
-                    input,
-                    layer,
-                    reply,
-                })
+            self.apply(edit::Edit::ClearAxisAssignment { input, layer })
                 .await
-                .unwrap();
-            rx.await.unwrap()
+                .map(|_| ())
         }
 
         /// The gamepad device's own recorded batches (ticket 71) — every
@@ -4982,103 +2563,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_fire_once_chord_fires_again_after_being_fully_released_and_re_pressed() {
-        // Regression test (code-review finding on this ticket's own build):
-        // `release_chord` only force-releases a FireOnce/HoldToRepeat
-        // Chord's in-flight firing, it never removes the `chord_in_flight`
-        // map entry (mirroring `fire`'s own single-Input `in_flight`, which
-        // is never cleaned up either) — an earlier version of the
-        // completion-detection filter treated bare presence in that map as
-        // "still active," which permanently excluded the Chord from ever
-        // completing again after its very first firing.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_chord_binding(
-                [Input::Grid(1, 1), Input::Grid(1, 2)],
-                Layer::Base,
-                keypress_binding(evdev::KeyCode::KEY_C),
-            )
-            .await
-            .unwrap();
-
-        for _ in 0..2 {
-            harness.press(Input::Grid(1, 1)).await;
-            harness.press(Input::Grid(1, 2)).await;
-            for _ in 0..5 {
-                tokio::task::yield_now().await;
-            }
-            harness.release(Input::Grid(1, 1)).await;
-            harness.release(Input::Grid(1, 2)).await;
-            for _ in 0..5 {
-                tokio::task::yield_now().await;
-            }
-        }
-
-        let batches = harness.shut_down().await;
-
-        // Two full firings — not just one — each a KeyDown/KeyUp pair.
-        assert_eq!(batches.len(), 4);
-        for pair in batches.chunks(2) {
-            let evdev::EventSummary::Key(_, down_code, down_value) = pair[0][0].destructure()
-            else {
-                panic!("expected a key event");
-            };
-            let evdev::EventSummary::Key(_, up_code, up_value) = pair[1][0].destructure() else {
-                panic!("expected a key event");
-            };
-            assert_eq!((down_code, down_value), (evdev::KeyCode::KEY_C, 1));
-            assert_eq!((up_code, up_value), (evdev::KeyCode::KEY_C, 0));
-        }
-    }
-
-    #[tokio::test]
-    async fn delete_macro_command_rejects_deleting_a_macro_still_referenced_only_by_a_chord() {
-        // Regression test: `macro_references` originally only scanned
-        // `base`/`held`, so a Macro referenced solely by a Chord's Action
-        // could be deleted, leaving `chords_base`/`chords_held` with a
-        // dangling `macro_id` that then failed `load_or_seed`'s own
-        // validation (which does scan Chords) on the next Daemon restart.
-        let (action, macros) = macro_action("test-macro", vec![MacroStepDto::Delay(1)]);
-        let macro_id = macros.keys().next().unwrap().clone();
-        let harness =
-            CommandHarness::spawn(config_with_bindings_and_macros(HashMap::new(), macros));
-        harness
-            .set_chord_binding(
-                [Input::Grid(1, 1), Input::Grid(1, 2)],
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::FireOnce,
-                    action,
-                },
-            )
-            .await
-            .unwrap();
-
-        let result = harness.delete_macro(macro_id).await;
-
-        assert!(matches!(result, Err(CommandError::InvalidRequest(_))));
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn set_binding_and_set_chord_binding_each_steal_a_stepper_direction_from_the_other() {
-        // Regression test: `SetChordBinding` originally never called
-        // `take_stepper_direction_elsewhere` at all, so an ordinary Binding
-        // and a Chord could both independently own the same
-        // `(stepper, direction)` — violating ticket 03's "at most one owner
-        // at a time" invariant. Covers both directions of the theft.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        let stepper_id = harness
-            .create_stepper(
-                "Weapon Wheel",
-                vec![crate::config::StepperItem::Key {
-                    key: evdev::KeyCode::KEY_1,
-                    modifiers: Modifiers::default(),
-                }],
-            )
-            .await
-            .unwrap();
-        let step_binding = Binding {
+    async fn set_binding_persist_failure_rolls_back_the_cross_profile_stepper_steal() {
+        // A `Step` Binding on the active Profile that steals a (stepper,
+        // direction) from a *different* Profile, then fails to persist: the
+        // whole edit — the steal *and* the target insert — must roll back, so
+        // the donor Profile keeps its Binding and the active Profile's target
+        // Layer stays empty. No persist-failure rollback had dispatch-harness
+        // coverage before ticket 03's `config::persist_edit`; this locks in
+        // the cross-Profile case the old hand-rolled `SetBinding` block
+        // reversed by replaying a `Vec` of moved Bindings.
+        let stepper_id = StepperId::from("wheel");
+        let step_forward = Binding {
             trigger: TriggerMode::FireOnce,
             action: Action::Step {
                 stepper: stepper_id.clone(),
@@ -5086,473 +2581,205 @@ mod tests {
             },
         };
 
-        // An ordinary Binding owns it first...
-        harness
-            .set_binding(Input::Grid(1, 1), Layer::Base, step_binding.clone())
-            .await
-            .unwrap();
-        // ...then a Chord steals it.
-        harness
-            .set_chord_binding(
-                [Input::Grid(2, 1), Input::Grid(2, 2)],
-                Layer::Base,
-                step_binding.clone(),
-            )
-            .await
-            .unwrap();
+        let mut donor = Profile::default();
+        donor.base.insert(Input::Grid(5, 5), step_forward.clone());
+        let mut profiles = HashMap::new();
+        profiles.insert(DEFAULT_PROFILE_NAME.to_string(), Profile::default());
+        profiles.insert("Alt".to_string(), donor);
+
+        let mut steppers = HashMap::new();
+        steppers.insert(
+            stepper_id.clone(),
+            StepperDef {
+                name: "Wheel".to_string(),
+                items: vec![StepperItem::Key {
+                    key: evdev::KeyCode::KEY_1,
+                    modifiers: Modifiers::default(),
+                }],
+            },
+        );
+
+        let harness = CommandHarness::spawn_with_failing_persist(Config {
+            schema_version: config::SCHEMA_VERSION,
+            active_profile: DEFAULT_PROFILE_NAME.to_string(),
+            profiles,
+            force_digital: false,
+            macros: HashMap::new(),
+            steppers,
+        });
+
+        let result = harness
+            .set_binding(Input::Grid(1, 1), Layer::Base, step_forward)
+            .await;
+        assert!(matches!(result, Err(CommandError::IoError(_))));
 
         let config = harness.get_config().await;
         assert!(
             !config.profiles[DEFAULT_PROFILE_NAME]
                 .base
-                .contains_key(&Input::Grid(1, 1))
+                .contains_key(&Input::Grid(1, 1)),
+            "the failed target insert must have rolled back"
         );
-        let chord_key = ChordKey::new(BTreeSet::from([Input::Grid(2, 1), Input::Grid(2, 2)]));
-        assert!(
-            config.profiles[DEFAULT_PROFILE_NAME]
-                .chords_base
-                .contains_key(&chord_key)
-        );
-
-        // ...then an ordinary Binding steals it back from the Chord.
-        harness
-            .set_binding(Input::Grid(3, 1), Layer::Base, step_binding)
-            .await
-            .unwrap();
-
-        let config = harness.get_config().await;
-        assert!(
-            !config.profiles[DEFAULT_PROFILE_NAME]
-                .chords_base
-                .contains_key(&chord_key)
-        );
-        assert!(
-            config.profiles[DEFAULT_PROFILE_NAME]
+        assert_eq!(
+            config.profiles["Alt"]
                 .base
-                .contains_key(&Input::Grid(3, 1))
+                .get(&Input::Grid(5, 5))
+                .map(|binding| &binding.action),
+            Some(&Action::Step {
+                stepper: stepper_id,
+                direction: StepDirection::Forward,
+            }),
+            "the donor Profile's Binding must have been restored on rollback"
         );
 
         harness.shut_down().await;
     }
 
     #[tokio::test]
-    async fn thumbstick_diagonals_fire_independently_and_share_a_member() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        harness
-            .set_chord_binding(
-                [
-                    Input::Thumbstick(Direction::Up),
-                    Input::Thumbstick(Direction::Right),
-                ],
-                Layer::Base,
-                keypress_binding(evdev::KeyCode::KEY_1),
-            )
-            .await
-            .expect("Up-Right must be settable");
-        harness
-            .set_chord_binding(
-                [
-                    Input::Thumbstick(Direction::Up),
-                    Input::Thumbstick(Direction::Left),
-                ],
-                Layer::Base,
-                keypress_binding(evdev::KeyCode::KEY_2),
-            )
-            .await
-            .expect("Up-Left must be settable despite sharing Up with Up-Right");
-
-        harness.press(Input::Thumbstick(Direction::Up)).await;
-        harness.press(Input::Thumbstick(Direction::Right)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        harness.release(Input::Thumbstick(Direction::Up)).await;
-        harness.release(Input::Thumbstick(Direction::Right)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-
-        // Up is reusable across both diagonals once released and re-pressed
-        // fresh (ticket 01's Answer).
-        harness.press(Input::Thumbstick(Direction::Up)).await;
-        harness.press(Input::Thumbstick(Direction::Left)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        harness.release(Input::Thumbstick(Direction::Up)).await;
-        harness.release(Input::Thumbstick(Direction::Left)).await;
-
-        let batches = harness.shut_down().await;
-
-        // Two Chords each fired exactly once — KEY_1 (Up-Right), then KEY_2
-        // (Up-Left) — never the thumbstick directions' own passthrough.
-        assert_eq!(batches.len(), 4);
-        let evdev::EventSummary::Key(_, code, value) = batches[0][0].destructure() else {
-            panic!("expected a key event");
+    async fn an_invariant_violating_edit_is_rejected_and_the_in_memory_config_is_rolled_back() {
+        // Ticket 04: the single "reject + roll back" integration test for the
+        // dispatch path. `config::validate` now runs inside `persist_edit`
+        // after the edit closure — a closure that mutates `Config` into a
+        // structurally invalid state (here: a Chord whose member set is a
+        // superset of an existing Chord's, *and* which steals a (stepper,
+        // direction) from another Binding on the way in) is rejected, and the
+        // whole edit — the steal included — is rolled back in memory. The
+        // per-invariant "which error" coverage lives in `config::validate`'s
+        // own synchronous test module; this is the one test that exercises
+        // the rejection through the full dispatch harness.
+        let stepper_id = StepperId::from("wheel");
+        let step_forward = Binding {
+            trigger: TriggerMode::FireOnce,
+            action: Action::Step {
+                stepper: stepper_id.clone(),
+                direction: StepDirection::Forward,
+            },
         };
-        assert_eq!((code, value), (evdev::KeyCode::KEY_1, 1));
-        let evdev::EventSummary::Key(_, code, value) = batches[1][0].destructure() else {
-            panic!("expected a key event");
-        };
-        assert_eq!((code, value), (evdev::KeyCode::KEY_1, 0));
-        let evdev::EventSummary::Key(_, code, value) = batches[2][0].destructure() else {
-            panic!("expected a key event");
-        };
-        assert_eq!((code, value), (evdev::KeyCode::KEY_2, 1));
-        let evdev::EventSummary::Key(_, code, value) = batches[3][0].destructure() else {
-            panic!("expected a key event");
-        };
-        assert_eq!((code, value), (evdev::KeyCode::KEY_2, 0));
-    }
-
-    #[tokio::test]
-    async fn hold_to_repeat_chord_refires_only_on_the_leader_members_repeat() {
-        // Hardware-verified regression (ticket 67): while a Chord is active
-        // every member stays physically down, so the kernel independently
-        // autorepeats *each* member at the same cadence. Re-firing on any
-        // member's Repeat (the original ticket-40 design) made an N-member
-        // Chord repeat up to N times as fast as a single Input ever would.
-        // Only the member sorted first by `ChordKey`'s `BTreeSet` ordering —
-        // `Input::Grid(1, 1)` here — now drives the re-fire.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_chord_binding(
-                [Input::Grid(1, 1), Input::Grid(1, 2)],
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::HoldToRepeat,
-                    action: Action::Keypress {
-                        modifiers: Modifiers::default(),
-                        key: evdev::KeyCode::KEY_C,
-                    },
-                },
-            )
-            .await
-            .unwrap();
-
-        harness.press(Input::Grid(1, 1)).await;
-        harness.press(Input::Grid(1, 2)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        // A Repeat on the non-leader member is a no-op — no re-fire.
-        harness.repeat(Input::Grid(1, 2)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        // A Repeat on the leader member does re-fire.
-        harness.repeat(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-
-        let batches = harness.shut_down().await;
-
-        // The initial completion, plus exactly one Repeat re-fire (from the
-        // leader member only) — each a KeyDown/KeyUp pair.
-        assert_eq!(batches.len(), 4);
-        for pair in batches.chunks(2) {
-            let evdev::EventSummary::Key(_, down_code, down_value) = pair[0][0].destructure()
-            else {
-                panic!("expected a key event");
-            };
-            let evdev::EventSummary::Key(_, up_code, up_value) = pair[1][0].destructure() else {
-                panic!("expected a key event");
-            };
-            assert_eq!((down_code, down_value), (evdev::KeyCode::KEY_C, 1));
-            assert_eq!((up_code, up_value), (evdev::KeyCode::KEY_C, 0));
-        }
-    }
-
-    #[tokio::test]
-    async fn toggle_chord_survives_releasing_one_member_and_stops_on_a_fresh_completion() {
-        // Hardware-verified correction (ticket 67): ticket 01's original
-        // Answer had releasing any one member end a Chord's Toggle — live on
-        // the real device that felt wrong (a Toggle should stay on past a
-        // release, like a real toggle). It now stops only when the full
-        // member set completes again, mirroring a single Input's own Toggle
-        // (a second Down stops it, never an Up).
-        let (action, macros) = macro_action(
-            "stuck",
-            vec![MacroStepDto::KeyDown(evdev::KeyCode::KEY_LEFTCTRL)],
+        let mut profile = Profile::default();
+        profile.base.insert(Input::Grid(5, 5), step_forward.clone());
+        profile.chords_base.insert(
+            ChordKey::new(BTreeSet::from([Input::Grid(1, 1), Input::Grid(1, 2)])),
+            keypress_binding(evdev::KeyCode::KEY_1),
         );
-        let harness =
-            CommandHarness::spawn(config_with_bindings_and_macros(HashMap::new(), macros));
-        harness
-            .set_chord_binding(
-                [Input::Grid(1, 1), Input::Grid(1, 2)],
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::Toggle,
-                    action,
-                },
-            )
-            .await
-            .unwrap();
+        let mut profiles = HashMap::new();
+        profiles.insert(DEFAULT_PROFILE_NAME.to_string(), profile);
+        let mut steppers = HashMap::new();
+        steppers.insert(
+            stepper_id.clone(),
+            StepperDef {
+                name: "Wheel".to_string(),
+                items: vec![StepperItem::Key {
+                    key: evdev::KeyCode::KEY_1,
+                    modifiers: Modifiers::default(),
+                }],
+            },
+        );
+        let harness = CommandHarness::spawn(Config {
+            schema_version: config::SCHEMA_VERSION,
+            active_profile: DEFAULT_PROFILE_NAME.to_string(),
+            profiles,
+            force_digital: false,
+            macros: HashMap::new(),
+            steppers,
+        });
 
+        let result = harness
+            .set_chord_binding(
+                [Input::Grid(1, 1), Input::Grid(1, 2), Input::Grid(1, 3)],
+                Layer::Base,
+                step_forward,
+            )
+            .await;
+        assert!(matches!(result, Err(CommandError::InvalidRequest(_))));
+
+        let config = harness.get_config().await;
+        harness.shut_down().await;
+        let base = &config.profiles[DEFAULT_PROFILE_NAME];
+        assert!(
+            !base
+                .chords_base
+                .contains_key(&ChordKey::new(BTreeSet::from([
+                    Input::Grid(1, 1),
+                    Input::Grid(1, 2),
+                    Input::Grid(1, 3),
+                ]))),
+            "the rejected superset Chord must not have been inserted"
+        );
+        assert!(
+            base.chords_base
+                .contains_key(&ChordKey::new(BTreeSet::from([
+                    Input::Grid(1, 1),
+                    Input::Grid(1, 2),
+                ]))),
+            "the pre-existing Chord must be untouched"
+        );
+        assert_eq!(
+            base.base.get(&Input::Grid(5, 5)).map(|b| &b.action),
+            Some(&Action::Step {
+                stepper: stepper_id,
+                direction: StepDirection::Forward,
+            }),
+            "the (stepper, direction) steal must have rolled back with the rejected insert"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chord_member_whose_individual_binding_is_a_profile_switch_switches_on_early_release()
+    {
+        // The one full `feed → FireIndividual → ProfileSwitch` input-path
+        // commit (post-release ticket 07): the pure Chord machine only ever
+        // emits `FireIndividual`, and the dispatch executor resolves it
+        // through the same `dispatch_individual_down` the ordinary Down path
+        // uses — so a Chord member whose *own* individual Binding is
+        // `Action::ProfileSwitch` still produces an `Edit::SwitchProfile` the
+        // `run` loop commits (a Chord's *own* Action can never be a switch,
+        // but a member's individual one can be anything).
+        let mut base = HashMap::new();
+        base.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::FireOnce,
+                action: Action::ProfileSwitch {
+                    target: "Gaming".to_string(),
+                },
+            },
+        );
+        let mut profile = Profile {
+            base,
+            ..Default::default()
+        };
+        profile.chords_base.insert(
+            ChordKey::new(BTreeSet::from([Input::Grid(1, 1), Input::Grid(1, 2)])),
+            keypress_binding(evdev::KeyCode::KEY_C),
+        );
+        let mut profiles = HashMap::new();
+        profiles.insert(DEFAULT_PROFILE_NAME.to_string(), profile);
+        profiles.insert("Gaming".to_string(), Profile::default());
+        let harness = CommandHarness::spawn(Config {
+            schema_version: config::SCHEMA_VERSION,
+            active_profile: DEFAULT_PROFILE_NAME.to_string(),
+            profiles,
+            force_digital: false,
+            macros: HashMap::new(),
+            steppers: HashMap::new(),
+        });
+
+        // Press one member (opens the window), then release it before the
+        // rest of the Chord joins — the pending member resolves right now.
         harness.press(Input::Grid(1, 1)).await;
-        harness.press(Input::Grid(1, 2)).await;
         for _ in 0..5 {
             tokio::task::yield_now().await;
         }
-
-        // Releasing just ONE member must NOT stop the Chord's Toggle.
         harness.release(Input::Grid(1, 1)).await;
         for _ in 0..5 {
             tokio::task::yield_now().await;
         }
 
-        // A fresh completion of the full member set — both members down
-        // again — is what stops it.
-        harness.press(Input::Grid(1, 1)).await;
-        harness.press(Input::Grid(1, 2)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-
-        let batches = harness.shut_down().await;
-
-        assert_eq!(
-            batches.len(),
-            2,
-            "one KeyDown lap surviving the mid-run release, then the stop's force-release"
-        );
-        let evdev::EventSummary::Key(_, code, value) = batches[0][0].destructure() else {
-            panic!("expected a key event");
-        };
-        assert_eq!((code, value), (evdev::KeyCode::KEY_LEFTCTRL, 1));
-        let evdev::EventSummary::Key(_, code, value) = batches[1][0].destructure() else {
-            panic!("expected a key event");
-        };
-        assert_eq!((code, value), (evdev::KeyCode::KEY_LEFTCTRL, 0));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn toggle_chord_mouse_button_holds_a_single_keydown_and_full_completion_stops_it() {
-        // Ticket 82/83's Chord blast radius: the same sustained-hold
-        // treatment applies when a Chord's own Action is a mouse-button
-        // Keypress under Toggle, mirroring a single Input's own Toggle
-        // above.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_chord_binding(
-                [Input::Grid(1, 1), Input::Grid(1, 2)],
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::Toggle,
-                    action: Action::Keypress {
-                        modifiers: Modifiers::default(),
-                        key: evdev::KeyCode::BTN_LEFT,
-                    },
-                },
-            )
-            .await
-            .unwrap();
-
-        harness.press(Input::Grid(1, 1)).await;
-        harness.press(Input::Grid(1, 2)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-
-        for _ in 0..7 {
-            tokio::time::advance(executor::MIN_TOGGLE_LAP).await;
-            tokio::task::yield_now().await;
-        }
-
-        // A fresh completion of the full member set stops it, mirroring a
-        // single Input's own Toggle.
-        harness.press(Input::Grid(1, 1)).await;
-        harness.press(Input::Grid(1, 2)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-
-        let batches = harness.shut_down().await;
-
-        assert_eq!(batches.len(), 2, "no re-fires between the two completions");
-        assert_eq!(key_and_value(batches[0][0]), (evdev::KeyCode::BTN_LEFT, 1));
-        assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::BTN_LEFT, 0));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn toggle_chord_controller_button_holds_a_single_keydown_and_full_completion_stops_it() {
-        // Ticket 78's Chord blast radius: the same sustained-hold treatment
-        // applies when a Chord's own Action is `ControllerButton` under
-        // Toggle, mirroring a single Input's own ControllerButton Toggle
-        // above and the mouse-button Chord Toggle carve-out above it.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_chord_binding(
-                [Input::Grid(1, 1), Input::Grid(1, 2)],
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::Toggle,
-                    action: Action::ControllerButton {
-                        button: evdev::KeyCode::BTN_SOUTH,
-                    },
-                },
-            )
-            .await
-            .unwrap();
-
-        harness.press(Input::Grid(1, 1)).await;
-        harness.press(Input::Grid(1, 2)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-
-        for _ in 0..7 {
-            tokio::time::advance(executor::MIN_TOGGLE_LAP).await;
-            tokio::task::yield_now().await;
-        }
-
-        // A fresh completion of the full member set stops it, mirroring a
-        // single Input's own Toggle.
-        harness.press(Input::Grid(1, 1)).await;
-        harness.press(Input::Grid(1, 2)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-
-        let batches = harness.gamepad_batches();
-        harness.shut_down().await;
-
-        assert_eq!(batches.len(), 2, "no re-fires between the two completions");
-        assert_eq!(key_and_value(batches[0][0]), (evdev::KeyCode::BTN_SOUTH, 1));
-        assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::BTN_SOUTH, 0));
-    }
-
-    #[tokio::test]
-    async fn set_chord_binding_command_persists_and_clear_chord_binding_removes_it() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        harness
-            .set_chord_binding(
-                [Input::Grid(1, 1), Input::Grid(1, 2)],
-                Layer::Base,
-                keypress_binding(evdev::KeyCode::KEY_C),
-            )
-            .await
-            .expect("SetChordBinding must succeed");
-
-        let key = ChordKey::new(BTreeSet::from([Input::Grid(1, 1), Input::Grid(1, 2)]));
-        let config = harness.get_config().await;
-        assert!(
-            config.profiles[DEFAULT_PROFILE_NAME]
-                .chords(Layer::Base)
-                .contains_key(&key)
-        );
-        let on_disk = std::fs::read_to_string(&harness.config_path).unwrap();
-        assert!(on_disk.contains("grid_r1c1+grid_r1c2"));
-
-        harness
-            .clear_chord_binding([Input::Grid(1, 1), Input::Grid(1, 2)], Layer::Base)
-            .await
-            .expect("ClearChordBinding must succeed");
-
-        let config = harness.get_config().await;
-        assert!(
-            !config.profiles[DEFAULT_PROFILE_NAME]
-                .chords(Layer::Base)
-                .contains_key(&key)
-        );
-
-        let err = harness
-            .clear_chord_binding([Input::Grid(1, 1), Input::Grid(1, 2)], Layer::Base)
-            .await
-            .expect_err("clearing an already-cleared Chord must fail");
-        assert!(matches!(err, CommandError::NotFound));
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn set_chord_binding_rejects_analog_repeat() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .set_chord_binding(
-                [Input::Grid(1, 1), Input::Grid(1, 2)],
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::AnalogRepeat,
-                    action: Action::Keypress {
-                        modifiers: Modifiers::default(),
-                        key: evdev::KeyCode::KEY_A,
-                    },
-                },
-            )
-            .await
-            .expect_err("an Analog-repeat Chord Binding must be rejected");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        let key = ChordKey::new(BTreeSet::from([Input::Grid(1, 1), Input::Grid(1, 2)]));
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-        assert!(
-            !config.profiles[DEFAULT_PROFILE_NAME]
-                .chords(Layer::Base)
-                .contains_key(&key),
-            "the rejected Chord Binding must not have been applied"
-        );
-    }
-
-    #[tokio::test]
-    async fn set_binding_rejects_analog_repeat_on_a_non_grid_input() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .set_binding(
-                Input::ModeKey,
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::AnalogRepeat,
-                    action: Action::Keypress {
-                        modifiers: Modifiers::default(),
-                        key: evdev::KeyCode::KEY_A,
-                    },
-                },
-            )
-            .await
-            .expect_err("an Analog-repeat Binding on a non-Grid Input must be rejected");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-        assert!(
-            !config.profiles[DEFAULT_PROFILE_NAME]
-                .base
-                .contains_key(&Input::ModeKey),
-            "the rejected Binding must not have been applied"
-        );
-    }
-
-    #[tokio::test]
-    async fn set_binding_accepts_analog_repeat_on_a_grid_input() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::AnalogRepeat,
-                    action: Action::Keypress {
-                        modifiers: Modifiers::default(),
-                        key: evdev::KeyCode::KEY_A,
-                    },
-                },
-            )
-            .await
-            .expect("Analog-repeat on a Grid Input must be accepted");
-
-        let config = harness.get_config().await;
+        let state = harness.get_state().await;
         harness.shut_down().await;
         assert_eq!(
-            config.profiles[DEFAULT_PROFILE_NAME].base[&Input::Grid(1, 1)].trigger,
-            TriggerMode::AnalogRepeat
+            state.profile, "Gaming",
+            "the member's individual ProfileSwitch Binding fired retroactively and committed"
         );
     }
 
@@ -5592,46 +2819,6 @@ mod tests {
                 key: evdev::KeyCode::KEY_F1,
             }
         );
-    }
-
-    #[tokio::test]
-    async fn clear_binding_command_removes_live_and_persists_to_disk() {
-        let mut bindings = HashMap::new();
-        bindings.insert(Input::Grid(1, 1), keypress_binding(evdev::KeyCode::KEY_F1));
-        let harness = CommandHarness::spawn(config_with_bindings(bindings));
-
-        harness
-            .clear_binding(Input::Grid(1, 1), Layer::Base)
-            .await
-            .expect("ClearBinding must succeed");
-
-        // Live: the Input is passthrough again (grid_r1c1 -> KEY_1).
-        harness.press(Input::Grid(1, 1)).await;
-
-        let on_disk = std::fs::read_to_string(&harness.config_path).unwrap();
-        let batches = harness.shut_down().await;
-
-        assert_eq!(batches.len(), 1, "passthrough is a single batch");
-        let evdev::EventSummary::Key(_, code, _) = batches[0][0].destructure() else {
-            panic!("expected a key event");
-        };
-        assert_eq!(code, evdev::KeyCode::KEY_1);
-
-        let reparsed: Config = toml::from_str(&on_disk).unwrap();
-        assert!(reparsed.profiles[DEFAULT_PROFILE_NAME].base.is_empty());
-    }
-
-    #[tokio::test]
-    async fn clear_binding_command_on_an_unbound_input_returns_not_found() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .clear_binding(Input::Grid(1, 1), Layer::Base)
-            .await
-            .expect_err("clearing an unbound Input must fail");
-        assert!(matches!(err, CommandError::NotFound));
-
-        harness.shut_down().await;
     }
 
     #[tokio::test]
@@ -5755,36 +2942,25 @@ mod tests {
     async fn held_layer_binding_fires_only_while_the_mode_key_is_down() {
         let mut held = HashMap::new();
         held.insert(Input::Grid(1, 1), keypress_binding(evdev::KeyCode::KEY_F1));
-        let harness = CommandHarness::spawn(config_with_profile(profile_with_held_bindings(held)));
+        let mut seam = Seam::new(config_with_profile(profile_with_held_bindings(held)));
 
         // Base layer: Grid(1,1) is unbound there, so pressing it while the
         // Mode key is up must passthrough (KEY_1), never the Held binding.
-        harness.press(Input::Grid(1, 1)).await;
+        seam.press(Input::Grid(1, 1)).await;
 
-        harness
-            .event_tx
-            .send(PhysicalEvent {
-                input: Input::ModeKey,
-                state: EventState::Down,
-                depth: None,
-            })
-            .await
-            .unwrap();
-        // `PhysicalEvent`s and `Command`s arrive on separate channels the
-        // dispatch task `select!`s over with no ordering guarantee between
-        // them, so a `GetState` sent right after this event isn't
-        // guaranteed to observe it applied yet — yield a few times first,
-        // same pattern the Toggle tests above use.
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(harness.get_state().await.layer, "held");
+        seam.feed(PhysicalEvent {
+            input: Input::ModeKey,
+            state: EventState::Down,
+            depth: None,
+        })
+        .await;
+        assert_eq!(seam.get_state().await.layer, "held");
 
         // Held layer active: the same physical key now fires the Held
         // Binding instead.
-        harness.press(Input::Grid(1, 1)).await;
+        seam.press(Input::Grid(1, 1)).await;
 
-        let batches = harness.shut_down().await;
+        let batches = seam.finish().await;
 
         assert_eq!(
             batches.len(),
@@ -5805,38 +2981,28 @@ mod tests {
     async fn releasing_the_mode_key_reverts_to_the_base_layer() {
         let mut held = HashMap::new();
         held.insert(Input::Grid(1, 1), keypress_binding(evdev::KeyCode::KEY_F1));
-        let harness = CommandHarness::spawn(config_with_profile(profile_with_held_bindings(held)));
+        let mut seam = Seam::new(config_with_profile(profile_with_held_bindings(held)));
 
-        harness
-            .event_tx
-            .send(PhysicalEvent {
-                input: Input::ModeKey,
-                state: EventState::Down,
-                depth: None,
-            })
-            .await
-            .unwrap();
-        harness
-            .event_tx
-            .send(PhysicalEvent {
-                input: Input::ModeKey,
-                state: EventState::Up,
-                depth: None,
-            })
-            .await
-            .unwrap();
-        // Same ordering caveat as the test above.
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        seam.feed(PhysicalEvent {
+            input: Input::ModeKey,
+            state: EventState::Down,
+            depth: None,
+        })
+        .await;
+        seam.feed(PhysicalEvent {
+            input: Input::ModeKey,
+            state: EventState::Up,
+            depth: None,
+        })
+        .await;
 
-        let state = harness.get_state().await;
+        let state = seam.get_state().await;
         assert_eq!(state.layer, "base");
 
         // Base resumed: Grid(1,1) is unbound there, so this passes through.
-        harness.press(Input::Grid(1, 1)).await;
+        seam.press(Input::Grid(1, 1)).await;
 
-        let batches = harness.shut_down().await;
+        let batches = seam.finish().await;
         assert_eq!(batches.len(), 1);
         let evdev::EventSummary::Key(_, code, _) = batches[0][0].destructure() else {
             panic!("expected a key event");
@@ -5850,28 +3016,22 @@ mod tests {
         // it must produce no injected output at all — it's consumed
         // entirely by the Layer transition, never passed through as
         // KEY_LEFTALT the way an ordinary unbound Input would be.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
+        let mut seam = Seam::with_bindings(HashMap::new());
 
-        harness
-            .event_tx
-            .send(PhysicalEvent {
-                input: Input::ModeKey,
-                state: EventState::Down,
-                depth: None,
-            })
-            .await
-            .unwrap();
-        harness
-            .event_tx
-            .send(PhysicalEvent {
-                input: Input::ModeKey,
-                state: EventState::Up,
-                depth: None,
-            })
-            .await
-            .unwrap();
+        seam.feed(PhysicalEvent {
+            input: Input::ModeKey,
+            state: EventState::Down,
+            depth: None,
+        })
+        .await;
+        seam.feed(PhysicalEvent {
+            input: Input::ModeKey,
+            state: EventState::Up,
+            depth: None,
+        })
+        .await;
 
-        let batches = harness.shut_down().await;
+        let batches = seam.finish().await;
         assert!(batches.is_empty());
     }
 
@@ -5943,183 +3103,6 @@ mod tests {
             assert_eq!((down_code, down_value), (evdev::KeyCode::KEY_F1, 1));
             assert_eq!((up_code, up_value), (evdev::KeyCode::KEY_F1, 0));
         }
-    }
-
-    #[tokio::test]
-    async fn held_layer_bindings_survive_a_bound_layer_switch_bound_round_trip() {
-        let mut held = HashMap::new();
-        held.insert(Input::Grid(1, 1), keypress_binding(evdev::KeyCode::KEY_F1));
-        let profile = Profile {
-            held,
-            mode_key_role: ModeKeyRole::Bound,
-            ..Default::default()
-        };
-        let harness = CommandHarness::spawn(config_with_profile(profile));
-
-        harness
-            .set_mode_key_role(ModeKeyRole::LayerSwitch)
-            .await
-            .expect("SetModeKeyRole must succeed");
-        harness
-            .set_mode_key_role(ModeKeyRole::Bound)
-            .await
-            .expect("SetModeKeyRole must succeed");
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-
-        let profile = &config.profiles[DEFAULT_PROFILE_NAME];
-        assert_eq!(profile.mode_key_role, ModeKeyRole::Bound);
-        assert_eq!(
-            profile.held[&Input::Grid(1, 1)].action,
-            Action::Keypress {
-                modifiers: Modifiers::default(),
-                key: evdev::KeyCode::KEY_F1,
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn set_binding_command_targets_the_held_layer_independently_of_base() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Held,
-                keypress_binding(evdev::KeyCode::KEY_F1),
-            )
-            .await
-            .expect("SetBinding must succeed");
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-
-        let profile = &config.profiles[DEFAULT_PROFILE_NAME];
-        assert!(
-            !profile.base.contains_key(&Input::Grid(1, 1)),
-            "Base layer must be untouched"
-        );
-        assert!(profile.held.contains_key(&Input::Grid(1, 1)));
-    }
-
-    #[tokio::test]
-    async fn set_binding_rejects_a_profile_switch_binding_that_is_not_fire_once() {
-        for trigger in [TriggerMode::HoldToRepeat, TriggerMode::Toggle] {
-            let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-            let err = harness
-                .set_binding(
-                    Input::Grid(1, 1),
-                    Layer::Base,
-                    Binding {
-                        trigger,
-                        action: Action::ProfileSwitch {
-                            target: "Gaming".to_string(),
-                        },
-                    },
-                )
-                .await
-                .expect_err("a non-Fire-once Profile Switch Binding must be rejected");
-            assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-            let config = harness.get_config().await;
-            harness.shut_down().await;
-            assert!(
-                !config.profiles[DEFAULT_PROFILE_NAME]
-                    .base
-                    .contains_key(&Input::Grid(1, 1)),
-                "the rejected Binding must not have been applied"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn set_binding_rejects_a_controller_button_outside_the_gamepad_allowlist() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::FireOnce,
-                    action: Action::ControllerButton {
-                        button: evdev::KeyCode::KEY_A,
-                    },
-                },
-            )
-            .await
-            .expect_err("a non-gamepad ControllerButton Binding must be rejected");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-        assert!(
-            !config.profiles[DEFAULT_PROFILE_NAME]
-                .base
-                .contains_key(&Input::Grid(1, 1)),
-            "the rejected Binding must not have been applied"
-        );
-    }
-
-    #[tokio::test]
-    async fn set_binding_accepts_a_controller_button_in_the_gamepad_allowlist() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::HoldToRepeat,
-                    action: Action::ControllerButton {
-                        button: evdev::KeyCode::BTN_SOUTH,
-                    },
-                },
-            )
-            .await
-            .expect("a gamepad ControllerButton Binding must be accepted");
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-        assert_eq!(
-            config.profiles[DEFAULT_PROFILE_NAME].base[&Input::Grid(1, 1)].action,
-            Action::ControllerButton {
-                button: evdev::KeyCode::BTN_SOUTH,
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn set_binding_rejects_a_fire_once_controller_button_binding() {
-        // Ticket 78: Fire-once is locked out for `Action::ControllerButton`
-        // at the live-write path too, mirroring `config::parse`'s own check.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::FireOnce,
-                    action: Action::ControllerButton {
-                        button: evdev::KeyCode::BTN_SOUTH,
-                    },
-                },
-            )
-            .await
-            .expect_err("a Fire-once ControllerButton Binding must be rejected");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-        assert!(
-            !config.profiles[DEFAULT_PROFILE_NAME]
-                .base
-                .contains_key(&Input::Grid(1, 1)),
-            "the rejected Binding must not have been applied"
-        );
     }
 
     #[tokio::test]
@@ -6196,838 +3179,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_profile_command_adds_an_empty_profile_and_persists() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        harness
-            .create_profile("Gaming")
-            .await
-            .expect("CreateProfile must succeed");
-
-        let on_disk = std::fs::read_to_string(&harness.config_path).unwrap();
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-
-        let profile = &config.profiles["Gaming"];
-        assert!(profile.base.is_empty());
-        assert!(profile.held.is_empty());
-        assert_eq!(profile.mode_key_role, ModeKeyRole::LayerSwitch);
-        let reparsed: Config = toml::from_str(&on_disk).unwrap();
-        assert!(reparsed.profiles.contains_key("Gaming"));
-    }
-
-    #[tokio::test]
-    async fn create_profile_command_rejects_a_duplicate_name() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .create_profile(DEFAULT_PROFILE_NAME)
-            .await
-            .expect_err("creating a Profile with an existing name must fail");
-        assert!(matches!(err, CommandError::AlreadyExists));
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn create_profile_command_rejects_an_empty_or_whitespace_name() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        for name in ["", "   "] {
-            let err = harness
-                .create_profile(name)
-                .await
-                .expect_err("creating a Profile with an empty name must fail");
-            assert!(matches!(err, CommandError::InvalidRequest(_)));
-        }
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-        assert_eq!(config.profiles.len(), 1, "no empty-named Profile created");
-    }
-
-    #[tokio::test]
-    async fn delete_profile_command_removes_a_non_active_profile_and_persists() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness.create_profile("Gaming").await.unwrap();
-
-        harness
-            .delete_profile("Gaming")
-            .await
-            .expect("DeleteProfile must succeed");
-
-        let on_disk = std::fs::read_to_string(&harness.config_path).unwrap();
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-
-        assert!(!config.profiles.contains_key("Gaming"));
-        let reparsed: Config = toml::from_str(&on_disk).unwrap();
-        assert!(!reparsed.profiles.contains_key("Gaming"));
-    }
-
-    #[tokio::test]
-    async fn delete_profile_command_rejects_deleting_the_active_profile() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .delete_profile(DEFAULT_PROFILE_NAME)
-            .await
-            .expect_err("deleting the active Profile must fail");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-        assert!(config.profiles.contains_key(DEFAULT_PROFILE_NAME));
-    }
-
-    #[tokio::test]
-    async fn delete_profile_command_on_an_unknown_name_returns_not_found() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .delete_profile("Nonexistent")
-            .await
-            .expect_err("deleting an unknown Profile must fail");
-        assert!(matches!(err, CommandError::NotFound));
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn delete_profile_command_rejects_deleting_a_profile_still_referenced_by_a_profile_switch_binding()
-     {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness.create_profile("Gaming").await.unwrap();
-        harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::FireOnce,
-                    action: Action::ProfileSwitch {
-                        target: "Gaming".to_string(),
-                    },
-                },
-            )
-            .await
-            .expect("SetBinding must succeed");
-
-        let err = harness
-            .delete_profile("Gaming")
-            .await
-            .expect_err("deleting a still-referenced Profile must fail");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-        assert!(
-            config.profiles.contains_key("Gaming"),
-            "the refused delete must not have removed the Profile"
-        );
-    }
-
-    #[tokio::test]
-    async fn rename_profile_command_renames_the_active_profile_and_updates_active_profile() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        harness
-            .rename_profile(DEFAULT_PROFILE_NAME, "Renamed")
-            .await
-            .expect("RenameProfile must succeed");
-
-        let on_disk = std::fs::read_to_string(&harness.config_path).unwrap();
-        let config = harness.get_config().await;
-        let state = harness.get_state().await;
-        harness.shut_down().await;
-
-        assert!(!config.profiles.contains_key(DEFAULT_PROFILE_NAME));
-        assert!(config.profiles.contains_key("Renamed"));
-        assert_eq!(config.active_profile, "Renamed");
-        assert_eq!(state.profile, "Renamed");
-        let reparsed: Config = toml::from_str(&on_disk).unwrap();
-        assert_eq!(reparsed.active_profile, "Renamed");
-    }
-
-    #[tokio::test]
-    async fn rename_profile_command_leaves_active_profile_untouched_when_renaming_a_different_one()
-    {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness.create_profile("Gaming").await.unwrap();
-
-        harness
-            .rename_profile("Gaming", "Editing")
-            .await
-            .expect("RenameProfile must succeed");
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-
-        assert_eq!(config.active_profile, DEFAULT_PROFILE_NAME);
-        assert!(config.profiles.contains_key("Editing"));
-    }
-
-    #[tokio::test]
-    async fn rename_profile_command_cascades_every_cross_profile_profile_switch_reference() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness.create_profile("Gaming").await.unwrap();
-        // A Binding on the (non-renamed) active Profile targeting "Gaming",
-        // plus a self-referencing Binding stored on "Gaming" itself — the
-        // cascade must reach both, not just the renamed Profile's own
-        // Bindings.
-        harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::FireOnce,
-                    action: Action::ProfileSwitch {
-                        target: "Gaming".to_string(),
-                    },
-                },
-            )
-            .await
-            .expect("SetBinding must succeed");
-        harness
-            .switch_profile("Gaming")
-            .await
-            .expect("SwitchProfile must succeed");
-        harness
-            .set_binding(
-                Input::Grid(1, 2),
-                Layer::Held,
-                Binding {
-                    trigger: TriggerMode::FireOnce,
-                    action: Action::ProfileSwitch {
-                        target: "Gaming".to_string(),
-                    },
-                },
-            )
-            .await
-            .expect("SetBinding must succeed");
-        harness
-            .switch_profile(DEFAULT_PROFILE_NAME)
-            .await
-            .expect("SwitchProfile must succeed");
-
-        harness
-            .rename_profile("Gaming", "Renamed")
-            .await
-            .expect("RenameProfile must succeed");
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-
-        assert_eq!(
-            config.profiles[DEFAULT_PROFILE_NAME].base[&Input::Grid(1, 1)].action,
-            Action::ProfileSwitch {
-                target: "Renamed".to_string(),
-            }
-        );
-        assert_eq!(
-            config.profiles["Renamed"].held[&Input::Grid(1, 2)].action,
-            Action::ProfileSwitch {
-                target: "Renamed".to_string(),
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn rename_profile_command_rejects_a_duplicate_new_name() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness.create_profile("Gaming").await.unwrap();
-
-        let err = harness
-            .rename_profile("Gaming", DEFAULT_PROFILE_NAME)
-            .await
-            .expect_err("renaming onto an existing name must fail");
-        assert!(matches!(err, CommandError::AlreadyExists));
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn rename_profile_command_rejects_an_empty_or_whitespace_new_name() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        for new_name in ["", "   "] {
-            let err = harness
-                .rename_profile(DEFAULT_PROFILE_NAME, new_name)
-                .await
-                .expect_err("renaming to an empty name must fail");
-            assert!(matches!(err, CommandError::InvalidRequest(_)));
-        }
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-        assert!(config.profiles.contains_key(DEFAULT_PROFILE_NAME));
-    }
-
-    #[tokio::test]
-    async fn rename_profile_command_on_an_unknown_old_name_returns_not_found() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .rename_profile("Nonexistent", "Whatever")
-            .await
-            .expect_err("renaming an unknown Profile must fail");
-        assert!(matches!(err, CommandError::NotFound));
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn create_macro_command_derives_a_slug_and_persists_it() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let macro_id = harness
-            .create_macro(
-                "Screenshot Combo",
-                vec![MacroStepDto::KeyDown(evdev::KeyCode::KEY_A)],
-            )
-            .await
-            .expect("CreateMacro must succeed");
-        assert_eq!(macro_id, MacroId::from("screenshot-combo"));
-
-        let on_disk = std::fs::read_to_string(&harness.config_path).unwrap();
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-
-        let def = &config.macros[&macro_id];
-        assert_eq!(def.name, "Screenshot Combo");
-        assert_eq!(
-            def.steps,
-            vec![MacroStepDto::KeyDown(evdev::KeyCode::KEY_A)]
-        );
-        assert!(on_disk.contains("screenshot-combo"));
-    }
-
-    #[tokio::test]
-    async fn create_macro_command_appends_a_numeric_suffix_on_slug_collision() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let first = harness
-            .create_macro("Screenshot Combo", vec![])
-            .await
-            .unwrap();
-        let second = harness
-            .create_macro("Screenshot Combo", vec![])
-            .await
-            .unwrap();
-
-        harness.shut_down().await;
-
-        assert_eq!(first, MacroId::from("screenshot-combo"));
-        assert_eq!(second, MacroId::from("screenshot-combo-2"));
-    }
-
-    #[tokio::test]
-    async fn create_macro_command_rejects_an_empty_or_whitespace_name() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        for name in ["", "   "] {
-            let err = harness
-                .create_macro(name, vec![])
-                .await
-                .expect_err("an empty/whitespace Macro name must fail");
-            assert!(matches!(err, CommandError::InvalidRequest(_)));
-        }
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn rename_macro_command_changes_the_name_not_the_macro_id() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        let macro_id = harness.create_macro("Old Name", vec![]).await.unwrap();
-
-        harness
-            .rename_macro(macro_id.clone(), "New Name")
-            .await
-            .expect("RenameMacro must succeed");
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-
-        assert_eq!(config.macros[&macro_id].name, "New Name");
-    }
-
-    #[tokio::test]
-    async fn rename_macro_command_on_an_unknown_macro_id_returns_not_found() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .rename_macro(MacroId::from("nonexistent"), "New Name")
-            .await
-            .expect_err("renaming an unknown Macro must fail");
-        assert!(matches!(err, CommandError::NotFound));
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn delete_macro_command_rejects_deleting_a_macro_still_referenced_by_a_binding() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        let macro_id = harness
-            .create_macro(
-                "Test macro",
-                vec![MacroStepDto::KeyDown(evdev::KeyCode::KEY_A)],
-            )
-            .await
-            .unwrap();
-        harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::FireOnce,
-                    action: Action::Macro {
-                        macro_id: macro_id.clone(),
-                    },
-                },
-            )
-            .await
-            .expect("SetBinding referencing a real macro_id must succeed");
-
-        let err = harness
-            .delete_macro(macro_id.clone())
-            .await
-            .expect_err("deleting a still-referenced Macro must fail");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        harness
-            .clear_binding(Input::Grid(1, 1), Layer::Base)
-            .await
-            .unwrap();
-        harness
-            .delete_macro(macro_id)
-            .await
-            .expect("deleting an unreferenced Macro must now succeed");
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn delete_macro_command_on_an_unknown_macro_id_returns_not_found() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .delete_macro(MacroId::from("nonexistent"))
-            .await
-            .expect_err("deleting an unknown Macro must fail");
-        assert!(matches!(err, CommandError::NotFound));
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn set_macro_steps_command_overwrites_steps_and_persists_but_leaves_name_alone() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        let macro_id = harness
-            .create_macro(
-                "Screenshot Combo",
-                vec![MacroStepDto::KeyDown(evdev::KeyCode::KEY_A)],
-            )
-            .await
-            .unwrap();
-
-        harness
-            .set_macro_steps(
-                macro_id.clone(),
-                vec![
-                    MacroStepDto::KeyDown(evdev::KeyCode::KEY_B),
-                    MacroStepDto::Delay(25),
-                    MacroStepDto::KeyUp(evdev::KeyCode::KEY_B),
-                ],
-            )
-            .await
-            .expect("SetMacroSteps must succeed");
-
-        let on_disk = std::fs::read_to_string(&harness.config_path).unwrap();
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-
-        let def = &config.macros[&macro_id];
-        assert_eq!(def.name, "Screenshot Combo");
-        assert_eq!(
-            def.steps,
-            vec![
-                MacroStepDto::KeyDown(evdev::KeyCode::KEY_B),
-                MacroStepDto::Delay(25),
-                MacroStepDto::KeyUp(evdev::KeyCode::KEY_B),
-            ]
-        );
-        assert!(on_disk.contains("screenshot-combo"));
-    }
-
-    #[tokio::test]
-    async fn set_macro_steps_command_on_an_unknown_macro_id_returns_not_found() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .set_macro_steps(MacroId::from("nonexistent"), vec![])
-            .await
-            .expect_err("setting steps on an unknown Macro must fail");
-        assert!(matches!(err, CommandError::NotFound));
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn create_stepper_command_derives_a_slug_and_persists_it() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let stepper_id = harness
-            .create_stepper(
-                "Weapon Wheel",
-                vec![crate::config::StepperItem::Key {
-                    key: evdev::KeyCode::KEY_1,
-                    modifiers: Modifiers::default(),
-                }],
-            )
-            .await
-            .expect("CreateStepper must succeed");
-        assert_eq!(stepper_id, StepperId::from("weapon-wheel"));
-
-        let on_disk = std::fs::read_to_string(&harness.config_path).unwrap();
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-
-        let def = &config.steppers[&stepper_id];
-        assert_eq!(def.name, "Weapon Wheel");
-        assert_eq!(
-            def.items,
-            vec![crate::config::StepperItem::Key {
-                key: evdev::KeyCode::KEY_1,
-                modifiers: Modifiers::default(),
-            }]
-        );
-        assert!(on_disk.contains("weapon-wheel"));
-    }
-
-    #[tokio::test]
-    async fn create_stepper_command_appends_a_numeric_suffix_on_slug_collision() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let first = harness
-            .create_stepper("Weapon Wheel", vec![])
-            .await
-            .unwrap();
-        let second = harness
-            .create_stepper("Weapon Wheel", vec![])
-            .await
-            .unwrap();
-
-        harness.shut_down().await;
-
-        assert_eq!(first, StepperId::from("weapon-wheel"));
-        assert_eq!(second, StepperId::from("weapon-wheel-2"));
-    }
-
-    #[tokio::test]
-    async fn create_stepper_command_rejects_an_empty_or_whitespace_name() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        for name in ["", "   "] {
-            let err = harness
-                .create_stepper(name, vec![])
-                .await
-                .expect_err("an empty/whitespace Stepper name must fail");
-            assert!(matches!(err, CommandError::InvalidRequest(_)));
-        }
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn rename_stepper_command_changes_the_name_not_the_stepper_id() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        let stepper_id = harness.create_stepper("Old Name", vec![]).await.unwrap();
-
-        harness
-            .rename_stepper(stepper_id.clone(), "New Name")
-            .await
-            .expect("RenameStepper must succeed");
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-
-        assert_eq!(config.steppers[&stepper_id].name, "New Name");
-    }
-
-    #[tokio::test]
-    async fn rename_stepper_command_on_an_unknown_stepper_id_returns_not_found() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .rename_stepper(StepperId::from("nonexistent"), "New Name")
-            .await
-            .expect_err("renaming an unknown Stepper must fail");
-        assert!(matches!(err, CommandError::NotFound));
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn delete_stepper_command_rejects_deleting_a_stepper_still_referenced_by_a_binding() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        let stepper_id = harness
-            .create_stepper(
-                "Weapon Wheel",
-                vec![crate::config::StepperItem::Key {
-                    key: evdev::KeyCode::KEY_1,
-                    modifiers: Modifiers::default(),
-                }],
-            )
-            .await
-            .unwrap();
-        harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::FireOnce,
-                    action: Action::Step {
-                        stepper: stepper_id.clone(),
-                        direction: StepDirection::Forward,
-                    },
-                },
-            )
-            .await
-            .expect("SetBinding referencing a real stepper_id must succeed");
-
-        let err = harness
-            .delete_stepper(stepper_id.clone())
-            .await
-            .expect_err("deleting a still-referenced Stepper must fail");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        harness
-            .clear_binding(Input::Grid(1, 1), Layer::Base)
-            .await
-            .unwrap();
-        harness
-            .delete_stepper(stepper_id)
-            .await
-            .expect("deleting an unreferenced Stepper must now succeed");
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn delete_stepper_command_on_an_unknown_stepper_id_returns_not_found() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .delete_stepper(StepperId::from("nonexistent"))
-            .await
-            .expect_err("deleting an unknown Stepper must fail");
-        assert!(matches!(err, CommandError::NotFound));
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn set_stepper_items_command_overwrites_items_and_persists_but_leaves_name_alone() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        let stepper_id = harness
-            .create_stepper(
-                "Weapon Wheel",
-                vec![crate::config::StepperItem::Key {
-                    key: evdev::KeyCode::KEY_1,
-                    modifiers: Modifiers::default(),
-                }],
-            )
-            .await
-            .unwrap();
-
-        harness
-            .set_stepper_items(
-                stepper_id.clone(),
-                vec![
-                    crate::config::StepperItem::Key {
-                        key: evdev::KeyCode::KEY_2,
-                        modifiers: Modifiers::default(),
-                    },
-                    crate::config::StepperItem::Key {
-                        key: evdev::KeyCode::KEY_3,
-                        modifiers: Modifiers::default(),
-                    },
-                ],
-            )
-            .await
-            .expect("SetStepperItems must succeed");
-
-        let on_disk = std::fs::read_to_string(&harness.config_path).unwrap();
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-
-        let def = &config.steppers[&stepper_id];
-        assert_eq!(def.name, "Weapon Wheel");
-        assert_eq!(
-            def.items,
-            vec![
-                crate::config::StepperItem::Key {
-                    key: evdev::KeyCode::KEY_2,
-                    modifiers: Modifiers::default(),
-                },
-                crate::config::StepperItem::Key {
-                    key: evdev::KeyCode::KEY_3,
-                    modifiers: Modifiers::default(),
-                },
-            ]
-        );
-        assert!(on_disk.contains("weapon-wheel"));
-    }
-
-    #[tokio::test]
-    async fn set_stepper_items_command_on_an_unknown_stepper_id_returns_not_found() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .set_stepper_items(StepperId::from("nonexistent"), vec![])
-            .await
-            .expect_err("setting items on an unknown Stepper must fail");
-        assert!(matches!(err, CommandError::NotFound));
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn set_binding_rejects_a_step_action_naming_an_unknown_stepper_id() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::FireOnce,
-                    action: Action::Step {
-                        stepper: StepperId::from("nonexistent"),
-                        direction: StepDirection::Forward,
-                    },
-                },
-            )
-            .await
-            .expect_err("SetBinding with an unknown stepper_id must fail");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn set_binding_rejects_a_toggle_step_binding() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        let stepper_id = harness
-            .create_stepper(
-                "Weapon Wheel",
-                vec![crate::config::StepperItem::Key {
-                    key: evdev::KeyCode::KEY_1,
-                    modifiers: Modifiers::default(),
-                }],
-            )
-            .await
-            .unwrap();
-
-        let err = harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::Toggle,
-                    action: Action::Step {
-                        stepper: stepper_id,
-                        direction: StepDirection::Forward,
-                    },
-                },
-            )
-            .await
-            .expect_err("a Toggle Step Binding must be rejected");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        harness.shut_down().await;
-    }
-
-    /// Ticket 03's Answer: assigning a Stepper list to a new Input pair
-    /// silently moves it off its old one — no reject-at-save step. Only the
-    /// same direction is moved; the other direction, bound elsewhere, is
-    /// left untouched.
-    #[tokio::test]
-    async fn set_binding_silently_moves_a_stepper_direction_off_its_old_input() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        let stepper_id = harness
-            .create_stepper(
-                "Weapon Wheel",
-                vec![crate::config::StepperItem::Key {
-                    key: evdev::KeyCode::KEY_1,
-                    modifiers: Modifiers::default(),
-                }],
-            )
-            .await
-            .unwrap();
-        let step_binding = |direction| Binding {
-            trigger: TriggerMode::FireOnce,
-            action: Action::Step {
-                stepper: stepper_id.clone(),
-                direction,
-            },
-        };
-
-        harness
-            .set_binding(
-                Input::Wheel(crate::input::WheelEvent::ScrollUp),
-                Layer::Base,
-                step_binding(StepDirection::Forward),
-            )
-            .await
-            .unwrap();
-        harness
-            .set_binding(
-                Input::Wheel(crate::input::WheelEvent::ScrollDown),
-                Layer::Base,
-                step_binding(StepDirection::Backward),
-            )
-            .await
-            .unwrap();
-
-        // Reassign Forward to a new pair of Inputs.
-        harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                step_binding(StepDirection::Forward),
-            )
-            .await
-            .expect("reassigning Forward to a new Input must succeed");
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-
-        let default_profile = &config.profiles[config::DEFAULT_PROFILE_NAME];
-        assert!(
-            !default_profile
-                .base
-                .contains_key(&Input::Wheel(crate::input::WheelEvent::ScrollUp)),
-            "the old Forward Binding must be silently removed"
-        );
-        assert_eq!(
-            default_profile.base[&Input::Grid(1, 1)].action,
-            Action::Step {
-                stepper: stepper_id.clone(),
-                direction: StepDirection::Forward,
-            }
-        );
-        // Backward, untouched by the Forward-only reassignment.
-        assert_eq!(
-            default_profile.base[&Input::Wheel(crate::input::WheelEvent::ScrollDown)].action,
-            Action::Step {
-                stepper: stepper_id,
-                direction: StepDirection::Backward,
-            }
-        );
-    }
-
-    #[tokio::test]
     async fn fire_once_step_binding_advances_the_cursor_forward_and_fires_the_new_item() {
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
         let stepper_id = harness
@@ -7083,116 +3234,10 @@ mod tests {
         assert_eq!((code, value), (evdev::KeyCode::KEY_2, 0));
     }
 
-    /// Ticket 63: `resolve_step` no longer hardcodes a bare KeyDown/KeyUp
-    /// pair — a modifier-bearing item compiles through the same canned
-    /// mods-down/key/mods-up sequence as `Action::Keypress`, mirroring
-    /// `executor::tests::compile_keypress_is_a_canned_modifier_key_sequence`'s
-    /// shape.
-    #[test]
-    fn resolve_step_with_modifiers_compiles_the_canned_mods_down_key_up_sequence() {
-        let stepper_id = StepperId::from("hotkey-pages");
-        let mut steppers = HashMap::new();
-        steppers.insert(
-            stepper_id.clone(),
-            StepperDef {
-                name: "Hotkey Pages".to_string(),
-                items: vec![crate::config::StepperItem::Key {
-                    key: evdev::KeyCode::KEY_3,
-                    modifiers: Modifiers {
-                        ctrl: true,
-                        shift: true,
-                        alt: false,
-                        super_key: false,
-                    },
-                }],
-            },
-        );
-        let mut cursors = HashMap::new();
-
-        let steps = resolve_step(&steppers, &mut cursors, &stepper_id, StepDirection::Forward);
-
-        assert_eq!(
-            steps,
-            vec![
-                executor::MacroStep::KeyDown(evdev::KeyCode::KEY_LEFTCTRL),
-                executor::MacroStep::KeyDown(evdev::KeyCode::KEY_LEFTSHIFT),
-                executor::MacroStep::KeyDown(evdev::KeyCode::KEY_3),
-                executor::MacroStep::KeyUp(evdev::KeyCode::KEY_3),
-                executor::MacroStep::KeyUp(evdev::KeyCode::KEY_LEFTSHIFT),
-                executor::MacroStep::KeyUp(evdev::KeyCode::KEY_LEFTCTRL),
-            ]
-        );
-    }
-
-    /// Ticket 92: a `StepperItem::ControllerButton` compiles to the same
-    /// down/dwell/up triple as `Action::ControllerButton`'s digital path.
-    #[test]
-    fn resolve_step_compiles_a_controller_button_item_to_the_dwell_triple() {
-        let stepper_id = StepperId::from("weapon-wheel");
-        let mut steppers = HashMap::new();
-        steppers.insert(
-            stepper_id.clone(),
-            StepperDef {
-                name: "Weapon Wheel".to_string(),
-                items: vec![crate::config::StepperItem::ControllerButton {
-                    button: evdev::KeyCode::BTN_SOUTH,
-                }],
-            },
-        );
-        let mut cursors = HashMap::new();
-
-        let steps = resolve_step(&steppers, &mut cursors, &stepper_id, StepDirection::Forward);
-
-        assert_eq!(
-            steps,
-            vec![
-                executor::MacroStep::KeyDown(evdev::KeyCode::BTN_SOUTH),
-                executor::MacroStep::Delay(executor::CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD),
-                executor::MacroStep::KeyUp(evdev::KeyCode::BTN_SOUTH),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn set_stepper_items_rejects_a_controller_button_item_naming_a_non_gamepad_code() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        let stepper_id = harness
-            .create_stepper("Weapon Wheel", vec![])
-            .await
-            .expect("CreateStepper must succeed");
-
-        let err = harness
-            .set_stepper_items(
-                stepper_id.clone(),
-                vec![crate::config::StepperItem::ControllerButton {
-                    button: evdev::KeyCode::KEY_A,
-                }],
-            )
-            .await
-            .expect_err("a non-gamepad controller button item must be rejected");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        // The rejected write never lands.
-        let config = harness.get_config().await;
-        assert!(config.steppers[&stepper_id].items.is_empty());
-    }
-
-    #[tokio::test]
-    async fn create_stepper_rejects_a_controller_button_item_naming_a_non_gamepad_code() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .create_stepper(
-                "Weapon Wheel",
-                vec![crate::config::StepperItem::ControllerButton {
-                    button: evdev::KeyCode::KEY_A,
-                }],
-            )
-            .await
-            .expect_err("a non-gamepad controller button item must be rejected");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-        assert!(harness.get_config().await.steppers.is_empty());
-    }
+    // `StepperItem` → `Vec<MacroStep>` compilation (tickets 63 / 92) is
+    // covered by `executor::tests::compile_stepper_item_*` since post-release
+    // ticket 12 moved that match to `executor::compile_stepper_item`; the
+    // cursor movement it feeds is covered by `stepper::tests`.
 
     #[tokio::test]
     async fn step_binding_wraps_around_at_either_end() {
@@ -7313,11 +3358,13 @@ mod tests {
     }
 
     /// Regression test for a `/code-review` finding: `DeleteStepper` used to
-    /// leave the deleted Stepper's runtime cursor sitting in
-    /// `stepper_cursors` — since `unique_stepper_id` can reassign a freed
-    /// slug to a brand-new, unrelated `CreateStepper` call, a stale nonzero
-    /// cursor would leak into that new entry's very first `GetState()`,
-    /// violating "always resets to the list's first item."
+    /// leave the deleted Stepper's runtime cursor sitting in the cursor map —
+    /// since `unique_stepper_id` can reassign a freed slug to a brand-new,
+    /// unrelated `CreateStepper` call, a stale nonzero cursor would leak into
+    /// that new entry's very first `GetState()`, violating "always resets to
+    /// the list's first item." Now `edit::plan` emits
+    /// `Effect::ReconcileStepperCursor` and `stepper::Cursors::reconcile`
+    /// drops it.
     #[tokio::test]
     async fn delete_stepper_command_clears_its_runtime_cursor() {
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
@@ -7378,8 +3425,9 @@ mod tests {
 
     /// Regression test for a `/code-review` finding: `SetStepperItems`
     /// shrinking a list used to leave a stored cursor pointing past the new
-    /// end, so `GetState()` reported an out-of-range index until the
-    /// Stepper was next fired (only `resolve_step` clamped).
+    /// end, so `GetState()` reported an out-of-range index until the Stepper
+    /// was next fired (only a subsequent `step` clamped). Now
+    /// `stepper::Cursors::reconcile` clamps it at commit time.
     #[tokio::test]
     async fn set_stepper_items_clamps_a_cursor_left_stranded_by_a_shrink() {
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
@@ -7540,60 +3588,6 @@ mod tests {
 
         let batches = harness.shut_down().await;
         assert_eq!(batches.len(), 2, "one press batch + one release batch");
-    }
-
-    #[tokio::test]
-    async fn set_binding_rejects_a_macro_action_naming_an_unknown_macro_id() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                Binding {
-                    trigger: TriggerMode::FireOnce,
-                    action: Action::Macro {
-                        macro_id: MacroId::from("nonexistent"),
-                    },
-                },
-            )
-            .await
-            .expect_err("SetBinding with an unknown macro_id must fail");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn switch_profile_command_switches_active_profile_and_persists() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness.create_profile("Gaming").await.unwrap();
-
-        harness
-            .switch_profile("Gaming")
-            .await
-            .expect("SwitchProfile must succeed");
-
-        let on_disk = std::fs::read_to_string(&harness.config_path).unwrap();
-        let state = harness.get_state().await;
-        harness.shut_down().await;
-
-        assert_eq!(state.profile, "Gaming");
-        let reparsed: Config = toml::from_str(&on_disk).unwrap();
-        assert_eq!(reparsed.active_profile, "Gaming");
-    }
-
-    #[tokio::test]
-    async fn switch_profile_command_on_an_unknown_name_returns_not_found() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .switch_profile("Nonexistent")
-            .await
-            .expect_err("switching to an unknown Profile must fail");
-        assert!(matches!(err, CommandError::NotFound));
-
-        harness.shut_down().await;
     }
 
     #[tokio::test]
@@ -7875,181 +3869,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_actuation_point_command_applies_live_and_persists_to_disk() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        harness
-            .set_actuation_point(Input::Grid(1, 1), 200, 180)
-            .await
-            .expect("SetActuationPoint must succeed");
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-
-        let profile = &config.profiles[DEFAULT_PROFILE_NAME];
-        assert_eq!(
-            profile.actuation_overrides[&Input::Grid(1, 1)],
-            ActuationPoint {
-                actuation: 200,
-                release: 180,
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn set_actuation_point_rejects_a_non_grid_input() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .set_actuation_point(Input::ModeKey, 200, 180)
-            .await
-            .expect_err("a non-Grid Input must be rejected");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn set_actuation_point_rejects_a_release_point_above_actuation() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .set_actuation_point(Input::Grid(1, 1), 100, 150)
-            .await
-            .expect_err("release > actuation must be rejected");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn set_actuation_point_rejects_a_release_point_equal_to_actuation() {
-        // Code-review finding on ticket 22: `release == actuation` used to
-        // pass this check, but `capture::analog::observe` would then
-        // chatter Down/Up forever on a key held at a perfectly steady
-        // Depth — hysteresis requires a strict gap, not just `<=`.
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .set_actuation_point(Input::Grid(1, 1), 128, 128)
-            .await
-            .expect_err("release == actuation must be rejected");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn clear_actuation_point_command_reverts_to_the_profile_default() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        harness
-            .set_actuation_point(Input::Grid(1, 1), 200, 180)
-            .await
-            .expect("SetActuationPoint must succeed");
-        harness
-            .clear_actuation_point(Input::Grid(1, 1))
-            .await
-            .expect("ClearActuationPoint must succeed");
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-
-        assert!(
-            !config.profiles[DEFAULT_PROFILE_NAME]
-                .actuation_overrides
-                .contains_key(&Input::Grid(1, 1))
-        );
-    }
-
-    #[tokio::test]
-    async fn clear_actuation_point_on_an_unoverridden_key_is_a_no_op_success() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        harness
-            .clear_actuation_point(Input::Grid(1, 1))
-            .await
-            .expect("clearing an unoverridden key must still succeed");
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn clear_actuation_point_rejects_a_non_grid_input() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .clear_actuation_point(Input::ModeKey)
-            .await
-            .expect_err("a non-Grid Input must be rejected");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn set_default_actuation_command_applies_live_and_persists_to_disk() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        harness
-            .set_default_actuation(140, 120)
-            .await
-            .expect("SetDefaultActuation must succeed");
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-
-        assert_eq!(
-            config.profiles[DEFAULT_PROFILE_NAME].default_actuation,
-            ActuationPoint {
-                actuation: 140,
-                release: 120,
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn set_default_actuation_rejects_a_release_point_above_actuation() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .set_default_actuation(100, 150)
-            .await
-            .expect_err("release > actuation must be rejected");
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn reset_actuation_points_clears_every_override_in_one_call() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        harness
-            .set_actuation_point(Input::Grid(1, 1), 200, 180)
-            .await
-            .expect("SetActuationPoint must succeed");
-        harness
-            .set_actuation_point(Input::Grid(2, 2), 90, 70)
-            .await
-            .expect("SetActuationPoint must succeed");
-
-        harness
-            .reset_actuation_points()
-            .await
-            .expect("ResetActuationPoints must succeed");
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-
-        assert!(
-            config.profiles[DEFAULT_PROFILE_NAME]
-                .actuation_overrides
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
     async fn set_actuation_point_publishes_the_resolved_snapshot() {
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
 
@@ -8223,174 +4042,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_axis_assignment_command_persists_and_is_reflected_in_get_config() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        harness
-            .set_axis_assignment(Input::Grid(1, 1), Layer::Base, AxisTarget::LeftTrigger)
-            .await
-            .expect("SetAxisAssignment must succeed");
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-
-        assert_eq!(
-            config.profiles[DEFAULT_PROFILE_NAME].axis_base[&Input::Grid(1, 1)],
-            AxisTarget::LeftTrigger
-        );
-    }
-
-    #[tokio::test]
-    async fn set_axis_assignment_rejects_a_non_grid_input() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .set_axis_assignment(Input::ModeKey, Layer::Base, AxisTarget::LeftTrigger)
-            .await
-            .expect_err("a non-Grid Input must be rejected");
-        harness.shut_down().await;
-
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-    }
-
-    #[tokio::test]
-    async fn set_axis_assignment_atomically_clears_an_existing_binding_on_the_same_input_and_layer()
-    {
-        let mut bindings = HashMap::new();
-        bindings.insert(Input::Grid(1, 1), keypress_binding(evdev::KeyCode::KEY_F1));
-        let harness = CommandHarness::spawn(config_with_bindings(bindings));
-
-        harness
-            .set_axis_assignment(Input::Grid(1, 1), Layer::Base, AxisTarget::LeftTrigger)
-            .await
-            .expect("SetAxisAssignment must succeed");
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-
-        assert!(
-            !config.profiles[DEFAULT_PROFILE_NAME]
-                .base
-                .contains_key(&Input::Grid(1, 1))
-        );
-        assert_eq!(
-            config.profiles[DEFAULT_PROFILE_NAME].axis_base[&Input::Grid(1, 1)],
-            AxisTarget::LeftTrigger
-        );
-    }
-
-    #[tokio::test]
-    async fn set_axis_assignment_atomically_clears_chord_membership_on_the_same_input_and_layer() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_chord_binding(
-                [Input::Grid(1, 1), Input::Grid(1, 2)],
-                Layer::Base,
-                keypress_binding(evdev::KeyCode::KEY_C),
-            )
-            .await
-            .expect("SetChordBinding must succeed");
-
-        harness
-            .set_axis_assignment(Input::Grid(1, 1), Layer::Base, AxisTarget::LeftTrigger)
-            .await
-            .expect("SetAxisAssignment must succeed");
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-
-        assert!(
-            config.profiles[DEFAULT_PROFILE_NAME].chords_base.is_empty(),
-            "the whole Chord must be removed, not just input's own membership"
-        );
-    }
-
-    #[tokio::test]
-    async fn set_binding_rejects_an_input_already_axis_assigned_on_the_same_layer() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_axis_assignment(Input::Grid(1, 1), Layer::Base, AxisTarget::LeftTrigger)
-            .await
-            .expect("SetAxisAssignment must succeed");
-
-        let err = harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                keypress_binding(evdev::KeyCode::KEY_F1),
-            )
-            .await
-            .expect_err("SetBinding on an Axis-assigned Input must be rejected");
-        harness.shut_down().await;
-
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-    }
-
-    #[tokio::test]
-    async fn set_binding_on_a_different_layer_than_an_axis_assignment_is_allowed() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_axis_assignment(Input::Grid(1, 1), Layer::Base, AxisTarget::LeftTrigger)
-            .await
-            .expect("SetAxisAssignment must succeed");
-
-        harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Held,
-                keypress_binding(evdev::KeyCode::KEY_F1),
-            )
-            .await
-            .expect("a Binding on the other Layer must be allowed");
-        harness.shut_down().await;
-    }
-
-    #[tokio::test]
-    async fn set_chord_binding_rejects_a_member_already_axis_assigned_on_the_same_layer() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_axis_assignment(Input::Grid(1, 1), Layer::Base, AxisTarget::LeftTrigger)
-            .await
-            .expect("SetAxisAssignment must succeed");
-
-        let err = harness
-            .set_chord_binding(
-                [Input::Grid(1, 1), Input::Grid(1, 2)],
-                Layer::Base,
-                keypress_binding(evdev::KeyCode::KEY_C),
-            )
-            .await
-            .expect_err("a Chord with an Axis-assigned member must be rejected");
-        harness.shut_down().await;
-
-        assert!(matches!(err, CommandError::InvalidRequest(_)));
-    }
-
-    #[tokio::test]
-    async fn clear_axis_assignment_removes_it_and_persists() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-        harness
-            .set_axis_assignment(Input::Grid(1, 1), Layer::Base, AxisTarget::LeftTrigger)
-            .await
-            .expect("SetAxisAssignment must succeed");
-
-        harness
-            .clear_axis_assignment(Input::Grid(1, 1), Layer::Base)
-            .await
-            .expect("ClearAxisAssignment must succeed");
-
-        let config = harness.get_config().await;
-        harness.shut_down().await;
-
-        assert!(config.profiles[DEFAULT_PROFILE_NAME].axis_base.is_empty());
-    }
-
-    #[tokio::test]
     async fn clear_axis_assignment_zeroes_a_still_live_output_that_dropped_out_of_the_map() {
-        // Code-review finding: `recompute_and_emit_axes` used to only ever
-        // walk the codes `axis_map` currently names — a code that drops out
-        // entirely (its last remaining Input cleared) was never revisited,
-        // so its last-written nonzero value stuck forever.
+        // Code-review finding (guarded here across the run_effects → engine →
+        // uinput boundary): axis resolution used to only ever walk the codes
+        // `axis_map` currently names — a code that drops out entirely (its
+        // last remaining Input cleared) was never revisited, so its
+        // last-written nonzero value stuck forever. `axis::Engine::recompute`
+        // carries the stale-code sweep; `axis::tests` covers the decision.
         let mut config = config_with_bindings(HashMap::new());
         config
             .active_profile_mut()
@@ -8417,53 +4075,6 @@ mod tests {
                 (evdev::AbsoluteAxisCode::ABS_Z, 0),
             ]
         );
-    }
-
-    #[tokio::test]
-    async fn retargeting_an_axis_assignment_zeroes_the_old_abs_code() {
-        let mut config = config_with_bindings(HashMap::new());
-        config
-            .active_profile_mut()
-            .unwrap()
-            .axis_base
-            .insert(Input::Grid(1, 1), AxisTarget::LeftTrigger);
-        let harness = CommandHarness::spawn(config);
-
-        harness.push_depth([(Input::Grid(1, 1), 200)]);
-        tokio::task::yield_now().await;
-
-        harness
-            .set_axis_assignment(Input::Grid(1, 1), Layer::Base, AxisTarget::RightTrigger)
-            .await
-            .expect("SetAxisAssignment must succeed");
-
-        let writes = flat_axis_writes(harness.gamepad_batches());
-        harness.shut_down().await;
-
-        // The old code (ABS_Z) is zeroed by the stale-code sweep; the
-        // now-retargeted Input's carried-over Depth immediately drives the
-        // new code (ABS_RZ) in the same recompute pass.
-        assert_eq!(
-            writes,
-            vec![
-                (evdev::AbsoluteAxisCode::ABS_Z, 200),
-                (evdev::AbsoluteAxisCode::ABS_Z, 0),
-                (evdev::AbsoluteAxisCode::ABS_RZ, 200),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn clear_axis_assignment_on_an_unassigned_input_returns_not_found() {
-        let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
-
-        let err = harness
-            .clear_axis_assignment(Input::Grid(1, 1), Layer::Base)
-            .await
-            .expect_err("clearing an unassigned Input must fail");
-        harness.shut_down().await;
-
-        assert!(matches!(err, CommandError::NotFound));
     }
 
     #[tokio::test]
@@ -8487,7 +4098,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn digital_mode_step_fallback_ramps_up_on_repeat_and_resets_on_release() {
+    async fn a_digital_sourced_axis_event_routes_through_the_engine_to_uinput() {
+        // Thin routing guard for `handle_event`'s Digital-mode branch
+        // (`event.depth.is_none()` -> `axis::Engine::step_digital` -> the
+        // emit loop). The ramp / saturate / reset *decision* is owned by
+        // `axis::tests::step_digital_*`; this only checks the seam still
+        // crosses the module boundary and reaches the gamepad device.
         let mut config = config_with_bindings(HashMap::new());
         config
             .active_profile_mut()
@@ -8507,11 +4123,8 @@ mod tests {
         assert_eq!(
             writes,
             vec![
-                (evdev::AbsoluteAxisCode::ABS_Z, i32::from(AXIS_DIGITAL_STEP)),
-                (
-                    evdev::AbsoluteAxisCode::ABS_Z,
-                    i32::from(AXIS_DIGITAL_STEP) * 2
-                ),
+                (evdev::AbsoluteAxisCode::ABS_Z, 64),
+                (evdev::AbsoluteAxisCode::ABS_Z, 128),
                 (evdev::AbsoluteAxisCode::ABS_Z, 0),
             ]
         );
@@ -8534,64 +4147,6 @@ mod tests {
         harness.shut_down().await;
 
         assert_eq!(writes, vec![(evdev::AbsoluteAxisCode::ABS_Z, 200)]);
-    }
-
-    #[tokio::test]
-    async fn two_keys_sharing_one_same_signed_target_take_the_greater_depth() {
-        let mut config = config_with_bindings(HashMap::new());
-        {
-            let profile = config.active_profile_mut().unwrap();
-            profile
-                .axis_base
-                .insert(Input::Grid(1, 1), AxisTarget::LeftTrigger);
-            profile
-                .axis_base
-                .insert(Input::Grid(1, 2), AxisTarget::LeftTrigger);
-        }
-        let harness = CommandHarness::spawn(config);
-
-        harness.push_depth([(Input::Grid(1, 1), 150), (Input::Grid(1, 2), 200)]);
-        tokio::task::yield_now().await;
-
-        let writes = flat_axis_writes(harness.gamepad_batches());
-        harness.shut_down().await;
-
-        assert_eq!(writes, vec![(evdev::AbsoluteAxisCode::ABS_Z, 200)]);
-    }
-
-    #[tokio::test]
-    async fn opposite_signed_halves_let_the_already_active_key_keep_driving() {
-        let mut config = config_with_bindings(HashMap::new());
-        {
-            let profile = config.active_profile_mut().unwrap();
-            profile
-                .axis_base
-                .insert(Input::Grid(1, 1), AxisTarget::LeftStickXPos);
-            profile
-                .axis_base
-                .insert(Input::Grid(1, 2), AxisTarget::LeftStickXNeg);
-        }
-        let harness = CommandHarness::spawn(config);
-
-        // Positive half activates alone first.
-        harness.push_depth([(Input::Grid(1, 1), 200)]);
-        tokio::task::yield_now().await;
-        // Negative half now also activates — the already-active positive
-        // half must keep winning (ticket 59 §5).
-        harness.push_depth([(Input::Grid(1, 1), 200), (Input::Grid(1, 2), 220)]);
-        tokio::task::yield_now().await;
-
-        let writes = flat_axis_writes(harness.gamepad_batches());
-        harness.shut_down().await;
-
-        assert_eq!(
-            writes,
-            vec![
-                (evdev::AbsoluteAxisCode::ABS_X, 200),
-                (evdev::AbsoluteAxisCode::ABS_X, 200),
-            ],
-            "the positive half must keep suppressing the newcomer negative half"
-        );
     }
 
     #[tokio::test]

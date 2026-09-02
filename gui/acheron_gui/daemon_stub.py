@@ -11,6 +11,15 @@ Seeded like a fresh install (issue 11): one `Default` Profile, empty Base
 and Held Layers (all passthrough), `mode_key_role` defaulting to
 `"layer_switch"` — matching the real Daemon's ticket 18 `GetConfig()` shape.
 
+This stub re-implements the *stateful* half of the Daemon's edit validation
+(reference-count refusals, the stepper-steal, `ProfileSwitch` rename cascade,
+the actuation numeric check, the axis↔binding mutual-exclusion clear) by hand.
+That is deliberate and is **not** a candidate for sharing, code-generation, or
+a `(Config, Edit)` contract fixture — see ADR 0005
+(`docs/adr/0005-gui-test-stub-mirrors-daemon-validation-by-hand.md`). Keep it
+faithful to `daemon/src/edit.rs` and `daemon/src/config.rs::validate`; the pure
+half lives in `rules.py` and is contract-tested.
+
 `simulate_mode_key_press`/`_release` stand in for a real physical Mode-key
 event reaching the Daemon and it pushing `ActiveLayerChanged` back out: there
 is no capture layer in GUI tests, so this is the seam a test uses to drive
@@ -34,13 +43,22 @@ no real session bus in GUI tests either.
 from __future__ import annotations
 
 import copy
-import re
 from typing import Callable
 
-from .axis_picker import AXIS_LABEL_BY_TARGET
-from .controller_picker import LABEL_BY_CODE as _GAMEPAD_CODES
+from . import rules
 from .daemon_client import AlreadyExistsError, InvalidBindingError, NotFoundError
 from .inputs import is_grid_input
+from .read_model import reference_count
+
+# Display names for a rejected Trigger mode, so the stub's error text stays
+# human ("Toggle is not a valid Trigger mode …") — the legality *decision*
+# comes from `rules.valid_triggers`, this map is only wording.
+_TRIGGER_LABELS = {
+    "fire_once": "Fire-once",
+    "hold_to_repeat": "Hold-to-repeat",
+    "toggle": "Toggle",
+    "analog_repeat": "Analog-repeat",
+}
 
 
 class DaemonStub:
@@ -85,7 +103,7 @@ class DaemonStub:
         self._capture_mode = "digital"
         # Ticket 99: the real Daemon reports its compile-time `crate::VERSION`
         # here; the stub stands in with a bare release string.
-        self._daemon_version = "1.0.1"
+        self._daemon_version = "1.0.2"
         # Ticket 101: the real Daemon reads these off the connected Tartarus
         # Pro over the Interface-2 control channel once per connect. The stub
         # stands in with plausible fixed values (the documented values for
@@ -148,51 +166,49 @@ class DaemonStub:
             state["serial_number"] = self._serial_number
         return state
 
-    def _validate_binding_action(self, binding: dict) -> None:
-        # Ticket 51/03/54/40: mirrors the real Daemon's shared
-        # `dispatch::validate_binding` — a Macro/Step Action naming an
-        # unknown library entry, or a Step paired with Toggle, is rejected
-        # outright. Shared by `set_binding` and `set_chord_binding` (a Chord
-        # Binding is "just a Binding keyed by a Set<Input>", ticket 01's
-        # Answer, held to the exact same rules).
-        if binding.get("type") == "macro" and binding.get("macro_id") not in self._macros:
+    def _validate_binding_action(self, binding: dict, input_str: str | None) -> None:
+        # Shared by `set_binding` and `set_chord_binding` (a Chord Binding is
+        # "just a Binding keyed by a Set<Input>", ticket 01's Answer, held to
+        # the same rules). `input_str is None` == a Chord's own Binding.
+        #
+        # The dangling-library-reference checks are stateful (they consult
+        # this stub's own `_macros`/`_steppers`) so they stay here; the pure
+        # vocab-and-matrix checks (gamepad allowlist, the TriggerMode matrix)
+        # go through the single `rules` mirror of `config::validate`.
+        kind = binding.get("type")
+        if kind == "macro" and binding.get("macro_id") not in self._macros:
             raise InvalidBindingError(
                 f"{binding.get('macro_id')!r} does not name a Macro in the library"
             )
-        if binding.get("type") == "step":
-            stepper_id = binding.get("stepper_id")
-            if stepper_id not in self._steppers:
-                raise InvalidBindingError(f"{stepper_id!r} does not name a Stepper in the library")
-            if binding.get("trigger") == "toggle":
-                raise InvalidBindingError("Toggle is not allowed for a Stepper Binding")
-        if binding.get("type") == "controller_button":
-            if binding.get("button") not in _GAMEPAD_CODES:
-                # Ticket 43: `dispatch::validate_binding` rejects a
-                # ControllerButton binding whose button isn't in the
-                # 57-entry gamepad allowlist — same guard the stepper-item
-                # path now mirrors (ticket 92).
-                raise InvalidBindingError(
-                    f"{binding.get('button')!r} is not a valid gamepad button"
-                )
-            if binding.get("trigger") == "fire_once":
-                # Ticket 78: Fire-once is locked out for Controller Button —
-                # Hold-to-repeat's sustained-hold behavior already covers a
-                # quick tap, so there's nothing left for Fire-once's
-                # decoupled pulse to uniquely serve.
-                raise InvalidBindingError(
-                    "Fire-once is not allowed for a Controller Button Binding"
-                )
+        if kind == "step" and binding.get("stepper_id") not in self._steppers:
+            raise InvalidBindingError(
+                f"{binding.get('stepper_id')!r} does not name a Stepper in the library"
+            )
+        if kind == "profile_switch" and binding.get("target") not in self._profiles:
+            raise InvalidBindingError(
+                f"{binding.get('target')!r} does not name a Profile"
+            )
+        if kind == "controller_button" and binding.get("button") not in rules.GAMEPAD_BUTTONS:
+            raise InvalidBindingError(f"{binding.get('button')!r} is not a valid gamepad button")
+
+        trigger = binding.get("trigger")
+        if kind in rules.ALL_ACTION_KINDS and trigger not in rules.valid_triggers(kind, input_str):
+            label = _TRIGGER_LABELS.get(trigger, trigger)
+            raise InvalidBindingError(
+                f"{label} is not a valid Trigger mode for a {kind!r} Binding here"
+            )
 
     def _validate_stepper_items(self, items: list[dict]) -> None:
         # Ticket 92: mirrors the real Daemon's `validate_stepper_items` —
         # a `controller_button` list item whose `button` is not in the
-        # 57-entry gamepad allowlist is rejected outright, the same guard
-        # `Action::ControllerButton` already has.
+        # gamepad allowlist (`rules.GAMEPAD_BUTTONS`) is rejected outright,
+        # the same guard `Action::ControllerButton` already has.
         for item in items:
-            if item.get("type") == "controller_button" and item.get("button") not in _GAMEPAD_CODES:
-                raise InvalidBindingError(
-                    f"{item.get('button')!r} is not a valid gamepad button"
-                )
+            if (
+                item.get("type") == "controller_button"
+                and item.get("button") not in rules.GAMEPAD_BUTTONS
+            ):
+                raise InvalidBindingError(f"{item.get('button')!r} is not a valid gamepad button")
 
     def _reject_if_axis_assigned(self, input_str: str, layer: str) -> None:
         # Ticket 59 §2's mutual exclusion: `SetBinding`/`SetChordBinding`
@@ -204,27 +220,55 @@ class DaemonStub:
                 f"{input_str!r} already has an Axis assignment on this Layer — clear it first"
             )
 
+    def _steal_stepper_direction(
+        self,
+        stepper_id: str,
+        direction: str,
+        *,
+        keep_input: tuple[str, str, str] | None = None,
+        keep_chord: tuple[str, str, str] | None = None,
+    ) -> None:
+        # Ticket 03's Answer, widened to Chords by ticket 40: a
+        # `(stepper, direction)` pair is unique across *both* the per-Input
+        # and the Chord keyspace, in every Profile/Layer — assigning it
+        # anywhere silently moves it off wherever it was. Mirrors
+        # `edit.rs::take_stepper_direction_elsewhere` *and*
+        # `..._from_chords`, both of which `SetBinding` and
+        # `SetChordBinding` run together. `keep_input` / `keep_chord` is the
+        # `(profile, layer, key)` slot currently being written, left alone.
+        def matches(other_binding: dict) -> bool:
+            return (
+                other_binding.get("type") == "step"
+                and other_binding.get("stepper_id") == stepper_id
+                and other_binding.get("direction") == direction
+            )
+
+        for name, profile in self._profiles.items():
+            for layer in ("base", "held"):
+                bindings = profile[layer]
+                for other in [
+                    key
+                    for key, b in bindings.items()
+                    if matches(b) and (name, layer, key) != keep_input
+                ]:
+                    del bindings[other]
+                chords = profile[f"chords_{layer}"]
+                for other in [
+                    key
+                    for key, b in chords.items()
+                    if matches(b) and (name, layer, key) != keep_chord
+                ]:
+                    del chords[other]
+
     def set_binding(self, input_str: str, layer: str, binding: dict) -> None:
         self._reject_if_axis_assigned(input_str, layer)
-        self._validate_binding_action(binding)
-        if binding.get("trigger") == "analog_repeat" and not is_grid_input(input_str):
-            raise InvalidBindingError("Analog-repeat is only valid on Grid Inputs")
+        self._validate_binding_action(binding, input_str)
         if binding.get("type") == "step":
-            # Ticket 03's Answer: assigning a Stepper list to a new Input
-            # silently moves it off its old one — no reject-at-save step,
-            # mirroring the real Daemon's `take_stepper_direction_elsewhere`.
-            stepper_id = binding.get("stepper_id")
-            direction = binding.get("direction")
-            for profile in self._profiles.values():
-                for layer_bindings in (profile["base"], profile["held"]):
-                    for other_input in [
-                        other
-                        for other, other_binding in layer_bindings.items()
-                        if other_binding.get("type") == "step"
-                        and other_binding.get("stepper_id") == stepper_id
-                        and other_binding.get("direction") == direction
-                    ]:
-                        del layer_bindings[other_input]
+            self._steal_stepper_direction(
+                binding.get("stepper_id"),
+                binding.get("direction"),
+                keep_input=(self._active_profile, layer, input_str),
+            )
         # Deep-copied for the same reason: SetBinding's real wire encoding
         # (wire.py) copies every field into a GLib.Variant, decoupled from
         # the caller's dict, so mutating `binding` afterward must not reach
@@ -234,62 +278,33 @@ class DaemonStub:
         self.calls.append(("set_binding", input_str, layer, copy.deepcopy(stored)))
 
     @staticmethod
-    def _input_sort_key(inp: str) -> tuple:
-        # Mirrors `daemon/src/input.rs::Input`'s *derived* `Ord` exactly —
-        # ModeKey < Grid(row, col) < Thumbstick(Direction) < Wheel(WheelEvent),
-        # each variant's own fields compared in declaration order (Grid by
-        # (row, col); Direction/WheelEvent by their own declared variant
-        # order). A plain alphabetical sort disagrees for any Chord mixing
-        # Input variant kinds — e.g. {mode_key, grid_r1c1}: the real Daemon's
-        # `ChordKey` Display is "mode_key+grid_r1c1" (ModeKey sorts first),
-        # not "grid_r1c1+mode_key" (code-review finding).
-        if inp == "mode_key":
-            return (0,)
-        grid_match = re.fullmatch(r"grid_r(\d+)c(\d+)", inp)
-        if grid_match:
-            return (1, int(grid_match.group(1)), int(grid_match.group(2)))
-        direction_order = {
-            "thumbstick_up": 0,
-            "thumbstick_down": 1,
-            "thumbstick_left": 2,
-            "thumbstick_right": 3,
-        }
-        if inp in direction_order:
-            return (2, direction_order[inp])
-        wheel_order = {"wheel_scroll_up": 0, "wheel_scroll_down": 1, "wheel_middle": 2}
-        return (3, wheel_order[inp])
-
-    @classmethod
-    def _chord_key(cls, inputs: list[str]) -> str:
-        # Mirrors `daemon/src/config.rs::ChordKey`'s Display: a "+"-joined
-        # string of member Input strings, ordered by `Input`'s own `Ord`
-        # (see `_input_sort_key`), not alphabetically.
-        return "+".join(sorted(inputs, key=cls._input_sort_key))
-
-    @staticmethod
     def _chord_conflict(chords: dict, key: str, members: set[str]) -> str | None:
-        # Ticket 01's amended Answer: only a subset/superset relationship
-        # between two Chords' member sets conflicts — a plain intersection
-        # (the thumbstick-diagonal shape) does not.
+        # Ticket 01's amended Answer, via the `rules` mirror: only a
+        # subset/superset relationship between two Chords' member sets
+        # conflicts — a plain intersection (the thumbstick-diagonal shape)
+        # does not.
         for other_key in chords:
             if other_key == key:
                 continue
-            other_members = set(other_key.split("+"))
-            if members <= other_members or other_members <= members:
+            if rules.chord_members_conflict(members, set(other_key.split("+"))):
                 return other_key
         return None
 
     def set_chord_binding(self, inputs: list[str], layer: str, binding: dict) -> None:
         if len(inputs) < 2:
             raise InvalidBindingError("a Chord needs at least two member Inputs")
-        if binding.get("type") == "profile_switch":
-            raise InvalidBindingError("a Chord's Binding can't be a Profile Switch")
-        if binding.get("trigger") == "analog_repeat":
-            raise InvalidBindingError("a Chord's Binding can't use Analog-repeat")
+        # A Chord's own Binding == `rules`' `input_str=None`: `valid_action_kinds`
+        # already drops `profile_switch` (nowhere to run a switch from a Chord)
+        # and `valid_triggers` already drops `analog_repeat` (a Chord fires on
+        # a discrete member-set completion, not a grid key's Depth) — no
+        # Chord-specific literal needed here.
+        kind = binding.get("type")
+        if kind not in rules.valid_action_kinds(None):
+            raise InvalidBindingError(f"a Chord's Binding can't be a {kind!r} Action")
         for input_str in inputs:
             self._reject_if_axis_assigned(input_str, layer)
-        self._validate_binding_action(binding)
-        key = self._chord_key(inputs)
+        self._validate_binding_action(binding, None)
+        key = rules.chord_key(inputs)
         chords = self._profiles[self._active_profile][f"chords_{layer}"]
         conflicting = self._chord_conflict(chords, key, set(inputs))
         if conflicting is not None:
@@ -297,11 +312,17 @@ class DaemonStub:
                 f"conflicts with the existing Chord {conflicting}: one member set fully "
                 "contains the other"
             )
+        if binding.get("type") == "step":
+            self._steal_stepper_direction(
+                binding.get("stepper_id"),
+                binding.get("direction"),
+                keep_chord=(self._active_profile, layer, key),
+            )
         chords[key] = copy.deepcopy(binding)
         self.calls.append(("set_chord_binding", list(inputs), layer, copy.deepcopy(binding)))
 
     def clear_chord_binding(self, inputs: list[str], layer: str) -> None:
-        key = self._chord_key(inputs)
+        key = rules.chord_key(inputs)
         chords = self._profiles[self._active_profile][f"chords_{layer}"]
         if key not in chords:
             raise NotFoundError(f"no Chord with members {key!r}")
@@ -311,12 +332,10 @@ class DaemonStub:
     def set_axis_assignment(self, input_str: str, layer: str, target: str) -> None:
         if not is_grid_input(input_str):
             raise InvalidBindingError(f"{input_str!r} is not a Grid Input")
-        if target not in AXIS_LABEL_BY_TARGET:
+        if target not in rules.AXIS_TARGETS:
             # Mirrors the real Daemon's `wire::axis_target_from_str`
-            # rejecting an unknown target string outright (code-review
-            # finding: without this, a stub-based test can't catch a typo/
-            # desync between `axis_picker.py`'s target strings and the
-            # Daemon's own 17-entry wire catalog).
+            # rejecting an unknown target string outright, via the single
+            # `rules` mirror of the Daemon's 17-entry wire catalog.
             raise InvalidBindingError(f"{target!r} is not a valid Axis target")
         profile = self._profiles[self._active_profile]
         # Ticket 59 §2's mutual exclusion: atomically clears any existing
@@ -349,6 +368,10 @@ class DaemonStub:
         self.calls.append(("set_mode_key_role", role))
 
     def create_profile(self, name: str) -> None:
+        if not name.strip():
+            # `config::validate`'s `EmptyProfileName` — a blank name is a
+            # bad request, same as for a Macro/Stepper.
+            raise InvalidBindingError("Profile name can't be empty")
         if name in self._profiles:
             raise AlreadyExistsError(f"a Profile named {name!r} already exists")
         self._profiles[name] = copy.deepcopy(self._SEED_PROFILE)
@@ -359,6 +382,12 @@ class DaemonStub:
             raise InvalidBindingError("cannot delete the active Profile")
         if name not in self._profiles:
             raise NotFoundError(f"no Profile named {name!r}")
+        if self._profile_switch_referenced(name):
+            # `edit.rs::profile_switch_references` — a dangling
+            # `ProfileSwitch` target can never exist.
+            raise InvalidBindingError(
+                f"Profile {name!r} is still referenced by a Profile Switch Binding"
+            )
         del self._profiles[name]
         self.calls.append(("delete_profile", name))
 
@@ -367,24 +396,28 @@ class DaemonStub:
             raise NotFoundError(f"no Profile named {old_name!r}")
         if new_name != old_name and new_name in self._profiles:
             raise AlreadyExistsError(f"a Profile named {new_name!r} already exists")
+        if not new_name.strip():
+            raise InvalidBindingError("Profile name can't be empty")
         self.calls.append(("rename_profile", old_name, new_name))
         if new_name == old_name:
             return
         self._profiles[new_name] = self._profiles.pop(old_name)
         if self._active_profile == old_name:
             self._active_profile = new_name
-
-    @staticmethod
-    def _slug_base(name: str, fallback: str = "macro") -> str:
-        # Mirrors daemon/src/config.rs's `slug_base`: lowercase, runs of
-        # non-alphanumeric characters collapsed to one hyphen, trimmed,
-        # falling back to `fallback` if nothing alphanumeric survives.
-        # Shared by both libraries, like the Rust side (ticket 03/54).
-        slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-        return slug or fallback
+        # `edit.rs::cascade_rename_profile_switch_targets` — every Base/Held
+        # `ProfileSwitch` Binding that named the old Profile is repointed, so
+        # a rename never silently leaves a dangling reference behind.
+        for profile in self._profiles.values():
+            for layer in ("base", "held"):
+                for binding in profile[layer].values():
+                    if (
+                        binding.get("type") == "profile_switch"
+                        and binding.get("target") == old_name
+                    ):
+                        binding["target"] = new_name
 
     def _unique_macro_id(self, name: str) -> str:
-        base = self._slug_base(name, "macro")
+        base = rules.slug(name, "macro")
         if base not in self._macros:
             return base
         n = 2
@@ -393,7 +426,7 @@ class DaemonStub:
         return f"{base}-{n}"
 
     def _unique_stepper_id(self, name: str) -> str:
-        base = self._slug_base(name, "stepper")
+        base = rules.slug(name, "stepper")
         if base not in self._steppers:
             return base
         n = 2
@@ -402,16 +435,25 @@ class DaemonStub:
         return f"{base}-{n}"
 
     def _stepper_referenced(self, stepper_id: str) -> bool:
-        return any(
-            binding.get("type") == "step" and binding.get("stepper_id") == stepper_id
-            for profile in self._profiles.values()
-            for layer in ("base", "held")
-            for binding in profile[layer].values()
-        )
+        # `read_model.reference_count` is the same Base/Held + Chord-Layer
+        # scan `library_view`'s "Used by N" gate runs (post-release ticket
+        # 13, ADR 0005's blessed opportunistic fold), mirroring
+        # `edit.rs::stepper_references` — so a Chord Binding holds a
+        # Stepper alive here exactly as it does in the real Daemon.
+        return reference_count(
+            self._profiles, binding_type="step", id_field="stepper_id", id_value=stepper_id
+        ) > 0
 
     def _macro_referenced(self, macro_id: str) -> bool:
+        return reference_count(
+            self._profiles, binding_type="macro", id_field="macro_id", id_value=macro_id
+        ) > 0
+
+    def _profile_switch_referenced(self, name: str) -> bool:
+        # Mirror of `edit.rs::profile_switch_references` — Base/Held only
+        # (a Chord's Binding can never be a `profile_switch`).
         return any(
-            binding.get("type") == "macro" and binding.get("macro_id") == macro_id
+            binding.get("type") == "profile_switch" and binding.get("target") == name
             for profile in self._profiles.values()
             for layer in ("base", "held")
             for binding in profile[layer].values()
@@ -508,8 +550,14 @@ class DaemonStub:
         self.calls.append(("stop_all_toggles",))
 
     def set_actuation_point(self, input_str: str, actuation: int, release: int) -> None:
-        if release > actuation:
-            raise InvalidBindingError("release must not exceed actuation")
+        if not is_grid_input(input_str):
+            # `config::validate`'s `InvalidActuationOverrideInput` — only
+            # Grid keys have Depth (same guard as `set_axis_assignment`).
+            raise InvalidBindingError(f"{input_str!r} is not a Grid Input")
+        if release >= actuation:
+            # `config::validate`'s `ReleaseNotBelowActuation` is "at or
+            # above" — equal points defeat hysteresis too.
+            raise InvalidBindingError("release must be below actuation")
         overrides = self._profiles[self._active_profile]["actuation_overrides"]
         overrides[input_str] = {"actuation": actuation, "release": release}
         self.calls.append(("set_actuation_point", input_str, actuation, release))
@@ -519,8 +567,8 @@ class DaemonStub:
         self.calls.append(("clear_actuation_point", input_str))
 
     def set_default_actuation(self, actuation: int, release: int) -> None:
-        if release > actuation:
-            raise InvalidBindingError("release must not exceed actuation")
+        if release >= actuation:
+            raise InvalidBindingError("release must be below actuation")
         self._profiles[self._active_profile]["default_actuation"] = {
             "actuation": actuation,
             "release": release,

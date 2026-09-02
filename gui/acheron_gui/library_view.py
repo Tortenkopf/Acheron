@@ -48,44 +48,61 @@ calls the Daemon and then a full `on_change()` rebuild, with no local
 Save button, mirroring the Profile sidebar's own autosave convention
 (ticket 31's Answer) — which is why the editor pane says so upfront.
 
-The Steppers panel mirrors the Macros panel's browse-list-plus-editor shape
-closely, with two settled differences (ticket 31 round 2's Answer) plus one
-deliberate parity choice: delete is gated exactly like Macro's — disabled
-with a "Used by N Binding(s) — can't delete" tooltip while
-`stepper_used_by_count` is nonzero (`dispatch.rs`'s `DeleteStepper` handler,
-landed by ticket 54, refuses exactly like `DeleteMacro` does; this ticket's
-own text originally read that as "no gate," since ticket 03 never specified
-an "in use" *concept*, but the user directed the GUI treatment to match
-Macro's regardless — consistent delete UX across both library panels
-outweighs that textual distinction). The two real differences: (1) the item
-editor has no step-kind selector, since `StepperItem` has exactly one wire
-variant (`Key`, covering both keyboard keys and mouse buttons through
-`key_picker`'s one unified picker) unlike Macro's three (KeyDown/KeyUp/
-Delay); (2) an assignment row (Forward/Backward Input dropdowns) sits below
-the item list — a Stepper Binding has no other GUI surface that lets a
-*list* pick its own Input pair (only the reverse: `binding_editor.py`'s
-Stepper Action branch lets one Input pick a list).
+## One editor, two kinds (post-release ticket 13)
+
+The Macro half and the Stepper half were a hand-aligned parallel
+implementation of one concept — CONTEXT.md's **Library** entry. They are
+now one set of kind-agnostic builders (`build_row`, `build_browse_list`,
+`build_editor_columns`, `_sorted_ids`, `_selected_id`, `used_by_count`)
+plus a frozen `LibraryKind` adapter — the two module constants `MACRO` and
+`STEPPER` — carrying everything the generic half would otherwise have to
+name `"macro"` or `"stepper"` for itself: the display noun, the `GetConfig`
+sub-dict keys, the `ui_state` selection key, the used-by scan predicate,
+the four `client` calls, the item label, the "add item" controls, and the
+editor's middle slot. `_KINDS` (insertion order = tab order) drives both
+`build_library_tabs` and the sidebar/content dispatch.
+
+The two settled Stepper/Macro differences (ticket 31 round 2's Answer) plus
+one deliberate parity choice now live entirely in `STEPPER` / `MACRO`:
+
+- delete is gated identically on both — disabled with a "Used by N
+  Binding(s) — can't delete" tooltip while `used_by_count` is nonzero
+  (`dispatch.rs`'s `DeleteStepper` handler, landed by ticket 54, refuses
+  exactly like `DeleteMacro`; this screen's used-by gate on both is a UX
+  mirror, not a kind difference).
+- the item editor differs by kind: Macro has a KeyDown/KeyUp/Delay
+  step-kind dropdown; Stepper has a Ctrl/Shift/Alt/Super modifiers row and
+  no step-kind selector (`StepperItem` has one keyboard wire variant,
+  `Key`, unlike Macro's three) — each owns its `_build_*_add_controls`.
+- the middle slot differs: Stepper renders an assignment row (Forward/
+  Backward Input dropdowns) since a *list* has no other GUI surface to
+  pick its own Input pair; Macro renders `_header_middle_reserve()`, a
+  blank box occupying the identical height so nothing shifts on a tab flip
+  (ticket 91).
+
 Reassigning the *same* list's forward/backward off its old pair is the
 Daemon's own job (`SetBinding`'s `take_stepper_direction_elsewhere`, ticket
 54) — this module only needs to detect what the Daemon doesn't announce
 back: silently overwriting a *different* list's Binding, or this same
 list's *other* direction, at the newly-picked Input — both surfaced as a
-one-shot toast via `ui_state["stepper_toast"]`.
+one-shot toast via `ui_state["stepper_toast"]` (`STEPPER.toast_key`).
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable
 
 from gi.repository import Gtk, Pango
 
-from .binding_editor import describe_step, labeled_row
+from .binding_editor import labeled_row
 from .controller_picker import LABEL_BY_CODE as CONTROLLER_LABEL_BY_CODE
 from .controller_picker import build_inline_controller_picker
 from .daemon_client import DaemonError
 from .gtk_utils import build_name_prompt_popover, build_pinned_sidebar_box, clear_children
 from .inputs import ALL_INPUTS, input_label
 from .key_picker import LABEL_BY_CODE, build_inline_key_picker
+from .read_model import reference_count
 
 # Ticket 92: the keyboard↔controller picker switcher's session-only mode,
 # shared across both library editors (so working in controller mode "stays
@@ -108,20 +125,20 @@ _UNASSIGNED_LABEL = "— Unassigned —"
 
 # Ticket 91: the Macro and Stepper editors are built to identical
 # measurements so nothing visibly shifts when the user flips between the two
-# library tabs. `build_macro_editor_columns` / `build_stepper_editor_columns`
-# are structured in lockstep:
+# library tabs. `build_editor_columns` is structured the same way regardless
+# of kind:
 #
 #   column 2 : name heading + vexpanding list scroller          (`_build_editor_col2`)
-#   column 3 : error label + "+ Add …" button                  (pinned, shared)
-#              + editor-specific middle (Stepper: the Forward/Backward
+#   column 3 : error label + "+ Add …" button                  (pinned)
+#              + `kind.build_middle_slot(...)` (Stepper: the Forward/Backward
 #                assignment row; Macro: `_header_middle_reserve()`, an inert
 #                copy of that same widget stack so it occupies the identical
 #                height on any theme) + a separator
 #              + `_vscrollable` body: "Changes save automatically." hint,
-#                then exactly one `labeled_row` (Macro: the step-kind
-#                dropdown; Stepper: `labeled_row("Modifiers", …)`), then the
-#                "Key"/"Delay (ms)" picker row — so the picker lands at the
-#                same y on both tabs.
+#                then `kind.build_add_controls(...)` — whose one `labeled_row`
+#                (Macro: the step-kind dropdown; Stepper:
+#                `labeled_row("Modifiers", …)`) keeps the "Key"/"Delay (ms)"
+#                picker row at the same y on both tabs.
 #
 # No hardcoded pixel constants: every "reserve the same space" is done by
 # building the same widget stack rather than a magic height (a shared
@@ -130,14 +147,50 @@ _UNASSIGNED_LABEL = "— Unassigned —"
 _EDITOR_COL_SPACING = 6
 
 
+def describe_macro_step(step: dict) -> str:
+    """The one-line label for a Macro step in the editor's step list.
+    Relocated verbatim from `binding_editor.py` (post-release ticket 13):
+    nothing in `binding_editor.py` calls it any more — its `Action::Step` /
+    `Action::Macro` branches only assign a reference — so it re-homes here
+    beside `describe_stepper_item`, both reached as `kind.describe_item`."""
+    kind = step["type"]
+    if kind in ("key_down", "key_up"):
+        raw = step["key"]
+        # Ticket 92: a KeyDown/KeyUp step may target a controller button
+        # (routed to the gamepad device by the injector). Render it with the
+        # gamepad catalog's label and a ↓/↑ prefix, e.g. "↓ Btn: A / South".
+        # Mouse buttons (also `BTN_*`) aren't in the gamepad catalog, so
+        # they keep the plain "KeyDown BTN_SIDE" form.
+        if raw in CONTROLLER_LABEL_BY_CODE:
+            return f"{'↓' if kind == 'key_down' else '↑'} Btn: {CONTROLLER_LABEL_BY_CODE[raw]}"
+        return f"{'KeyDown' if kind == 'key_down' else 'KeyUp'} {raw}"
+    if kind == "delay_ms":
+        return f"Delay {step['ms']}ms"
+    return str(step)
+
+
+def describe_stepper_item(item: dict) -> str:
+    if item.get("type") == "controller_button":
+        # Ticket 92: reuse the gamepad picker's catalog label, e.g.
+        # "Btn: A / South". No modifier combination on this variant.
+        raw = item["button"]
+        return f"Btn: {CONTROLLER_LABEL_BY_CODE.get(raw, raw)}"
+    raw_key = item["key"]
+    key = LABEL_BY_CODE.get(raw_key, raw_key)
+    mods = "+".join(m.capitalize() for m in item.get("modifiers", []))
+    return f"{mods}+{key}" if mods else key
+
+
 def build_library_tabs(selected_tab: str, on_select: Callable[[str], None]) -> Gtk.Box:
     """Same widget shape as `device_overview.build_layer_bar`'s own Base/
     Held tabs — a plain button row toggling `suggested-action`, carrying no
     state of its own (the caller owns `ui_state`, same pattern as every
-    other tab/destination switch in this GUI)."""
+    other tab/destination switch in this GUI). Iterates `_KINDS`, so tab
+    order is `_KINDS`' insertion order (Steppers, then Macros) and a
+    third kind is a `_KINDS` entry with no change here."""
     row = Gtk.Box(spacing=6)
-    for tab_key, label in (("steppers", "Steppers"), ("macros", "Macros")):
-        btn = Gtk.Button(label=label)
+    for tab_key, kind in _KINDS.items():
+        btn = Gtk.Button(label=f"{kind.noun}s")
         if tab_key == selected_tab:
             btn.add_css_class("suggested-action")
 
@@ -149,43 +202,53 @@ def build_library_tabs(selected_tab: str, on_select: Callable[[str], None]) -> G
     return row
 
 
-def macro_used_by_count(config: dict, macro_id: str) -> int:
-    """How many Bindings, across every Profile's Base/Held Layer, reference
-    `macro_id` — computed client-side from `GetConfig()`'s own data (no new
-    wire field needed, unlike the ticket text's own phrasing might suggest):
-    mirrors the real Daemon's `dispatch.rs::macro_references` scan exactly,
-    just counted rather than boolean so the delete tooltip can name N."""
-    return sum(
-        1
-        for profile in config["profiles"].values()
-        for layer_key in ("base", "held")
-        for binding in profile[layer_key].values()
-        if binding.get("type") == "macro" and binding.get("macro_id") == macro_id
+def used_by_count(config: dict, kind: LibraryKind, entry_id: str) -> int:
+    """How many Bindings, across every Profile's Base/Held *and* Chord
+    Layers, reference `entry_id` — computed client-side from `GetConfig()`'s
+    own data, mirroring the real Daemon's `edit.rs::macro_references` /
+    `stepper_references` scan exactly (via `read_model.reference_count`,
+    shared with `daemon_stub`), just counted rather than boolean so the
+    delete tooltip can name N."""
+    return reference_count(
+        config["profiles"],
+        binding_type=kind.binding_type,
+        id_field=kind.id_field,
+        id_value=entry_id,
     )
 
 
-def _sorted_macro_ids(macros: dict) -> list[str]:
-    return sorted(macros, key=lambda mid: macros[mid]["name"].lower())
+def _sorted_ids(entries: dict) -> list[str]:
+    return sorted(entries, key=lambda eid: entries[eid]["name"].lower())
 
 
-def build_macro_row(
+def _selected_id(config: dict, kind: LibraryKind, ui_state: dict) -> str | None:
+    entries = config.get(kind.config_key, {})
+    selected = ui_state.get(kind.selection_key)
+    if selected not in entries:
+        selected = _sorted_ids(entries)[0] if entries else None
+        ui_state[kind.selection_key] = selected
+    return selected
+
+
+def build_row(
     client,
     config: dict,
-    macro_id: str,
-    selected_macro_id: str | None,
+    kind: LibraryKind,
+    entry_id: str,
+    selected_id: str | None,
     ui_state: dict,
     on_change: Callable[[], None],
     show_error: Callable[[Exception], None],
 ) -> Gtk.Box:
-    name = config["macros"][macro_id]["name"]
+    name = config[kind.config_key][entry_id]["name"]
     row = Gtk.Box(spacing=4)
 
     select_btn = Gtk.Button(label=name, hexpand=True)
-    if macro_id == selected_macro_id:
+    if entry_id == selected_id:
         select_btn.add_css_class("suggested-action")
 
-    def on_select_clicked(_b, macro_id=macro_id):
-        ui_state["library_selected_macro"] = macro_id
+    def on_select_clicked(_b, entry_id=entry_id):
+        ui_state[kind.selection_key] = entry_id
         on_change()
 
     select_btn.connect("clicked", on_select_clicked)
@@ -194,8 +257,8 @@ def build_macro_row(
     rename_btn = Gtk.MenuButton(label="✎")
     rename_btn.set_tooltip_text(f"Rename {name!r}")
 
-    def on_rename_submitted(new_name: str, macro_id=macro_id):
-        client.rename_macro(macro_id, new_name)
+    def on_rename_submitted(new_name: str, entry_id=entry_id):
+        kind.rename(client, entry_id, new_name)
         on_change()
 
     rename_btn.set_popover(
@@ -203,21 +266,21 @@ def build_macro_row(
     )
     row.append(rename_btn)
 
-    used_by = macro_used_by_count(config, macro_id)
+    used_by = used_by_count(config, kind, entry_id)
     delete_btn = Gtk.Button(label="×")
     delete_btn.set_sensitive(used_by == 0)
     delete_btn.set_tooltip_text(
         f"Used by {used_by} Binding(s) — can't delete" if used_by else f"Delete {name!r}"
     )
 
-    def on_delete_clicked(_b, macro_id=macro_id):
+    def on_delete_clicked(_b, entry_id=entry_id):
         try:
-            client.delete_macro(macro_id)
+            kind.delete(client, entry_id)
         except DaemonError as exc:
             show_error(exc)
             return
-        if ui_state.get("library_selected_macro") == macro_id:
-            ui_state["library_selected_macro"] = None
+        if ui_state.get(kind.selection_key) == entry_id:
+            ui_state[kind.selection_key] = None
         on_change()
 
     delete_btn.connect("clicked", on_delete_clicked)
@@ -226,24 +289,17 @@ def build_macro_row(
     return row
 
 
-def _selected_macro_id(config: dict, ui_state: dict) -> str | None:
-    macros = config.get("macros", {})
-    selected_macro_id = ui_state.get("library_selected_macro")
-    if selected_macro_id not in macros:
-        selected_macro_id = _sorted_macro_ids(macros)[0] if macros else None
-        ui_state["library_selected_macro"] = selected_macro_id
-    return selected_macro_id
-
-
-def build_macros_browse_list(client, config: dict, ui_state: dict, on_change: Callable[[], None]) -> Gtk.Widget:
-    """Column 1's Macro-tab content (ticket 70): the browse rows and "+ New"
-    button alone — no heading (the tab row above already reads "Macros")
-    and no width/`sidebar`-css treatment of its own, since the caller
-    (`build_library_sidebar`) already wraps column 1 in
+def build_browse_list(
+    client, config: dict, kind: LibraryKind, ui_state: dict, on_change: Callable[[], None]
+) -> Gtk.Widget:
+    """Column 1's per-tab content (ticket 70): the browse rows and "+ New"
+    button alone — no heading (the tab row above already reads "Macros" /
+    "Steppers") and no width/`sidebar`-css treatment of its own, since the
+    caller (`build_library_sidebar`) already wraps column 1 in
     `gtk_utils.build_pinned_sidebar_box`."""
-    macros = config.get("macros", {})
-    macro_ids = _sorted_macro_ids(macros)
-    selected_macro_id = _selected_macro_id(config, ui_state)
+    entries = config.get(kind.config_key, {})
+    entry_ids = _sorted_ids(entries)
+    selected_id = _selected_id(config, kind, ui_state)
 
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
 
@@ -257,9 +313,9 @@ def build_macros_browse_list(client, config: dict, ui_state: dict, on_change: Ca
         error_label.set_visible(True)
 
     rows_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-    for macro_id in macro_ids:
+    for entry_id in entry_ids:
         rows_list.append(
-            build_macro_row(client, config, macro_id, selected_macro_id, ui_state, on_change, show_error)
+            build_row(client, config, kind, entry_id, selected_id, ui_state, on_change, show_error)
         )
     rows_scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
     # Ticket 70 follow-up, live-verified: column 1 now has the grid/chords
@@ -280,11 +336,13 @@ def build_macros_browse_list(client, config: dict, ui_state: dict, on_change: Ca
     new_btn = Gtk.MenuButton(label="+ New")
 
     def on_create_submitted(name: str):
-        macro_id = client.create_macro(name, [])
-        ui_state["library_selected_macro"] = macro_id
+        entry_id = kind.create(client, name)
+        ui_state[kind.selection_key] = entry_id
         on_change()
 
-    new_btn.set_popover(build_name_prompt_popover("Creating a Macro", "", "Create", on_create_submitted))
+    new_btn.set_popover(
+        build_name_prompt_popover(f"Creating a {kind.noun}", "", "Create", on_create_submitted)
+    )
     box.append(new_btn)
 
     return box
@@ -337,226 +395,6 @@ def _header_middle_reserve() -> Gtk.Widget:
     spacer = Gtk.Box()
     spacer.set_size_request(-1, 2 * _dropdown_row_height() + _EDITOR_COL_SPACING)
     return spacer
-
-
-def build_macro_editor_columns(
-    client, config: dict, macro_id: str, ui_state: dict, on_change: Callable[[], None]
-) -> tuple[Gtk.Widget, Gtk.Widget]:
-    """Columns 2+3 for the selected Macro (ticket 70): column 2 is the name
-    heading plus the steps list; column 3 is the error label and
-    "+ Add step" pinned above a `_vscrollable` body holding the save-hint
-    and the kind selector/key-value picker (ticket 70 follow-up) — both
-    stay visible regardless of where the body is scrolled to, rather than
-    merely sitting above the picker within the same scrolled content.
-    Split from one `editor_box` so `build_library_content` can place them
-    either side of column 1's old space, per the map's settled
-    three-column shape."""
-    macro = config["macros"][macro_id]
-    steps = macro["steps"]
-
-    # col3 is an unscrolled outer container: the error label and
-    # "+ Add step" (appended below) stay pinned at the top, with the hint
-    # and the kind selector/key-value picker inside a `_vscrollable` body
-    # beneath them (ticket 70 follow-up, live-verified: the picker's own
-    # expandable content can grow tall enough to scroll everything below
-    # it out of view — the error label, the button, and (Stepper's own)
-    # toast message are exactly what the user asked to stay visible
-    # regardless of scroll position). Structured in lockstep with
-    # `build_stepper_editor_columns` (ticket 91) — see `_header_middle_reserve`.
-    col3 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_EDITOR_COL_SPACING)
-
-    error_label = Gtk.Label(xalign=0, wrap=True, css_classes=["error"])
-    error_label.set_visible(False)
-    col3.append(error_label)
-
-    body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_EDITOR_COL_SPACING)
-    body.append(
-        Gtk.Label(
-            label="Changes save automatically.",
-            xalign=0,
-            wrap=True,
-            css_classes=["dim"],
-        )
-    )
-
-    def persist(new_steps: list[dict]) -> None:
-        try:
-            client.set_macro_steps(macro_id, new_steps)
-        except DaemonError as exc:
-            error_label.set_label(str(exc))
-            error_label.set_visible(True)
-            return
-        on_change()
-
-    steps_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-    for i, step in enumerate(steps):
-        row_box = Gtk.Box(spacing=6)
-        row_box.set_margin_top(2)
-        row_box.set_margin_bottom(2)
-        row_box.set_margin_start(4)
-        row_box.set_margin_end(4)
-        row_box.append(Gtk.Label(label=describe_step(step), hexpand=True, xalign=0))
-
-        up_btn = Gtk.Button(label="↑")
-        up_btn.set_sensitive(i > 0)
-
-        def on_up(_b, i=i):
-            new_steps = list(steps)
-            new_steps[i - 1], new_steps[i] = new_steps[i], new_steps[i - 1]
-            persist(new_steps)
-
-        up_btn.connect("clicked", on_up)
-        row_box.append(up_btn)
-
-        down_btn = Gtk.Button(label="↓")
-        down_btn.set_sensitive(i < len(steps) - 1)
-
-        def on_down(_b, i=i):
-            new_steps = list(steps)
-            new_steps[i + 1], new_steps[i] = new_steps[i], new_steps[i + 1]
-            persist(new_steps)
-
-        down_btn.connect("clicked", on_down)
-        row_box.append(down_btn)
-
-        rm_btn = Gtk.Button(label="×")
-
-        def on_remove(_b, i=i):
-            new_steps = list(steps)
-            new_steps.pop(i)
-            persist(new_steps)
-
-        rm_btn.connect("clicked", on_remove)
-        row_box.append(rm_btn)
-
-        steps_list.append(row_box)
-
-    # Ticket 70 follow-up (kept in lockstep by ticket 91's `_build_editor_col2`
-    # / `_vexpanding_list_scroller`): column 2 fills the full column height
-    # column 1's old list used to occupy, so a short list leaves no dead space.
-    col2 = _build_editor_col2(macro["name"], _vexpanding_list_scroller(steps_list))
-
-    # "+ Add step" is appended straight into col3 (not body), pinning it
-    # above the scrolled area entirely rather than merely above add_box
-    # within it. `on_add` closes over `step_kind_dd`/`new_step_value`, both
-    # assigned below but only read here at click time (Python's
-    # late-binding closures), so construction order doesn't need to match
-    # visual order.
-    # Ticket 92 §3: each picker mode keeps its own independent draft —
-    # `controller_key` alongside the existing keyboard `key` — so flipping
-    # the switcher back and forth never clobbers either. Only the active
-    # mode's value is what "+ Add step" commits.
-    new_step_value = {"key": "KEY_A", "ms_text": "0", "controller_key": _DEFAULT_CONTROLLER_CODE}
-
-    add_btn = Gtk.Button(label="+ Add step")
-
-    def on_add(_b):
-        kind_i = step_kind_dd.get_selected()
-        if kind_i == 2:
-            val = new_step_value["ms_text"]
-            step = {"type": "delay_ms", "ms": int(val) if val.isdigit() else 0}
-        else:
-            kind = "key_down" if kind_i == 0 else "key_up"
-            in_controller = ui_state.get(_PICKER_MODE_KEY, "keyboard") == "controller"
-            code = new_step_value["controller_key"] if in_controller else new_step_value["key"]
-            step = {"type": kind, "key": code}
-        persist(list(steps) + [step])
-
-    add_btn.connect("clicked", on_add)
-    col3.append(add_btn)
-
-    # Ticket 91 #1: the Stepper editor's column 3 carries a Forward/Backward
-    # assignment row + separator here; the Macro editor reserves the same
-    # vertical space (blank) + its own separator, so the scrollable body
-    # below starts at the same y on both tabs.
-    col3.append(_header_middle_reserve())
-    col3.append(Gtk.Separator())
-
-    add_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_EDITOR_COL_SPACING)
-
-    # Ticket 92 §3: the keyboard↔controller switcher, its own row directly
-    # below the hint and above the step-kind dropdown — on *both* editors
-    # (ticket 91 lockstep). It's greyed when the step-kind is Delay (no
-    # value picker to switch between) and is orthogonal to the step-kind
-    # dropdown: "controller button" is *not* a fourth step-kind, it just
-    # changes which picker fills the value slot for a KeyDown/KeyUp step.
-    switch_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-    add_box.append(switch_slot)
-
-    step_kind_dd = Gtk.DropDown(model=Gtk.StringList.new(["KeyDown", "KeyUp", "Delay (ms)"]))
-    add_box.append(labeled_row("New step", step_kind_dd))
-
-    value_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-    add_box.append(value_slot)
-
-    current_mode, rerender_switch = _mount_picker_mode_switch(
-        switch_slot,
-        ui_state,
-        on_mode_changed=lambda _mode: render_value_slot(),
-        sensitive=lambda: step_kind_dd.get_selected() != 2,
-    )
-
-    def render_value_slot():
-        clear_children(value_slot)
-        if step_kind_dd.get_selected() == 2:
-            ms_entry = Gtk.Entry(text=new_step_value["ms_text"], width_chars=10)
-            ms_entry.connect("changed", lambda e: new_step_value.__setitem__("ms_text", e.get_text()))
-            # Ticket 91 #2: this field genuinely isn't a key (the step-kind
-            # dropdown selects KeyDown / KeyUp / Delay).
-            value_slot.append(labeled_row("Delay (ms)", ms_entry))
-        elif current_mode() == "controller":
-            def on_controller_changed(code: str) -> None:
-                new_step_value["controller_key"] = code
-
-            picker = build_inline_controller_picker(
-                new_step_value["controller_key"], on_controller_changed
-            )
-            value_slot.append(labeled_row("Button", picker))
-            value_slot.append(
-                Gtk.Label(label=_CONTROLLER_MACRO_HINT, xalign=0, wrap=True, css_classes=["dim"])
-            )
-        else:
-            def on_value_key_changed(code: str) -> None:
-                new_step_value["key"] = code
-
-            # No modifier warning here, same reasoning as the pre-ticket-51
-            # editor this was ported from: a KeyDown-only step *is* that
-            # warning's own recommended workaround, not a case it applies to.
-            value_picker, _refresh = build_inline_key_picker(
-                new_step_value["key"], on_value_key_changed, warn_predicate=lambda: False
-            )
-            # Ticket 91 #2: "Key", matching the grid-view key-picker's own
-            # label and the Stepper item editor's.
-            value_slot.append(labeled_row("Key", value_picker))
-
-    def on_kind_changed(*_):
-        rerender_switch()  # re-evaluate the greyed-when-Delay state
-        render_value_slot()
-
-    step_kind_dd.connect("notify::selected", on_kind_changed)
-    rerender_switch()
-    render_value_slot()
-
-    body.append(add_box)
-    col3.append(_vscrollable(body))
-
-    return col2, col3
-
-
-def _sorted_stepper_ids(steppers: dict) -> list[str]:
-    return sorted(steppers, key=lambda sid: steppers[sid]["name"].lower())
-
-
-def describe_stepper_item(item: dict) -> str:
-    if item.get("type") == "controller_button":
-        # Ticket 92: reuse the gamepad picker's catalog label, e.g.
-        # "Btn: A / South". No modifier combination on this variant.
-        raw = item["button"]
-        return f"Btn: {CONTROLLER_LABEL_BY_CODE.get(raw, raw)}"
-    raw_key = item["key"]
-    key = LABEL_BY_CODE.get(raw_key, raw_key)
-    mods = "+".join(m.capitalize() for m in item.get("modifiers", []))
-    return f"{mods}+{key}" if mods else key
 
 
 def build_library_picker_switch(selected_mode: str, on_select: Callable[[str], None]) -> Gtk.Box:
@@ -635,79 +473,6 @@ def _stepper_pair_inputs(bindings: dict, stepper_id: str) -> dict[str, str | Non
     return result
 
 
-def stepper_used_by_count(config: dict, stepper_id: str) -> int:
-    """How many Bindings, across every Profile's Base/Held Layer, reference
-    `stepper_id` (either direction counts) — mirrors `macro_used_by_count`
-    exactly, just for `dispatch.rs::stepper_references`'s Stepper
-    counterpart, so the delete tooltip can name N the same way Macro's
-    does."""
-    return sum(
-        1
-        for profile in config["profiles"].values()
-        for layer_key in ("base", "held")
-        for binding in profile[layer_key].values()
-        if binding.get("type") == "step" and binding.get("stepper_id") == stepper_id
-    )
-
-
-def build_stepper_row(
-    client,
-    config: dict,
-    stepper_id: str,
-    selected_stepper_id: str | None,
-    ui_state: dict,
-    on_change: Callable[[], None],
-    show_error: Callable[[Exception], None],
-) -> Gtk.Box:
-    name = config["steppers"][stepper_id]["name"]
-    row = Gtk.Box(spacing=4)
-
-    select_btn = Gtk.Button(label=name, hexpand=True)
-    if stepper_id == selected_stepper_id:
-        select_btn.add_css_class("suggested-action")
-
-    def on_select_clicked(_b, stepper_id=stepper_id):
-        ui_state["library_selected_stepper"] = stepper_id
-        on_change()
-
-    select_btn.connect("clicked", on_select_clicked)
-    row.append(select_btn)
-
-    rename_btn = Gtk.MenuButton(label="✎")
-    rename_btn.set_tooltip_text(f"Rename {name!r}")
-
-    def on_rename_submitted(new_name: str, stepper_id=stepper_id):
-        client.rename_stepper(stepper_id, new_name)
-        on_change()
-
-    rename_btn.set_popover(
-        build_name_prompt_popover(f"Renaming {name!r}", name, "Rename", on_rename_submitted)
-    )
-    row.append(rename_btn)
-
-    used_by = stepper_used_by_count(config, stepper_id)
-    delete_btn = Gtk.Button(label="×")
-    delete_btn.set_sensitive(used_by == 0)
-    delete_btn.set_tooltip_text(
-        f"Used by {used_by} Binding(s) — can't delete" if used_by else f"Delete {name!r}"
-    )
-
-    def on_delete_clicked(_b, stepper_id=stepper_id):
-        try:
-            client.delete_stepper(stepper_id)
-        except DaemonError as exc:
-            show_error(exc)
-            return
-        if ui_state.get("library_selected_stepper") == stepper_id:
-            ui_state["library_selected_stepper"] = None
-        on_change()
-
-    delete_btn.connect("clicked", on_delete_clicked)
-    row.append(delete_btn)
-
-    return row
-
-
 def build_stepper_assignment_row(
     client,
     config: dict,
@@ -719,11 +484,12 @@ def build_stepper_assignment_row(
     show_error: Callable[[Exception], None],
 ) -> Gtk.Widget:
     """The Forward/Backward Input dropdowns beneath a Stepper's item list
-    (ticket 31 round 2's Answer). Scoped to the currently selected Profile/
-    Layer (the same pair Device Overview's own per-key editor targets,
-    threaded in from `device_overview.build_main_view`) since `SetBinding`/
-    `ClearBinding` always operate on the Daemon's *active* Profile — matching
-    every other Binding mutation in this GUI, not a Stepper-specific choice.
+    (ticket 31 round 2's Answer) — `STEPPER.build_middle_slot`. Scoped to
+    the currently selected Profile/Layer (the same pair Device Overview's
+    own per-key editor targets, threaded in from
+    `device_overview.build_main_view`) since `SetBinding`/`ClearBinding`
+    always operate on the Daemon's *active* Profile — matching every other
+    Binding mutation in this GUI, not a Stepper-specific choice.
 
     Reassigning the *same* list off its own old pair (a different Input)
     needs no client-side logic: `SetBinding`'s `Action::Step` handling
@@ -731,14 +497,14 @@ def build_stepper_assignment_row(
     ticket 54). Two things it does *not* announce, and this function
     detects itself (by reading the target Input's existing Binding before
     calling `SetBinding`), leaving a one-shot toast in
-    `ui_state["stepper_toast"]` for `build_stepper_editor_columns`'s next
-    render to show: a plain overwrite stealing a *different* list's Binding
-    at the newly-picked Input, and — since `take_stepper_direction_
-    elsewhere` only guards the *same* direction living on two Inputs — this
-    *same* list's other direction already sitting on the newly-picked Input
-    (e.g. reassigning Forward onto the Input that's currently this list's
-    own Backward), which an ordinary Binding-slot overwrite would otherwise
-    drop with no signal at all.
+    `ui_state["stepper_toast"]` for the next render to show: a plain
+    overwrite stealing a *different* list's Binding at the newly-picked
+    Input, and — since `take_stepper_direction_elsewhere` only guards the
+    *same* direction living on two Inputs — this *same* list's other
+    direction already sitting on the newly-picked Input (e.g. reassigning
+    Forward onto the Input that's currently this list's own Backward),
+    which an ordinary Binding-slot overwrite would otherwise drop with no
+    signal at all.
     """
     bindings = config["profiles"][profile][layer]
     pair = _stepper_pair_inputs(bindings, stepper_id)
@@ -798,174 +564,141 @@ def build_stepper_assignment_row(
     return box
 
 
-def _selected_stepper_id(config: dict, ui_state: dict) -> str | None:
-    steppers = config.get("steppers", {})
-    selected_stepper_id = ui_state.get("library_selected_stepper")
-    if selected_stepper_id not in steppers:
-        selected_stepper_id = _sorted_stepper_ids(steppers)[0] if steppers else None
-        ui_state["library_selected_stepper"] = selected_stepper_id
-    return selected_stepper_id
-
-
-def build_steppers_browse_list(client, config: dict, ui_state: dict, on_change: Callable[[], None]) -> Gtk.Widget:
-    """Column 1's Stepper-tab content — the Macro browse list's counterpart,
-    see `build_macros_browse_list`."""
-    steppers = config.get("steppers", {})
-    stepper_ids = _sorted_stepper_ids(steppers)
-    selected_stepper_id = _selected_stepper_id(config, ui_state)
-
-    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-
-    error_label = Gtk.Label(xalign=0, wrap=True)
-    error_label.add_css_class("error")
-    error_label.set_visible(False)
-    box.append(error_label)
-
-    def show_error(exc: Exception) -> None:
-        error_label.set_label(str(exc))
-        error_label.set_visible(True)
-
-    rows_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-    for stepper_id in stepper_ids:
-        rows_list.append(
-            build_stepper_row(client, config, stepper_id, selected_stepper_id, ui_state, on_change, show_error)
-        )
-    rows_scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
-    # See build_macros_browse_list's matching comment — same fix, same
-    # reasoning, for the Steppers browse list.
-    rows_scroller.set_vexpand(True)
-    rows_scroller.set_child(rows_list)
-    box.append(rows_scroller)
-
-    new_btn = Gtk.MenuButton(label="+ New")
-
-    def on_create_submitted(name: str):
-        stepper_id = client.create_stepper(name, [])
-        ui_state["library_selected_stepper"] = stepper_id
-        on_change()
-
-    new_btn.set_popover(build_name_prompt_popover("Creating a Stepper", "", "Create", on_create_submitted))
-    box.append(new_btn)
-
-    return box
-
-
-def build_stepper_editor_columns(
+def _build_macro_middle_reserve(
     client,
     config: dict,
     profile: str,
     layer: str,
-    stepper_id: str,
+    entry_id: str,
     ui_state: dict,
     on_change: Callable[[], None],
-) -> tuple[Gtk.Widget, Gtk.Widget]:
-    """Columns 2+3 for the selected Stepper (ticket 70) — the Macro editor
-    columns' counterpart, see `build_macro_editor_columns`. Column 3's
-    pinned header — the toast (if any), the error label, "+ Add item", and
-    the Forward/Backward `build_stepper_assignment_row` — sits above a
-    `_vscrollable` body holding the hint label and the "New item" key
-    picker (ticket 70 follow-up): the header stays visible regardless of
-    where the body is scrolled to, rather than merely sitting above the
-    picker within the same scrolled content."""
-    stepper = config["steppers"][stepper_id]
-    items = stepper["items"]
+    show_error: Callable[[Exception], None],
+) -> Gtk.Widget:
+    """`MACRO.build_middle_slot` — the Macro editor has no assignment row,
+    so its middle slot is the blank `_header_middle_reserve()` that keeps
+    the scrollable body at the same y as the Stepper tab (ticket 91 #1).
+    Takes the full middle-slot signature and ignores it."""
+    return _header_middle_reserve()
 
-    # col3 is an unscrolled outer container: the toast/error-label/
-    # "+ Add item"/assignment-row header (appended below) stays pinned at
-    # the top, with the hint and the "New item" key picker inside a
-    # `_vscrollable` body beneath it. The buttons, the error label, and the
-    # toast are exactly what the user asked to stay visible regardless of
-    # scroll position (ticket 70 follow-up, live-verified). Structured in
-    # lockstep with `build_macro_editor_columns` (ticket 91).
-    col3 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_EDITOR_COL_SPACING)
 
-    toast = ui_state.pop("stepper_toast", None)
-    if toast is not None:
-        col3.append(Gtk.Label(label=toast, xalign=0, wrap=True, css_classes=["toast"]))
+def _build_macro_add_controls(
+    ui_state: dict, steps: list[dict], persist: Callable[[list[dict]], None]
+) -> tuple[Gtk.Widget, Gtk.Button]:
+    """`MACRO.build_add_controls` — the KeyDown/KeyUp/Delay step-kind
+    dropdown, the ticket-92 keyboard↔controller switcher (greyed on Delay),
+    and the value slot (key picker / controller picker / delay entry).
+    Returns `(add_box, add_btn)`: the generic `build_editor_columns` pins
+    `add_btn` ("+ Add step") above the scrolled area and drops `add_box`
+    into the body.
 
-    error_label = Gtk.Label(xalign=0, wrap=True, css_classes=["error"])
-    error_label.set_visible(False)
-    col3.append(error_label)
+    `on_add` closes over `step_kind_dd` / `new_step_value`, both assigned
+    below but only read here at click time (Python's late-binding closures),
+    so construction order doesn't need to match visual order. Ticket 92 §3:
+    each picker mode keeps its own independent draft — `controller_key`
+    alongside the keyboard `key` — so flipping the switcher never clobbers
+    either; only the active mode's value is what "+ Add step" commits."""
+    new_step_value = {"key": "KEY_A", "ms_text": "0", "controller_key": _DEFAULT_CONTROLLER_CODE}
 
-    body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_EDITOR_COL_SPACING)
-    body.append(
-        Gtk.Label(
-            label="Changes save automatically.",
-            xalign=0,
-            wrap=True,
-            css_classes=["dim"],
-        )
+    add_btn = Gtk.Button(label="+ Add step")
+
+    def on_add(_b):
+        kind_i = step_kind_dd.get_selected()
+        if kind_i == 2:
+            val = new_step_value["ms_text"]
+            step = {"type": "delay_ms", "ms": int(val) if val.isdigit() else 0}
+        else:
+            kind = "key_down" if kind_i == 0 else "key_up"
+            in_controller = ui_state.get(_PICKER_MODE_KEY, "keyboard") == "controller"
+            code = new_step_value["controller_key"] if in_controller else new_step_value["key"]
+            step = {"type": kind, "key": code}
+        persist(list(steps) + [step])
+
+    add_btn.connect("clicked", on_add)
+
+    add_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_EDITOR_COL_SPACING)
+
+    # Ticket 92 §3: the keyboard↔controller switcher, its own row directly
+    # below the hint and above the step-kind dropdown — on *both* editors
+    # (ticket 91 lockstep). It's greyed when the step-kind is Delay (no
+    # value picker to switch between) and is orthogonal to the step-kind
+    # dropdown: "controller button" is *not* a fourth step-kind, it just
+    # changes which picker fills the value slot for a KeyDown/KeyUp step.
+    switch_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    add_box.append(switch_slot)
+
+    step_kind_dd = Gtk.DropDown(model=Gtk.StringList.new(["KeyDown", "KeyUp", "Delay (ms)"]))
+    add_box.append(labeled_row("New step", step_kind_dd))
+
+    value_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    add_box.append(value_slot)
+
+    current_mode, rerender_switch = _mount_picker_mode_switch(
+        switch_slot,
+        ui_state,
+        on_mode_changed=lambda _mode: render_value_slot(),
+        sensitive=lambda: step_kind_dd.get_selected() != 2,
     )
 
-    def show_error(exc: Exception) -> None:
-        error_label.set_label(str(exc))
-        error_label.set_visible(True)
+    def render_value_slot():
+        clear_children(value_slot)
+        if step_kind_dd.get_selected() == 2:
+            ms_entry = Gtk.Entry(text=new_step_value["ms_text"], width_chars=10)
+            ms_entry.connect("changed", lambda e: new_step_value.__setitem__("ms_text", e.get_text()))
+            # Ticket 91 #2: this field genuinely isn't a key (the step-kind
+            # dropdown selects KeyDown / KeyUp / Delay).
+            value_slot.append(labeled_row("Delay (ms)", ms_entry))
+        elif current_mode() == "controller":
+            def on_controller_changed(code: str) -> None:
+                new_step_value["controller_key"] = code
 
-    def persist(new_items: list[dict]) -> None:
-        try:
-            client.set_stepper_items(stepper_id, new_items)
-        except DaemonError as exc:
-            show_error(exc)
-            return
-        on_change()
+            picker = build_inline_controller_picker(
+                new_step_value["controller_key"], on_controller_changed
+            )
+            value_slot.append(labeled_row("Button", picker))
+            value_slot.append(
+                Gtk.Label(label=_CONTROLLER_MACRO_HINT, xalign=0, wrap=True, css_classes=["dim"])
+            )
+        else:
+            def on_value_key_changed(code: str) -> None:
+                new_step_value["key"] = code
 
-    items_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-    for i, item in enumerate(items):
-        row_box = Gtk.Box(spacing=6)
-        row_box.set_margin_top(2)
-        row_box.set_margin_bottom(2)
-        row_box.set_margin_start(4)
-        row_box.set_margin_end(4)
-        row_box.append(Gtk.Label(label=describe_stepper_item(item), hexpand=True, xalign=0))
+            # No modifier warning here, same reasoning as the pre-ticket-51
+            # editor this was ported from: a KeyDown-only step *is* that
+            # warning's own recommended workaround, not a case it applies to.
+            value_picker, _refresh = build_inline_key_picker(
+                new_step_value["key"], on_value_key_changed, warn_predicate=lambda: False
+            )
+            # Ticket 91 #2: "Key", matching the grid-view key-picker's own
+            # label and the Stepper item editor's.
+            value_slot.append(labeled_row("Key", value_picker))
 
-        up_btn = Gtk.Button(label="↑")
-        up_btn.set_sensitive(i > 0)
+    def on_kind_changed(*_):
+        rerender_switch()  # re-evaluate the greyed-when-Delay state
+        render_value_slot()
 
-        def on_up(_b, i=i):
-            new_items = list(items)
-            new_items[i - 1], new_items[i] = new_items[i], new_items[i - 1]
-            persist(new_items)
+    step_kind_dd.connect("notify::selected", on_kind_changed)
+    rerender_switch()
+    render_value_slot()
 
-        up_btn.connect("clicked", on_up)
-        row_box.append(up_btn)
+    return add_box, add_btn
 
-        down_btn = Gtk.Button(label="↓")
-        down_btn.set_sensitive(i < len(items) - 1)
 
-        def on_down(_b, i=i):
-            new_items = list(items)
-            new_items[i + 1], new_items[i] = new_items[i], new_items[i + 1]
-            persist(new_items)
+def _build_stepper_add_controls(
+    ui_state: dict, items: list[dict], persist: Callable[[list[dict]], None]
+) -> tuple[Gtk.Widget, Gtk.Button]:
+    """`STEPPER.build_add_controls` — the ticket-92 keyboard↔controller
+    switcher, the Ctrl/Shift/Alt/Super modifiers row (hidden in controller
+    mode), and the value slot (key picker / controller picker). Returns
+    `(add_box, add_btn)`: the generic `build_editor_columns` pins `add_btn`
+    ("+ Add item") above the scrolled area and drops `add_box` into the
+    body.
 
-        down_btn.connect("clicked", on_down)
-        row_box.append(down_btn)
-
-        rm_btn = Gtk.Button(label="×")
-
-        def on_remove(_b, i=i):
-            new_items = list(items)
-            new_items.pop(i)
-            persist(new_items)
-
-        rm_btn.connect("clicked", on_remove)
-        row_box.append(rm_btn)
-
-        items_list.append(row_box)
-
-    # Same `_build_editor_col2` / `_vexpanding_list_scroller` as the Macro
-    # editor (ticket 70 follow-up, kept in lockstep by ticket 91).
-    col2 = _build_editor_col2(stepper["name"], _vexpanding_list_scroller(items_list))
-
-    # "+ Add item" and the Forward/Backward assignment row are appended
-    # straight into col3 (not body), pinning them above the scrolled area
-    # entirely rather than merely above add_box within it. `on_add` closes
-    # over `new_item_value`, assigned below but only read here at click
-    # time (Python's late-binding closures), so construction order doesn't
-    # need to match visual order.
-    # Ticket 92 §3: each picker mode keeps its own independent draft —
-    # `controller_key` alongside the keyboard `key`/`modifiers` — so
-    # flipping the switcher never clobbers either. Only the active mode's
-    # value is what "+ Add item" commits.
+    `on_add` closes over `new_item_value`, assigned below but only read here
+    at click time (Python's late-binding closures), so construction order
+    doesn't need to match visual order. Ticket 92 §3: each picker mode keeps
+    its own independent draft — `controller_key` alongside the keyboard
+    `key`/`modifiers` — so flipping the switcher never clobbers either; only
+    the active mode's value is what "+ Add item" commits."""
     new_item_value = {"key": "KEY_A", "modifiers": [], "controller_key": _DEFAULT_CONTROLLER_CODE}
 
     add_btn = Gtk.Button(label="+ Add item")
@@ -982,16 +715,6 @@ def build_stepper_editor_columns(
         persist(list(items) + [item])
 
     add_btn.connect("clicked", on_add)
-    col3.append(add_btn)
-
-    # Ticket 91 #1: the Forward/Backward assignment row + separator here is
-    # what the Macro editor reserves the same blank space for (via
-    # `_header_middle_reserve`), so both editors' scrollable bodies start at
-    # the same y.
-    col3.append(
-        build_stepper_assignment_row(client, config, profile, layer, stepper_id, ui_state, on_change, show_error)
-    )
-    col3.append(Gtk.Separator())
 
     add_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_EDITOR_COL_SPACING)
 
@@ -1084,6 +807,199 @@ def build_stepper_editor_columns(
     mod_row.set_visible(current_mode() != "controller")
     render_value_slot()
 
+    return add_box, add_btn
+
+
+@dataclass(frozen=True)
+class LibraryKind:
+    """One library flavour (post-release ticket 13). Everything the
+    kind-agnostic builders would otherwise have to name 'macro' or
+    'stepper' for themselves — so `build_row`, `build_browse_list`,
+    `build_editor_columns`, `_sorted_ids`, `_selected_id` and
+    `used_by_count` are written once and `MACRO` / `STEPPER` are the only
+    place the divergence lives."""
+
+    noun: str  # "Macro" / "Stepper" — popover titles, tab labels, empty-state text
+    config_key: str  # "macros" / "steppers" — the GetConfig sub-dict
+    items_key: str  # "steps" / "items" — the ordered list inside one entry
+    selection_key: str  # "library_selected_macro" / "...stepper" — ui_state
+    binding_type: str  # "macro" / "step" — the used-by scan predicate
+    id_field: str  # "macro_id" / "stepper_id" — the used-by scan field
+    toast_key: str | None  # "stepper_toast" / None — the one-shot col-3 notice
+
+    # client calls — `client` passed explicitly so `grep client.create_macro`
+    # still finds the call site
+    create: Callable[[object, str], str]  # (client, name) -> new id
+    rename: Callable[[object, str, str], None]  # (client, entry_id, new_name)
+    delete: Callable[[object, str], None]  # (client, entry_id)
+    set_items: Callable[[object, str, list], None]  # (client, entry_id, items)
+
+    describe_item: Callable[[dict], str]
+    # (ui_state, current_list, persist) -> (add_box, add_btn)
+    build_add_controls: Callable[..., tuple[Gtk.Widget, Gtk.Button]]
+    # (client, config, profile, layer, entry_id, ui_state, on_change, show_error) -> Widget
+    build_middle_slot: Callable[..., Gtk.Widget]
+
+
+MACRO = LibraryKind(
+    noun="Macro",
+    config_key="macros",
+    items_key="steps",
+    selection_key="library_selected_macro",
+    binding_type="macro",
+    id_field="macro_id",
+    toast_key=None,
+    create=lambda client, name: client.create_macro(name, []),
+    rename=lambda client, mid, new: client.rename_macro(mid, new),
+    delete=lambda client, mid: client.delete_macro(mid),
+    set_items=lambda client, mid, steps: client.set_macro_steps(mid, steps),
+    describe_item=describe_macro_step,
+    build_add_controls=_build_macro_add_controls,
+    build_middle_slot=_build_macro_middle_reserve,
+)
+STEPPER = LibraryKind(
+    noun="Stepper",
+    config_key="steppers",
+    items_key="items",
+    selection_key="library_selected_stepper",
+    binding_type="step",
+    id_field="stepper_id",
+    toast_key="stepper_toast",
+    create=lambda client, name: client.create_stepper(name, []),
+    rename=lambda client, sid, new: client.rename_stepper(sid, new),
+    delete=lambda client, sid: client.delete_stepper(sid),
+    set_items=lambda client, sid, items: client.set_stepper_items(sid, items),
+    describe_item=describe_stepper_item,
+    build_add_controls=_build_stepper_add_controls,
+    build_middle_slot=build_stepper_assignment_row,
+)
+
+# Insertion order = tab order (Steppers, then Macros). Default tab stays
+# "macros" (see `build_library_sidebar` / `build_library_content`).
+_KINDS: dict[str, LibraryKind] = {"steppers": STEPPER, "macros": MACRO}
+
+
+def build_editor_columns(
+    client,
+    config: dict,
+    profile: str,
+    layer: str,
+    kind: LibraryKind,
+    entry_id: str,
+    ui_state: dict,
+    on_change: Callable[[], None],
+) -> tuple[Gtk.Widget, Gtk.Widget]:
+    """Columns 2+3 for the selected library entry (ticket 70), kind-agnostic
+    (post-release ticket 13). Column 2 is the name heading plus the
+    steps/items list; column 3 is the toast (Stepper only) and error label
+    and "+ Add …" button pinned above `kind.build_middle_slot(...)`, a
+    separator, and a `_vscrollable` body holding the save-hint and
+    `kind.build_add_controls(...)` — the pinned header stays visible
+    regardless of where the body is scrolled to (ticket 70 follow-up,
+    live-verified: the picker's own expandable content can grow tall enough
+    to scroll everything below it out of view). Structured identically for
+    both kinds so nothing shifts on a tab flip (ticket 91) — see
+    `_header_middle_reserve`."""
+    entry = config[kind.config_key][entry_id]
+    current_list = entry[kind.items_key]
+
+    col3 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_EDITOR_COL_SPACING)
+
+    if kind.toast_key is not None:
+        toast = ui_state.pop(kind.toast_key, None)
+        if toast is not None:
+            col3.append(Gtk.Label(label=toast, xalign=0, wrap=True, css_classes=["toast"]))
+
+    error_label = Gtk.Label(xalign=0, wrap=True, css_classes=["error"])
+    error_label.set_visible(False)
+    col3.append(error_label)
+
+    def show_error(exc: Exception) -> None:
+        error_label.set_label(str(exc))
+        error_label.set_visible(True)
+
+    def persist(new_list: list[dict]) -> None:
+        try:
+            kind.set_items(client, entry_id, new_list)
+        except DaemonError as exc:
+            show_error(exc)
+            return
+        on_change()
+
+    rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    for i, item in enumerate(current_list):
+        row_box = Gtk.Box(spacing=6)
+        row_box.set_margin_top(2)
+        row_box.set_margin_bottom(2)
+        row_box.set_margin_start(4)
+        row_box.set_margin_end(4)
+        row_box.append(Gtk.Label(label=kind.describe_item(item), hexpand=True, xalign=0))
+
+        up_btn = Gtk.Button(label="↑")
+        up_btn.set_sensitive(i > 0)
+
+        def on_up(_b, i=i):
+            new_list = list(current_list)
+            new_list[i - 1], new_list[i] = new_list[i], new_list[i - 1]
+            persist(new_list)
+
+        up_btn.connect("clicked", on_up)
+        row_box.append(up_btn)
+
+        down_btn = Gtk.Button(label="↓")
+        down_btn.set_sensitive(i < len(current_list) - 1)
+
+        def on_down(_b, i=i):
+            new_list = list(current_list)
+            new_list[i + 1], new_list[i] = new_list[i], new_list[i + 1]
+            persist(new_list)
+
+        down_btn.connect("clicked", on_down)
+        row_box.append(down_btn)
+
+        rm_btn = Gtk.Button(label="×")
+
+        def on_remove(_b, i=i):
+            new_list = list(current_list)
+            new_list.pop(i)
+            persist(new_list)
+
+        rm_btn.connect("clicked", on_remove)
+        row_box.append(rm_btn)
+
+        rows.append(row_box)
+
+    # Ticket 70 follow-up (kept in lockstep by ticket 91's `_build_editor_col2`
+    # / `_vexpanding_list_scroller`): column 2 fills the full column height
+    # column 1's old list used to occupy, so a short list leaves no dead space.
+    col2 = _build_editor_col2(entry["name"], _vexpanding_list_scroller(rows))
+
+    # "+ Add …" is appended straight into col3 (not body), pinning it above
+    # the scrolled area entirely rather than merely above `add_box` within
+    # it.
+    add_box, add_btn = kind.build_add_controls(ui_state, current_list, persist)
+    col3.append(add_btn)
+
+    # Ticket 91 #1: the Stepper editor's column 3 carries a Forward/Backward
+    # assignment row + separator here; the Macro editor reserves the same
+    # vertical space (blank) + its own separator, so the scrollable body
+    # below starts at the same y on both tabs.
+    col3.append(
+        kind.build_middle_slot(
+            client, config, profile, layer, entry_id, ui_state, on_change, show_error
+        )
+    )
+    col3.append(Gtk.Separator())
+
+    body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_EDITOR_COL_SPACING)
+    body.append(
+        Gtk.Label(
+            label="Changes save automatically.",
+            xalign=0,
+            wrap=True,
+            css_classes=["dim"],
+        )
+    )
     body.append(add_box)
     col3.append(_vscrollable(body))
 
@@ -1095,7 +1011,8 @@ def build_library_sidebar(client, config: dict, ui_state: dict, on_change: Calla
     `device_overview.build_main_view` in the Profile-sidebar's own slot.
     The tab row plus the selected panel's browse list, pinned to the same
     fixed 220px width `device_overview.build_profile_sidebar` uses so
-    nothing visibly resizes when flipping Grid↔Library."""
+    nothing visibly resizes when flipping Grid↔Library. Dispatches on
+    `_KINDS[selected_tab]` — no `if/else` (post-release ticket 13)."""
     selected_tab = ui_state.setdefault("library_tab", "macros")
 
     sidebar = build_pinned_sidebar_box()
@@ -1106,11 +1023,7 @@ def build_library_sidebar(client, config: dict, ui_state: dict, on_change: Calla
 
     sidebar.append(build_library_tabs(selected_tab, on_tab_select))
     sidebar.append(Gtk.Separator())
-
-    if selected_tab == "steppers":
-        sidebar.append(build_steppers_browse_list(client, config, ui_state, on_change))
-    else:
-        sidebar.append(build_macros_browse_list(client, config, ui_state, on_change))
+    sidebar.append(build_browse_list(client, config, _KINDS[selected_tab], ui_state, on_change))
 
     return sidebar
 
@@ -1139,34 +1052,24 @@ def build_library_content(
     `device_overview.build_main_view` in the "right" slot below the
     Grid/Library switcher, the same slot the Grid destination's own device
     grid occupies. Reads `ui_state["library_tab"]`, already established by
-    `build_library_sidebar`'s own render this cycle."""
+    `build_library_sidebar`'s own render this cycle. Dispatches on
+    `_KINDS[selected_tab]` — no `if/else` (post-release ticket 13)."""
     selected_tab = ui_state.setdefault("library_tab", "macros")
+    kind = _KINDS[selected_tab]
 
     root = Gtk.Box(spacing=16)
     root.set_hexpand(True)
 
-    if selected_tab == "steppers":
-        selected_stepper_id = _selected_stepper_id(config, ui_state)
-        if selected_stepper_id is None:
-            root.append(_empty_library_label("No Steppers yet — use “+ New” to create one."))
-        else:
-            _mount_editor_columns(
-                root,
-                *build_stepper_editor_columns(
-                    client, config, profile, layer, selected_stepper_id, ui_state, on_change
-                ),
-            )
+    entry_id = _selected_id(config, kind, ui_state)
+    if entry_id is None:
+        root.append(_empty_library_label(f"No {kind.noun}s yet — use “+ New” to create one."))
     else:
-        selected_macro_id = _selected_macro_id(config, ui_state)
-        if selected_macro_id is None:
-            root.append(_empty_library_label("No Macros yet — use “+ New” to create one."))
-        else:
-            _mount_editor_columns(
-                root,
-                *build_macro_editor_columns(
-                    client, config, selected_macro_id, ui_state, on_change
-                ),
-            )
+        _mount_editor_columns(
+            root,
+            *build_editor_columns(
+                client, config, profile, layer, kind, entry_id, ui_state, on_change
+            ),
+        )
 
     return root
 

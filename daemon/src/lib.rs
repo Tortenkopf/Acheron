@@ -2,21 +2,35 @@
 // Copyright © 2026 Justin Milatz
 
 /// The Daemon's runtime version string (ticket 99), stamped at compile time
-/// by `build.rs`: `1.0.1` for a release-tag or tarball build, or
-/// `1.0.1-dev+<short-hash>` for any other git checkout. Reported to the GUI
+/// by `build.rs`: `1.0.2` for a release-tag or tarball build, or
+/// `1.0.2-dev+<short-hash>` for any other git checkout. Reported to the GUI
 /// as `GetState()`'s `daemon_version` key so the About dialog (ticket 102)
 /// can show it, and any drift from the GUI's own `__version__` shows up in
 /// bug reports.
 pub const VERSION: &str = env!("ACHERON_VERSION");
 
+pub mod analog_repeat;
+pub mod axis;
 pub mod capture;
+pub mod chord;
 pub mod command;
 pub mod config;
 pub mod dbus;
 pub mod dispatch;
+pub mod edit;
 pub mod executor;
 pub mod injector;
 pub mod input;
+pub mod stepper;
+pub mod trigger;
+
+/// The GUI-mirror contract fixture generator (post-release ticket 06) — a
+/// single golden-file `#[test]` deriving the daemon's device catalogs and
+/// `config::validate` verdicts and checking `daemon/contract/daemon-schema.json`
+/// against them. Test-only: it drives `config::validate` and nothing links
+/// it into the running daemon.
+#[cfg(test)]
+pub(crate) mod schema;
 
 #[cfg(test)]
 mod build_version_tests {

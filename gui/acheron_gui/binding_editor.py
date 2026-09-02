@@ -22,6 +22,7 @@ from typing import Callable
 
 from gi.repository import Gtk, GLib
 
+from . import rules
 from .daemon_client import DaemonError
 from .gtk_utils import build_name_prompt_popover, clear_children
 from .inputs import (
@@ -99,23 +100,6 @@ def action_summary(
     macro_id = binding.get("macro_id", "?")
     name = macros.get(macro_id, {}).get("name", macro_id)
     return f"Macro: {name}  [{TRIGGER_SHORT[binding['trigger']]}]"
-
-
-def describe_step(step: dict) -> str:
-    kind = step["type"]
-    if kind in ("key_down", "key_up"):
-        raw = step["key"]
-        # Ticket 92: a KeyDown/KeyUp step may target a controller button
-        # (routed to the gamepad device by the injector). Render it with the
-        # gamepad catalog's label and a ↓/↑ prefix, e.g. "↓ Btn: A / South".
-        # Mouse buttons (also `BTN_*`) aren't in the gamepad catalog, so
-        # they keep the plain "KeyDown BTN_SIDE" form.
-        if raw in CONTROLLER_LABEL_BY_CODE:
-            return f"{'↓' if kind == 'key_down' else '↑'} Btn: {CONTROLLER_LABEL_BY_CODE[raw]}"
-        return f"{'KeyDown' if kind == 'key_down' else 'KeyUp'} {raw}"
-    if kind == "delay_ms":
-        return f"Delay {step['ms']}ms"
-    return str(step)
 
 
 def labeled_row(label: str, widget: Gtk.Widget) -> Gtk.Box:
@@ -506,19 +490,17 @@ def build_action_and_trigger_fields(
     # Analog-repeat only has meaning for a grid key (ticket 20/39 — only a
     # Grid Input has Depth) — excluded outright for a non-grid Input or a
     # Chord's own Binding (`inp is None`), mirroring `available_action_
-    # types`'s own `is_grid_input`-gated "Axis" exclusion above it. The
-    # Daemon's own `parse`/`SetBinding`/`SetChordBinding` validation
-    # (ticket 39) makes it structurally impossible for `starting["trigger"]`
-    # to be "analog_repeat" here when this filters it out. Fixed for the
-    # popover's whole lifetime (an Input's grid-ness never changes), unlike
-    # `trigger_options` below, which `render_action_editor` also narrows for
-    # Controller Button and rebuilds live as the Action-kind changes (ticket
-    # 78).
-    base_trigger_options = (
-        TRIGGER_OPTIONS
-        if inp is not None and is_grid_input(inp)
-        else [(k, lbl) for k, lbl in TRIGGER_OPTIONS if k != "analog_repeat"]
-    )
+    # types`'s own grid-gated "Axis" exclusion above it. Derived from the
+    # `rules` mirror of `config::validate` rather than a hardcoded
+    # `"analog_repeat"` literal: `valid_triggers` already gates that entry
+    # on grid-ness (and on `inp is None`). `keypress` is the permissive
+    # kind — every trigger it doesn't allow here, no kind does — so this is
+    # the widest matrix any Action kind can show. `render_action_editor`
+    # narrows it further per kind (ticket 78's Controller Button carve-out)
+    # and rebuilds live as the Action-kind changes.
+    base_trigger_options = [
+        (k, lbl) for k, lbl in TRIGGER_OPTIONS if k in rules.valid_triggers("keypress", inp)
+    ]
     trigger_options = base_trigger_options
     trigger_keys = [k for k, _ in trigger_options]
     trigger_dd = Gtk.DropDown(model=Gtk.StringList.new([lbl for _, lbl in trigger_options]))
@@ -591,16 +573,18 @@ def build_action_and_trigger_fields(
 
         # Ticket 78: Fire-once is locked out for Controller Button (Hold-to-
         # repeat's sustained-hold behavior already covers a quick tap; no
-        # real gamepad button press works like Fire-once's decoupled pulse)
-        # — unlike Analog-repeat's exclusion above (fixed for the popover's
-        # whole lifetime, since an Input's grid-ness never changes), this
-        # depends on `kind`, which the user can flip live via `action_dd`, so
-        # the model is rebuilt here rather than computed once. Mirrors the
-        # non-grid-Input/Chord Analog-repeat exclusion's own reasoning
-        # (`Gtk.DropDown` has no per-item sensitivity — ticket 39's
-        # precedent), applied a second time for a second kind-gated entry.
+        # real gamepad button press works like Fire-once's decoupled pulse).
+        # Unlike Profile Switch / Axis (locked to a single option, handled by
+        # disabling the dropdown below) and Step (two of three options, left
+        # unlocked — the Daemon's own rejection surfaces on Save), Controller
+        # Button drops one entry from an otherwise-normal list, so the model
+        # is rebuilt here from the `rules` matrix rather than a hardcoded
+        # `"fire_once"` literal. It depends on `kind`, which the user can flip
+        # live via `action_dd`, so it can't be computed once like
+        # `base_trigger_options`. (`Gtk.DropDown` has no per-item sensitivity
+        # — ticket 39's precedent.)
         new_trigger_options = (
-            [(k, lbl) for k, lbl in base_trigger_options if k != "fire_once"]
+            [(k, lbl) for k, lbl in base_trigger_options if k in rules.valid_triggers(kind, inp)]
             if kind == "controller_button"
             else base_trigger_options
         )
@@ -713,7 +697,7 @@ def build_action_and_trigger_fields(
             # dropdown sits alongside the Stepper dropdown; full item
             # authoring and the Forward/Backward *Input*-pair assignment
             # both live in the Library screen
-            # (`library_view.build_stepper_editor_columns`), not here — this
+            # (`library_view.build_editor_columns`), not here — this
             # popover only ever assigns `stepper_id`/`direction` to the
             # Binding on this one Input, exactly like every other branch
             # here only assigns its own field(s).
@@ -772,7 +756,7 @@ def build_action_and_trigger_fields(
             # internal) plus "+ New Macro" to create one inline and assign it
             # right away, replacing ticket 51's temporary read-only stub.
             # Full step authoring lives in the Library screen
-            # (`library_view.build_macro_editor_columns`), not here — this popover
+            # (`library_view.build_editor_columns`), not here — this popover
             # only ever assigns a `macro_id` to the Binding, exactly like the
             # Controller-button/Profile-switch branches only ever assign
             # their own single field.
@@ -917,8 +901,10 @@ def build_binding_editor(
         }
     # "Axis" is offered only for grid keys (ticket 60's Answer) — non-grid
     # Inputs (Mode key, thumbstick, wheel) never see the option at all,
-    # rather than seeing it disabled.
-    available_action_types = ACTION_TYPES if is_grid_input(inp) else [e for e in ACTION_TYPES if e[0] != "axis"]
+    # rather than seeing it disabled. Filtered through the `rules` mirror of
+    # `config::validate`'s Action-placement checks rather than a hardcoded
+    # `"axis"` literal.
+    available_action_types = [e for e in ACTION_TYPES if e[0] in rules.valid_action_kinds(inp)]
 
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     box.set_margin_top(10)
@@ -1058,8 +1044,9 @@ def build_chord_binding_dialog(
     # Chord's own Binding — Profile Switch because `fire_chord` has no
     # `&mut Config` to run a switch through, Axis because it isn't a Binding
     # at all (ticket 59 §2) and a Chord fires on a discrete Down, not a
-    # continuous value.
-    chord_action_types = [(k, lbl) for k, lbl in ACTION_TYPES if k not in ("profile_switch", "axis")]
+    # continuous value. Both fall out of `rules.valid_action_kinds(None)`
+    # (`None` == a Chord's own Binding) rather than a hardcoded exclusion.
+    chord_action_types = [(k, lbl) for k, lbl in ACTION_TYPES if k in rules.valid_action_kinds(None)]
 
     dialog = Gtk.Window(transient_for=win, modal=True, title="Chord binding")
     dialog.set_default_size(320, 280)

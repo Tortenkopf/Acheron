@@ -30,6 +30,7 @@ from typing import Callable
 from gi.repository import Gtk
 
 from .gtk_utils import clear_children
+from .rules import AXIS_TARGETS
 
 # ---------------------------------------------------------------------
 # Catalog — ticket 59 §3's settled 17-target list: 5 unsigned single-key
@@ -74,7 +75,11 @@ AXIS_LABEL_BY_TARGET: dict[str, str] = {
     "wheel_neg": "Wheel −",
 }
 
-assert len(AXIS_LABEL_BY_TARGET) == 17, "the axis catalog must match the Daemon's 17-target list"
+# Assert the catalog's *contents* (not just its length) against the single
+# contract-tested mirror of the Daemon's `AxisTarget::ALL` wire strings.
+assert set(AXIS_LABEL_BY_TARGET) == AXIS_TARGETS, (
+    "the axis catalog must match rules.AXIS_TARGETS (the Daemon's 17-target list)"
+)
 
 
 def _target_button(target: str, cap: str, current: str) -> Gtk.Button:

@@ -23,8 +23,9 @@ use zbus::interface;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::OwnedValue;
 
-use crate::command::{Command, CommandError};
+use crate::command::Command;
 use crate::config::{MacroId, StepperId};
+use crate::edit::{CommandError, CreatedId, Edit};
 use crate::injector::Injector;
 use crate::input::Input;
 
@@ -136,6 +137,40 @@ impl Daemon {
         input
             .parse()
             .map_err(|_| DaemonError::InvalidBinding(format!("{input:?} is not a valid Input")))
+    }
+
+    /// Hands `edit` to the dispatch task and awaits its verdict — the
+    /// `oneshot::channel` + `send` + `dispatch_gone` + `rx.await` +
+    /// `DaemonError::from` round-trip every mutating method shares (ticket 11).
+    /// Used by the 22 non-create mutating methods; `apply_creating` is its
+    /// sibling for the two that mint an id.
+    async fn apply(&self, edit: Edit) -> DaemonResult<()> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::Apply { edit, reply })
+            .await
+            .map_err(dispatch_gone)?;
+        rx.await
+            .map_err(dispatch_gone)?
+            .map_err(DaemonError::from)?;
+        Ok(())
+    }
+
+    /// `apply` for `create_macro` / `create_stepper` — the same round-trip,
+    /// plus the "a create always mints an id" unwrap. `edit::plan` sets
+    /// `Outcome.created` to `Some` for exactly `Edit::CreateMacro` /
+    /// `Edit::CreateStepper`, so `None` here is unreachable.
+    async fn apply_creating(&self, edit: Edit) -> DaemonResult<CreatedId> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::Apply { edit, reply })
+            .await
+            .map_err(dispatch_gone)?;
+        let created = rx
+            .await
+            .map_err(dispatch_gone)?
+            .map_err(DaemonError::from)?;
+        Ok(created.expect("a create Edit always mints a CreatedId"))
     }
 }
 
@@ -363,17 +398,12 @@ impl Daemon {
         let layer = wire::layer_from_str(&layer).map_err(DaemonError::InvalidBinding)?;
         let binding = wire::binding_from_dict(&binding).map_err(DaemonError::InvalidBinding)?;
 
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::SetBinding {
-                input,
-                layer,
-                binding,
-                reply,
-            })
-            .await
-            .map_err(dispatch_gone)?;
-        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+        self.apply(Edit::SetBinding {
+            input,
+            layer,
+            binding,
+        })
+        .await
     }
 
     /// Atomic: removes the Binding (passthrough resumes) and rewrites
@@ -383,16 +413,7 @@ impl Daemon {
         let input = Self::parse_input(&input)?;
         let layer = wire::layer_from_str(&layer).map_err(DaemonError::InvalidBinding)?;
 
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::ClearBinding {
-                input,
-                layer,
-                reply,
-            })
-            .await
-            .map_err(dispatch_gone)?;
-        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+        self.apply(Edit::ClearBinding { input, layer }).await
     }
 
     /// Atomic: validates, applies in-memory, and rewrites `config.toml`
@@ -411,17 +432,12 @@ impl Daemon {
         let layer = wire::layer_from_str(&layer).map_err(DaemonError::InvalidBinding)?;
         let target = wire::axis_target_from_str(&target).map_err(DaemonError::InvalidBinding)?;
 
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::SetAxisAssignment {
-                input,
-                layer,
-                target,
-                reply,
-            })
-            .await
-            .map_err(dispatch_gone)?;
-        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+        self.apply(Edit::SetAxisAssignment {
+            input,
+            layer,
+            target,
+        })
+        .await
     }
 
     /// Atomic: removes the Axis assignment (ordinary passthrough resumes)
@@ -431,16 +447,7 @@ impl Daemon {
         let input = Self::parse_input(&input)?;
         let layer = wire::layer_from_str(&layer).map_err(DaemonError::InvalidBinding)?;
 
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::ClearAxisAssignment {
-                input,
-                layer,
-                reply,
-            })
-            .await
-            .map_err(dispatch_gone)?;
-        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+        self.apply(Edit::ClearAxisAssignment { input, layer }).await
     }
 
     /// Flips the active Profile's `mode_key_role` (ticket 18) —
@@ -449,12 +456,7 @@ impl Daemon {
     async fn set_mode_key_role(&self, role: String) -> Result<(), DaemonError> {
         let role = wire::mode_key_role_from_str(&role).map_err(DaemonError::InvalidBinding)?;
 
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::SetModeKeyRole { role, reply })
-            .await
-            .map_err(dispatch_gone)?;
-        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+        self.apply(Edit::SetModeKeyRole { role }).await
     }
 
     /// Creates a new, empty Profile (ticket 19) — atomic/immediately-
@@ -462,40 +464,21 @@ impl Daemon {
     /// `SetModeKeyRole` already established. Errors `AlreadyExists` if
     /// `name` is already taken.
     async fn create_profile(&self, name: String) -> Result<(), DaemonError> {
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::CreateProfile { name, reply })
-            .await
-            .map_err(dispatch_gone)?;
-        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+        self.apply(Edit::CreateProfile { name }).await
     }
 
     /// Deletes a Profile by name. Errors `NotFound` if it doesn't exist, or
     /// `InvalidBinding` if it's the currently active Profile — switch away
     /// from it first via `SwitchProfile`.
     async fn delete_profile(&self, name: String) -> Result<(), DaemonError> {
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::DeleteProfile { name, reply })
-            .await
-            .map_err(dispatch_gone)?;
-        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+        self.apply(Edit::DeleteProfile { name }).await
     }
 
     /// Renames a Profile, updating `active_profile` too if it's the active
     /// one. Errors `NotFound` if `old_name` doesn't exist, or
     /// `AlreadyExists` if `new_name` is already taken.
     async fn rename_profile(&self, old_name: String, new_name: String) -> Result<(), DaemonError> {
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::RenameProfile {
-                old_name,
-                new_name,
-                reply,
-            })
-            .await
-            .map_err(dispatch_gone)?;
-        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+        self.apply(Edit::RenameProfile { old_name, new_name }).await
     }
 
     /// Creates a new Macro library entry (ticket 15/51) — atomic/
@@ -516,45 +499,32 @@ impl Daemon {
             .collect::<Result<Vec<_>, _>>()
             .map_err(DaemonError::InvalidBinding)?;
 
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::CreateMacro { name, steps, reply })
-            .await
-            .map_err(dispatch_gone)?;
-        let macro_id = rx
-            .await
-            .map_err(dispatch_gone)?
-            .map_err(DaemonError::from)?;
+        let CreatedId::Macro(macro_id) = self
+            .apply_creating(Edit::CreateMacro { name, steps })
+            .await?
+        else {
+            unreachable!("CreateMacro always mints a Macro id")
+        };
         Ok(macro_id.to_string())
     }
 
     /// Renames a Macro — a pure display-name field write; the `MacroId`
     /// itself never changes. Errors `NotFound` if `macro_id` doesn't exist.
     async fn rename_macro(&self, macro_id: String, new_name: String) -> Result<(), DaemonError> {
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::RenameMacro {
-                macro_id: MacroId::from(macro_id),
-                new_name,
-                reply,
-            })
-            .await
-            .map_err(dispatch_gone)?;
-        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+        self.apply(Edit::RenameMacro {
+            macro_id: MacroId::from(macro_id),
+            new_name,
+        })
+        .await
     }
 
     /// Deletes a Macro. Errors `NotFound` if it doesn't exist, or
     /// `InvalidBinding` if any Binding anywhere still references it.
     async fn delete_macro(&self, macro_id: String) -> Result<(), DaemonError> {
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::DeleteMacro {
-                macro_id: MacroId::from(macro_id),
-                reply,
-            })
-            .await
-            .map_err(dispatch_gone)?;
-        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+        self.apply(Edit::DeleteMacro {
+            macro_id: MacroId::from(macro_id),
+        })
+        .await
     }
 
     /// Overwrites a Macro's step sequence in place — the real persistence
@@ -573,16 +543,11 @@ impl Daemon {
             .collect::<Result<Vec<_>, _>>()
             .map_err(DaemonError::InvalidBinding)?;
 
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::SetMacroSteps {
-                macro_id: MacroId::from(macro_id),
-                steps,
-                reply,
-            })
-            .await
-            .map_err(dispatch_gone)?;
-        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+        self.apply(Edit::SetMacroSteps {
+            macro_id: MacroId::from(macro_id),
+            steps,
+        })
+        .await
     }
 
     /// Creates a new Stepper library entry (ticket 03/54) — atomic/
@@ -600,15 +565,12 @@ impl Daemon {
             .collect::<Result<Vec<_>, _>>()
             .map_err(DaemonError::InvalidBinding)?;
 
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::CreateStepper { name, items, reply })
-            .await
-            .map_err(dispatch_gone)?;
-        let stepper_id = rx
-            .await
-            .map_err(dispatch_gone)?
-            .map_err(DaemonError::from)?;
+        let CreatedId::Stepper(stepper_id) = self
+            .apply_creating(Edit::CreateStepper { name, items })
+            .await?
+        else {
+            unreachable!("CreateStepper always mints a Stepper id")
+        };
         Ok(stepper_id.to_string())
     }
 
@@ -620,30 +582,20 @@ impl Daemon {
         stepper_id: String,
         new_name: String,
     ) -> Result<(), DaemonError> {
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::RenameStepper {
-                stepper_id: StepperId::from(stepper_id),
-                new_name,
-                reply,
-            })
-            .await
-            .map_err(dispatch_gone)?;
-        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+        self.apply(Edit::RenameStepper {
+            stepper_id: StepperId::from(stepper_id),
+            new_name,
+        })
+        .await
     }
 
     /// Deletes a Stepper. Errors `NotFound` if it doesn't exist, or
     /// `InvalidBinding` if any Binding anywhere still references it.
     async fn delete_stepper(&self, stepper_id: String) -> Result<(), DaemonError> {
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::DeleteStepper {
-                stepper_id: StepperId::from(stepper_id),
-                reply,
-            })
-            .await
-            .map_err(dispatch_gone)?;
-        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+        self.apply(Edit::DeleteStepper {
+            stepper_id: StepperId::from(stepper_id),
+        })
+        .await
     }
 
     /// Overwrites a Stepper's item list in place, mirroring
@@ -660,16 +612,11 @@ impl Daemon {
             .collect::<Result<Vec<_>, _>>()
             .map_err(DaemonError::InvalidBinding)?;
 
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::SetStepperItems {
-                stepper_id: StepperId::from(stepper_id),
-                items,
-                reply,
-            })
-            .await
-            .map_err(dispatch_gone)?;
-        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+        self.apply(Edit::SetStepperItems {
+            stepper_id: StepperId::from(stepper_id),
+            items,
+        })
+        .await
     }
 
     /// Creates or edits a Chord Binding on the active Profile (ticket 01/40
@@ -694,17 +641,12 @@ impl Daemon {
         let layer = wire::layer_from_str(&layer).map_err(DaemonError::InvalidBinding)?;
         let binding = wire::binding_from_dict(&binding).map_err(DaemonError::InvalidBinding)?;
 
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::SetChordBinding {
-                inputs: parsed_inputs,
-                layer,
-                binding,
-                reply,
-            })
-            .await
-            .map_err(dispatch_gone)?;
-        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+        self.apply(Edit::SetChordBinding {
+            inputs: parsed_inputs,
+            layer,
+            binding,
+        })
+        .await
     }
 
     /// Removes a Chord Binding by its exact member set. Errors `NotFound` if
@@ -720,16 +662,11 @@ impl Daemon {
         }
         let layer = wire::layer_from_str(&layer).map_err(DaemonError::InvalidBinding)?;
 
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::ClearChordBinding {
-                inputs: parsed_inputs,
-                layer,
-                reply,
-            })
-            .await
-            .map_err(dispatch_gone)?;
-        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+        self.apply(Edit::ClearChordBinding {
+            inputs: parsed_inputs,
+            layer,
+        })
+        .await
     }
 
     /// Switches the active Profile, force-stopping every currently running
@@ -737,12 +674,7 @@ impl Daemon {
     /// active (ticket 19). Errors `NotFound` if `name` doesn't name a real
     /// Profile.
     async fn switch_profile(&self, name: String) -> Result<(), DaemonError> {
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::SwitchProfile { name, reply })
-            .await
-            .map_err(dispatch_gone)?;
-        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+        self.apply(Edit::SwitchProfile { name }).await
     }
 
     /// Force-stops every currently running Toggle (ticket 25) — a deliberate
@@ -776,17 +708,12 @@ impl Daemon {
     ) -> Result<(), DaemonError> {
         let input = Self::parse_input(&input)?;
 
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::SetActuationPoint {
-                input,
-                actuation,
-                release,
-                reply,
-            })
-            .await
-            .map_err(dispatch_gone)?;
-        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+        self.apply(Edit::SetActuationPoint {
+            input,
+            actuation,
+            release,
+        })
+        .await
     }
 
     /// Removes a per-key override, reverting that key to the active
@@ -795,28 +722,15 @@ impl Daemon {
     async fn clear_actuation_point(&self, input: String) -> Result<(), DaemonError> {
         let input = Self::parse_input(&input)?;
 
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::ClearActuationPoint { input, reply })
-            .await
-            .map_err(dispatch_gone)?;
-        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+        self.apply(Edit::ClearActuationPoint { input }).await
     }
 
     /// Sets the active Profile's default Actuation/Release point — what
     /// every Grid key without its own override uses. Errors
     /// `InvalidBinding` if `release > actuation`.
     async fn set_default_actuation(&self, actuation: u8, release: u8) -> Result<(), DaemonError> {
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::SetDefaultActuation {
-                actuation,
-                release,
-                reply,
-            })
+        self.apply(Edit::SetDefaultActuation { actuation, release })
             .await
-            .map_err(dispatch_gone)?;
-        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
     }
 
     /// Clears every per-key override on the active Profile in one call/one
@@ -824,12 +738,7 @@ impl Daemon {
     /// default" affordance (ticket 17 §5). Never fails on validation
     /// grounds; can still surface `IoError` if the rewrite itself fails.
     async fn reset_actuation_points(&self) -> Result<(), DaemonError> {
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::ResetActuationPoints { reply })
-            .await
-            .map_err(dispatch_gone)?;
-        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+        self.apply(Edit::ResetActuationPoints).await
     }
 
     /// The live setter for `Config.force_digital` (ticket 17 §4) — the
@@ -837,12 +746,7 @@ impl Daemon {
     /// Analog would otherwise unlock. Persists the flag and (ticket 23)
     /// actually swaps the live capture source.
     async fn set_force_digital(&self, force: bool) -> Result<(), DaemonError> {
-        let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::SetForceDigital { force, reply })
-            .await
-            .map_err(dispatch_gone)?;
-        rx.await.map_err(dispatch_gone)?.map_err(DaemonError::from)
+        self.apply(Edit::SetForceDigital { force }).await
     }
 
     /// Starts (or retargets) live depth streaming for `input` — the GUI's
@@ -2818,17 +2722,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_actuation_point_over_real_dbus_with_a_non_grid_input_is_rejected() {
+    async fn clear_actuation_point_over_real_dbus_on_a_non_grid_input_succeeds_as_a_no_op() {
+        // Ticket 04: `ClearActuationPoint` no longer runs a non-Grid guard —
+        // a non-Grid Input never has an override, so clearing one is the same
+        // silent success as clearing an unoverridden Grid key, over the wire
+        // too (the old `..._with_a_non_grid_input_is_rejected` test is gone).
         let server = TestServer::start().await;
 
-        let err = server
+        server
             .proxy
             .clear_actuation_point("mode_key")
             .await
-            .expect_err("a non-Grid Input must be rejected");
-        assert!(
-            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.InvalidBinding")
-        );
+            .expect("ClearActuationPoint on a non-Grid Input must be a no-op success");
 
         server.shut_down().await;
     }

@@ -30,6 +30,7 @@ from typing import Callable
 from gi.repository import Gtk
 
 from .gtk_utils import clear_children
+from .rules import GAMEPAD_BUTTONS
 
 # ---------------------------------------------------------------------
 # Catalog — ticket 14's settled device-advertising scope, mirrored from
@@ -81,7 +82,12 @@ _ALL_ENTRIES: list[tuple[str, str]] = [
 ]
 LABEL_BY_CODE = {code: label for code, label in _ALL_ENTRIES}
 
-assert len(LABEL_BY_CODE) == 57, "the gamepad catalog must match the Daemon's 57-entry allowlist"
+# Assert the catalog's *contents* (not just its length) against the single
+# contract-tested mirror of the Daemon's `gamepad_button_codes()` allowlist —
+# a renamed or swapped entry is caught here, not just a miscount.
+assert set(LABEL_BY_CODE) == GAMEPAD_BUTTONS, (
+    "the gamepad catalog must match rules.GAMEPAD_BUTTONS (the Daemon's allowlist)"
+)
 
 
 def button_css_class(code: str) -> str | None:
