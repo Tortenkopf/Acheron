@@ -60,11 +60,11 @@ prototype adds no daemon changes and carries no caution beyond what analog alrea
 - **Every Profile has a defined Status-LED state** (Q4, Option A) — default `(off, off, off)`;
   switching Profiles is fully deterministic from the active Profile alone. Migration default
   for pre-existing Profiles is all-off.
-- **Startup:** the daemon asserts the active Profile's Status-LED state on launch (Q6).
-- **Shutdown:** clear all three LEDs on clean daemon exit *if* all-off is a hardware-reachable
-  state — **contingent on [ticket 01](./issues/01-prototype-status-led-controllability.md)
-  criterion 5** (Q6/Q13). If all-off is impossible, this decision reopens (see Not yet
-  specified).
+- **Startup + reconnect:** the daemon asserts the active Profile's Status-LED state on launch
+  **and on every device (re)connect** (Q6; ticket 01 made the reconnect assertion a hard
+  requirement — the firmware reclaims the LEDs on every enumeration).
+- **Shutdown:** clear all three LEDs on clean daemon exit — settled; ticket 01 confirmed
+  all-off `(0,0,0)` is hardware-reachable (Q6/Q13 contingency did not trigger).
 - **Layers never touch the Status LEDs** (Q10) — they track the Profile only. The user knows
   when they're holding the Mode key; the value of a static indicator is knowing which Profile
   is active.
@@ -85,8 +85,8 @@ prototype adds no daemon changes and carries no caution beyond what analog alrea
     switch.
 
 **Skills to consult:** `/grilling` + `/domain-modeling` for the two decision tickets (03, 04);
-`/prototype` is *not* needed (the GUI control is conventional, settled in text); `/research`
-for ticket 02.
+`/prototype` is *not* needed (the GUI control is conventional, settled in text). Tickets 01
+(prototype) and 02 (research) are resolved.
 
 ## Decisions so far
 
@@ -94,17 +94,18 @@ for ticket 02.
 
 - [Research: Status-LED wire protocol](./issues/02-research-status-led-wire-protocol.md) —
   implementation-ready ([write-up](./research/status-led-wire-protocol.md), all primary-source
-  cited). The frame is a standard extended-matrix static effect =
-  `build_razer_cmd(0x1F, 0x0F, 0x02, &[0x01,0x0B,0x01,0x00,0x00,0x01, r,g,b])`, **no helper
+  cited; annotated with ticket 01's hardware corrections). The frame is a standard
+  extended-matrix static effect =
+  `build_razer_cmd(0x1F, 0x0F, 0x02, &[0x00,0x0B,0x01,0x00,0x00,0x01, r,g,b])`, **no helper
   changes**, arg6/7/8 = R/G/B. Settled: **no driver-mode call needed** (LED frame is
-  independent of Capture mode — send on a short-lived Interface-2 fd); **device read-back is
-  unreliable** (z3ntu rejected it, it's why PR #2336 never merged) so the **daemon owns an
-  authoritative RGB triple and re-sends the whole frame per change**, GET is startup-seed
-  only; **off = static frame with channel byte `0x00`**, never `effect_none`; **arg4 = `0x00`**
-  (CommandPost's `0x01` is inert, fallback only). NOSTORE (`arg0=0x00`) has no precedent but is
-  a safe one-byte try — **ticket 01 tries NOSTORE first**, falls back to VARSTORE. Corrects
-  three prose claims in the grounding file's §3 (driver mode / read-back / PR #1577 — which
-  contains no `0x0B` code; **PR #2336 is the sole real implementation and it's unmerged**).
+  independent of Capture mode — send on a short-lived Interface-2 fd); the **daemon owns an
+  authoritative RGB triple and re-sends the whole frame per change** (safe cross-device — and
+  it must write unconditionally on every connect anyway); **off = static frame with channel
+  byte `0x00`**, never `effect_none`; **arg4 = `0x00`** (CommandPost's `0x01` is inert);
+  **arg0 = `0x00`** for intent-clarity (the storage byte turned out inert on our unit — see
+  ticket 01 — so no config knob). Corrects three prose claims in the grounding file's §3
+  (driver mode / read-back framing / PR #1577 — which contains no `0x0B` code; **PR #2336 is
+  the sole real implementation and it's unmerged**).
 
 - [Prototype: Status-LED controllability](./issues/01-prototype-status-led-controllability.md)
   — **KILL-GATE PASSED, the effort proceeds.** On the real unit (fw v1.2): all 8 on/off

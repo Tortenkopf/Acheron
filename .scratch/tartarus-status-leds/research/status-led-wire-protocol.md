@@ -25,11 +25,17 @@ PR-comment citations.
 - **The grounding file's §3 arg table is correct** (arg3 `0x00`, arg4 `0x00`/`0x01`, arg5
   `0x01`); two of its *prose* claims need correcting (details below in §7):
   (a) "enable driver/streaming mode first" is **wrong** — the frame needs no driver mode and
-  OpenRazer drives this device's lighting with driver mode permanently disabled; (b) the
-  read-back path is **not reliable** — the OpenRazer maintainer rejected it as
-  unmergeable-quality and the PR author never got it working. It also leaves two things open
-  that this file settles: send `arg4 = 0x00` (not CommandPost's `0x01`), and `effect_none` is
-  used by neither impl.
+  OpenRazer drives this device's lighting with driver mode permanently disabled; (b) read-back
+  is unreliable *across devices* per the OpenRazer maintainer (it's why #2336 stalled), so
+  the design keeps an authoritative RGB triple in the daemon — **though on our fw v1.2
+  [ticket 01](../issues/01-prototype-status-led-controllability.md) found `0x82` reliable in
+  practice**. It also leaves two things open that this file settles: send `arg4 = 0x00` (not
+  CommandPost's `0x01`), and `effect_none` is used by neither impl.
+- **Hardware caveat (ticket 01, fw v1.2):** the source analysis of storage-mode behaviour in
+  §6 was wrong — **nothing persists** across a USB re-enumeration (VARSTORE or NOSTORE), the
+  firmware always reclaims the LEDs to its orange-only default, and `arg0` is inert. Net
+  effect on the spec: send `arg0 = 0x00`, no config knob, and **the daemon must re-assert
+  Status-LED state on startup and every reconnect** (not merely a boot-flash optimisation).
 
 ---
 
@@ -172,12 +178,11 @@ Synapse USB capture — not about it failing.
 
 `razer_chroma_extended_matrix_effect_none` does exist (`razerchromacommon.c:498`:
 `_effect_base(0x06, varstore, led_id, 0x00)` — effect id `0x00`, `data_size 0x06`, args
-`{varstore, led_id, 0x00, 0…}`), but sending it to LED `0x0B` is **untested by any primary
-source** and its effect on a fixed-colour indicator LED is undefined (it may do nothing, or
-hand the LED back to firmware keymap-indicator control).
+`{varstore, led_id, 0x00, 0…}`). **Ticket 01 tried it on LED `0x0B`: it ACKs (`status 0x02`)
+but does nothing to the LEDs** — the static-zero frame is the working off path.
 
 **⇒ Acheron's "off" = the static frame with the relevant channel byte(s) `0x00`.**
-All-off frame: args `01 0B 01 00 00 01 00 00 00`. Do not use `effect_none`.
+All-off frame: args `00 0B 01 00 00 01 00 00 00`. Do not use `effect_none`.
 
 ---
 
@@ -383,7 +388,11 @@ buffer index − 1. CRC = `XOR(buf[3..89])`.
 
 ### 8.1 Write frame — set all three channels
 
-`build_razer_cmd(0x1F, 0x0F, 0x02, &[0x01, 0x0B, 0x01, 0x00, 0x00, 0x01, r, g, b])`
+`build_razer_cmd(0x1F, 0x0F, 0x02, &[0x00, 0x0B, 0x01, 0x00, 0x00, 0x01, r, g, b])`
+
+> **Ticket 01 settled `arg0 = 0x00`** (the storage byte is inert on fw v1.2; `0x00` just
+> states intent — nothing persists either way). Tables updated accordingly; `build_razer_cmd`
+> computes the CRC itself so the worked values are only for cross-checking a USB capture.
 
 | buf idx | value | field |
 |---------|-------|-------|
@@ -395,7 +404,7 @@ buffer index − 1. CRC = `XOR(buf[3..89])`.
 | `[6]`  | `0x09` | data_size |
 | `[7]`  | `0x0F` | command_class |
 | `[8]`  | `0x02` | command_id (write) |
-| `[9]`  | `0x01` | arg0 — storage: `0x01` VARSTORE (try `0x00` NOSTORE first — §6) |
+| `[9]`  | `0x00` | arg0 — storage byte; **send `0x00`** (inert on fw v1.2 — ticket 01/§6) |
 | `[10]` | `0x0B` | arg1 — LED id `SIDE_STRIPE_LED` |
 | `[11]` | `0x01` | arg2 — effect id: static |
 | `[12]` | `0x00` | arg3 — unused for static |
@@ -405,30 +414,33 @@ buffer index − 1. CRC = `XOR(buf[3..89])`.
 | `[16]` | `g`    | arg7 — green LED |
 | `[17]` | `b`    | arg8 — blue LED |
 | `[18..88]` | `00` | padding |
-| `[89]` | `0x0E ^ r ^ g ^ b` | crc |
+| `[89]` | `0x0F ^ r ^ g ^ b` | crc |
 | `[90]` | `0x00` | reserved |
 
-CRC derivation: `0x09^0x0F^0x02 ^ 0x01^0x0B^0x01 ^ 0x00^0x00^0x01 ^ r^g^b = 0x0E ^ r ^ g ^ b`.
-(With CommandPost's arg4=`0x01`: crc = `0x0F ^ r ^ g ^ b`.)
+CRC derivation: `0x09^0x0F^0x02 ^ 0x00^0x0B^0x01 ^ 0x00^0x00^0x01 ^ r^g^b = 0x0F ^ r ^ g ^ b`.
+(`build_razer_cmd` computes the CRC — these values are just for cross-checking a capture.)
 
-Worked examples:
+Worked examples (`arg0 = 0x00`):
 
 | intent | r g b | crc | arg bytes `[9..18]` |
 |--------|-------|-----|----------------------|
-| all off | `00 00 00` | `0x0E` | `01 0B 01 00 00 01 00 00 00` |
-| green only | `00 FF 00` | `0xF1` | `01 0B 01 00 00 01 00 FF 00` |
-| red only | `FF 00 00` | `0xF1` | `01 0B 01 00 00 01 FF 00 00` |
-| all on | `FF FF FF` | `0xF1` | `01 0B 01 00 00 01 FF FF FF` |
+| all off | `00 00 00` | `0x0F` | `00 0B 01 00 00 01 00 00 00` |
+| green only | `00 FF 00` | `0xF0` | `00 0B 01 00 00 01 00 FF 00` |
+| red only | `FF 00 00` | `0xF0` | `00 0B 01 00 00 01 FF 00 00` |
+| all on | `FF FF FF` | `0xF0` | `00 0B 01 00 00 01 FF FF FF` |
 
 ### 8.2 Off frame
 
 Not a distinct command — it is §8.1 with `r = g = b = 0x00`
-(arg bytes `01 0B 01 00 00 01 00 00 00`, crc `0x0E`). To turn off just one channel, send the
-full frame with that channel `0x00` and the other two at their cached values.
+(arg bytes `00 0B 01 00 00 01 00 00 00`, crc `0x0F` with `arg0 = 0x00`). To turn off just one
+channel, send the full frame with that channel `0x00` and the other two at their cached values.
+`effect_none` is **not** an off frame — ticket 01 confirmed it ACKs but does nothing.
 
 ### 8.3 Read-back frame — `command_id 0x82`
 
-`build_razer_cmd(0x1F, 0x0F, 0x82, &[0x01, 0x0B, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00])`
+`build_razer_cmd(0x1F, 0x0F, 0x82, &[0x00, 0x0B, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00])`
+(OpenRazer's GET helper passes `0x01` here; the storage byte is equally inert — match the
+write's `0x00`. Ticket 01 confirmed the read itself is reliable on fw v1.2.)
 
 | buf idx | value | field |
 |---------|-------|-------|
@@ -436,16 +448,16 @@ full frame with that channel `0x00` and the other two at their cached values.
 | `[6]`  | `0x09` | data_size |
 | `[7]`  | `0x0F` | command_class |
 | `[8]`  | `0x82` | command_id (read) |
-| `[9]`  | `0x01` | arg0 — VARSTORE (match the write's storage) |
+| `[9]`  | `0x00` | arg0 — match the write's storage byte (inert) |
 | `[10]` | `0x0B` | arg1 — LED id |
 | `[11]` | `0x01` | arg2 — effect id: static |
 | `[12]` | `0x00` | arg3 |
 | `[13]` | `0x00` | arg4 |
 | `[14]` | `0x01` | arg5 — colour count |
 | `[15..18]` | `00 00 00` | arg6–8 (zero on request) |
-| `[89]` | `0x8E` | crc |
+| `[89]` | `0x8F` | crc (`0x8E` if `arg0 = 0x01`) |
 
-CRC: `0x09^0x0F^0x82 ^ 0x01^0x0B^0x01 ^ 0x01 = 0x8E`.
+CRC: `0x09^0x0F^0x82 ^ 0x00^0x0B^0x01 ^ 0x01 = 0x8F` (`build_razer_cmd` computes this).
 
 **Response** (via `HIDIOCGFEATURE`, 91-byte buffer, `RESP_ARGS = 9`):
 
@@ -465,6 +477,10 @@ Channel values may come back as `0x00`/`0xFF` (CommandPost's assumption) or `0x0
 ---
 
 ## 9. Answers to the six open questions
+
+*[Ticket 01](../issues/01-prototype-status-led-controllability.md) verified 1, 2, 4, 5 on
+hardware exactly as stated; it corrected the hardware-behaviour predictions in 3 and 6 (noted
+inline).*
 
 1. **`arg3`/`arg4` semantics.** `arg3` and `arg4` are the two effect-specific sub-parameter
    slots (direction / speed for wave/starlight/reactive); the **static** effect uses

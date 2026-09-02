@@ -74,11 +74,12 @@ The six questions:
    use it.
 3. **Read-back (`0x82`).** Request is byte-identical to the write frame bar `command_id` and
    zeroed RGB; channels return in `arguments[6/7/8]` (Acheron resp buffer `[15]/[16]/[17]`).
-   **But read-back is unreliable** — z3ntu rejected the GET call ("across devices we can never
-   reliably get back what we've set earlier"), plxty never got it working, and that is the
-   specific thing that kept #2336 from merging. **Acheron must own an authoritative RGB triple
-   in daemon state and re-send the whole frame per change** (both reference impls do this); a
-   single `0x82` at startup to *seed* that state is fine, a per-change GET-modify-SET is not.
+   z3ntu rejected the GET call as unreliable *across devices* ("we can never reliably get back
+   what we've set earlier") — the specific thing that kept #2336 from merging. **Acheron owns
+   an authoritative RGB triple in daemon state and re-sends the whole frame per change** (both
+   reference impls do this; and the daemon must write unconditionally on every connect anyway).
+   *Hardware update — ticket 01: `0x82` was in fact reliable on fw v1.2, including cold reads
+   after a replug, so a startup seed is trustworthy on this unit.*
 4. **`data_size`.** `0x09` — confirmed in OpenRazer, CommandPost, and against `struct
    razer_report` (CRC over bytes `[2..87]`).
 5. **Driver mode: not required.** CommandPost sends no device-mode command at all; OpenRazer
@@ -88,11 +89,13 @@ The six questions:
    the grid task has the device unlocked. (Grounding §3's "enable driver mode first" is
    **wrong**.)
 6. **VARSTORE vs NOSTORE.** Both impls use VARSTORE (`arg0=0x01`); no NOSTORE variant of
-   `0x0F/0x02` exists in the OpenRazer tree. VARSTORE persists to onboard flash ⇒ the side
-   LEDs show stale indicator state on every boot until the daemon reconnects and re-asserts.
-   **The prototype (ticket 01) should try `arg0=0x00` (NOSTORE) first**; if the device ignores
-   it, fall back to `0x01` (the confirmed-working value) and assert correct state as early as
-   possible on daemon start / device connect. Make it a config knob either way.
+   `0x0F/0x02` exists in the OpenRazer tree. Source analysis predicted VARSTORE would persist
+   and flash stale state on boot — *hardware update — ticket 01 disproved this on fw v1.2:*
+   **neither VARSTORE nor NOSTORE survives a USB re-enumeration** (firmware reclaims the LEDs
+   to its orange-only power-on default), and a settled read-back always echoes `arg0=0x01`, so
+   the byte is inert. **Send `arg0=0x00` for intent-clarity; no config knob.** The real
+   requirement this surfaces: **the daemon must assert Status-LED state on startup *and* every
+   device reconnect** (feeds [ticket 03](./03-daemon-architecture-for-status-leds.md)).
 
 **Corrections to the grounding file's §3 prose** (arg *table* was correct): "enable driver
 mode first" — wrong (Q5); clean GET-modify-SET read-back — unreliable (Q3); `effect_none` —
@@ -102,6 +105,23 @@ real implementation of the `0x0B` path and it is unmerged**. The merged PR #2710
 create no `profile_led_*` files for the Pro — status LEDs are unimplemented in any shipping
 OpenRazer release.
 
-**For ticket 01:** build against
-[`status-led-wire-protocol.md`](../research/status-led-wire-protocol.md) §8, not the grounding
-file's §3 — try NOSTORE first, no driver-mode call needed, don't rely on read-back.
+### Hardware update — [ticket 01](./01-prototype-status-led-controllability.md) (fw v1.2, 2026-09-02)
+
+The prototype exercised **every byte of the source-derived frame against the real device —
+they agree**. The write frame (`arg4=0x00`), the off frame (static-zero; `effect_none` ACKs
+but does nothing), the read-back slots, `data_size 0x09`, and "no driver mode needed" all
+verified. Corrections to this write-up's *predictions* (source analysis stands, the
+hardware-behaviour guesses in §3.3 / §6 / §9.3 / §9.6 did not):
+
+- **Nothing persists.** Neither VARSTORE nor NOSTORE survives a re-enumeration; the firmware
+  always returns to orange-only. `arg0` is inert (read-back echoes `0x01` regardless). → send
+  `arg0=0x00`, drop the config knob, and **the daemon must re-assert on startup + every
+  reconnect** (hard requirement, → ticket 03).
+- **`0x82` read-back is reliable on this unit** (incl. cold-read seed case) — the "unreliable"
+  caution is a cross-device one; keep the authoritative-triple design but a startup seed is
+  trustworthy here.
+- **No on-device keymap switch exists** on the Tartarus Pro (LED↔keymap link is Synapse-side
+  only) → the "re-assert after on-device keymap change" hook is **not needed**.
+
+The write-up (`status-led-wire-protocol.md` §3.3, §6, §7, §9) has been annotated inline with
+these. **Ticket 01 unblocks tickets 03 and 04.**

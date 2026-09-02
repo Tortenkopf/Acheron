@@ -20,9 +20,14 @@ Settle at least:
   decide whether it sets the whole triple or one channel at a time.
 - **`GetState()` exposure.** Does the GUI need the active Profile's current Status-LED state
   reported back (like `capture_mode` was added in `tartarus-input-expansion` ticket 17), and
-  a change signal? Or is the config the single source of truth the GUI already has? Consider
-  the on-device-keymap-clobber case from [ticket 01](./01-prototype-status-led-controllability.md)
-  criterion 3 — if the hardware can diverge from config, the GUI may want the real value.
+  a change signal? Or is the config the single source of truth the GUI already has?
+  ([Ticket 01](./01-prototype-status-led-controllability.md) found no on-device keymap switch,
+  so the hardware can't diverge from config *behind the daemon's back* — but the brief
+  orange-only window on every connect, before the daemon asserts, is a real transient state.)
+- **Storage-mode config knob — likely drop.** Ticket 02's write-up floated a NOSTORE/VARSTORE
+  config option; [ticket 01](./01-prototype-status-led-controllability.md) found the byte
+  inert on our unit (nothing persists either way). Confirm there is nothing user-visible to
+  expose and this knob is cut.
 - **The GUI control.** Confirmed (charting Q4/Q14): three labelled colour toggles in a
   "Status LEDs" group on the Device Overview panel, near the Profile selector. Pin down which
   file (`gui/acheron_gui/...`), whether it edits the *active* Profile or the
