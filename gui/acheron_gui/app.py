@@ -161,6 +161,21 @@ CSS = """
 /* Ticket 102: the About dialog (about_dialog.py). */
 .about-title { font-size: 1.6em; font-weight: bold; }
 .quote { font-style: italic; opacity: 0.85; }
+/* tartarus-status-leds ticket 04: the Status LEDs lozenge group in the
+   Device Overview (device_overview.py::build_status_leds_section). Lit =
+   full-saturation colour fill + white border + glow; unlit = heavily
+   desaturated + flat. The lit/unlit contrast is the primary state signal,
+   so it's deliberately strong, not a faint brightness shift. `.status-led`
+   plus a per-colour class, with `.lit` toggled from the active Profile's
+   stored `status_leds`. */
+.status-led { min-width: 52px; min-height: 22px; padding: 0; border-radius: 999px; border: 2px solid transparent; opacity: 0.4; }
+.status-led.lit { opacity: 1; border-color: #ffffff; }
+.status-led-orange { background-image: none; background-color: alpha(#ff9800, 0.14); }
+.status-led-green { background-image: none; background-color: alpha(#4caf50, 0.14); }
+.status-led-blue { background-image: none; background-color: alpha(#2196f3, 0.14); }
+.status-led-orange.lit { background-color: #ff9800; box-shadow: 0 0 8px 2px alpha(#ff9800, 0.75); }
+.status-led-green.lit { background-color: #4caf50; box-shadow: 0 0 8px 2px alpha(#4caf50, 0.75); }
+.status-led-blue.lit { background-color: #2196f3; box-shadow: 0 0 8px 2px alpha(#2196f3, 0.75); }
 """
 
 

@@ -115,10 +115,18 @@ PLACEHOLDER_CONFIG = {
             "mode_key_role": "layer_switch",
             "chords_base": {},
             "chords_held": {},
-            # Ticket 71: read unconditionally by `build_binding_editor`
-            # (every grid-button popover build) and `make_input_button`'s
-            # own axis-stripe check, so this placeholder needs both present
-            # too, not just the real seed Profile shape.
+            # Every Profile key a `build_main_view` render reads
+            # *unconditionally* must be present here, not just the ones the
+            # dimmed grid strictly needs — `build_binding_editor` is built
+            # eagerly for every grid button (`make_input_button`), and it
+            # reads `default_actuation` / `actuation_overrides` (ticket 26)
+            # and `status_leds` (tartarus-status-leds ticket 04); the
+            # axis-stripe check reads `axis_base` / `axis_held` (ticket 71).
+            # A missing key here is a launch-time KeyError on the
+            # before-the-Daemon-answers path. Mirror `DaemonStub._SEED_PROFILE`.
+            "default_actuation": {"actuation": 128, "release": 112},
+            "actuation_overrides": {},
+            "status_leds": {"orange": False, "green": False, "blue": False},
             "axis_base": {},
             "axis_held": {},
         }
@@ -729,6 +737,84 @@ def build_chords_section(
     return box
 
 
+# tartarus-status-leds ticket 04 — the three fixed-colour Status LEDs, top
+# to bottom, roughly mirroring their physical placement on the device's left
+# side. `(config key, display word)`; the display word feeds the tooltip and
+# the accessible name.
+_STATUS_LED_CHANNELS = (("orange", "Orange"), ("green", "Green"), ("blue", "Blue"))
+
+
+def build_status_leds_section(
+    client, config: dict, profile: str, on_change: Callable[[], None]
+) -> Gtk.Widget:
+    """The Status LEDs lozenge group (tartarus-status-leds ticket 04, spec
+    §"GUI") — three vertically-stacked colour lozenges (orange top, green
+    middle, blue bottom) showing and editing the **active** Profile's Status
+    LED assignment, as direct as editing a Binding.
+
+    Profile-scoped, never Layer-scoped: it renders identically on Base and
+    Held from `config["profiles"][profile]["status_leds"]` regardless of
+    `selected_layer`, and shows the stored state even while the device is
+    disconnected — the state is always config, never a live hardware read.
+    On a newly created Profile all three show dark (`status_leds` defaults
+    all-off; "never set" is byte-identical to "explicitly all-off"). Grid
+    destination only — built in `build_main_view`'s `device_row` alongside
+    `build_chords_section`, not in the Library branch.
+
+    Each lozenge's click reads all three current states, flips its own, and
+    calls `client.set_status_leds(orange, green, blue)`; the group then
+    rebuilds from config on the shared `on_change`, like everything else on
+    the panel. The `Effect::AssertStatusLeds` that `SetStatusLeds` emits
+    drives the hardware immediately.
+    """
+    stored = config["profiles"][profile]["status_leds"]
+    current = {name: bool(stored.get(name, False)) for name, _ in _STATUS_LED_CHANNELS}
+
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, valign=Gtk.Align.START)
+    box.append(Gtk.Label(label="Status LEDs", xalign=0, css_classes=["heading"]))
+
+    # A failed `SetStatusLeds` (Daemon vanished mid-click) must visibly do
+    # something rather than silently no-op — same convention as
+    # `build_profile_sidebar`'s shared error label.
+    error_label = Gtk.Label(xalign=0, wrap=True, css_classes=["error"])
+    error_label.set_visible(False)
+    box.append(error_label)
+
+    for name, title in _STATUS_LED_CHANNELS:
+        on = current[name]
+        state_word = "on" if on else "off"
+
+        lozenge = Gtk.Button(halign=Gtk.Align.CENTER)
+        lozenge.add_css_class("status-led")
+        lozenge.add_css_class(f"status-led-{name}")
+        if on:
+            lozenge.add_css_class("lit")
+        # No visible per-lozenge text — hue + brightness alone fails a
+        # colour-blind user, so the colour and the on/off state both go in
+        # the tooltip and the accessible name/description.
+        lozenge.set_tooltip_text(f"{title} status LED — {state_word}")
+        lozenge.update_property(
+            [Gtk.AccessibleProperty.LABEL, Gtk.AccessibleProperty.DESCRIPTION],
+            [f"{title} status LED", state_word],
+        )
+
+        def on_clicked(_b, name=name):
+            triple = dict(current)
+            triple[name] = not triple[name]
+            try:
+                client.set_status_leds(triple["orange"], triple["green"], triple["blue"])
+            except DaemonError as exc:
+                error_label.set_label(str(exc))
+                error_label.set_visible(True)
+                return
+            on_change()
+
+        lozenge.connect("clicked", on_clicked)
+        box.append(lozenge)
+
+    return box
+
+
 def build_main_view(
     client,
     config: dict,
@@ -883,6 +969,10 @@ def build_main_view(
         device.append(stick_col)
 
         device_row.append(device)
+        # tartarus-status-leds ticket 04: the Status LEDs lozenge group,
+        # between the thumbstick column and the Chords section. Profile-scoped
+        # — passes no `selected_layer`, renders identically on Base and Held.
+        device_row.append(build_status_leds_section(client, config, profile, on_change))
         # Always visible while Grid is selected, no toggle (ticket 47's
         # round 2: nothing should rescale on open/close) — the real
         # Chord-recording flow (ticket 40).
