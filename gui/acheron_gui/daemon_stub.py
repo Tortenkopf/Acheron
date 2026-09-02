@@ -71,6 +71,11 @@ class DaemonStub:
         # with (ticket 26).
         "default_actuation": {"actuation": 128, "release": 112},
         "actuation_overrides": {},
+        # tartarus-status-leds ticket 01: a Profile's Status LED assignment —
+        # the same nested `{orange, green, blue}` bool dict the real Daemon's
+        # `GetConfig` hands back (`daemon/src/dbus/wire.rs::status_leds_to_dict`),
+        # defaulting all-off like `StatusLeds::default()`.
+        "status_leds": {"orange": False, "green": False, "blue": False},
         # Ticket 40: a Profile's Chord Bindings, keyed the same way the real
         # Daemon's wire shape does — a "+"-joined, sorted string of member
         # Input strings (mirrors `daemon/src/config.rs::ChordKey`'s Display).
