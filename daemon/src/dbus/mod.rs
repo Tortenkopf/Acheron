@@ -749,6 +749,28 @@ impl Daemon {
         self.apply(Edit::SetForceDigital { force }).await
     }
 
+    /// Sets the active Profile's Status LED assignment — the triple of on/off
+    /// states for the orange, green and blue side indicator LEDs (CONTEXT.md:
+    /// Status LED assignment; `tartarus-status-leds` ticket 03). Persisted to
+    /// `config.toml` and driven to the hardware immediately; a Profile switch
+    /// re-asserts the newly active Profile's triple, so the physical indicator
+    /// always follows the active Profile. Profile-unscoped like every mutating
+    /// method — `plan` applies it to the active Profile. Never fails on its own
+    /// account; can still surface `IoError` if the `config.toml` rewrite fails.
+    async fn set_status_leds(
+        &self,
+        orange: bool,
+        green: bool,
+        blue: bool,
+    ) -> Result<(), DaemonError> {
+        self.apply(Edit::SetStatusLeds {
+            orange,
+            green,
+            blue,
+        })
+        .await
+    }
+
     /// Starts (or retargets) live depth streaming for `input` — the GUI's
     /// Actuation & release editor's `DepthChanged` feed (ticket 19/26).
     /// Connection-scoped and last-write-wins, mirroring
@@ -961,6 +983,7 @@ mod tests {
         fn set_default_actuation(&self, actuation: u8, release: u8) -> zbus::Result<()>;
         fn reset_actuation_points(&self) -> zbus::Result<()>;
         fn set_force_digital(&self, force: bool) -> zbus::Result<()>;
+        fn set_status_leds(&self, orange: bool, green: bool, blue: bool) -> zbus::Result<()>;
         fn start_depth_stream(&self, input: &str) -> zbus::Result<()>;
         fn stop_depth_stream(&self, input: &str) -> zbus::Result<()>;
 
@@ -2823,6 +2846,52 @@ mod tests {
         server.shut_down().await;
 
         assert!(on_disk.contains("force_digital = true"));
+    }
+
+    #[tokio::test]
+    async fn set_status_leds_over_real_dbus_persists_the_triple_and_surfaces_it_via_get_config() {
+        let server = TestServer::start().await;
+
+        server
+            .proxy
+            .set_status_leds(true, false, true)
+            .await
+            .expect("SetStatusLeds over D-Bus must succeed");
+
+        let config = server.proxy.get_config().await.unwrap();
+        let profiles: wire::Dict = config.get("profiles").unwrap().clone().try_into().unwrap();
+        let default_profile: wire::Dict = profiles
+            .get(DEFAULT_PROFILE_NAME)
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let status_leds: wire::Dict = default_profile
+            .get("status_leds")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let orange: bool = status_leds
+            .get("orange")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let green: bool = status_leds
+            .get("green")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let blue: bool = status_leds.get("blue").unwrap().clone().try_into().unwrap();
+        assert!(orange && !green && blue);
+
+        let on_disk = std::fs::read_to_string(&server.config_path).unwrap();
+        server.shut_down().await;
+
+        assert!(on_disk.contains("[profiles.Default.status_leds]"));
+        assert!(on_disk.contains("orange = true"));
     }
 
     #[tokio::test]

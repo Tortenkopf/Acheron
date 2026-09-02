@@ -588,6 +588,12 @@ impl DispatchState {
                         let _ = Daemon::active_profile_changed(emitter, &name).await;
                     }
                 }
+                edit::Effect::AssertStatusLeds => {
+                    // A `SetStatusLeds` edit or a Profile switch re-asserts the
+                    // active Profile's triple — same helper the `rx_connection`
+                    // arm calls on connect, reading the just-committed `config`.
+                    self.push_status_leds(config);
+                }
             }
         }
     }
@@ -2506,6 +2512,21 @@ mod tests {
                 .map(|_| ())
         }
 
+        async fn set_status_leds(
+            &self,
+            orange: bool,
+            green: bool,
+            blue: bool,
+        ) -> Result<(), CommandError> {
+            self.apply(edit::Edit::SetStatusLeds {
+                orange,
+                green,
+                blue,
+            })
+            .await
+            .map(|_| ())
+        }
+
         async fn get_config(&self) -> Config {
             let (reply, rx) = oneshot::channel();
             self.cmd_tx.send(Command::GetConfig(reply)).await.unwrap();
@@ -3097,6 +3118,111 @@ mod tests {
 
         assert!(!harness.status_leds_re_pushed());
         assert_eq!(harness.take_status_leds_pushed(), None);
+        harness.shut_down().await;
+    }
+
+    // -- Status LEDs: a `SetStatusLeds` D-Bus edit and a Profile switch both
+    // re-assert the active Profile's triple on the `led` channel
+    // (`tartarus-status-leds` ticket 03, via `edit::Effect::AssertStatusLeds`
+    // → `push_status_leds`). ----------------------------------------------
+
+    #[tokio::test]
+    async fn a_set_status_leds_edit_persists_the_triple_and_pushes_it() {
+        let want = StatusLeds {
+            orange: true,
+            green: false,
+            blue: true,
+        };
+        let mut harness = CommandHarness::spawn(config_with_status_leds(StatusLeds::default()));
+
+        harness
+            .set_status_leds(want.orange, want.green, want.blue)
+            .await
+            .expect("SetStatusLeds must succeed");
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(harness.take_status_leds_pushed(), Some(want));
+        assert_eq!(
+            harness
+                .get_config()
+                .await
+                .active_profile()
+                .unwrap()
+                .status_leds,
+            want,
+        );
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn switching_profile_re_asserts_the_newly_active_profiles_triple() {
+        let gaming = StatusLeds {
+            orange: false,
+            green: true,
+            blue: false,
+        };
+        let mut config = config_with_status_leds(StatusLeds {
+            orange: true,
+            ..Default::default()
+        });
+        config.profiles.insert(
+            "Gaming".to_string(),
+            Profile {
+                status_leds: gaming,
+                ..Default::default()
+            },
+        );
+        let mut harness = CommandHarness::spawn(config);
+
+        harness
+            .switch_profile("Gaming")
+            .await
+            .expect("SwitchProfile must succeed");
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(harness.take_status_leds_pushed(), Some(gaming));
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_switches_coalesces_to_the_final_profiles_triple() {
+        let a = StatusLeds {
+            orange: true,
+            ..Default::default()
+        };
+        let b = StatusLeds {
+            green: true,
+            ..Default::default()
+        };
+        let mut config = config_with_status_leds(StatusLeds::default());
+        config.profiles.insert(
+            "A".to_string(),
+            Profile {
+                status_leds: a,
+                ..Default::default()
+            },
+        );
+        config.profiles.insert(
+            "B".to_string(),
+            Profile {
+                status_leds: b,
+                ..Default::default()
+            },
+        );
+        let mut harness = CommandHarness::spawn(config);
+
+        harness.switch_profile("A").await.unwrap();
+        harness.switch_profile("B").await.unwrap();
+        harness.switch_profile("A").await.unwrap();
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(harness.take_status_leds_pushed(), Some(a));
         harness.shut_down().await;
     }
 

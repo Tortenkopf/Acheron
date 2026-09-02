@@ -592,6 +592,18 @@ class DaemonStub:
         self._force_digital = force
         self.calls.append(("set_force_digital", force))
 
+    def set_status_leds(self, orange: bool, green: bool, blue: bool) -> None:
+        # `tartarus-status-leds` ticket 03: the whole triple in one call,
+        # always an edit to the active Profile (Profile-unscoped, like every
+        # mutating method). Mirrors what a real `GetConfig` would return after
+        # the call so stub-backed GUI code rebuilding from config sees it.
+        self._profiles[self._active_profile]["status_leds"] = {
+            "orange": orange,
+            "green": green,
+            "blue": blue,
+        }
+        self.calls.append(("set_status_leds", orange, green, blue))
+
     def start_depth_stream(self, input_str: str, on_depth: Callable[[int], None]) -> None:
         self._depth_target = input_str
         self._depth_callback = on_depth
