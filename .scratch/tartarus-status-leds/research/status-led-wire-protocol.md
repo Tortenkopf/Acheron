@@ -323,26 +323,36 @@ every caller in the tree passes `VARSTORE`. (`NOSTORE 0x00` is real —
 `razercommon.h:33` — and PR #1577 uses it, but only for `MACRO_LED` via the *classic*
 `razer_chroma_standard_set_led_effect` command `0x03/0x00`, a different command family.)
 
-Whether the Pro's firmware honours `arg0 = 0x00` on the `0x0F/0x02` frame is **untested by
-any primary source**. `arg0` is copied verbatim into `report.arguments[0]`
-(`_effect_base`), so a NOSTORE attempt is a one-byte change and safe to try.
+Whether the Pro's firmware honours `arg0 = 0x00` on the `0x0F/0x02` frame was **untested by
+any primary source** at the time of writing. `arg0` is copied verbatim into
+`report.arguments[0]` (`_effect_base`), so a NOSTORE attempt is a one-byte change and safe
+to try.
 
-Trade-offs:
+> **Hardware-verified ([ticket 01](../issues/01-prototype-status-led-controllability.md), fw
+> v1.2, 2026-09-02) — this section's premise was wrong.** On our unit **neither `arg0 = 0x01`
+> nor `arg0 = 0x00` persists across a USB re-enumeration.** Wrote green with VARSTORE,
+> replugged → device came back **orange-only** (firmware keymap-indicator power-on default);
+> identical result with NOSTORE. The persistent orange LED is *not* a stored host write from
+> Synapse — it is simply the firmware default. Further: a settled `0x82` read-back **always
+> echoes `arg0 = 0x01`** regardless of what was sent, so the firmware appears to ignore the
+> distinction and treat every write as VARSTORE.
+>
+> Consequences:
+> - The "stale *host* RGB flashes on boot" concern **does not apply** — the firmware always
+>   reclaims the LEDs to orange-only on enumeration, so there is a brief orange-only window on
+>   every connect no matter the storage mode, closed only by the daemon asserting.
+> - **The daemon must assert Status-LED state on startup *and* on every device reconnect** —
+>   a hard requirement (feeds [ticket 03](../issues/03-daemon-architecture-for-status-leds.md)),
+>   not a boot-flash mitigation.
+> - `arg0` choice is **cosmetic on this unit.** Send `arg0 = 0x00` for intent-clarity (we do
+>   not want persistence), but expect no observable difference and **do not assume it avoids
+>   flash writes.** The config knob floated below is **probably not worth exposing** — there
+>   is no user-visible behaviour to toggle.
 
-| | VARSTORE `0x01` | NOSTORE `0x00` (if honoured) |
-|---|---|---|
-| Persistence | Written to onboard memory; survives replug / reboot | Volatile; LEDs revert to firmware default on power-cycle |
-| Boot behaviour | **Firmware restores Acheron's last RGB at boot → the side LEDs show stale indicator state until the daemon reconnects and re-asserts** | Clean — LEDs are whatever firmware wants until the daemon asserts |
-| Flash wear | One flash write per change (minor, but real for a frequently-updated indicator) | None |
-| Fighting firmware's own keymap-indicator use | Worse — persisted host state and firmware's 3-bit keymap code both claim the same LEDs | Slightly better |
-| Support risk | Confirmed working (plxty, #2336) | Unverified; may be silently treated as VARSTORE or ignored |
-
-**⇒ Recommendation: the prototype (ticket 01) should try `arg0 = 0x00` (NOSTORE) first.**
-A live indicator that Acheron fully owns wants volatile state and no stale-flash-on-boot.
-If a real unit ignores writes with `arg0 = 0x00` (LEDs don't change), fall back to
-`arg0 = 0x01` (VARSTORE, the confirmed-working value) and mitigate the boot flash by
-asserting correct LED state as early as possible on daemon start and on every device
-connect. Make it a config knob either way.
+**⇒ Recommendation (post-hardware): send `arg0 = 0x00` (NOSTORE) for intent-clarity; the
+daemon owns the LEDs and re-asserts on every connect regardless.** The earlier
+"try NOSTORE first, fall back to VARSTORE, expose a config knob" plan is superseded — on
+fw v1.2 the byte is inert and nothing persists either way.
 
 ---
 
@@ -352,9 +362,9 @@ connect. Make it a config knob either way.
 |---|---|
 | "Enable driver/streaming mode first (`command_class 0x00, command_id 0x04, arg0 = 0x03`), the same as for the backlight" | **No.** Neither impl does. OpenRazer runs this device with `DRIVER_MODE = False` and its `0x0F` lighting still works. The LED frame is independent of Capture mode — send it on a standalone Interface-2 fd. (§5) |
 | arg table "arg 4 = `0x01` or `0x00` … arg 5 = `0x01`" | Table is **correct** — not a contradiction. Clarifications: arg5 = `0x01` is the "colour count" byte (both impls, always); arg4 is the effect's ignored "speed" slot, so **send arg4 = `0x00`** (OpenRazer's value = Razer's own captured static frame). CommandPost's `arg4 = 0x01` is a documented fallback only. (§1.3) |
-| Read-back: "current channel values come back in `arg6/arg7/arg8`" — presented as a clean way to GET-modify-SET one channel | Slot positions are right (r=6, g=7, b=8), but **read-back is unreliable** — z3ntu rejected the GET call ("across devices we can never reliably get back what we've set earlier"), the PR author never got it working, and it's why #2336 stalled. Keep an authoritative RGB triple in daemon state instead. (§3.3) |
-| "An `effect_none` … on LED `0x0B` is plausible but untested" | Confirmed untested and **not done by either impl**. Off = static frame with channel byte `0x00`. (§2) |
-| arg0 "= `0x01` VARSTORE (persists in onboard memory)" — stated as the only option | Correct that both impls use VARSTORE, but **NOSTORE `0x00` is worth trying first** for a host-owned indicator to avoid the stale-flash-on-boot. (§6) |
+| Read-back: "current channel values come back in `arg6/arg7/arg8`" — presented as a clean way to GET-modify-SET one channel | Slot positions are right (r=6, g=7, b=8). z3ntu rejected the GET call as unreliable *across devices* ("we can never reliably get back what we've set earlier") and it's why #2336 stalled — but [ticket 01](../issues/01-prototype-status-led-controllability.md) tested it directly on fw v1.2 and **it was reliable, including the cold-read-after-replug seed case**. Keep an authoritative RGB triple in daemon state anyway (safe cross-device; the daemon must write unconditionally on connect regardless). (§3.3) |
+| "An `effect_none` … on LED `0x0B` is plausible but untested" | Not done by either impl; [ticket 01](../issues/01-prototype-status-led-controllability.md) tried it — **`effect_none` ACKs (`status 0x02`) but does nothing to the LEDs.** Off = static frame with channel byte `0x00`. (§2) |
+| arg0 "= `0x01` VARSTORE (persists in onboard memory)" — stated as the only option | **Nothing persists** on fw v1.2 — [ticket 01](../issues/01-prototype-status-led-controllability.md) found neither VARSTORE nor NOSTORE survives re-enumeration, and read-back always echoes `arg0 = 0x01`. Send `arg0 = 0x00` for intent-clarity; the byte is cosmetic here. The orange LED is the firmware power-on default, not a stored write. (§6) |
 | PR #1577 cited as an implementation ("Profile LEDs are now set together as one RGB led (0xb)") | That phrase is from the PR's commit message / description. **The #1577 diff contains no `0x0B` code** — it treats the Pro exactly like the Tartarus V2 (backlight-only, `BACKLIGHT_LED`). #2336 is the only real implementation of the `0x0B` path. |
 
 Also worth noting (not a contradiction): grounding §5 says the merged PR #2710 "deliberately
@@ -471,9 +481,10 @@ Channel values may come back as `0x00`/`0xFF` (CommandPost's assumption) or `0x0
 3. **Read-back frame.** `command_id 0x82`, `transaction_id 0x1F`, `data_size 0x09`, args
    `01 0B 01 00 00 01 00 00 00` (byte-identical to the write frame bar `command_id` and the
    zeroed RGB). Channels return in `arguments[6]/[7]/[8]` (Acheron resp buffer `[15]/[16]/[17]`).
-   **But read-back is unreliable** — the OpenRazer maintainer rejected the GET call and the
-   PR author never got it working. Keep an authoritative RGB triple in daemon state; treat
-   a GET as startup-seed only.
+   z3ntu rejected the GET as unreliable *across devices*, but **[ticket 01](../issues/01-prototype-status-led-controllability.md)
+   verified it reliable on fw v1.2**, including cold reads after a replug. Keep an
+   authoritative RGB triple in daemon state anyway (safe cross-device; the daemon re-asserts
+   on every connect regardless), and a startup `0x82` seed is trustworthy on this unit.
 
 4. **`data_size` / argument count.** `0x09` (9 arg bytes) — confirmed in OpenRazer
    (`_effect_base(0x09,…)`), CommandPost (`[arguments count]` = 9, doc-comment `09`), and
@@ -487,11 +498,14 @@ Channel values may come back as `0x00`/`0xFF` (CommandPost's assumption) or `0x0
    Interface-2 fd. (Grounding §3's "enable driver mode first" is wrong.)
 
 6. **VARSTORE vs NOSTORE.** Both impls use VARSTORE (`0x01`); there is no NOSTORE variant
-   of `0x0F/0x02` in the OpenRazer tree. VARSTORE persists to onboard memory → the side
-   LEDs show stale indicator state at every boot until the daemon reconnects and
-   re-asserts. **Try NOSTORE (`arg0 = 0x00`) first** in the prototype; if the device
-   ignores it, fall back to VARSTORE (`0x01`, the confirmed-working value) and assert
-   correct state as early as possible on daemon start. Make it configurable.
+   of `0x0F/0x02` in the OpenRazer tree. Source analysis predicted VARSTORE would persist and
+   flash stale state on boot — **[ticket 01](../issues/01-prototype-status-led-controllability.md)
+   disproved this on fw v1.2: neither VARSTORE nor NOSTORE survives a USB re-enumeration**
+   (the firmware reclaims the LEDs to its orange-only power-on default), and read-back always
+   echoes `arg0 = 0x01`, so the byte appears inert. **Send `arg0 = 0x00` for intent-clarity;
+   no config knob** (nothing observable to toggle). The real requirement this surfaces:
+   **the daemon must assert Status-LED state on startup *and* every device reconnect**
+   (feeds [ticket 03](../issues/03-daemon-architecture-for-status-leds.md)).
 
 ---
 
