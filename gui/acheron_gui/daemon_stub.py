@@ -71,6 +71,11 @@ class DaemonStub:
         # with (ticket 26).
         "default_actuation": {"actuation": 128, "release": 112},
         "actuation_overrides": {},
+        # tartarus-status-leds ticket 01: a Profile's Status LED assignment —
+        # the same nested `{orange, green, blue}` bool dict the real Daemon's
+        # `GetConfig` hands back (`daemon/src/dbus/wire.rs::status_leds_to_dict`),
+        # defaulting all-off like `StatusLeds::default()`.
+        "status_leds": {"orange": False, "green": False, "blue": False},
         # Ticket 40: a Profile's Chord Bindings, keyed the same way the real
         # Daemon's wire shape does — a "+"-joined, sorted string of member
         # Input strings (mirrors `daemon/src/config.rs::ChordKey`'s Display).
@@ -103,7 +108,7 @@ class DaemonStub:
         self._capture_mode = "digital"
         # Ticket 99: the real Daemon reports its compile-time `crate::VERSION`
         # here; the stub stands in with a bare release string.
-        self._daemon_version = "1.0.2"
+        self._daemon_version = "1.1.0"
         # Ticket 101: the real Daemon reads these off the connected Tartarus
         # Pro over the Interface-2 control channel once per connect. The stub
         # stands in with plausible fixed values (the documented values for
@@ -586,6 +591,18 @@ class DaemonStub:
         # stub tracks it too rather than only recording the call.
         self._force_digital = force
         self.calls.append(("set_force_digital", force))
+
+    def set_status_leds(self, orange: bool, green: bool, blue: bool) -> None:
+        # `tartarus-status-leds` ticket 03: the whole triple in one call,
+        # always an edit to the active Profile (Profile-unscoped, like every
+        # mutating method). Mirrors what a real `GetConfig` would return after
+        # the call so stub-backed GUI code rebuilding from config sees it.
+        self._profiles[self._active_profile]["status_leds"] = {
+            "orange": orange,
+            "green": green,
+            "blue": blue,
+        }
+        self.calls.append(("set_status_leds", orange, green, blue))
 
     def start_depth_stream(self, input_str: str, on_depth: Callable[[int], None]) -> None:
         self._depth_target = input_str

@@ -149,6 +149,16 @@ pub struct Profile {
     /// type level, per ticket 17 §3).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub actuation_overrides: HashMap<Input, ActuationPoint>,
+    /// The Status LED assignment for this Profile (`tartarus-status-leds`
+    /// ticket 01 — CONTEXT.md: Status LED assignment). `#[serde(default)]`
+    /// **without** `skip_serializing_if` — always written back in full, like
+    /// `default_actuation` and `mode_key_role`, so `toml::to_string_pretty`
+    /// renders a `[profiles.<name>.status_leds]` sub-table with all three keys
+    /// spelled out. A pre-feature `config.toml` with no `status_leds` key
+    /// parses with every Profile at `StatusLeds::default()` (all-off) — the
+    /// serde default *is* the migration, exactly as every prior added field.
+    #[serde(default)]
+    pub status_leds: StatusLeds,
     /// Chord Bindings active while this Profile's Base Layer is active
     /// (ticket 01/40 — CONTEXT.md: Chord): a `Binding` reused unchanged,
     /// keyed by the `Set<Input>` that must all be down together within the
@@ -369,6 +379,25 @@ impl Default for ActuationPoint {
             release: 112,
         }
     }
+}
+
+/// CONTEXT.md: Status LED assignment. The per-Profile triple of on/off states
+/// for the three fixed-colour (orange, green, blue) indicator LEDs on the
+/// device's left side (`tartarus-status-leds` ticket 01). A **named struct**,
+/// never `[bool; 3]` or a tuple — a later brightness byte, effect/speed
+/// params, or a sibling `backlight` sub-struct must be an *additive* change.
+/// `Default` derives to all-`false` (all LEDs dark); per-field
+/// `#[serde(default)]` so a hand-edited partial inline table
+/// (`status_leds = { orange = true }`) still parses. No `config::validate`
+/// rule — every `(bool, bool, bool)` is structurally valid.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusLeds {
+    #[serde(default)]
+    pub orange: bool,
+    #[serde(default)]
+    pub green: bool,
+    #[serde(default)]
+    pub blue: bool,
 }
 
 /// CONTEXT.md: Axis assignment. One of the 17 targets ticket 59 §3 settled —
@@ -1602,6 +1631,83 @@ action = { type = "keypress", key = "KEY_F1" }
             }
         );
         assert!(profile.actuation_overrides.is_empty());
+    }
+
+    #[test]
+    fn a_pre_status_led_config_defaults_status_leds() {
+        // A config.toml written before the Status-LED feature has no
+        // `status_leds` key at all — it must still parse unchanged, with every
+        // Profile defaulting to all-off (tartarus-status-leds ticket 01:
+        // additive `#[serde(default)]` field, no schema_version bump), exactly
+        // like the pre-ticket-17 actuation-defaults case above.
+        let toml = r#"
+schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base.grid_r1c1]
+trigger = "fire_once"
+action = { type = "keypress", key = "KEY_F1" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let profile = &config.profiles["Default"];
+        assert_eq!(profile.status_leds, StatusLeds::default());
+        assert_eq!(
+            profile.status_leds,
+            StatusLeds {
+                orange: false,
+                green: false,
+                blue: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_partial_hand_edited_status_leds_inline_table_parses() {
+        // Per-field `#[serde(default)]`: a hand-edited config naming only one
+        // channel still parses, with the unnamed channels defaulting off.
+        let toml = r#"
+schema_version = 1
+active_profile = "Default"
+
+[profiles.Default]
+status_leds = { orange = true }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.profiles["Default"].status_leds,
+            StatusLeds {
+                orange: true,
+                green: false,
+                blue: false,
+            }
+        );
+    }
+
+    #[test]
+    fn status_leds_survive_a_full_write_and_reparse_round_trip() {
+        // `#[serde(default)]` without `skip_serializing_if` — the triple is
+        // always written back in full and re-reads identically.
+        let mut config = Config::seed();
+        config
+            .profiles
+            .get_mut(DEFAULT_PROFILE_NAME)
+            .unwrap()
+            .status_leds = StatusLeds {
+            orange: true,
+            green: false,
+            blue: true,
+        };
+        let rendered = serialize(&config);
+        assert!(rendered.contains("[profiles.Default.status_leds]"));
+        let reparsed = parse(&rendered).unwrap();
+        assert_eq!(
+            reparsed.profiles[DEFAULT_PROFILE_NAME].status_leds,
+            StatusLeds {
+                orange: true,
+                green: false,
+                blue: true,
+            }
+        );
     }
 
     #[test]

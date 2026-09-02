@@ -142,6 +142,8 @@ class DaemonClient(Protocol):
 
     def set_force_digital(self, force: bool) -> None: ...
 
+    def set_status_leds(self, orange: bool, green: bool, blue: bool) -> None: ...
+
     def start_depth_stream(self, input_str: str, on_depth: Callable[[int], None]) -> None: ...
 
     def stop_depth_stream(self, input_str: str) -> None: ...
@@ -285,6 +287,9 @@ class DBusDaemonClient:
 
     def set_force_digital(self, force: bool) -> None:
         self._call("SetForceDigital", GLib.Variant("(b)", (force,)))
+
+    def set_status_leds(self, orange: bool, green: bool, blue: bool) -> None:
+        self._call("SetStatusLeds", GLib.Variant("(bbb)", (orange, green, blue)))
 
     def start_depth_stream(self, input_str: str, on_depth: Callable[[int], None]) -> None:
         """Starts (or retargets) live depth streaming for `input_str`,

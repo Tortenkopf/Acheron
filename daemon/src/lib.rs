@@ -2,8 +2,8 @@
 // Copyright © 2026 Justin Milatz
 
 /// The Daemon's runtime version string (ticket 99), stamped at compile time
-/// by `build.rs`: `1.0.2` for a release-tag or tarball build, or
-/// `1.0.2-dev+<short-hash>` for any other git checkout. Reported to the GUI
+/// by `build.rs`: `1.1.0` for a release-tag or tarball build, or
+/// `1.1.0-dev+<short-hash>` for any other git checkout. Reported to the GUI
 /// as `GetState()`'s `daemon_version` key so the About dialog (ticket 102)
 /// can show it, and any drift from the GUI's own `__version__` shows up in
 /// bug reports.
@@ -21,6 +21,7 @@ pub mod edit;
 pub mod executor;
 pub mod injector;
 pub mod input;
+pub mod led;
 pub mod stepper;
 pub mod trigger;
 

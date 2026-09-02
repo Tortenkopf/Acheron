@@ -22,6 +22,7 @@ def test_fresh_stub_matches_the_seed_configs_shape():
                 "mode_key_role": "layer_switch",
                 "default_actuation": {"actuation": 128, "release": 112},
                 "actuation_overrides": {},
+                "status_leds": {"orange": False, "green": False, "blue": False},
                 "chords_base": {},
                 "chords_held": {},
                 "axis_base": {},
@@ -38,7 +39,7 @@ def test_fresh_stub_matches_the_seed_configs_shape():
         "active_toggles": [],
         "device_connected": True,
         "capture_mode": "digital",
-        "daemon_version": "1.0.2",
+        "daemon_version": "1.1.0",
         # Ticket 101: present because the stub starts "connected".
         "firmware_version": "v1.2",
         "serial_number": "PM2443F36300141",
@@ -116,6 +117,7 @@ def test_create_profile_adds_an_empty_profile():
         "mode_key_role": "layer_switch",
         "default_actuation": {"actuation": 128, "release": 112},
         "actuation_overrides": {},
+        "status_leds": {"orange": False, "green": False, "blue": False},
         "chords_base": {},
         "chords_held": {},
         "axis_base": {},
@@ -738,3 +740,19 @@ def test_set_default_actuation_rejects_release_equal_to_actuation():
 
     with pytest.raises(InvalidBindingError):
         stub.set_default_actuation(128, 128)
+
+
+def test_set_status_leds_updates_the_active_profile_and_records_the_call():
+    # `tartarus-status-leds` ticket 03: the whole triple in one call, always
+    # an edit to the active Profile. `get_config` reflects it the way a real
+    # `GetConfig` would after `SetStatusLeds`.
+    stub = DaemonStub()
+
+    stub.set_status_leds(True, False, True)
+
+    assert stub.get_config()["profiles"]["Default"]["status_leds"] == {
+        "orange": True,
+        "green": False,
+        "blue": True,
+    }
+    assert stub.calls == [("set_status_leds", True, False, True)]

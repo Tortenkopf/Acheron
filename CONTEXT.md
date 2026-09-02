@@ -90,6 +90,14 @@ _Avoid_: trigger point, threshold
 **Release point**:
 The (lower) Depth at which a grid key's Binding is considered released (fires an Up), paired with its Actuation point so a single boundary doesn't chatter (hysteresis).
 
+**Status LED**:
+One of the three fixed-colour (orange, green, blue) on/off indicator LEDs on the device's left side. On/off only — no brightness, no custom colour, no non-static effect (all hardware limits). Driven only by the active Profile's Status LED assignment, never by a Binding or a Layer.
+_Avoid_: profile LED, keymap indicator (Razer's Synapse term), Chroma (the separate per-key backlight)
+
+**Status LED assignment**:
+The per-Profile triple of on/off states for the three Status LEDs. Every Profile has one (default all-off); the Daemon asserts the active Profile's assignment on Profile switch, on Daemon startup, and on every device (re)connect — the firmware reclaims the LEDs to its orange-only default on every USB enumeration, so re-assertion is mandatory, not an optimisation. Cleared to all-off on clean Daemon exit. Stored as a `[profiles.<name>.status_leds]` table in `config.toml`.
+_Avoid_: LED profile, LED state (too vague — reserve for the momentary hardware condition)
+
 ### Runtime
 
 **Daemon**:

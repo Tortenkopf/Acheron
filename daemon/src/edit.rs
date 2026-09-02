@@ -25,7 +25,7 @@ use std::path::Path;
 
 use crate::config::{
     self, Action, ActuationPoint, AxisTarget, Binding, ChordKey, Config, Layer, MacroId,
-    MacroStepDto, ModeKeyRole, Profile, StepDirection, StepperId, StepperItem,
+    MacroStepDto, ModeKeyRole, Profile, StatusLeds, StepDirection, StepperId, StepperItem,
 };
 use crate::input::Input;
 
@@ -221,6 +221,18 @@ pub enum Edit {
     /// Removes an Axis assignment, reverting `input` to ordinary passthrough
     /// on `layer`. Fails `NotFound` if `input` has no Axis assignment there.
     ClearAxisAssignment { input: Input, layer: Layer },
+    /// Sets the active Profile's Status LED assignment (CONTEXT.md: Status LED
+    /// assignment). The whole triple in one call — one hardware frame drives
+    /// all three channels, so no per-channel edit and no channel-name enum on
+    /// the wire. Pushes `Effect::AssertStatusLeds` unconditionally, like
+    /// `SetActuationPoint` → `RepublishActuation`. Never fails on its own
+    /// account (every `(bool, bool, bool)` is valid); the `Result` is the
+    /// shared `config.toml`-write-failure case.
+    SetStatusLeds {
+        orange: bool,
+        green: bool,
+        blue: bool,
+    },
 }
 
 /// A post-commit effect the caller must run — described here by `plan`,
@@ -257,6 +269,11 @@ pub(crate) enum Effect {
     ReconcileStepperCursor(StepperId),
     /// Emit `ActiveProfileChanged(name)`.
     AnnounceProfileChange(String),
+    /// Re-assert the active Profile's Status LED assignment on the hardware
+    /// (CONTEXT.md: Status LED assignment; ADR-0006). `run_effects` routes it
+    /// to dispatch's `push_status_leds(&config)` — the same helper the connect
+    /// edge uses. Pushed by `SetStatusLeds` and by `SwitchProfile`.
+    AssertStatusLeds,
 }
 
 /// The freshly-minted id a `CreateMacro` / `CreateStepper` mints — the D-Bus
@@ -396,6 +413,10 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             effects.push(Effect::RepublishActuation);
             effects.push(Effect::ResetAxisOutputs);
             effects.push(Effect::StopAllAnalogRepeats);
+            // The physical indicator follows the active Profile deterministically
+            // (`tartarus-status-leds` ticket 03). Order is irrelevant — the LEDs
+            // are independent of Toggles / axes / Analog-repeat.
+            effects.push(Effect::AssertStatusLeds);
             effects.push(Effect::AnnounceProfileChange(name));
         }
         Edit::SetActuationPoint {
@@ -586,6 +607,18 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             }
             effects.push(Effect::ForgetAxisContribution(input));
             effects.push(Effect::RecomputeAxes { layer });
+        }
+        Edit::SetStatusLeds {
+            orange,
+            green,
+            blue,
+        } => {
+            active_profile_mut(&mut next).status_leds = StatusLeds {
+                orange,
+                green,
+                blue,
+            };
+            effects.push(Effect::AssertStatusLeds);
         }
     }
 
@@ -1168,9 +1201,31 @@ mod tests {
                 Effect::RepublishActuation,
                 Effect::ResetAxisOutputs,
                 Effect::StopAllAnalogRepeats,
+                Effect::AssertStatusLeds,
                 Effect::AnnounceProfileChange("Gaming".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn set_status_leds_writes_the_active_profiles_triple_and_asks_for_an_assert() {
+        let (next, outcome) = plan_ok(
+            &seed(),
+            Edit::SetStatusLeds {
+                orange: true,
+                green: false,
+                blue: true,
+            },
+        );
+        assert_eq!(
+            next.profiles[DEFAULT_PROFILE_NAME].status_leds,
+            crate::config::StatusLeds {
+                orange: true,
+                green: false,
+                blue: true,
+            }
+        );
+        assert_eq!(outcome.effects, vec![Effect::AssertStatusLeds]);
     }
 
     #[test]

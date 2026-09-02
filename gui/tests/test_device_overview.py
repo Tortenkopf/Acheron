@@ -5,7 +5,12 @@ from gi.repository import Gtk, Pango
 
 from acheron_gui.daemon_client import AlreadyExistsError, DaemonError, NotFoundError
 from acheron_gui.daemon_stub import DaemonStub
-from acheron_gui.device_overview import build_main_view, build_status_wrapped_view, compute_status
+from acheron_gui.device_overview import (
+    PLACEHOLDER_CONFIG,
+    build_main_view,
+    build_status_wrapped_view,
+    compute_status,
+)
 from acheron_gui.library_view import build_library_sidebar
 from acheron_gui.inputs import ALL_INPUTS
 
@@ -776,3 +781,141 @@ def test_status_badge_shows_the_right_label_per_state():
         badge = find_one(outer, lambda w: "status-badge" in w.get_css_classes())
         label = find_one(badge, lambda w: isinstance(w, Gtk.Label))
         assert label_text in label.get_label()
+
+
+# --- Status LEDs lozenge group (tartarus-status-leds ticket 04) ---
+
+
+def _status_led(root, colour: str) -> Gtk.Button:
+    return find_one(
+        root,
+        lambda w: isinstance(w, Gtk.Button) and f"status-led-{colour}" in w.get_css_classes(),
+    )
+
+
+def _status_leds(root) -> list[Gtk.Button]:
+    return find_all(
+        root, lambda w: isinstance(w, Gtk.Button) and "status-led" in w.get_css_classes()
+    )
+
+
+def test_status_leds_group_renders_lit_and_unlit_from_the_active_profiles_config():
+    stub = DaemonStub()
+    stub.set_status_leds(True, False, True)
+    stub.calls.clear()
+
+    root = _build(stub, {})
+
+    heading = find_one(root, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "Status LEDs")
+    assert "heading" in heading.get_css_classes()
+
+    orange, green, blue = (_status_led(root, c) for c in ("orange", "green", "blue"))
+    assert "lit" in orange.get_css_classes()
+    assert "lit" not in green.get_css_classes()
+    assert "lit" in blue.get_css_classes()
+
+    assert orange.get_tooltip_text() == "Orange status LED — on"
+    assert green.get_tooltip_text() == "Green status LED — off"
+    assert blue.get_tooltip_text() == "Blue status LED — on"
+
+    # No visible text on the lozenges themselves.
+    assert all(led.get_label() is None for led in _status_leds(root))
+
+
+def test_clicking_a_status_led_calls_set_status_leds_with_the_full_triple():
+    stub = DaemonStub()  # seed Profile: all three off
+    root = _build(stub, {})
+
+    _status_led(root, "green").emit("clicked")
+
+    assert stub.calls == [("set_status_leds", False, True, False)]
+
+
+def test_clicking_a_lit_status_led_turns_only_that_channel_off():
+    stub = DaemonStub()
+    stub.set_status_leds(True, True, True)
+    stub.calls.clear()
+
+    root = _build(stub, {})
+    _status_led(root, "blue").emit("clicked")
+
+    assert stub.calls == [("set_status_leds", True, True, False)]
+
+
+def test_status_leds_group_rebuilds_from_config_on_change():
+    stub = DaemonStub()
+    ui_state = {}
+    root = _build(stub, ui_state)
+    _status_led(root, "orange").emit("clicked")
+
+    rebuilt = _build(stub, ui_state)
+    assert "lit" in _status_led(rebuilt, "orange").get_css_classes()
+    assert _status_led(rebuilt, "orange").get_tooltip_text() == "Orange status LED — on"
+
+
+def test_a_newly_created_profile_shows_all_status_leds_dark():
+    stub = DaemonStub()
+    stub.set_status_leds(True, True, True)  # dirty the original Profile
+    stub.create_profile("Fresh")
+    stub.switch_profile("Fresh")
+
+    root = _build(stub, {})
+
+    assert all("lit" not in led.get_css_classes() for led in _status_leds(root))
+    assert len(_status_leds(root)) == 3
+
+
+def test_status_leds_group_renders_identically_on_base_and_held():
+    stub = DaemonStub()
+    stub.set_status_leds(True, False, False)
+
+    base = _build(stub, {"selected_layer": "base"})
+    held = _build(stub, {"selected_layer": "held"})
+
+    for root in (base, held):
+        assert "lit" in _status_led(root, "orange").get_css_classes()
+        assert "lit" not in _status_led(root, "green").get_css_classes()
+        assert "lit" not in _status_led(root, "blue").get_css_classes()
+
+
+def test_status_leds_group_is_grid_destination_only():
+    stub = DaemonStub()
+
+    grid = _build(stub, {"dest": "grid"})
+    assert len(_status_leds(grid)) == 3
+
+    library = _build(stub, {"dest": "library"})
+    assert _status_leds(library) == []
+
+
+def test_status_leds_group_still_renders_stored_state_when_device_disconnected():
+    stub = DaemonStub()
+    stub.set_status_leds(False, True, False)
+    stub.simulate_device_disconnected()
+
+    outer = _build_status(stub, "running_disconnected")
+
+    assert "lit" in _status_led(outer, "green").get_css_classes()
+    assert "lit" not in _status_led(outer, "orange").get_css_classes()
+    assert _status_led(outer, "green").get_tooltip_text() == "Green status LED — on"
+
+
+def test_placeholder_config_renders_before_the_daemon_ever_answers():
+    # Regression: the pre-Daemon launch path (app.py's `last_known["config"]
+    # = PLACEHOLDER_CONFIG`) builds the whole Device Overview — grid buttons
+    # each eagerly build a Binding editor (reads `default_actuation` /
+    # `actuation_overrides`) and the Status LEDs group reads `status_leds`.
+    # A key missing from PLACEHOLDER_CONFIG is a launch-time KeyError.
+    class _InertClient:
+        def __getattr__(self, _name):
+            return lambda *a, **k: None
+
+    outer = build_status_wrapped_view(
+        _InertClient(), PLACEHOLDER_CONFIG, "Default", "base", "not_running", lambda: None, {}
+    )
+
+    root = _device_overview_root(outer)
+    assert not root.get_sensitive()
+    leds = _status_leds(root)
+    assert len(leds) == 3
+    assert all("lit" not in led.get_css_classes() for led in leds)

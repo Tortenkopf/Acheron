@@ -24,8 +24,8 @@ use zbus::zvariant::{OwnedValue, Value};
 use crate::command::State;
 use crate::config::{
     Action, ActuationPoint, AxisTarget, Binding, ChordKey, Config, Layer, MacroDef, MacroId,
-    MacroStepDto, ModeKeyRole, Modifiers, Profile, StepDirection, StepperDef, StepperId,
-    StepperItem, TriggerMode,
+    MacroStepDto, ModeKeyRole, Modifiers, Profile, StatusLeds, StepDirection, StepperDef,
+    StepperId, StepperItem, TriggerMode,
 };
 
 /// The `a{sv}` shape every `Action`/`MacroStep`/`Binding`/`Config` entity
@@ -342,6 +342,18 @@ fn actuation_point_to_dict(point: ActuationPoint) -> Dict {
     dict
 }
 
+/// A Profile's `StatusLeds` marshals as a flat three-field `a{sv}` of bools
+/// (`tartarus-status-leds` ticket 01), following `actuation_point_to_dict`'s
+/// bundle-related-scalars convention. The GUI reads it straight out of the
+/// `GetConfig` reply via `GLib.Variant.unpack()`.
+fn status_leds_to_dict(leds: StatusLeds) -> Dict {
+    let mut dict = Dict::new();
+    dict.insert("orange".to_string(), scalar(leds.orange));
+    dict.insert("green".to_string(), scalar(leds.green));
+    dict.insert("blue".to_string(), scalar(leds.blue));
+    dict
+}
+
 fn actuation_overrides_to_dict(overrides: &HashMap<crate::input::Input, ActuationPoint>) -> Dict {
     overrides
         .iter()
@@ -411,6 +423,10 @@ fn profile_to_dict(profile: &Profile) -> Dict {
     dict.insert(
         "actuation_overrides".to_string(),
         scalar(actuation_overrides_to_dict(&profile.actuation_overrides)),
+    );
+    dict.insert(
+        "status_leds".to_string(),
+        scalar(status_leds_to_dict(profile.status_leds)),
     );
     dict
 }
@@ -1049,6 +1065,54 @@ mod tests {
             u8::try_from(get(&override_point, "release").unwrap()).unwrap(),
             180
         );
+    }
+
+    /// tartarus-status-leds ticket 01: `config_to_dict` must serialize a
+    /// Profile's `status_leds` as a nested `{ orange, green, blue }` bool dict,
+    /// mirroring the default-actuation serialization test above so the GUI's
+    /// `GetConfig` consumer sees the triple per Profile.
+    #[test]
+    fn config_to_dict_serializes_status_leds() {
+        use std::collections::HashMap as StdHashMap;
+
+        let mut profiles = StdHashMap::new();
+        profiles.insert(
+            "Default".to_string(),
+            Profile {
+                status_leds: StatusLeds {
+                    orange: true,
+                    green: false,
+                    blue: true,
+                },
+                ..Default::default()
+            },
+        );
+        let config = Config {
+            schema_version: 1,
+            active_profile: "Default".to_string(),
+            profiles,
+            force_digital: false,
+            macros: StdHashMap::new(),
+            steppers: StdHashMap::new(),
+        };
+
+        let dict = config_to_dict(&config);
+        let profiles_dict: Dict = get(&dict, "profiles").unwrap().clone().try_into().unwrap();
+        let default_profile: Dict = profiles_dict
+            .get("Default")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let status_leds: Dict = get(&default_profile, "status_leds")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+
+        assert!(bool::try_from(get(&status_leds, "orange").unwrap()).unwrap());
+        assert!(!bool::try_from(get(&status_leds, "green").unwrap()).unwrap());
+        assert!(bool::try_from(get(&status_leds, "blue").unwrap()).unwrap());
     }
 
     /// Ticket 40: `config_to_dict` must serialize a Profile's Chord
