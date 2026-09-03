@@ -22,6 +22,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::input::Input;
 
+/// The pure, per-Binding half of `validate` (post-release ticket 14) —
+/// `check_binding` / `check_axis_assignment`. `pub(crate)` so `schema.rs`'s
+/// contract fixture can drive the two functions directly, one per
+/// truth-table cell, instead of synthesizing a throwaway `Config`.
+pub(crate) mod binding;
+
+use self::binding::{BindingSite, check_axis_assignment, check_binding};
+
 pub const SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_PROFILE_NAME: &str = "Default";
 
@@ -1114,10 +1122,13 @@ fn parse(contents: &str) -> Result<Config, ConfigError> {
 /// persists it — ticket 05), so a rule lives in exactly one place and a
 /// hand-edited file and a live D-Bus edit are held to the identical contract.
 ///
-/// Returns the first violation it finds (as `parse` historically did). The
-/// checks run in `parse`'s original order, with the six ticket-04 additions
-/// appended, so no existing single-violation `parse` test changes which
-/// error it sees.
+/// Returns the first violation. Per-Binding rules (`binding::check_binding` /
+/// `binding::check_axis_assignment`) are checked first as a group;
+/// whole-`Config` rules follow in `parse`'s original order, with the six
+/// ticket-04 additions appended. Single-violation ordering is unchanged (so
+/// no existing single-violation `parse` test changes which error it sees); a
+/// `Config` that violates rules of both classes now reports the per-Binding
+/// one.
 ///
 /// This is *only* for invariants of the resulting `Config`. Operation
 /// preconditions — "that name isn't taken", "that entry doesn't exist",
@@ -1129,34 +1140,21 @@ pub(crate) fn validate(config: &Config) -> Result<(), ConfigError> {
             config.active_profile.clone(),
         ));
     }
-    let has_invalid_profile_switch_trigger = config.profiles.values().any(|profile| {
-        profile_all_bindings(profile).any(|binding| {
-            matches!(binding.action, Action::ProfileSwitch { .. })
-                && binding.trigger != TriggerMode::FireOnce
-        })
-    });
-    if has_invalid_profile_switch_trigger {
-        return Err(ConfigError::InvalidProfileSwitchTrigger);
-    }
-    let invalid_controller_button = config.profiles.values().find_map(|profile| {
-        profile_all_bindings(profile).find_map(|binding| match binding.action {
-            Action::ControllerButton { button } if !crate::input::is_gamepad_button(button) => {
-                Some(button)
+    // The pure per-Binding / per-axis-placement rules, as one group (ticket
+    // 14). Each rule is a function of one Binding, where it sits, and the
+    // fixed device vocab — `binding::check_binding` / `check_axis_assignment`
+    // own them, and `schema.rs` drives those two functions directly. Every
+    // rule that needs the rest of the `Config` (dangling refs, the Axis
+    // *conflict* checks, …) stays below, in `parse`'s original order.
+    for profile in config.profiles.values() {
+        for (site, binding) in profile_all_binding_sites(profile) {
+            check_binding(site, binding)?;
+        }
+        for layer in [Layer::Base, Layer::Held] {
+            for input in profile.axis_layer(layer).keys() {
+                check_axis_assignment(*input)?;
             }
-            _ => None,
-        })
-    });
-    if let Some(button) = invalid_controller_button {
-        return Err(ConfigError::InvalidControllerButton(format!("{button:?}")));
-    }
-    let has_invalid_controller_button_trigger = config.profiles.values().any(|profile| {
-        profile_all_bindings(profile).any(|binding| {
-            matches!(binding.action, Action::ControllerButton { .. })
-                && binding.trigger == TriggerMode::FireOnce
-        })
-    });
-    if has_invalid_controller_button_trigger {
-        return Err(ConfigError::InvalidControllerButtonTrigger);
+        }
     }
     let dangling_macro_id = config.profiles.values().find_map(|profile| {
         profile_all_bindings(profile).find_map(|binding| match &binding.action {
@@ -1180,14 +1178,6 @@ pub(crate) fn validate(config: &Config) -> Result<(), ConfigError> {
     if let Some(stepper_id) = dangling_stepper_id {
         return Err(ConfigError::UnknownStepper(stepper_id.to_string()));
     }
-    let has_invalid_step_trigger = config.profiles.values().any(|profile| {
-        profile_all_bindings(profile).any(|binding| {
-            matches!(binding.action, Action::Step { .. }) && binding.trigger == TriggerMode::Toggle
-        })
-    });
-    if has_invalid_step_trigger {
-        return Err(ConfigError::InvalidStepTrigger);
-    }
     let invalid_stepper_controller_button = config.steppers.values().find_map(|def| {
         def.items.iter().find_map(|item| match item {
             StepperItem::ControllerButton { button }
@@ -1202,53 +1192,6 @@ pub(crate) fn validate(config: &Config) -> Result<(), ConfigError> {
         return Err(ConfigError::InvalidControllerButtonStepperItem(format!(
             "{button:?}"
         )));
-    }
-    let invalid_analog_repeat_input = config.profiles.values().find_map(|profile| {
-        [Layer::Base, Layer::Held].into_iter().find_map(|layer| {
-            profile
-                .layer(layer)
-                .iter()
-                .find(|(input, binding)| {
-                    binding.trigger == TriggerMode::AnalogRepeat
-                        && !matches!(input, Input::Grid(_, _))
-                })
-                .map(|(input, _)| input.to_string())
-        })
-    });
-    if let Some(input) = invalid_analog_repeat_input {
-        return Err(ConfigError::InvalidAnalogRepeatInput(input));
-    }
-    let has_chord_analog_repeat = config.profiles.values().any(|profile| {
-        profile
-            .chords_base
-            .values()
-            .chain(profile.chords_held.values())
-            .any(|binding| binding.trigger == TriggerMode::AnalogRepeat)
-    });
-    if has_chord_analog_repeat {
-        return Err(ConfigError::InvalidChordAnalogRepeat);
-    }
-    let has_chord_profile_switch = config.profiles.values().any(|profile| {
-        profile
-            .chords_base
-            .values()
-            .chain(profile.chords_held.values())
-            .any(|binding| matches!(binding.action, Action::ProfileSwitch { .. }))
-    });
-    if has_chord_profile_switch {
-        return Err(ConfigError::InvalidChordProfileSwitch);
-    }
-    let invalid_axis_input = config.profiles.values().find_map(|profile| {
-        [Layer::Base, Layer::Held].into_iter().find_map(|layer| {
-            profile
-                .axis_layer(layer)
-                .keys()
-                .find(|input| !matches!(input, Input::Grid(_, _)))
-                .copied()
-        })
-    });
-    if let Some(input) = invalid_axis_input {
-        return Err(ConfigError::InvalidAxisInput(input.to_string()));
     }
     let axis_binding_conflict = config.profiles.values().find_map(|profile| {
         [Layer::Base, Layer::Held].into_iter().find_map(|layer| {
@@ -1347,19 +1290,36 @@ pub(crate) fn validate(config: &Config) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Every Binding on `profile` paired with where it sits — the four Binding
+/// maps (`base` / `held` → `Individual(input)`, `chords_base` / `chords_held`
+/// → `Chord`) in exactly one place. `validate`'s per-Binding loop
+/// (`binding::check_binding`) and `schema.rs`'s contract fixture both need
+/// the site; the plain-`&Binding` callers go through `profile_all_bindings`.
+pub(crate) fn profile_all_binding_sites(
+    profile: &Profile,
+) -> impl Iterator<Item = (BindingSite, &Binding)> {
+    let individual = profile
+        .base
+        .iter()
+        .chain(profile.held.iter())
+        .map(|(input, b)| (BindingSite::Individual(*input), b));
+    let chords = profile
+        .chords_base
+        .values()
+        .chain(profile.chords_held.values())
+        .map(|b| (BindingSite::Chord, b));
+    individual.chain(chords)
+}
+
 /// Every Binding on `profile`, across both ordinary per-`Input` Layers and
 /// both per-`ChordKey` Chord Layers (ticket 40) — shared by every
 /// cross-cutting validation check `parse` runs, so a hand-edited
 /// `config.toml`'s Chord Bindings are held to the exact same
 /// ProfileSwitch/ControllerButton/Macro/Stepper invariants as ordinary ones
-/// rather than silently skipped.
+/// rather than silently skipped. Reimplemented on `profile_all_binding_sites`
+/// so the four-map list lives in exactly one place.
 pub(crate) fn profile_all_bindings(profile: &Profile) -> impl Iterator<Item = &Binding> {
-    profile
-        .base
-        .values()
-        .chain(profile.held.values())
-        .chain(profile.chords_base.values())
-        .chain(profile.chords_held.values())
+    profile_all_binding_sites(profile).map(|(_, b)| b)
 }
 
 /// Serializes `config` to its `config.toml` text. Split out so the async
@@ -2785,6 +2745,9 @@ action = { type = "profile_switch", target = "Gaming" }
                     matches: |e| matches!(e, ConfigError::InvalidActiveProfile(n) if n == "ghost"),
                 },
                 Case {
+                    // Wiring smoke: `validate` actually drives the per-Binding
+                    // seam (`binding::check_binding`). The exhaustive
+                    // per-Binding truth table lives in `config::binding::tests`.
                     invariant: "held/toggled ProfileSwitch Binding",
                     break_it: |c| {
                         profile(c).base.insert(
@@ -2798,36 +2761,6 @@ action = { type = "profile_switch", target = "Gaming" }
                         );
                     },
                     matches: |e| matches!(e, ConfigError::InvalidProfileSwitchTrigger),
-                },
-                Case {
-                    invariant: "ControllerButton outside the gamepad allowlist",
-                    break_it: |c| {
-                        profile(c).base.insert(
-                            Input::Grid(1, 1),
-                            Binding {
-                                trigger: TriggerMode::HoldToRepeat,
-                                action: Action::ControllerButton {
-                                    button: KeyCode::KEY_A,
-                                },
-                            },
-                        );
-                    },
-                    matches: |e| matches!(e, ConfigError::InvalidControllerButton(_)),
-                },
-                Case {
-                    invariant: "Fire-once ControllerButton Binding",
-                    break_it: |c| {
-                        profile(c).base.insert(
-                            Input::Grid(1, 1),
-                            Binding {
-                                trigger: TriggerMode::FireOnce,
-                                action: Action::ControllerButton {
-                                    button: KeyCode::BTN_SOUTH,
-                                },
-                            },
-                        );
-                    },
-                    matches: |e| matches!(e, ConfigError::InvalidControllerButtonTrigger),
                 },
                 Case {
                     invariant: "dangling Macro reference",
@@ -2861,29 +2794,6 @@ action = { type = "profile_switch", target = "Gaming" }
                     matches: |e| matches!(e, ConfigError::UnknownStepper(_)),
                 },
                 Case {
-                    invariant: "Toggle Step Binding",
-                    break_it: |c| {
-                        c.steppers.insert(
-                            StepperId::from("s"),
-                            stepper_def(vec![StepperItem::Key {
-                                key: KeyCode::KEY_1,
-                                modifiers: Modifiers::default(),
-                            }]),
-                        );
-                        profile(c).base.insert(
-                            Input::Grid(1, 1),
-                            Binding {
-                                trigger: TriggerMode::Toggle,
-                                action: Action::Step {
-                                    stepper: StepperId::from("s"),
-                                    direction: StepDirection::Forward,
-                                },
-                            },
-                        );
-                    },
-                    matches: |e| matches!(e, ConfigError::InvalidStepTrigger),
-                },
-                Case {
                     invariant: "non-gamepad ControllerButton Stepper item",
                     break_it: |c| {
                         c.steppers.insert(
@@ -2896,53 +2806,9 @@ action = { type = "profile_switch", target = "Gaming" }
                     matches: |e| matches!(e, ConfigError::InvalidControllerButtonStepperItem(_)),
                 },
                 Case {
-                    invariant: "Analog-repeat on a non-grid Input",
-                    break_it: |c| {
-                        profile(c).base.insert(
-                            Input::ModeKey,
-                            Binding {
-                                trigger: TriggerMode::AnalogRepeat,
-                                action: Action::Keypress {
-                                    modifiers: Modifiers::default(),
-                                    key: KeyCode::KEY_A,
-                                },
-                            },
-                        );
-                    },
-                    matches: |e| matches!(e, ConfigError::InvalidAnalogRepeatInput(i) if i == "mode_key"),
-                },
-                Case {
-                    invariant: "Analog-repeat Chord Binding",
-                    break_it: |c| {
-                        profile(c).chords_base.insert(
-                            chord([Input::Grid(1, 1), Input::Grid(1, 2)]),
-                            Binding {
-                                trigger: TriggerMode::AnalogRepeat,
-                                action: Action::Keypress {
-                                    modifiers: Modifiers::default(),
-                                    key: KeyCode::KEY_A,
-                                },
-                            },
-                        );
-                    },
-                    matches: |e| matches!(e, ConfigError::InvalidChordAnalogRepeat),
-                },
-                Case {
-                    invariant: "ProfileSwitch Chord Binding",
-                    break_it: |c| {
-                        profile(c).chords_base.insert(
-                            chord([Input::Grid(1, 1), Input::Grid(1, 2)]),
-                            Binding {
-                                trigger: TriggerMode::FireOnce,
-                                action: Action::ProfileSwitch {
-                                    target: DEFAULT_PROFILE_NAME.to_string(),
-                                },
-                            },
-                        );
-                    },
-                    matches: |e| matches!(e, ConfigError::InvalidChordProfileSwitch),
-                },
-                Case {
+                    // Wiring smoke for the per-axis-placement seam
+                    // (`binding::check_axis_assignment`); the exhaustive
+                    // coverage is in `config::binding::tests`.
                     invariant: "Axis assignment on a non-grid Input",
                     break_it: |c| {
                         profile(c)

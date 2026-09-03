@@ -11,7 +11,10 @@
 //! Binding-legality matrix — as `gui/acheron_gui/rules.py`. This module makes
 //! that mirror's faithfulness a **test** rather than a comment: the single
 //! `#[test]` below derives the two catalogs and the two verdict matrices by
-//! driving the real [`crate::config::validate`], serialises the lot to
+//! driving the real per-Binding seam
+//! ([`crate::config::binding::check_binding`] /
+//! [`crate::config::binding::check_axis_assignment`] — the pure half of
+//! `config::validate`), serialises the lot to
 //! `daemon/contract/daemon-schema.json`, and fails on any diff against the
 //! checked-in file. `gui/tests/test_rules_contract.py` loads the same file
 //! and asserts `rules` agrees with it row for row.
@@ -30,14 +33,14 @@
 //! the GUI suite. See `CONTRIBUTING.md`.
 
 use std::collections::BTreeSet;
-use std::collections::HashMap;
 use std::path::Path;
 
 use evdev::KeyCode;
 
+use crate::config::binding::BindingSite;
 use crate::config::{
-    self, Action, AxisTarget, Binding, ChordKey, Config, MacroDef, MacroId, Modifiers, Profile,
-    SCHEMA_VERSION, StepDirection, StepperDef, StepperId, TriggerMode,
+    self, Action, AxisTarget, Binding, ChordKey, MacroId, Modifiers, StepDirection, StepperId,
+    TriggerMode,
 };
 use crate::dbus::wire::axis_target_str;
 use crate::input::{Direction, Input, WheelEvent, gamepad_button_codes};
@@ -93,43 +96,6 @@ fn real_inputs() -> Vec<Input> {
     inputs
 }
 
-/// A minimal two-profile `Config` seeded so every *out-of-scope* check in
-/// `validate` (dangling macro/stepper/profile-switch target,
-/// `release < actuation`, …) always passes — leaving the combination under
-/// test as the only thing that can make `validate` fail.
-fn seeded_config() -> Config {
-    let mut profiles = HashMap::new();
-    profiles.insert("P1".to_string(), Profile::default());
-    profiles.insert("P2".to_string(), Profile::default());
-
-    let mut macros = HashMap::new();
-    macros.insert(
-        MacroId::from("m"),
-        MacroDef {
-            name: "m".to_string(),
-            steps: Vec::new(),
-        },
-    );
-
-    let mut steppers = HashMap::new();
-    steppers.insert(
-        StepperId::from("s"),
-        StepperDef {
-            name: "s".to_string(),
-            items: Vec::new(),
-        },
-    );
-
-    Config {
-        schema_version: SCHEMA_VERSION,
-        active_profile: "P1".to_string(),
-        profiles,
-        force_digital: false,
-        macros,
-        steppers,
-    }
-}
-
 fn action_for(kind: &str) -> Action {
     match kind {
         "keypress" => Action::Keypress {
@@ -173,60 +139,44 @@ fn neutral_trigger_for(kind: &str) -> TriggerMode {
     }
 }
 
-/// The fixed two-member Chord (`{grid_r1c1, grid_r1c2}`) every `__chord__`
-/// row is derived from — one Chord, so the subset/superset and
-/// axis-conflict checks never fire on it.
-fn chord_members() -> BTreeSet<Input> {
-    [Input::Grid(1, 1), Input::Grid(1, 2)].into_iter().collect()
+/// The `BindingSite` a matrix row's `input` column names — the `__chord__`
+/// sentinel is a Chord's own Binding, everything else an individual Input.
+fn site_for(input: &str) -> BindingSite {
+    if input == CHORD_SENTINEL {
+        BindingSite::Chord
+    } else {
+        BindingSite::Individual(input.parse().expect("a real Input string"))
+    }
 }
 
-/// `Ok(())` from `validate` → `true`; any `Err(_)` → `false`.
+/// `Ok(())` from the pure per-Binding seam → `true`; any `Err(_)` → `false`.
+/// Calls `binding::check_binding` directly — the fixture pins *exactly* the
+/// per-Binding legality `rules.py` mirrors, nothing else.
 fn trigger_verdict(input: &str, kind: &str, trigger: &str) -> bool {
     let binding = Binding {
         trigger: trigger_for(trigger),
         action: action_for(kind),
     };
-    let mut config = seeded_config();
-    let profile = config.profiles.get_mut("P1").expect("P1 seeded");
-    if input == CHORD_SENTINEL {
-        profile
-            .chords_base
-            .insert(ChordKey::new(chord_members()), binding);
-    } else {
-        let parsed: Input = input.parse().expect("a real Input string");
-        profile.base.insert(parsed, binding);
-    }
-    config::validate(&config).is_ok()
+    config::binding::check_binding(site_for(input), &binding).is_ok()
 }
 
 fn action_kind_verdict(input: &str, kind: &str) -> bool {
-    let mut config = seeded_config();
-    let profile = config.profiles.get_mut("P1").expect("P1 seeded");
-
     if kind == "axis" {
         // An Axis assignment has no `Config` representation on a Chord at
-        // all, so `__chord__ + axis` is simply never legal.
+        // all, so `__chord__ + axis` is simply never legal — that is the
+        // type system, not a validation rule.
         if input == CHORD_SENTINEL {
             return false;
         }
         let parsed: Input = input.parse().expect("a real Input string");
-        profile.axis_base.insert(parsed, AxisTarget::LeftTrigger);
-        return config::validate(&config).is_ok();
+        return config::binding::check_axis_assignment(parsed).is_ok();
     }
 
     let binding = Binding {
         trigger: neutral_trigger_for(kind),
         action: action_for(kind),
     };
-    if input == CHORD_SENTINEL {
-        profile
-            .chords_base
-            .insert(ChordKey::new(chord_members()), binding);
-    } else {
-        let parsed: Input = input.parse().expect("a real Input string");
-        profile.base.insert(parsed, binding);
-    }
-    config::validate(&config).is_ok()
+    config::binding::check_binding(site_for(input), &binding).is_ok()
 }
 
 // --- hand-authored transformation example lists ------------------------------
