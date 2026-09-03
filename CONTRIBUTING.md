@@ -182,7 +182,8 @@ and it can be verified before merge.
   both the individual (`Input`-keyed) and Chord (`ChordKey`-keyed) paths. Only
   the *performance* of a `TriggerDecision` (`compile_action`, `spawn_fire_once`
   / `ActiveToggle::spawn{,_held}`, the map insert) belongs in
-  `dispatch::perform_trigger`.
+  `trigger::Slots::perform`, the `async` method on the `(firings, toggles)`
+  handle pair.
 
 - **Changing axis conflict resolution** (the §5 rule — opposite-half
   suppression, greater-Depth-wins, the owner tie-break — or the
@@ -202,7 +203,7 @@ and it can be verified before merge.
   or adjust the logic there and add a row to the `analog_repeat::tests`
   tables, never in `dispatch`. Only the task shell
   (`analog_repeat::Engine`, `run_analog_repeat_loop`) and the
-  `compile_action` handoff belong outside the pure core.
+  `trigger::compile_action` handoff belong outside the pure core.
 
 - **Changing Stepper cursor behaviour** (the wrap-around, which item a step
   lands on, the default-to-first, or how an edited/deleted list reconciles a
@@ -213,8 +214,9 @@ and it can be verified before merge.
   `Effect::ReconcileStepperCursor(id)` on a `DeleteStepper` /
   `SetStepperItems`; the drop-vs-clamp rule is `reconcile`'s. The
   `StepperItem` → `Vec<MacroStep>` compilation is
-  `executor::compile_stepper_item`. Only spawning the compiled firing stays
-  in `dispatch` (`compile_action`).
+  `executor::compile_stepper_item`; `trigger::compile_action` picks the
+  cursor-advancing path and hands the steps to `trigger::Slots::perform` (or
+  `analog_repeat`) to spawn.
 
 - **Adding a new piece of dispatch runtime state** (a new per-Input handle
   map, another momentary mode flag, a live view of something the supervisor

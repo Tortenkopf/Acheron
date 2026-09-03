@@ -7,37 +7,50 @@
 //! 79, 80, 82) stop being re-tuned in two near-verbatim `match` bodies.
 //!
 //! `decide` answers one question — what does a `(Binding, EventState,
-//! slot-liveness)` triple do? — with a data-only `TriggerDecision` the
-//! `dispatch`-side executor (`dispatch::perform_trigger`) then performs
-//! against the runtime state it owns, keyed by `Input` for the individual
-//! path and by `ChordKey` for the Chord path. `decide` does no I/O, spawns no
-//! task, takes no `&Injector`, and imports nothing from `executor`,
-//! `injector`, or `edit`. It replaces the old `dispatch::fire` and
+//! slot-liveness)` triple do? — with a data-only `TriggerDecision` then
+//! performed by `Slots::perform` (below) against the `(firings, toggles)`
+//! handle pair `Slots<K>` owns, keyed by `Input` for the individual path and
+//! by `ChordKey` for the Chord path. `decide` itself does no I/O, spawns no
+//! task, takes no `&Injector`, and reads nothing from `executor` / `injector`
+//! / `edit`. It replaces the old `dispatch::fire` and
 //! `dispatch::execute_chord_fire` (ex-`fire_chord`), whose `match` bodies were
 //! arm-for-arm identical.
 //!
-//! `force_release_stuck` / `stop_toggle` at the bottom are the one place this
-//! module touches `executor` / `injector` types — they are shared executor
-//! helpers, deliberately *not* part of the pure core, kept here only because
-//! both the `Input` path and the `ChordKey` path call them and a shared home
-//! beats a third hand-rolled copy of two lines.
+//! `Slots<K>` (post-release ticket 15) is the runtime `(HashMap<K,
+//! FiringHandle>, HashMap<K, ActiveToggle>)` pair `decide`'s output is
+//! performed against — firing-wins liveness of one key (`slot`, the overlap
+//! guard's input), toggle-wins liveness of every key (`snapshot`,
+//! `chord::feed`'s completion input), the performance of a decision
+//! (`perform`), and the teardown paths (`force_release` / `stop_toggle` /
+//! `stop_all_toggles`, absorbing what were three hand-rolled copies of the same
+//! two lines plus `dispatch::stop_all_toggles`). It owns `FiringHandle` /
+//! `ActiveToggle` and its `perform` is `async`, so `Slots<K>` is deliberately
+//! *not* part of the pure core — the same carve-out the old
+//! `force_release_stuck` / `stop_toggle` free functions it absorbs always had.
+//! `compile_action` (below) stays synchronous: it turns a `Binding`'s `Action`
+//! into the flat step sequence `perform` spawns.
 
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::io;
+use std::time::Duration;
 
 use evdev::KeyCode;
 
 use crate::capture::EventState;
-use crate::config::{Action, Binding, TriggerMode};
-use crate::executor::{ActiveToggle, FiringHandle};
+use crate::config::{
+    Action, Binding, Config, MacroDef, MacroId, StepperDef, StepperId, TriggerMode,
+};
+use crate::executor::{self, ActiveToggle, FiringHandle, MacroStep};
 use crate::injector::Injector;
 use crate::input::is_mouse_button;
+use crate::stepper;
 
 /// Liveness of one firing/toggle slot, passed IN to `decide` rather than
 /// held — the function stays pure, tests construct it directly. Absent
 /// (`None`) means no live firing or toggle for that key. Folds in the old
 /// `chord::ChordSlot` verbatim (same three states); `chord::feed` and
-/// `dispatch::chord_slots` now take `trigger::Slot`.
+/// `Slots::snapshot` now speak `trigger::Slot`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Slot {
     /// An active Toggle-mode firing.
@@ -158,37 +171,230 @@ pub(crate) fn decide(binding: &Binding, state: EventState, slot: Option<Slot>) -
     }
 }
 
-/// Ticket 33's force-release, factored out of the individual `Up` arm, the
-/// Chord `ReleaseChordFiring` effect, and the Chord `ForceReleaseIndividual`
-/// effect — three hand-rolled copies of the same two lines. Releases (but
-/// never removes) `key`'s firing entry: a balanced Macro has already
-/// self-released (`held` empty, a no-op); a bare unbalanced `KeyDown` (a
-/// `HoldKeyDown` decision) is exactly what this cleans up. The entry lingers
-/// so a later `FiringFinished` slot stays distinct from `None`.
-pub(crate) async fn force_release_stuck<K: Eq + Hash>(
-    firings: &HashMap<K, FiringHandle>,
-    key: &K,
-    injector: &Injector,
-) {
-    if let Some(firing) = firings.get(key) {
-        firing.force_release_stuck(injector).await;
+/// The `(firings, toggles)` runtime handle pair `decide`'s output is performed
+/// against (post-release ticket 15), generic over the slot key — `Input` on
+/// the individual path, `ChordKey` on the Chord path, and a coming
+/// `Slots<StageKey>` for dual-stage keys instead of a fourth hand-rolled copy.
+/// Both maps are **private**: every read and mutation the two-map protocol
+/// needs is a method here, so the two deliberately-inverse tie-breaks
+/// (`slot` firing-wins, `snapshot` toggle-wins) live next to the state they
+/// guard rather than in a doc comment on a free function. `DispatchState`
+/// holds two — `individual: Slots<Input>` and `chord_slots: Slots<ChordKey>` —
+/// the way `axis::Engine` bundles its own two maps.
+pub(crate) struct Slots<K> {
+    firings: HashMap<K, FiringHandle>,
+    toggles: HashMap<K, ActiveToggle>,
+}
+
+impl<K> Default for Slots<K> {
+    fn default() -> Self {
+        Slots {
+            firings: HashMap::new(),
+            toggles: HashMap::new(),
+        }
     }
 }
 
-/// Stops and removes `key`'s Toggle, awaiting its force-release. Shared by
-/// `handle_event`'s inline toggle-stop-on-`Down` (whose `bool` return drives
-/// the "this press is consumed by the stop" early return) and the Chord
-/// `StopChordToggle` effect. Returns whether a Toggle was actually present.
-pub(crate) async fn stop_toggle<K: Eq + Hash>(
-    toggles: &mut HashMap<K, ActiveToggle>,
-    key: &K,
-) -> bool {
-    match toggles.remove(key) {
-        Some(toggle) => {
-            toggle.stop().await;
-            true
+/// What `Slots::perform` needs beyond the two maps it already owns — the tail
+/// of the old `dispatch::TriggerCtx` minus `firings` / `toggles`. Built at each
+/// call site with `PerformDeps::new` (a one-liner, no macro) rather than the
+/// old `trigger_ctx!`: the macro existed only because "a `&mut self` method
+/// can't be generic over which map type `K` selects", and that reason is gone
+/// now that `Slots<K>` *is* the `self`. `&macros` / `&steppers` are split out
+/// of `Config` here so `Slots` never sees a `Config` (ticket 05), matching
+/// `executor::compile`'s own signature.
+pub(crate) struct PerformDeps<'a> {
+    pub injector: &'a Injector,
+    pub macros: &'a HashMap<MacroId, MacroDef>,
+    pub steppers: &'a HashMap<StepperId, StepperDef>,
+    pub cursors: &'a mut stepper::Cursors,
+    pub toggle_lap_target: Duration,
+}
+
+impl<'a> PerformDeps<'a> {
+    /// The call-site constructor — takes `&Config` (read-only) and the two
+    /// disjoint `DispatchState` borrows, so each retargeted site is one line
+    /// instead of the six-field literal.
+    pub(crate) fn new(
+        injector: &'a Injector,
+        config: &'a Config,
+        cursors: &'a mut stepper::Cursors,
+        toggle_lap_target: Duration,
+    ) -> Self {
+        PerformDeps {
+            injector,
+            macros: &config.macros,
+            steppers: &config.steppers,
+            cursors,
+            toggle_lap_target,
         }
-        None => false,
+    }
+}
+
+impl<K: Eq + Hash + Clone> Slots<K> {
+    /// Firing-wins liveness of one key — `decide`'s overlap guard input. The
+    /// firing slot first (`FiringUnfinished` / `FiringFinished` by
+    /// `handle.is_finished()`), `Slot::Toggle` only as a fallback when no
+    /// firing entry exists. The old `dispatch::slot_for`, verbatim. This is
+    /// the deliberate inverse of `snapshot`'s tie-break: `decide` only ever
+    /// blocks on `Some(Slot::FiringUnfinished)`, so a key holding *both* a
+    /// live firing and a Toggle must report the firing here.
+    pub(crate) fn slot(&self, key: &K) -> Option<Slot> {
+        if let Some(handle) = self.firings.get(key) {
+            return Some(if handle.is_finished() {
+                Slot::FiringFinished
+            } else {
+                Slot::FiringUnfinished
+            });
+        }
+        self.toggles.contains_key(key).then_some(Slot::Toggle)
+    }
+
+    /// Toggle-wins liveness of every key — `chord::feed`'s completion input.
+    /// Every firing inserted first, then overwritten with `Slot::Toggle` for
+    /// every key in `toggles`, so a key holding both reports the Toggle. The
+    /// old `dispatch::chord_slots`, verbatim. Rebuilt per call — no cache; the
+    /// Chord map is ≤ ~12 keys and a cache would need invalidation on every
+    /// mutation. The deliberate inverse of `slot`'s tie-break —
+    /// `chord.rs`'s "second completion stops the Toggle" branch reads
+    /// `Some(Slot::Toggle)`, which firing-wins would hide.
+    pub(crate) fn snapshot(&self) -> HashMap<K, Slot> {
+        let mut live = HashMap::new();
+        for (key, handle) in &self.firings {
+            let slot = if handle.is_finished() {
+                Slot::FiringFinished
+            } else {
+                Slot::FiringUnfinished
+            };
+            live.insert(key.clone(), slot);
+        }
+        for key in self.toggles.keys() {
+            live.insert(key.clone(), Slot::Toggle);
+        }
+        live
+    }
+
+    /// Performs one `decision` against the pair — `compile_action` (behind the
+    /// overlap guard `decide` already cleared, so a dropped Fire-once /
+    /// Hold-to-repeat `Step` firing never advances the cursor) + `executor::
+    /// spawn_fire_once` / `ActiveToggle::spawn{,_held}` + the map insert, or
+    /// `force_release`. Never produces an `edit::Edit` (`ProfileSwitch` is
+    /// handled before this is ever reached). The old
+    /// `dispatch::perform_trigger` executor, now a `&mut self` method.
+    pub(crate) async fn perform(
+        &mut self,
+        decision: TriggerDecision,
+        key: K,
+        binding: &Binding,
+        deps: PerformDeps<'_>,
+    ) -> io::Result<()> {
+        use TriggerDecision as D;
+        match decision {
+            D::Nothing => {}
+            D::SpawnFireOnce => {
+                let steps =
+                    compile_action(&binding.action, deps.macros, deps.steppers, deps.cursors);
+                let handle = executor::spawn_fire_once(deps.injector.clone(), steps);
+                self.firings.insert(key, handle);
+            }
+            D::HoldKeyDown(code) => {
+                // A bare, unbalanced `KeyDown` mirroring the physical hold —
+                // released by a `ForceReleaseStuck` (individual) or
+                // `ChordEffect::ReleaseChordFiring` (Chord) later, reusing
+                // ticket 33's force-release path rather than inventing new
+                // architecture.
+                let handle = executor::spawn_fire_once(
+                    deps.injector.clone(),
+                    vec![MacroStep::KeyDown(code)],
+                );
+                self.firings.insert(key, handle);
+            }
+            D::StartToggleLoop => {
+                let steps =
+                    compile_action(&binding.action, deps.macros, deps.steppers, deps.cursors);
+                self.toggles.insert(
+                    key,
+                    ActiveToggle::spawn(deps.injector.clone(), steps, deps.toggle_lap_target),
+                );
+            }
+            D::StartToggleHeld(code) => {
+                self.toggles
+                    .insert(key, ActiveToggle::spawn_held(deps.injector.clone(), code));
+            }
+            D::ForceReleaseStuck => {
+                self.force_release(&key, deps.injector).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Ticket 33's force-release, factored out of the individual `Up` arm, the
+    /// Chord `ReleaseChordFiring` effect, and the Chord `ForceReleaseIndividual`
+    /// effect — three hand-rolled copies of the same two lines. Releases (but
+    /// **never removes**) `key`'s firing entry: a balanced Macro has already
+    /// self-released (`held` empty, a no-op); a bare unbalanced `KeyDown` (a
+    /// `HoldKeyDown` decision) is exactly what this cleans up. The entry
+    /// lingers so a later `FiringFinished` slot stays distinct from `None`.
+    pub(crate) async fn force_release(&self, key: &K, injector: &Injector) {
+        if let Some(firing) = self.firings.get(key) {
+            firing.force_release_stuck(injector).await;
+        }
+    }
+
+    /// Stops and **removes** `key`'s Toggle, awaiting its force-release.
+    /// Shared by `handle_event`'s inline toggle-stop-on-`Down` (whose `bool`
+    /// return drives the "this press is consumed by the stop" early return),
+    /// the `StopToggle` effect, and the Chord `StopChordToggle` effect.
+    /// Returns whether a Toggle was actually present.
+    pub(crate) async fn stop_toggle(&mut self, key: &K) -> bool {
+        match self.toggles.remove(key) {
+            Some(toggle) => {
+                toggle.stop().await;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Drains and stops every Toggle — `SwitchProfile`'s `StopAllToggles`
+    /// effect and the `StopAllToggles` command (ticket 25). The old free
+    /// `dispatch::stop_all_toggles`, verbatim.
+    pub(crate) async fn stop_all_toggles(&mut self) {
+        for (_, toggle) in self.toggles.drain() {
+            toggle.stop().await;
+        }
+    }
+
+    /// The keys with a currently-active Toggle — `GetState`'s `active_toggles`
+    /// read model.
+    pub(crate) fn active_toggle_keys(&self) -> impl Iterator<Item = &K> {
+        self.toggles.keys()
+    }
+}
+
+/// Compiles a `Binding`'s `Action` into the flat step sequence `Slots::perform`
+/// (and `analog_repeat`'s spawn path) spawns — `executor::compile` for every
+/// ordinary Action, or, for `Action::Step`, `stepper::Cursors::step` (which
+/// advances the Daemon-owned per-list cursor `executor::compile` has no access
+/// to, ticket 03/54) followed by `executor::compile_stepper_item`. A zero-item
+/// list steps to nothing. Called *inside* `perform`, after `decide` has
+/// cleared the overlap guard, so a dropped `Step` firing never advances the
+/// cursor.
+pub(crate) fn compile_action(
+    action: &Action,
+    macros: &HashMap<MacroId, MacroDef>,
+    steppers: &HashMap<StepperId, StepperDef>,
+    cursors: &mut stepper::Cursors,
+) -> Vec<MacroStep> {
+    match action {
+        Action::Step {
+            stepper: id,
+            direction,
+        } => cursors
+            .step(steppers, id, *direction)
+            .map(executor::compile_stepper_item)
+            .unwrap_or_default(),
+        other => executor::compile(other, macros),
     }
 }
 
@@ -307,5 +513,320 @@ mod tests {
             decide(&htr, EventState::Down, Some(Slot::Toggle)),
             TriggerDecision::SpawnFireOnce
         );
+    }
+}
+
+#[cfg(test)]
+mod slots {
+    //! `Slots<K>` is the runtime half — an injector and a `tokio` runtime, but
+    //! no `Config`, no D-Bus, no tempfile. The primary surface here is the
+    //! **two deliberately-inverse tie-breaks** (`slot` firing-wins,
+    //! `snapshot` toggle-wins), which used to be guarded only by a doc comment
+    //! on `dispatch::slot_for`, plus `perform`'s decision → map-mutation table.
+
+    use super::*;
+    use crate::config::Modifiers;
+    use crate::injector::{self, testing::RecordingSink};
+
+    type Key = u32;
+    const K: Key = 1;
+    const BTN: KeyCode = KeyCode::BTN_LEFT;
+
+    /// An injector wired to a recording sink plus the empty `macros` /
+    /// `steppers` / `cursors` `perform` needs — no `Config` in sight.
+    struct Fixture {
+        inj: Injector,
+        sink: RecordingSink,
+        macros: HashMap<MacroId, MacroDef>,
+        steppers: HashMap<StepperId, StepperDef>,
+        cursors: stepper::Cursors,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let sink = RecordingSink::new();
+            // The gamepad sink is the same recorder, so `BTN_LEFT` (routed to
+            // the gamepad device) and keyboard codes land in one batch list.
+            let (inj, _handle) = injector::spawn(sink.clone(), sink.clone());
+            Fixture {
+                inj,
+                sink,
+                macros: HashMap::new(),
+                steppers: HashMap::new(),
+                cursors: stepper::Cursors::default(),
+            }
+        }
+
+        fn deps(&mut self) -> PerformDeps<'_> {
+            PerformDeps {
+                injector: &self.inj,
+                macros: &self.macros,
+                steppers: &self.steppers,
+                cursors: &mut self.cursors,
+                toggle_lap_target: executor::MIN_TOGGLE_LAP,
+            }
+        }
+
+        fn key_events(&self) -> Vec<(KeyCode, i32)> {
+            self.sink
+                .batches()
+                .iter()
+                .flatten()
+                .filter_map(|e| match e.destructure() {
+                    evdev::EventSummary::Key(_, code, value) => Some((code, value)),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    fn kbd_binding() -> Binding {
+        Binding {
+            trigger: TriggerMode::FireOnce,
+            action: Action::Keypress {
+                modifiers: Modifiers::default(),
+                key: KeyCode::KEY_A,
+            },
+        }
+    }
+
+    /// A firing that never completes (a 1-hour `Delay` under paused time) —
+    /// `is_finished()` stays false, so it reads as `FiringUnfinished`.
+    fn unfinished_firing(inj: &Injector) -> FiringHandle {
+        executor::spawn_fire_once(
+            inj.clone(),
+            vec![MacroStep::Delay(Duration::from_secs(3600))],
+        )
+    }
+
+    /// A firing whose (empty) step list has already been walked —
+    /// `is_finished()` is true, so it reads as `FiringFinished`.
+    async fn finished_firing(inj: &Injector) -> FiringHandle {
+        let handle = executor::spawn_fire_once(inj.clone(), Vec::new());
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            handle.is_finished(),
+            "empty firing should finish immediately"
+        );
+        handle
+    }
+
+    fn held_toggle(inj: &Injector) -> ActiveToggle {
+        ActiveToggle::spawn_held(inj.clone(), BTN)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slot_is_firing_wins_and_snapshot_is_toggle_wins_across_every_combination() {
+        let fx = Fixture::new();
+
+        // ── The load-bearing case: one key present in BOTH maps ──────────────
+        let mut both: Slots<Key> = Slots::default();
+        both.firings.insert(K, unfinished_firing(&fx.inj));
+        both.toggles.insert(K, held_toggle(&fx.inj));
+        assert_eq!(
+            both.slot(&K),
+            Some(Slot::FiringUnfinished),
+            "slot() is firing-wins — the overlap guard must see the firing"
+        );
+        assert_eq!(
+            both.snapshot().get(&K),
+            Some(&Slot::Toggle),
+            "snapshot() is toggle-wins — chord::feed's second-completion stop needs the Toggle"
+        );
+
+        // ── firing only ─────────────────────────────────────────────────────
+        let mut firing_only: Slots<Key> = Slots::default();
+        firing_only.firings.insert(K, unfinished_firing(&fx.inj));
+        assert_eq!(firing_only.slot(&K), Some(Slot::FiringUnfinished));
+        assert_eq!(
+            firing_only.snapshot().get(&K),
+            Some(&Slot::FiringUnfinished)
+        );
+
+        // ── finished firing only ────────────────────────────────────────────
+        let mut finished_only: Slots<Key> = Slots::default();
+        finished_only
+            .firings
+            .insert(K, finished_firing(&fx.inj).await);
+        assert_eq!(finished_only.slot(&K), Some(Slot::FiringFinished));
+        assert_eq!(
+            finished_only.snapshot().get(&K),
+            Some(&Slot::FiringFinished)
+        );
+
+        // ── toggle only ─────────────────────────────────────────────────────
+        let mut toggle_only: Slots<Key> = Slots::default();
+        toggle_only.toggles.insert(K, held_toggle(&fx.inj));
+        assert_eq!(toggle_only.slot(&K), Some(Slot::Toggle));
+        assert_eq!(toggle_only.snapshot().get(&K), Some(&Slot::Toggle));
+
+        // ── absent ──────────────────────────────────────────────────────────
+        let absent: Slots<Key> = Slots::default();
+        assert_eq!(absent.slot(&K), None);
+        assert!(absent.snapshot().is_empty());
+
+        for mut s in [both, firing_only, finished_only, toggle_only] {
+            s.stop_all_toggles().await;
+        }
+    }
+
+    /// The firing variants `slot()` can report for a key with a firing entry —
+    /// `perform` never branches on whether the firing has finished walking
+    /// (that is `decide`'s guard), so a test that only cares "a firing landed"
+    /// accepts either.
+    fn is_firing(slot: Option<Slot>) -> bool {
+        matches!(slot, Some(Slot::FiringUnfinished | Slot::FiringFinished))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn perform_routes_each_decision_to_the_expected_map() {
+        let mut fx = Fixture::new();
+        let binding = kbd_binding();
+        let mut slots: Slots<Key> = Slots::default();
+
+        // Asserted through the public `slot()` / `snapshot()` reads, not the
+        // private maps — `slot()` is firing-wins, so a firing key reports a
+        // `Firing*` variant and a toggle-only key reports `Toggle`.
+        slots
+            .perform(TriggerDecision::Nothing, 10, &binding, fx.deps())
+            .await
+            .unwrap();
+        assert_eq!(slots.slot(&10), None);
+        assert!(slots.snapshot().is_empty());
+
+        slots
+            .perform(TriggerDecision::SpawnFireOnce, 20, &binding, fx.deps())
+            .await
+            .unwrap();
+        assert!(
+            is_firing(slots.slot(&20)),
+            "SpawnFireOnce → the firings map"
+        );
+        assert!(is_firing(slots.snapshot().get(&20).copied()));
+
+        slots
+            .perform(TriggerDecision::HoldKeyDown(BTN), 30, &binding, fx.deps())
+            .await
+            .unwrap();
+        assert!(is_firing(slots.slot(&30)), "HoldKeyDown → the firings map");
+
+        slots
+            .perform(TriggerDecision::StartToggleLoop, 40, &binding, fx.deps())
+            .await
+            .unwrap();
+        assert_eq!(
+            slots.slot(&40),
+            Some(Slot::Toggle),
+            "StartToggleLoop → the toggles map (no firing, so slot() falls back to Toggle)"
+        );
+
+        slots
+            .perform(
+                TriggerDecision::StartToggleHeld(BTN),
+                50,
+                &binding,
+                fx.deps(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            slots.slot(&50),
+            Some(Slot::Toggle),
+            "StartToggleHeld → the toggles map"
+        );
+
+        slots.stop_all_toggles().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn perform_is_unconditional_it_does_not_re_check_the_slot_state() {
+        // `perform` runs the arm `decide` already chose — it never inspects a
+        // pre-existing entry for the key (that guard is `decide`'s). Firing a
+        // `SpawnFireOnce` at a key that already holds a Toggle adds to the
+        // firings map and leaves the Toggle, and `slot()`'s firing-wins rule
+        // then reports the fresh firing.
+        let mut fx = Fixture::new();
+        let binding = kbd_binding();
+        let mut slots: Slots<Key> = Slots::default();
+        slots.toggles.insert(K, held_toggle(&fx.inj));
+
+        slots
+            .perform(TriggerDecision::SpawnFireOnce, K, &binding, fx.deps())
+            .await
+            .unwrap();
+
+        assert!(
+            is_firing(slots.slot(&K)),
+            "the fresh firing wins the slot() read"
+        );
+        assert_eq!(
+            slots.snapshot().get(&K),
+            Some(&Slot::Toggle),
+            "but the Toggle is untouched — snapshot() still sees it"
+        );
+
+        slots.stop_all_toggles().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn perform_force_release_releases_a_stuck_hold_and_keeps_the_entry() {
+        let mut fx = Fixture::new();
+        let binding = kbd_binding();
+        let mut slots: Slots<Key> = Slots::default();
+
+        // A bare unbalanced KeyDown — the sustained-hold shape.
+        slots
+            .perform(TriggerDecision::HoldKeyDown(BTN), K, &binding, fx.deps())
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(fx.key_events(), vec![(BTN, 1)]);
+        assert!(slots.firings.contains_key(&K));
+
+        slots
+            .perform(TriggerDecision::ForceReleaseStuck, K, &binding, fx.deps())
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            slots.firings.contains_key(&K),
+            "force_release releases the held key but never removes the entry"
+        );
+        assert_eq!(
+            fx.key_events(),
+            vec![(BTN, 1), (BTN, 0)],
+            "the stuck KeyDown is now balanced by a force-released KeyUp"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_toggle_removes_one_entry_and_reports_presence() {
+        let fx = Fixture::new();
+        let mut slots: Slots<Key> = Slots::default();
+        slots.toggles.insert(K, held_toggle(&fx.inj));
+
+        assert!(slots.stop_toggle(&K).await, "a Toggle was present");
+        assert!(!slots.toggles.contains_key(&K), "and it is now removed");
+        assert!(!slots.stop_toggle(&K).await, "second call finds nothing");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_all_toggles_drains_every_entry() {
+        let fx = Fixture::new();
+        let mut slots: Slots<Key> = Slots::default();
+        slots.toggles.insert(1, held_toggle(&fx.inj));
+        slots.toggles.insert(2, held_toggle(&fx.inj));
+        slots.toggles.insert(3, held_toggle(&fx.inj));
+
+        slots.stop_all_toggles().await;
+
+        assert!(slots.toggles.is_empty());
+        assert!(slots.active_toggle_keys().next().is_none());
     }
 }

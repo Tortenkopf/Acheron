@@ -62,7 +62,7 @@ fn modifier_codes(modifiers: Modifiers) -> Vec<KeyCode> {
 /// both edges inside the same input-poll frame on the receiving game, so the
 /// whole press is silently swallowed. Originally tuned for Fire-once, but
 /// ticket 78 locked Fire-once out for `Action::ControllerButton` entirely —
-/// this now only fires via `dispatch::compile_action`'s Digital-Capture-mode
+/// this now only fires via `trigger::compile_action`'s Digital-Capture-mode
 /// Analog-repeat fallback (a Digital-sourced Analog-repeat Binding resolves
 /// to `trigger::TriggerDecision::SpawnFireOnce`, which calls straight through
 /// to `compile()`, per ticket 20's Answer), so the same single-poll-swallow risk still
@@ -138,7 +138,7 @@ pub fn compile(action: &Action, macros: &HashMap<MacroId, MacroDef>) -> Vec<Macr
         }
         Action::Step { .. } => {
             unreachable!(
-                "Action::Step's steps depend on Daemon-owned runtime cursor state, resolved by dispatch::compile_action before this generic compile is ever reached for it"
+                "Action::Step's steps depend on Daemon-owned runtime cursor state, resolved by trigger::compile_action before this generic compile is ever reached for it"
             )
         }
         // Almost the same shape as a plain, unmodified Keypress (ticket 14's
@@ -160,7 +160,7 @@ pub fn compile(action: &Action, macros: &HashMap<MacroId, MacroDef>) -> Vec<Macr
 
 /// Compiles one already-selected Stepper list item into the flat step
 /// sequence the shared executor runs (ticket 62 / 92, post-release ticket
-/// 12) — `dispatch::compile_action` calls this on the item
+/// 12) — `trigger::compile_action` calls this on the item
 /// `stepper::Cursors::step` returns. A `Key` item reuses `Action::Keypress`'s
 /// mods-down/key/mods-up path, carrying its own modifier combination if it
 /// has one (ticket 62); a `ControllerButton` item reuses
@@ -222,9 +222,9 @@ pub struct FiringHandle {
 
 impl FiringHandle {
     /// Whether the firing's steps have finished walking — feeds
-    /// `dispatch::slot_for`'s `FiringUnfinished` / `FiringFinished` split for
-    /// `trigger::decide`'s overlap guard, unchanged from the old bare
-    /// `JoinHandle<()>` check.
+    /// `trigger::Slots::slot` / `snapshot`'s `FiringUnfinished` /
+    /// `FiringFinished` split for `trigger::decide`'s overlap guard, unchanged
+    /// from the old bare `JoinHandle<()>` check.
     pub fn is_finished(&self) -> bool {
         self.handle.is_finished()
     }

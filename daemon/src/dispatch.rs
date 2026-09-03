@@ -24,7 +24,6 @@
 //! and Trigger-mode dispatch as any other Input.
 
 use std::collections::{HashMap, HashSet};
-use std::hash::Hash;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -40,52 +39,14 @@ use crate::capture::{CaptureMode, EventState, PhysicalEvent};
 use crate::chord;
 use crate::command::{Command, State};
 use crate::config::{
-    self, Action, ActuationPoint, Binding, ChordKey, Config, Layer, MacroDef, MacroId, ModeKeyRole,
-    StatusLeds, StepperDef, StepperId, TriggerMode,
+    self, Action, ActuationPoint, ChordKey, Config, Layer, ModeKeyRole, StatusLeds, TriggerMode,
 };
 use crate::dbus::Daemon;
 use crate::edit;
-use crate::executor::{self, ActiveToggle, FiringHandle, MacroStep};
 use crate::injector::Injector;
 use crate::input::Input;
 use crate::stepper;
 use crate::trigger;
-
-/// Builds a `TriggerCtx` (below) from a `(firings, toggles)` pair plus the
-/// shared `config` view and the `DispatchState` fields it needs — a
-/// per-call-site borrow struct built from a macro, so the three
-/// `trigger::decide` + `perform_trigger` sites don't each spell the struct
-/// literal. Each site passes a disjoint `&mut self.<map>` borrow (`in_flight`
-/// on the individual path, `chord_runtime.{firings,toggles}` on the Chord
-/// path) — a `&mut self` method can't be generic over which map type `K`
-/// selects, so `perform_trigger<K>` stays a free function. Defined up here
-/// because `macro_rules!` is textually scoped and the first user
-/// (`handle_event`) precedes `TriggerCtx`'s own definition.
-macro_rules! trigger_ctx {
-    ($injector:expr, $config:expr, $firings:expr, $toggles:expr, $cursors:expr, $lap:expr $(,)?) => {
-        TriggerCtx {
-            injector: $injector,
-            firings: $firings,
-            toggles: $toggles,
-            macros: &$config.macros,
-            steppers: &$config.steppers,
-            cursors: $cursors,
-            toggle_lap_target: $lap,
-        }
-    };
-}
-
-/// Every piece of Daemon-owned, `ChordKey`-keyed runtime state a Chord's own
-/// Trigger-mode dispatch touches (ticket 01/40) — the firing/toggle *handles*
-/// the pure `chord` state machine (post-release ticket 07) never holds. One
-/// nested `DispatchState` field, reset fresh per dispatch task start,
-/// mirroring how `axis::Engine` bundles its own two maps; the executor derives
-/// the `trigger::Slot` liveness snapshot `chord::feed` wants from it.
-#[derive(Default)]
-struct ChordRuntime {
-    firings: HashMap<ChordKey, FiringHandle>,
-    toggles: HashMap<ChordKey, ActiveToggle>,
-}
 
 /// Every piece of ephemeral runtime state the dispatch task owns — built
 /// fresh on every task start, the same lifetime as the loose `run` locals it
@@ -97,12 +58,19 @@ struct ChordRuntime {
 /// piece of dispatch runtime state means a field here, not a fresh `run`
 /// local or a new `handle_*` parameter (CONTRIBUTING.md).
 struct DispatchState {
-    toggles: HashMap<Input, ActiveToggle>,
-    in_flight: HashMap<Input, FiringHandle>,
+    /// The individual (`Input`-keyed) firing/toggle handle pair — was the
+    /// loose `in_flight` + `toggles` maps (post-release ticket 15).
+    individual: trigger::Slots<Input>,
     stepper: stepper::Cursors,
     active_layer: Layer,
     chord_machine: chord::ChordMachine,
-    chord_runtime: ChordRuntime,
+    /// The Chord path's own `ChordKey`-keyed firing/toggle handle pair — the
+    /// runtime *handles* the pure `chord` state machine (post-release ticket
+    /// 07) never holds; `chord::feed` is handed a `trigger::Slot` snapshot
+    /// (`chord_slots.snapshot()`) each call. Was the `ChordRuntime` struct
+    /// (ticket 01/40), now the same `trigger::Slots<K>` the individual path
+    /// uses, the way `axis::Engine` bundles its own two maps.
+    chord_slots: trigger::Slots<ChordKey>,
     axis: axis::Engine,
     analog_repeat: analog_repeat::Engine,
     device_connected: bool,
@@ -135,12 +103,11 @@ impl DispatchState {
         led_tx: watch::Sender<Option<StatusLeds>>,
     ) -> Self {
         DispatchState {
-            toggles: HashMap::new(),
-            in_flight: HashMap::new(),
+            individual: trigger::Slots::default(),
             stepper: stepper::Cursors::default(),
             active_layer: Layer::Base,
             chord_machine: chord::ChordMachine::default(),
-            chord_runtime: ChordRuntime::default(),
+            chord_slots: trigger::Slots::default(),
             axis: axis::Engine::default(),
             analog_repeat: analog_repeat::Engine::default(),
             device_connected: true,
@@ -206,9 +173,7 @@ impl DispatchState {
         // assigns — this press is consumed entirely by the stop, per spec.md's
         // "Toggle behavior across Layer/Profile switches". Only a later press
         // resumes normal evaluation.
-        if event.state == EventState::Down
-            && trigger::stop_toggle(&mut self.toggles, &event.input).await
-        {
+        if event.state == EventState::Down && self.individual.stop_toggle(&event.input).await {
             return Ok(Vec::new());
         }
 
@@ -237,7 +202,7 @@ impl DispatchState {
         // Binding lookup — it owns the "is this event mine?" predicate now
         // (`ChordOutcome::NotMine` when it isn't), rather than `handle_event`
         // reaching into `claimed` / `chord_keys_containing` itself.
-        let live = chord_slots(&self.chord_runtime);
+        let live = self.chord_slots.snapshot();
         match chord::feed(
             &mut self.chord_machine,
             profile.chords(self.active_layer),
@@ -268,7 +233,7 @@ impl DispatchState {
 
         match event.state {
             EventState::Down => {
-                // The bound → `trigger::decide` + `perform_trigger` /
+                // The bound → `trigger::decide` + `Slots::perform` /
                 // `ProfileSwitch` → `Edit` / unbound → passthrough tail, shared
                 // verbatim with the Chord machine's `FireIndividual` executor so
                 // the retroactive-fire logic exists once.
@@ -287,17 +252,17 @@ impl DispatchState {
                 if matches!(binding.action, Action::ProfileSwitch { .. }) {
                     return Ok(Vec::new());
                 }
-                let slot = slot_for(&self.in_flight, &self.toggles, &event.input);
+                let slot = self.individual.slot(&event.input);
                 let decision = trigger::decide(&binding, event.state, slot);
-                let mut ctx = trigger_ctx!(
+                let deps = trigger::PerformDeps::new(
                     &self.injector,
                     config,
-                    &mut self.in_flight,
-                    &mut self.toggles,
                     &mut self.stepper,
                     self.toggle_lap_target,
                 );
-                perform_trigger(decision, event.input, &binding, &mut ctx).await?;
+                self.individual
+                    .perform(decision, event.input, &binding, deps)
+                    .await?;
                 Ok(Vec::new())
             }
         }
@@ -325,40 +290,35 @@ impl DispatchState {
                     // The Chord path's own Trigger-mode dispatch — `trigger::
                     // decide` (the same matrix the individual path runs) against
                     // this Chord's `ChordKey`-keyed liveness, performed by the
-                    // generic `perform_trigger`. A Chord's Action is never
+                    // generic `Slots::perform`. A Chord's Action is never
                     // `AnalogRepeat` or `ProfileSwitch`, and `chord::feed` only
                     // ever emits `Down` / `Repeat`, so those `decide` arms are
                     // unreachable here.
-                    let slot = slot_for(
-                        &self.chord_runtime.firings,
-                        &self.chord_runtime.toggles,
-                        &key,
-                    );
+                    let slot = self.chord_slots.slot(&key);
                     let decision = trigger::decide(&binding, state, slot);
-                    let mut ctx = trigger_ctx!(
+                    let deps = trigger::PerformDeps::new(
                         &self.injector,
                         config,
-                        &mut self.chord_runtime.firings,
-                        &mut self.chord_runtime.toggles,
                         &mut self.stepper,
                         self.toggle_lap_target,
                     );
-                    perform_trigger(decision, key, &binding, &mut ctx).await?;
+                    self.chord_slots
+                        .perform(decision, key, &binding, deps)
+                        .await?;
                 }
                 chord::ChordEffect::ReleaseChordFiring { key } => {
                     // Fire-once / Hold-to-repeat only — a Toggle Chord is
                     // deliberately not stopped by a member's `Up` (ticket 67).
-                    trigger::force_release_stuck(&self.chord_runtime.firings, &key, &self.injector)
-                        .await;
+                    self.chord_slots.force_release(&key, &self.injector).await;
                 }
                 chord::ChordEffect::StopChordToggle { key } => {
-                    trigger::stop_toggle(&mut self.chord_runtime.toggles, &key).await;
+                    self.chord_slots.stop_toggle(&key).await;
                 }
                 chord::ChordEffect::FireIndividual { input } => {
                     edits.extend(self.dispatch_individual_down(config, input).await?);
                 }
                 chord::ChordEffect::ForceReleaseIndividual { input } => {
-                    trigger::force_release_stuck(&self.in_flight, &input, &self.injector).await;
+                    self.individual.force_release(&input, &self.injector).await;
                 }
             }
         }
@@ -407,7 +367,7 @@ impl DispatchState {
 
     /// Dispatches a single fresh `Down` on `input` against the active Layer —
     /// the `ProfileSwitch → Edit` / bound → `trigger::decide` +
-    /// `perform_trigger` / unbound → passthrough tail carved out of
+    /// `Slots::perform` / unbound → passthrough tail carved out of
     /// `handle_event`, shared verbatim by the ordinary input path and the
     /// Chord machine's `FireIndividual` executor (a member's individual
     /// Binding firing retroactively — the window elapsed, or the member was
@@ -443,17 +403,17 @@ impl DispatchState {
                 // grid key that's both a Chord member *and* individually
                 // Analog-repeat-triggered is a narrow combination this
                 // fast-follow doesn't specially engineer for.
-                let slot = slot_for(&self.in_flight, &self.toggles, &input);
+                let slot = self.individual.slot(&input);
                 let decision = trigger::decide(&binding, EventState::Down, slot);
-                let mut ctx = trigger_ctx!(
+                let deps = trigger::PerformDeps::new(
                     &self.injector,
                     config,
-                    &mut self.in_flight,
-                    &mut self.toggles,
                     &mut self.stepper,
                     self.toggle_lap_target,
                 );
-                perform_trigger(decision, input, &binding, &mut ctx).await?;
+                self.individual
+                    .perform(decision, input, &binding, deps)
+                    .await?;
                 Ok(Vec::new())
             }
             None => {
@@ -476,7 +436,7 @@ impl DispatchState {
     /// resolution off the same snapshot. A rising edge through
     /// `ANALOG_REPEAT_DEADZONE` on an Input whose active-Layer Binding is
     /// `TriggerMode::AnalogRepeat` spawns a task (compiling its steps once,
-    /// the same "once per fire" precedent `perform_trigger` follows); a
+    /// the same "once per fire" precedent `trigger::Slots::perform` follows); a
     /// falling edge — or the Binding no longer being Analog-repeat,
     /// best-effort only, see below — stops one. A Binding changed away from
     /// Analog-repeat without an intervening depth-crossing (e.g. edited live
@@ -508,11 +468,11 @@ impl DispatchState {
                 .get(&input)
                 .expect("reconcile only returns Spawn for a repeat_inputs member");
             // Compiled once, here, from the Binding's Action as of the moment
-            // Depth first crossed the deadzone (mirrors `perform_trigger`'s
-            // own once-per-fire `compile_action` call) — `compile_action`
-            // stays dispatch-side so the engine needn't depend on `dispatch`
-            // or drag `Config` + the `stepper::Cursors` in.
-            let steps = compile_action(
+            // Depth first crossed the deadzone (mirrors `trigger::Slots::
+            // perform`'s own once-per-fire `compile_action` call) —
+            // `trigger::compile_action` takes `Config` + the `stepper::Cursors`
+            // so the engine needn't, and hands the task pre-compiled steps.
+            let steps = trigger::compile_action(
                 &binding.action,
                 &config.macros,
                 &config.steppers,
@@ -567,11 +527,9 @@ impl DispatchState {
                     let _ = self.capture_control_tx.send(force).await;
                 }
                 edit::Effect::StopToggle(input) => {
-                    if let Some(toggle) = self.toggles.remove(&input) {
-                        toggle.stop().await;
-                    }
+                    self.individual.stop_toggle(&input).await;
                 }
-                edit::Effect::StopAllToggles => stop_all_toggles(&mut self.toggles).await,
+                edit::Effect::StopAllToggles => self.individual.stop_all_toggles().await,
                 edit::Effect::StopAllAnalogRepeats => self.analog_repeat.stop_all().await,
                 edit::Effect::ResetAxisOutputs => {
                     for w in self.axis.reset() {
@@ -647,7 +605,7 @@ impl DispatchState {
                 let _ = reply.send(State {
                     profile: config.active_profile.clone(),
                     layer: self.active_layer.as_str(),
-                    active_toggles: self.toggles.keys().copied().collect(),
+                    active_toggles: self.individual.active_toggle_keys().copied().collect(),
                     device_connected: self.device_connected,
                     capture_mode: self.capture_mode.as_str(),
                     daemon_version: crate::VERSION,
@@ -663,7 +621,7 @@ impl DispatchState {
                 });
             }
             Command::StopAllToggles { reply } => {
-                stop_all_toggles(&mut self.toggles).await;
+                self.individual.stop_all_toggles().await;
                 let _ = reply.send(());
             }
             Command::Apply { edit, reply } => {
@@ -860,119 +818,6 @@ pub async fn run(
     Ok(())
 }
 
-/// Builds the `trigger::Slot` liveness snapshot `chord::feed` wants from
-/// dispatch's `ChordRuntime` — `toggles` → `Toggle`, `firings` →
-/// `FiringUnfinished` / `FiringFinished` by `handle.is_finished()`. Firings
-/// are inserted first so a `Toggle` entry wins if a live re-bind ever left
-/// both (matching the old `starting`/`stopping` filters, which checked the
-/// toggle map first). `slot_for` reads the same three states for a single key
-/// on the executor paths, but with the opposite tie-break — see its doc.
-fn chord_slots(runtime: &ChordRuntime) -> HashMap<ChordKey, trigger::Slot> {
-    let mut live = HashMap::new();
-    for (key, handle) in &runtime.firings {
-        let slot = if handle.is_finished() {
-            trigger::Slot::FiringFinished
-        } else {
-            trigger::Slot::FiringUnfinished
-        };
-        live.insert(key.clone(), slot);
-    }
-    for key in runtime.toggles.keys() {
-        live.insert(key.clone(), trigger::Slot::Toggle);
-    }
-    live
-}
-
-/// The single-key liveness read `trigger::decide`'s overlap guard needs, over
-/// a `(firings, toggles)` pair — `Input`-keyed on the individual path,
-/// `ChordKey`-keyed on the Chord `FireChord` path. Replaces the old `fire` /
-/// `execute_chord_fire` inline `firings.get(&key).is_finished()` checks, which
-/// consulted *only* the firings map — so a firing entry wins here (the guard
-/// `decide` makes is purely `Some(FiringUnfinished)`), and `Toggle` is only
-/// reported as a fallback when no firing exists. This differs deliberately
-/// from `chord_slots`' toggle-wins tie-break, which serves `chord::feed`'s
-/// completion logic, not this guard.
-fn slot_for<K: Eq + Hash>(
-    firings: &HashMap<K, FiringHandle>,
-    toggles: &HashMap<K, ActiveToggle>,
-    key: &K,
-) -> Option<trigger::Slot> {
-    if let Some(handle) = firings.get(key) {
-        return Some(if handle.is_finished() {
-            trigger::Slot::FiringFinished
-        } else {
-            trigger::Slot::FiringUnfinished
-        });
-    }
-    toggles.contains_key(key).then_some(trigger::Slot::Toggle)
-}
-
-/// The runtime state `perform_trigger` performs a `trigger::TriggerDecision`
-/// against, generic over the slot key (`Input` for the individual path,
-/// `ChordKey` for the Chord path). Built fresh per call site from a disjoint
-/// `&mut self.<map>` borrow plus `&config` (ticket 05/08) — never held across
-/// a `select!` poll. It survives the ticket-09 `DispatchState` reshape
-/// precisely because a `&mut self` method can't be generic over which map
-/// type `K` selects, so `perform_trigger<K>` stays a free function.
-/// Dispatch-internal: never part of `trigger`'s interface.
-struct TriggerCtx<'a, K> {
-    injector: &'a Injector,
-    firings: &'a mut HashMap<K, FiringHandle>,
-    toggles: &'a mut HashMap<K, ActiveToggle>,
-    macros: &'a HashMap<MacroId, MacroDef>,
-    steppers: &'a HashMap<StepperId, StepperDef>,
-    cursors: &'a mut stepper::Cursors,
-    toggle_lap_target: Duration,
-}
-
-/// Performs `decision` against `ctx` — `compile_action` (behind the overlap
-/// guard `trigger::decide` already cleared, so a dropped Fire-once /
-/// Hold-to-repeat `Step` firing never advances the cursor) + `executor::
-/// spawn_fire_once` / `ActiveToggle::spawn{,_held}` + map insert, or
-/// `trigger::force_release_stuck`. Never produces an `edit::Edit`
-/// (`ProfileSwitch` is handled before this is ever reached). The old `fire` /
-/// `execute_chord_fire` executor halves, now one generic function.
-async fn perform_trigger<K: Eq + Hash + Clone>(
-    decision: trigger::TriggerDecision,
-    key: K,
-    binding: &Binding,
-    ctx: &mut TriggerCtx<'_, K>,
-) -> io::Result<()> {
-    use trigger::TriggerDecision as D;
-    match decision {
-        D::Nothing => {}
-        D::SpawnFireOnce => {
-            let steps = compile_action(&binding.action, ctx.macros, ctx.steppers, ctx.cursors);
-            let handle = executor::spawn_fire_once(ctx.injector.clone(), steps);
-            ctx.firings.insert(key, handle);
-        }
-        D::HoldKeyDown(code) => {
-            // A bare, unbalanced `KeyDown` mirroring the physical hold —
-            // released by a `ForceReleaseStuck` (individual) or
-            // `ChordEffect::ReleaseChordFiring` (Chord) later, reusing ticket
-            // 33's force-release path rather than inventing new architecture.
-            let handle =
-                executor::spawn_fire_once(ctx.injector.clone(), vec![MacroStep::KeyDown(code)]);
-            ctx.firings.insert(key, handle);
-        }
-        D::StartToggleLoop => {
-            let steps = compile_action(&binding.action, ctx.macros, ctx.steppers, ctx.cursors);
-            ctx.toggles.insert(
-                key,
-                ActiveToggle::spawn(ctx.injector.clone(), steps, ctx.toggle_lap_target),
-            );
-        }
-        D::StartToggleHeld(code) => {
-            ctx.toggles
-                .insert(key, ActiveToggle::spawn_held(ctx.injector.clone(), code));
-        }
-        D::ForceReleaseStuck => {
-            trigger::force_release_stuck(ctx.firings, &key, ctx.injector).await;
-        }
-    }
-    Ok(())
-}
-
 /// Awaits the active Chord window's deadline, or never resolves if none is
 /// open — the `select!` branch in `run` re-creates this future every loop
 /// iteration, so a window opened, extended, or cleared by `handle_event` in
@@ -1072,30 +917,6 @@ async fn handle_capture_mode_change(
     }
 }
 
-/// Compiles a Binding's `Action` into the flat step sequence
-/// `perform_trigger` spawns — `executor::compile` for every ordinary Action,
-/// or, for `Action::Step`, `stepper::Cursors::step` (which advances the
-/// Daemon-owned per-list cursor `executor::compile` has no access to, ticket
-/// 03/54) followed by `executor::compile_stepper_item`. A zero-item list
-/// steps to nothing.
-fn compile_action(
-    action: &Action,
-    macros: &HashMap<MacroId, MacroDef>,
-    steppers: &HashMap<StepperId, StepperDef>,
-    cursors: &mut stepper::Cursors,
-) -> Vec<executor::MacroStep> {
-    match action {
-        Action::Step {
-            stepper: id,
-            direction,
-        } => cursors
-            .step(steppers, id, *direction)
-            .map(executor::compile_stepper_item)
-            .unwrap_or_default(),
-        other => executor::compile(other, macros),
-    }
-}
-
 /// Republishes the active Profile's resolved Actuation-point snapshot
 /// (ticket 18 §5) — `run_effects`'s handler for `edit::Effect::RepublishActuation`,
 /// which `edit::plan` emits from `SetActuationPoint` / `ClearActuationPoint` /
@@ -1115,25 +936,17 @@ fn publish_actuation_snapshot(
     actuation_tx.send_replace(profile.resolved_actuation_points());
 }
 
-/// Force-stops every currently running Toggle — shared by `SwitchProfile`'s
-/// `StopAllToggles` effect and the `StopAllToggles` command (ticket 25, on
-/// its own, GUI-focus-gain triggered) so the drain-and-stop loop has exactly
-/// one implementation.
-async fn stop_all_toggles(toggles: &mut HashMap<Input, ActiveToggle>) {
-    for (_, toggle) in toggles.drain() {
-        toggle.stop().await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::capture::EventState;
     use crate::config::{
-        Action, ActuationPoint, AxisTarget, DEFAULT_PROFILE_NAME, MacroStepDto, Modifiers, Profile,
-        StatusLeds, StepDirection, StepperItem,
+        Action, ActuationPoint, AxisTarget, Binding, DEFAULT_PROFILE_NAME, MacroDef, MacroId,
+        MacroStepDto, Modifiers, Profile, StatusLeds, StepDirection, StepperDef, StepperId,
+        StepperItem,
     };
     use crate::edit::{CommandError, CreatedId};
+    use crate::executor;
     use crate::injector::testing::RecordingSink;
     use crate::injector::{self};
     use crate::input::{Direction, WheelEvent};
@@ -1392,7 +1205,7 @@ mod tests {
         /// injector — mirrors `run` returning and the drop-and-join tail the
         /// full-rig helpers use.
         async fn finish(mut self) -> Vec<Vec<evdev::InputEvent>> {
-            stop_all_toggles(&mut self.state.toggles).await;
+            self.state.individual.stop_all_toggles().await;
             self.state.analog_repeat.stop_all().await;
             drop(self.state);
             drop(self.inj);
