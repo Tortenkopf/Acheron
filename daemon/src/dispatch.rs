@@ -45,6 +45,7 @@ use crate::dbus::Daemon;
 use crate::edit;
 use crate::injector::Injector;
 use crate::input::Input;
+use crate::stage;
 use crate::stepper;
 use crate::trigger;
 
@@ -73,6 +74,12 @@ struct DispatchState {
     chord_slots: trigger::Slots<ChordKey>,
     axis: axis::Engine,
     analog_repeat: analog_repeat::Engine,
+    /// The third depth engine (`tartarus-dual-stage-keys` ticket 03),
+    /// alongside `axis`/`analog_repeat` above — drives every dual-stage
+    /// grid key's Handoff/No-Return/Additive state machine off the same
+    /// live-Depth stream `handle_depth_update`/`update_analog_repeats`
+    /// already read (`update_stages`, called from the same `rx_depth` arm).
+    stage: stage::Engine,
     device_connected: bool,
     capture_mode: CaptureMode,
     device_info: Option<DeviceInfo>,
@@ -110,6 +117,7 @@ impl DispatchState {
             chord_slots: trigger::Slots::default(),
             axis: axis::Engine::default(),
             analog_repeat: analog_repeat::Engine::default(),
+            stage: stage::Engine::default(),
             device_connected: true,
             capture_mode: CaptureMode::Digital,
             device_info: None,
@@ -162,6 +170,7 @@ impl DispatchState {
                 &self.signal_emitter,
                 &mut self.axis,
                 &mut self.analog_repeat,
+                &mut self.stage,
                 event.state,
             )
             .await;
@@ -488,6 +497,31 @@ impl DispatchState {
         }
     }
 
+    /// Drives every dual-stage grid key's Staging-mode state machine off a
+    /// fresh `rx_depth` snapshot (`tartarus-dual-stage-keys` ticket 03) — the
+    /// third depth-driven step alongside `handle_depth_update`/
+    /// `update_analog_repeats`, sharing the same snapshot value. `stage::
+    /// Engine::update` performs every op itself (against `self.individual`
+    /// for the primary keyspace, its own `Slots<StageKey>` for the deep one)
+    /// and returns any `Edit::SwitchProfile` a re-press or a deep firing
+    /// produced, for the `run` loop to commit — same shape as `handle_event`'s
+    /// own return.
+    async fn update_stages(
+        &mut self,
+        config: &Config,
+        snapshot: &HashMap<Input, u8>,
+    ) -> io::Result<Vec<edit::Edit>> {
+        let deps = stage::EngineDeps {
+            config,
+            active_layer: self.active_layer,
+            individual: &mut self.individual,
+            injector: &self.injector,
+            cursors: &mut self.stepper,
+            toggle_lap_target: self.toggle_lap_target,
+        };
+        self.stage.update(deps, snapshot).await
+    }
+
     /// Runs each `edit::Effect` an `edit::plan` derived, in order, against the
     /// `DispatchState` fields it touches (ticket 05). `config` is the
     /// just-committed `Config` — every effect that reads the new state
@@ -743,6 +777,10 @@ pub async fn run(
                         let snapshot = rx_depth.borrow_and_update().clone();
                         state.handle_depth_update(&config, &snapshot).await;
                         state.update_analog_repeats(&config, &rx_depth, &snapshot).await;
+                        let edits = state.update_stages(&config, &snapshot).await?;
+                        if !edits.is_empty() {
+                            state.commit_input_edits(edits, &mut config, &config_path).await;
+                        }
                     }
                     Err(_) => depth_open = false,
                 }
@@ -790,6 +828,8 @@ pub async fn run(
                         &mut state.capture_mode,
                         &state.signal_emitter,
                         &mut state.analog_repeat,
+                        &mut state.stage,
+                        &state.injector,
                         mode,
                     )
                     .await,
@@ -849,6 +889,7 @@ async fn handle_layer_switch(
     signal_emitter: &Option<SignalEmitter<'static>>,
     axis: &mut axis::Engine,
     analog_repeat: &mut analog_repeat::Engine,
+    stage: &mut stage::Engine,
     state: EventState,
 ) {
     let new_layer = match state {
@@ -864,6 +905,12 @@ async fn handle_layer_switch(
         let _ = injector.set_axis_value(w.code, w.value).await;
     }
     analog_repeat.stop_all().await;
+    // `tartarus-dual-stage-keys` ticket 03: the incoming Layer's dual-stage
+    // config generally differs from the outgoing one's (or has none at all),
+    // so any live deep firing/Toggle compiled against the old Layer's
+    // Binding must not keep running under the new one — same reasoning as
+    // the `analog_repeat.stop_all()` call just above.
+    stage.stop_all(injector).await;
     if let Some(emitter) = signal_emitter {
         let _ = Daemon::active_layer_changed(emitter, new_layer.as_str()).await;
     }
@@ -903,6 +950,8 @@ async fn handle_capture_mode_change(
     capture_mode: &mut CaptureMode,
     signal_emitter: &Option<SignalEmitter<'static>>,
     analog_repeat: &mut analog_repeat::Engine,
+    stage: &mut stage::Engine,
+    injector: &Injector,
     mode: CaptureMode,
 ) {
     if mode == *capture_mode {
@@ -911,6 +960,13 @@ async fn handle_capture_mode_change(
     *capture_mode = mode;
     if mode == CaptureMode::Digital {
         analog_repeat.stop_all().await;
+        // `tartarus-dual-stage-keys` ticket 03: `stage::Engine::update` only
+        // ever runs off `rx_depth`, which the Digital-mode capture source
+        // never populates — a dual-stage key's deep stage is inert for free
+        // the moment this transition completes. Force-release any deep
+        // firing/Toggle still live from the outgoing Analog session, same
+        // reasoning as `analog_repeat.stop_all()` just above.
+        stage.stop_all(injector).await;
     }
     if let Some(emitter) = signal_emitter {
         let _ = Daemon::capture_mode_changed(emitter, mode.as_str()).await;
@@ -941,9 +997,9 @@ mod tests {
     use super::*;
     use crate::capture::EventState;
     use crate::config::{
-        Action, ActuationPoint, AxisTarget, Binding, DEFAULT_PROFILE_NAME, MacroDef, MacroId,
-        MacroStepDto, Modifiers, Profile, StatusLeds, StepDirection, StepperDef, StepperId,
-        StepperItem,
+        Action, ActuationPoint, AxisTarget, Binding, DEFAULT_PROFILE_NAME, DeepStageConfig,
+        MacroDef, MacroId, MacroStepDto, Modifiers, Profile, StagingMode, StatusLeds,
+        StepDirection, StepperDef, StepperId, StepperItem,
     };
     use crate::edit::{CommandError, CreatedId};
     use crate::executor;
@@ -2417,6 +2473,37 @@ mod tests {
                 .send(PhysicalEvent {
                     input,
                     state: EventState::Down,
+                    depth: Some(depth),
+                })
+                .await
+                .unwrap();
+        }
+
+        /// `press_analog`'s `Up` mirror (`tartarus-dual-stage-keys` ticket
+        /// 03) — stands in for `capture::analog`'s own primary-band `observe`
+        /// firing a real Up when Depth crosses back down through the
+        /// primary's Release point, the same way a real Analog capture
+        /// session would alongside a `push_depth` call for the same report.
+        async fn release_analog(&self, input: Input, depth: u8) {
+            self.event_tx
+                .send(PhysicalEvent {
+                    input,
+                    state: EventState::Up,
+                    depth: Some(depth),
+                })
+                .await
+                .unwrap();
+        }
+
+        /// `press_analog`'s `Repeat` mirror (`tartarus-dual-stage-keys`
+        /// ticket 03) — stands in for `capture::analog`'s synthesized
+        /// Hold-to-repeat `Repeat` pulses (`RepeatSchedule`) while a Grid key
+        /// stays physically held in Analog capture.
+        async fn repeat_analog(&self, input: Input, depth: u8) {
+            self.event_tx
+                .send(PhysicalEvent {
+                    input,
+                    state: EventState::Repeat,
                     depth: Some(depth),
                 })
                 .await
@@ -4282,5 +4369,641 @@ mod tests {
                 (evdev::AbsoluteAxisCode::ABS_Z, 0),
             ]
         );
+    }
+
+    // ── `tartarus-dual-stage-keys` ticket 03: `stage::Engine` end-to-end ────
+
+    /// Builds a `Config` with `Input::Grid(1, 1)` carrying a primary
+    /// Binding, a deep Binding, and a `DeepStageConfig` in the given Staging
+    /// `mode`. Primary's Actuation/Release stays the Profile default
+    /// (128/112); deep's own band (220/200) is spec.md's own sample
+    /// fragment — `deep.release` 200 > `primary.actuation` 128 (disjoint and
+    /// stacked), `deep.release` 200 < `deep.actuation` 220 (the deep pair's
+    /// own hysteresis).
+    fn dual_stage_config(mode: StagingMode, primary: Binding, deep: Binding) -> Config {
+        config_with_profile(Profile {
+            base: HashMap::from([(Input::Grid(1, 1), primary)]),
+            deep_base: HashMap::from([(Input::Grid(1, 1), deep)]),
+            deep_stages: HashMap::from([(
+                Input::Grid(1, 1),
+                DeepStageConfig {
+                    actuation: ActuationPoint {
+                        actuation: 220,
+                        release: 200,
+                    },
+                    mode,
+                },
+            )]),
+            ..Default::default()
+        })
+    }
+
+    fn toggle_binding(key: evdev::KeyCode) -> Binding {
+        Binding {
+            trigger: TriggerMode::Toggle,
+            action: Action::Keypress {
+                modifiers: Modifiers::default(),
+                key,
+            },
+        }
+    }
+
+    fn hold_to_repeat_binding(key: evdev::KeyCode) -> Binding {
+        Binding {
+            trigger: TriggerMode::HoldToRepeat,
+            action: Action::Keypress {
+                modifiers: Modifiers::default(),
+                key,
+            },
+        }
+    }
+
+    /// A generous settle for a spawned Fire-once/Toggle task to actually run
+    /// and land its writes in the `RecordingSink` — mirrors `Seam::feed`'s
+    /// own five-yield spacing.
+    async fn settle() {
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A multiset of decoded `(KeyCode, value)` events — for asserting two
+    /// concurrently in-flight Fire-once firings both completed a full
+    /// Down/Up pair without depending on how their individual steps
+    /// interleaved (`Slots::perform` spawns and returns without awaiting).
+    fn event_counts(events: &[(evdev::KeyCode, i32)]) -> HashMap<(evdev::KeyCode, i32), usize> {
+        let mut counts = HashMap::new();
+        for &event in events {
+            *counts.entry(event).or_insert(0) += 1;
+        }
+        counts
+    }
+
+    #[tokio::test]
+    async fn dual_stage_handoff_walks_primary_then_deep_then_back_across_separate_reports() {
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        // The primary crossing: the real Analog-sourced Down `capture::
+        // analog` would emit for any single-stage key's own Actuation point
+        // — `stage::Engine` leaves this lone `FirePrimary` row alone
+        // entirely, relying on this unmodified path.
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+
+        // The deep crossing, a separate report: primary's own hysteresis
+        // never re-crosses its own Actuation/Release going from 150 to 250,
+        // so capture emits nothing here — only `stage::Engine`, off the
+        // depth watch, reacts (`ReleasePrimary` -> `FireDeep`).
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+
+        // Back out of the deep band, a separate report again (`ReleaseDeep`
+        // -> `RepressPrimary`, a *fresh* Fire-once).
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+
+        // The full release: the real Analog-sourced Up — a no-op against
+        // the already self-released `RepressPrimary` firing.
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+
+        let batches = harness.shut_down().await;
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 0),
+                (evdev::KeyCode::KEY_B, 1),
+                (evdev::KeyCode::KEY_B, 0),
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 0),
+            ],
+            "primary fires, hands off to deep, hands back to a fresh primary press, \
+             and the final real Up is a no-op against an already self-released Fire-once"
+        );
+    }
+
+    #[tokio::test]
+    async fn dual_stage_handoff_same_report_double_crossing_resolves_synchronously() {
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        // A single hidraw report jumping straight from fully released past
+        // the deep Actuation point, with **no** real primary event ever
+        // sent — the adversarial case ADR-0007's ordering-race fix must
+        // survive: mechanical replay walks the full `[FirePrimary,
+        // ReleasePrimary, FireDeep]` sequence synchronously, off `rx_depth`
+        // alone, in one `stage::Engine::update` call. `FirePrimary` is
+        // *initiated* strictly before `FireDeep` (checked below via each
+        // fire's own leading `Down`), but `Slots::perform` spawns each
+        // Fire-once and returns without awaiting it — the same fire-and-
+        // forget shape any two ordinary Fire-once presses have — so once
+        // both are concurrently in flight their *own* Down/Up pairs can
+        // interleave with each other; this asserts the multiset each jump
+        // produces, plus each jump's leading event, rather than one single
+        // fully-interleaved sequence.
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        let first_jump: Vec<_> = harness
+            .sink
+            .batches()
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect();
+        assert_eq!(
+            first_jump[0],
+            (evdev::KeyCode::KEY_A, 1),
+            "FirePrimary must be initiated before FireDeep, even with no real \
+             primary event ever sent"
+        );
+        assert_eq!(
+            event_counts(&first_jump),
+            event_counts(&[
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 0),
+                (evdev::KeyCode::KEY_B, 1),
+                (evdev::KeyCode::KEY_B, 0),
+            ]),
+            "FirePrimary and FireDeep must each complete a full Down/Up pair"
+        );
+
+        // The mirror on the way back out, in one report too:
+        // `[ReleaseDeep, RepressPrimary, ReleasePrimary]` — `ReleaseDeep`
+        // and the trailing `ReleasePrimary` are no-ops against an
+        // already-self-released Fire-once, so only `RepressPrimary`'s fresh
+        // fire is visible.
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+        let batches = harness.shut_down().await;
+        let second_jump: Vec<_> = batches[first_jump.len()..]
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect();
+        assert_eq!(
+            second_jump,
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "RepressPrimary must fire fresh; ReleaseDeep/the trailing ReleasePrimary \
+             stay no-ops"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_handoff_toggle_primary_gets_a_fresh_loop_on_repress_not_a_resume() {
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            toggle_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        // The primary crossing starts the Toggle loop — a lone `FirePrimary`
+        // row, unaffected by `stage::Engine`.
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        tokio::time::advance(executor::MIN_TOGGLE_LAP * 3).await;
+        settle().await;
+        let running_count = harness.sink.batches().len();
+        assert!(running_count > 0, "the Toggle loop must already be tapping");
+
+        // Crossing into the deep band: `ReleasePrimary` force-stops the
+        // Toggle unconditionally (unlike an ordinary bare Up, which leaves a
+        // Toggle running) before `FireDeep` fires.
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        let stopped_count = harness.sink.batches().len();
+
+        // Advancing well past several laps produces nothing further — the
+        // Toggle is genuinely gone, not merely paused mid-loop.
+        tokio::time::advance(executor::MIN_TOGGLE_LAP * 5).await;
+        settle().await;
+        assert_eq!(
+            harness.sink.batches().len(),
+            stopped_count,
+            "the Toggle must be fully stopped, not paused, once the deep band engages"
+        );
+
+        // Crossing back out: `RepressPrimary` starts a *fresh* Toggle loop
+        // (`decide(Toggle, Down, None)` has no "resume") — new taps resume.
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        tokio::time::advance(executor::MIN_TOGGLE_LAP * 3).await;
+        settle().await;
+        assert!(
+            harness.sink.batches().len() > stopped_count,
+            "a fresh Toggle loop must be tapping again after RepressPrimary"
+        );
+
+        harness.stop_all_toggles().await;
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn dual_stage_additive_holds_both_stages_on_independent_untouched_cadences() {
+        let config = dual_stage_config(
+            StagingMode::Additive,
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        // Primary crossing: the real Down, then a synthesized Hold-to-repeat
+        // `Repeat` pulse (mirroring `capture::analog`'s own
+        // `RepeatSchedule`) — both fire normally; Additive never touches
+        // this crossing at all.
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.repeat_analog(Input::Grid(1, 1), 150).await;
+        settle().await;
+
+        // Deep crossing: Additive fires the deep stage without touching the
+        // primary's own liveness at all.
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+
+        // The primary's Repeat cadence is completely unaffected by the deep
+        // stage engaging — capture keeps emitting it exactly as it would
+        // for a single-stage key, and Additive never suppresses it: each
+        // stage repeats on its own, mutually untouched, cadence.
+        harness.repeat_analog(Input::Grid(1, 1), 250).await;
+        settle().await;
+
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+
+        let batches = harness.shut_down().await;
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 0),
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 0),
+                (evdev::KeyCode::KEY_B, 1),
+                (evdev::KeyCode::KEY_B, 0),
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 0),
+            ],
+            "primary Down, primary Repeat, FireDeep, then primary's Repeat again \
+             while the deep band stays engaged — untouched by it"
+        );
+    }
+
+    #[tokio::test]
+    async fn dual_stage_no_return_never_represses_the_primary_on_the_way_back_out() {
+        let config = dual_stage_config(
+            StagingMode::NoReturn,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+
+        // Back out of the deep band: No-Return releases the deep stage
+        // only — no `RepressPrimary`, unlike Handoff's own equivalent row.
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+
+        let batches = harness.shut_down().await;
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 0),
+                (evdev::KeyCode::KEY_B, 1),
+                (evdev::KeyCode::KEY_B, 0),
+            ],
+            "No-Return must never repress the primary on the way back out — \
+             the key stays quiet until a fresh press"
+        );
+    }
+
+    #[tokio::test]
+    async fn dual_stage_key_in_digital_mode_fires_only_its_primary() {
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        // Digital-sourced events only (`depth: None`) — `rx_depth` never
+        // moves, so `stage::Engine::update` never runs at all; the deep
+        // stage is inert for free (spec.md: "In Digital Capture mode ...
+        // only the primary fires").
+        harness.press(Input::Grid(1, 1)).await;
+        harness.release(Input::Grid(1, 1)).await;
+        settle().await;
+
+        let batches = harness.shut_down().await;
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn dual_stage_quick_skip_key_is_an_unaffected_primary_only_key_for_now() {
+        // Ticket 03's own scoping: a `QuickSkip` dual-stage key is accepted
+        // by config (ticket 01) but not yet specially handled here — it
+        // behaves as an ordinary primary-only key, deep never engaging, even
+        // while physically crossing the deep band. Ticket 04 completes it.
+        let config = dual_stage_config(
+            StagingMode::QuickSkip,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+
+        // Straight through the deep band and back — `stage::Engine` skips
+        // every `QuickSkip`-mode Input entirely, so `KEY_B` never fires.
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+
+        let batches = harness.shut_down().await;
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "a QuickSkip dual-stage key must behave as an unaffected primary-only key"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_layer_switch_mid_press_force_releases_a_live_deep_toggle() {
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            toggle_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        // Hand off into the deep Toggle.
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        tokio::time::advance(executor::MIN_TOGGLE_LAP * 3).await;
+        settle().await;
+        let running_count = harness.sink.batches().len();
+        assert!(
+            running_count > 0,
+            "the deep Toggle loop must already be tapping"
+        );
+
+        // A Layer switch mid-press: `handle_layer_switch` wires `stage::
+        // Engine::stop_all()` alongside `analog_repeat.stop_all()`, force-
+        // releasing the live deep Toggle — the incoming Held Layer's own
+        // `deep_held` (empty here) never picks it up mid-Depth.
+        harness.press(Input::ModeKey).await;
+        settle().await;
+        let stopped_count = harness.sink.batches().len();
+
+        tokio::time::advance(executor::MIN_TOGGLE_LAP * 5).await;
+        settle().await;
+        assert_eq!(
+            harness.sink.batches().len(),
+            stopped_count,
+            "the deep Toggle must be genuinely stopped by the Layer switch, not paused"
+        );
+
+        harness.release(Input::ModeKey).await;
+        harness.shut_down().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_digital_mode_flip_mid_press_force_releases_a_live_deep_toggle() {
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            toggle_binding(evdev::KeyCode::KEY_B),
+        );
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let (_conn_tx, conn_rx) = mpsc::channel(8);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (depth_tx, depth_rx) = watch::channel(HashMap::new());
+        let (capture_mode_tx, capture_mode_rx) = mpsc::channel(8);
+        let dispatch_handle = tokio::spawn(run(
+            event_rx,
+            conn_rx,
+            cmd_rx,
+            inj.clone(),
+            config,
+            unused_config_path(),
+            None,
+            actuation_channel(),
+            capture_mode_rx,
+            capture_control_channel(),
+            executor::MIN_TOGGLE_LAP,
+            depth_rx,
+            device_info_channel(),
+            led_channel(),
+        ));
+
+        // `DispatchState::new` starts `capture_mode` at `Digital` — flip to
+        // `Analog` first so the later flip back to `Digital` is a genuine
+        // transition `handle_capture_mode_change` actually acts on.
+        capture_mode_tx.send(CaptureMode::Analog).await.unwrap();
+        settle().await;
+
+        event_tx
+            .send(PhysicalEvent {
+                input: Input::Grid(1, 1),
+                state: EventState::Down,
+                depth: Some(150),
+            })
+            .await
+            .unwrap();
+        depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), 150)]));
+        settle().await;
+        depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), 250)]));
+        settle().await;
+        tokio::time::advance(executor::MIN_TOGGLE_LAP * 3).await;
+        settle().await;
+        assert!(
+            !sink.batches().is_empty(),
+            "the deep Toggle loop must already be tapping"
+        );
+
+        // The Analog→Digital transition: `handle_capture_mode_change` wires
+        // `stage::Engine::stop_all()` alongside `analog_repeat.stop_all()`
+        // in its existing Digital-transition branch, force-releasing the
+        // live deep Toggle — `stage::Engine::update` never runs off
+        // Digital-sourced events, so nothing would otherwise release it.
+        capture_mode_tx.send(CaptureMode::Digital).await.unwrap();
+        settle().await;
+        let stopped_count = sink.batches().len();
+
+        tokio::time::advance(executor::MIN_TOGGLE_LAP * 5).await;
+        settle().await;
+        assert_eq!(
+            sink.batches().len(),
+            stopped_count,
+            "the deep Toggle must be genuinely stopped by the capture-mode flip, not paused"
+        );
+
+        drop(event_tx);
+        drop(depth_tx);
+        drop(capture_mode_tx);
+        dispatch_handle.await.unwrap().unwrap();
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_deep_toggle_stops_on_release_deep_and_gets_a_fresh_loop_on_refire() {
+        // Code-review finding on this ticket: `ReleaseDeep` used to run the
+        // ordinary `decide(Up)` + `perform` path, a no-op for a Toggle-mode
+        // deep Binding — the deep Toggle never stopped, and the next
+        // `FireDeep` unconditionally started a second, orphaned loop over
+        // it. `ReleaseDeep` now mirrors `ReleasePrimary`'s own unconditional
+        // stop, exactly like this test exercises: two full in/out
+        // oscillations through the deep band must never leave more than one
+        // Toggle loop alive at a time.
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            toggle_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+
+        // First hand-off into the deep Toggle.
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        tokio::time::advance(executor::MIN_TOGGLE_LAP * 3).await;
+        settle().await;
+        let first_loop_count = harness.sink.batches().len();
+        assert!(
+            first_loop_count > 0,
+            "the first deep Toggle loop must be tapping"
+        );
+
+        // Back out: `ReleaseDeep` must fully stop it.
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        let stopped_count = harness.sink.batches().len();
+        tokio::time::advance(executor::MIN_TOGGLE_LAP * 5).await;
+        settle().await;
+        assert_eq!(
+            harness.sink.batches().len(),
+            stopped_count,
+            "the first deep Toggle must be genuinely stopped, not left running"
+        );
+
+        // Back in: `FireDeep` must start one *fresh* loop, not stack a
+        // second one atop a leaked first.
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        tokio::time::advance(executor::MIN_TOGGLE_LAP * 3).await;
+        settle().await;
+        let second_loop_count = harness.sink.batches().len() - stopped_count;
+        assert!(
+            second_loop_count > 0 && second_loop_count <= first_loop_count + 2,
+            "exactly one fresh Toggle loop must be tapping, not two overlapping ones \
+             (first window: {first_loop_count}, second window: {second_loop_count})"
+        );
+
+        // Clean up via the staging mechanism itself (`ReleaseDeep` on the
+        // way back out), not `Command::StopAllToggles` — draining
+        // `stage::Engine`'s own `Slots<StageKey>` toggles through that
+        // command is ticket 06's job (spec.md's "GUI-focus StopAllToggles"
+        // extension), not part of this ticket; leaving the second loop
+        // running here would hang `shut_down()` forever on the still-open
+        // injector clone it holds.
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn dual_stage_layer_switch_mid_press_while_still_deep_does_not_spuriously_refire() {
+        // Code-review finding on this ticket: `stop_all()` resetting a held
+        // key's `KeyRuntime` to `(Up, Up)` must not let the very next
+        // `Engine::update` tick see a stale-`(Up,Up)`-to-still-deep
+        // transition and mechanically replay a full fresh press through
+        // both bands the instant the new Layer becomes active, even though
+        // the user's finger never moved.
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        let engaged_count = harness.sink.batches().len();
+        assert!(engaged_count > 0, "primary and deep must have fired by now");
+
+        // A Layer switch while the key is still held deep — `stop_all()`
+        // runs, but the key's own Depth never moved.
+        harness.press(Input::ModeKey).await;
+        settle().await;
+        assert_eq!(
+            harness.sink.batches().len(),
+            engaged_count,
+            "a Layer switch must not spuriously replay a fresh press just because \
+             tracking reset under an unmoved Depth"
+        );
+
+        // A later depth tick under the new Layer (no deep stage there)
+        // still produces nothing further — confirming the reset genuinely
+        // resynced rather than merely deferring the spurious replay.
+        harness.push_depth([(Input::Grid(1, 1), 200)]);
+        settle().await;
+        assert_eq!(harness.sink.batches().len(), engaged_count);
+
+        harness.release(Input::ModeKey).await;
+        harness.shut_down().await;
     }
 }

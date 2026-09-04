@@ -370,6 +370,27 @@ impl<K: Eq + Hash + Clone> Slots<K> {
     pub(crate) fn active_toggle_keys(&self) -> impl Iterator<Item = &K> {
         self.toggles.keys()
     }
+
+    /// Force-releases every live firing (entries linger, matching
+    /// `force_release`'s own contract) and drains every Toggle — full
+    /// teardown for a caller that's about to discard this `Slots<K>`'s
+    /// liveness entirely, e.g. `stage::Engine::stop_all()`
+    /// (`tartarus-dual-stage-keys` ticket 03) on a Layer/Profile switch or an
+    /// Analog→Digital capture-mode flip. Unlike `stop_all_toggles`, also
+    /// covers a stuck bare `KeyDown` (`HoldKeyDown`) a live Fire-once/
+    /// Hold-to-repeat firing may be holding. Same narrow, pre-existing race
+    /// `force_release` itself always had: a firing spawned an instant
+    /// earlier that `tokio` hasn't polled yet has nothing in `held` to
+    /// release, and the caller discarding this `Slots<K>` right after (as
+    /// `stage::Engine::stop_all()` does) means nothing will ever reach it
+    /// again — not a new risk this method introduces, just this method's
+    /// own share of it.
+    pub(crate) async fn stop_all(&mut self, injector: &Injector) {
+        for firing in self.firings.values() {
+            firing.force_release_stuck(injector).await;
+        }
+        self.stop_all_toggles().await;
+    }
 }
 
 /// Compiles a `Binding`'s `Action` into the flat step sequence `Slots::perform`
