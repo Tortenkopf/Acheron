@@ -22,6 +22,7 @@ pub mod executor;
 pub mod injector;
 pub mod input;
 pub mod led;
+pub mod stage;
 pub mod stepper;
 pub mod trigger;
 
