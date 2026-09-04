@@ -192,6 +192,24 @@ pub struct Profile {
     /// `axis_base`'s exact mirror for the Held Layer.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub axis_held: HashMap<Input, AxisTarget>,
+    /// Deep-stage Bindings active while this Profile's Base Layer is active
+    /// (CONTEXT.md: Actuation stage) — `base`'s exact per-Layer-map sibling,
+    /// one level deeper. An entry here requires a matching entry in `base`
+    /// for the same Input (`ConfigError::DeepStageWithoutPrimary`) and a
+    /// matching entry in `deep_stages` (`ConfigError::DeepStageMissingConfig`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub deep_base: HashMap<Input, Binding>,
+    /// `deep_base`'s exact mirror for the Held Layer.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub deep_held: HashMap<Input, Binding>,
+    /// Deep-stage Actuation point + staging mode, per-Input per-Profile,
+    /// shared across Base and Held — it interprets physical travel, like
+    /// `default_actuation`/`actuation_overrides`. Legal with no matching
+    /// `deep_base`/`deep_held` entry (an unused, inert deep-stage config,
+    /// same shape as an `actuation_overrides` entry on a key with no primary
+    /// Binding) — illegal the other way around.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub deep_stages: HashMap<Input, DeepStageConfig>,
 }
 
 impl Profile {
@@ -268,6 +286,23 @@ impl Profile {
         match layer {
             Layer::Base => &mut self.axis_base,
             Layer::Held => &mut self.axis_held,
+        }
+    }
+
+    /// `layer`'s exact mirror for a Profile's deep-stage Bindings
+    /// (CONTEXT.md: Actuation stage).
+    pub fn deep_layer(&self, layer: Layer) -> &HashMap<Input, Binding> {
+        match layer {
+            Layer::Base => &self.deep_base,
+            Layer::Held => &self.deep_held,
+        }
+    }
+
+    /// `layer_mut`'s exact mirror for a Profile's deep-stage Bindings.
+    pub fn deep_layer_mut(&mut self, layer: Layer) -> &mut HashMap<Input, Binding> {
+        match layer {
+            Layer::Base => &mut self.deep_base,
+            Layer::Held => &mut self.deep_held,
         }
     }
 }
@@ -387,6 +422,35 @@ impl Default for ActuationPoint {
             release: 112,
         }
     }
+}
+
+/// CONTEXT.md: Actuation stage. A grid key's deep-stage physical/behavioral
+/// configuration — its own Actuation/Release pair plus which staging mode
+/// governs the handoff with the primary stage. Bundled as one struct (not
+/// two parallel maps) because the two fields are only ever meaningful
+/// together, mirroring how `ActuationPoint` itself bundles
+/// `actuation`+`release` rather than splitting them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeepStageConfig {
+    pub actuation: ActuationPoint,
+    #[serde(default)]
+    pub mode: StagingMode,
+}
+
+/// CONTEXT.md: Staging mode. The four staging modes governing how a grid
+/// key's primary and deep stages hand off as Depth crosses the deep band.
+/// `Default = Handoff` — the canonical "camera shutter" mode — so
+/// `SetDeepActuation`/`SetStagingMode` can `.entry(input).or_default()` into
+/// a fresh `DeepStageConfig` without special-casing which field arrived
+/// first.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StagingMode {
+    #[default]
+    Handoff,
+    NoReturn,
+    Additive,
+    QuickSkip,
 }
 
 /// CONTEXT.md: Status LED assignment. The per-Profile triple of on/off states
@@ -939,6 +1003,39 @@ pub enum ConfigError {
     /// the structural mirror of `CreateProfile`/`RenameProfile`'s own
     /// friendly rejection, so a hand-edited `[profiles.""]` refuses to load.
     EmptyProfileName,
+    /// A `deep_base`/`deep_held`/`deep_stages` entry keyed by an `Input` that
+    /// isn't a `Grid` variant — only grid keys have Depth for a deep stage to
+    /// threshold against, same reasoning as `InvalidAxisInput`/
+    /// `InvalidActuationOverrideInput`.
+    InvalidDeepStageInput(String),
+    /// A `deep_stages` entry whose own `release` is not strictly below its
+    /// own `actuation` — the deep band's internal hysteresis,
+    /// `ReleaseNotBelowActuation`'s exact concern one level deeper. A
+    /// dedicated variant, not a reuse of `ReleaseNotBelowActuation`, so the
+    /// message doesn't conflate "your primary override is backwards" with
+    /// "your deep stage's own pair is backwards" on the same key.
+    DeepStageReleaseNotBelowActuation(String),
+    /// A `deep_stages` entry whose `release` is not strictly greater than the
+    /// same Input's resolved primary `actuation` (the disjoint-and-stacked
+    /// constraint: `deep.release > primary.actuation`) — the two bands
+    /// overlap.
+    DeepStageBandOverlapsPrimary(String),
+    /// A `deep_base`/`deep_held` Binding with no matching Binding in `base`/
+    /// `held` (same Input, same Layer) — "no primary, no deep stage."
+    DeepStageWithoutPrimary(String),
+    /// A `deep_base`/`deep_held` Binding with no matching entry in
+    /// `deep_stages` for that Input — a deep stage with a Binding but no
+    /// Actuation point or staging mode to run it against.
+    DeepStageMissingConfig(String),
+    /// A Binding — primary *or* deep, on either Layer — using `analog_repeat`
+    /// on an Input that has a functioning deep stage (a `deep_base`/
+    /// `deep_held` entry on that Layer) — the Analog-repeat background task
+    /// ignores Actuation points and would fight the staging logic.
+    AnalogRepeatOnDualStageKey(String),
+    /// An Input that is both a Chord member (on some Layer) and carries a
+    /// `deep_base`/`deep_held` Binding on that same Layer — a Chord member
+    /// cannot have a deep stage.
+    ChordMemberDeepStageConflict(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -1036,6 +1133,34 @@ impl fmt::Display for ConfigError {
             ConfigError::EmptyProfileName => {
                 write!(f, "a Profile has an empty or whitespace-only name")
             }
+            ConfigError::InvalidDeepStageInput(input) => write!(
+                f,
+                "a deep stage on {input:?} is not allowed — only Grid Inputs can carry one"
+            ),
+            ConfigError::DeepStageReleaseNotBelowActuation(input) => write!(
+                f,
+                "{input:?}'s deep stage release point is not below its own actuation point"
+            ),
+            ConfigError::DeepStageBandOverlapsPrimary(input) => write!(
+                f,
+                "{input:?}'s deep stage release point must be strictly greater than its primary actuation point — the two bands must not overlap"
+            ),
+            ConfigError::DeepStageWithoutPrimary(input) => write!(
+                f,
+                "{input:?} has a deep stage Binding on a Layer with no primary Binding there"
+            ),
+            ConfigError::DeepStageMissingConfig(input) => write!(
+                f,
+                "{input:?} has a deep stage Binding but no deep Actuation point / staging mode configured"
+            ),
+            ConfigError::AnalogRepeatOnDualStageKey(input) => write!(
+                f,
+                "{input:?} cannot use analog_repeat on either stage while it has a deep stage"
+            ),
+            ConfigError::ChordMemberDeepStageConflict(input) => write!(
+                f,
+                "{input:?} is a Chord member and cannot also carry a deep stage"
+            ),
         }
     }
 }
@@ -1287,6 +1412,93 @@ pub(crate) fn validate(config: &Config) -> Result<(), ConfigError> {
     if config.profiles.keys().any(|name| name.trim().is_empty()) {
         return Err(ConfigError::EmptyProfileName);
     }
+    // --- tartarus-dual-stage-keys ticket 01 additions ---
+    let invalid_deep_stage_input = config.profiles.values().find_map(|profile| {
+        profile
+            .deep_base
+            .keys()
+            .chain(profile.deep_held.keys())
+            .chain(profile.deep_stages.keys())
+            .find(|input| !matches!(input, Input::Grid(_, _)))
+            .map(ToString::to_string)
+    });
+    if let Some(input) = invalid_deep_stage_input {
+        return Err(ConfigError::InvalidDeepStageInput(input));
+    }
+    let deep_stage_release_not_below_actuation = config.profiles.values().find_map(|profile| {
+        profile
+            .deep_stages
+            .iter()
+            .find(|(_, cfg)| cfg.actuation.release >= cfg.actuation.actuation)
+            .map(|(input, _)| input.to_string())
+    });
+    if let Some(input) = deep_stage_release_not_below_actuation {
+        return Err(ConfigError::DeepStageReleaseNotBelowActuation(input));
+    }
+    let deep_stage_band_overlaps_primary = config.profiles.values().find_map(|profile| {
+        profile.deep_stages.iter().find_map(|(input, cfg)| {
+            let primary = profile.resolved_actuation_point(*input);
+            (cfg.actuation.release <= primary.actuation).then(|| input.to_string())
+        })
+    });
+    if let Some(input) = deep_stage_band_overlaps_primary {
+        return Err(ConfigError::DeepStageBandOverlapsPrimary(input));
+    }
+    let deep_stage_without_primary = config.profiles.values().find_map(|profile| {
+        [Layer::Base, Layer::Held].into_iter().find_map(|layer| {
+            profile
+                .deep_layer(layer)
+                .keys()
+                .find(|input| !profile.layer(layer).contains_key(*input))
+                .map(ToString::to_string)
+        })
+    });
+    if let Some(input) = deep_stage_without_primary {
+        return Err(ConfigError::DeepStageWithoutPrimary(input));
+    }
+    let deep_stage_missing_config = config.profiles.values().find_map(|profile| {
+        profile
+            .deep_base
+            .keys()
+            .chain(profile.deep_held.keys())
+            .find(|input| !profile.deep_stages.contains_key(*input))
+            .map(ToString::to_string)
+    });
+    if let Some(input) = deep_stage_missing_config {
+        return Err(ConfigError::DeepStageMissingConfig(input));
+    }
+    let analog_repeat_on_dual_stage_key = config.profiles.values().find_map(|profile| {
+        [Layer::Base, Layer::Held].into_iter().find_map(|layer| {
+            profile
+                .deep_layer(layer)
+                .iter()
+                .find_map(|(input, deep_binding)| {
+                    let primary_is_analog_repeat = profile
+                        .layer(layer)
+                        .get(input)
+                        .is_some_and(|b| b.trigger == TriggerMode::AnalogRepeat);
+                    (deep_binding.trigger == TriggerMode::AnalogRepeat || primary_is_analog_repeat)
+                        .then(|| input.to_string())
+                })
+        })
+    });
+    if let Some(input) = analog_repeat_on_dual_stage_key {
+        return Err(ConfigError::AnalogRepeatOnDualStageKey(input));
+    }
+    let chord_member_deep_stage_conflict = config.profiles.values().find_map(|profile| {
+        [Layer::Base, Layer::Held].into_iter().find_map(|layer| {
+            profile.deep_layer(layer).keys().find_map(|input| {
+                profile
+                    .chords(layer)
+                    .keys()
+                    .any(|key| key.members().contains(input))
+                    .then_some(*input)
+            })
+        })
+    });
+    if let Some(input) = chord_member_deep_stage_conflict {
+        return Err(ConfigError::ChordMemberDeepStageConflict(input.to_string()));
+    }
     Ok(())
 }
 
@@ -1303,12 +1515,17 @@ pub(crate) fn profile_all_binding_sites(
         .iter()
         .chain(profile.held.iter())
         .map(|(input, b)| (BindingSite::Individual(*input), b));
+    let deep_individual = profile
+        .deep_base
+        .iter()
+        .chain(profile.deep_held.iter())
+        .map(|(input, b)| (BindingSite::Individual(*input), b));
     let chords = profile
         .chords_base
         .values()
         .chain(profile.chords_held.values())
         .map(|b| (BindingSite::Chord, b));
-    individual.chain(chords)
+    individual.chain(deep_individual).chain(chords)
 }
 
 /// Every Binding on `profile`, across both ordinary per-`Input` Layers and
@@ -1619,6 +1836,29 @@ action = { type = "keypress", key = "KEY_F1" }
                 blue: false,
             }
         );
+    }
+
+    #[test]
+    fn a_pre_dual_stage_config_defaults_deep_fields() {
+        // A config.toml written before the dual-stage-keys feature has no
+        // `deep_base`/`deep_held`/`deep_stages` keys at all — it must still
+        // parse unchanged, with every Profile's three new maps empty
+        // (tartarus-dual-stage-keys ticket 01: additive `#[serde(default)]`
+        // fields, no schema_version bump), exactly like the pre-ticket-17
+        // actuation-defaults and pre-status-LED cases above.
+        let toml = r#"
+schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base.grid_r1c1]
+trigger = "fire_once"
+action = { type = "keypress", key = "KEY_F1" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let profile = &config.profiles["Default"];
+        assert!(profile.deep_base.is_empty());
+        assert!(profile.deep_held.is_empty());
+        assert!(profile.deep_stages.is_empty());
     }
 
     #[test]
@@ -2692,6 +2932,47 @@ action = { type = "profile_switch", target = "Gaming" }
         );
     }
 
+    #[test]
+    fn a_disjoint_stacked_deep_stage_config_parses_and_validates_clean() {
+        // spec.md's "Config schema" sample fragment (tartarus-dual-stage-keys
+        // ticket 01): a Handoff `grid_r1c1` whose deep band's release (200)
+        // sits strictly above the primary's actuation (128) — disjoint and
+        // stacked — and whose own release (200) sits strictly below its own
+        // actuation (220) — the deep pair's own hysteresis.
+        let toml = r#"
+schema_version = 1
+active_profile = "Default"
+
+[profiles.Default]
+default_actuation = { actuation = 128, release = 112 }
+
+[profiles.Default.base.grid_r1c1]
+trigger = "hold_to_repeat"
+action = { type = "keypress", key = "KEY_W" }
+
+[profiles.Default.deep_base.grid_r1c1]
+trigger = "fire_once"
+action = { type = "keypress", key = "KEY_LEFTSHIFT" }
+
+[profiles.Default.deep_stages.grid_r1c1]
+actuation = { actuation = 220, release = 200 }
+mode = "handoff"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        validate(&config).expect("a disjoint, stacked deep stage must validate clean");
+        let profile = &config.profiles["Default"];
+        assert_eq!(
+            profile.deep_stages[&Input::Grid(1, 1)],
+            DeepStageConfig {
+                actuation: ActuationPoint {
+                    actuation: 220,
+                    release: 200,
+                },
+                mode: StagingMode::Handoff,
+            }
+        );
+    }
+
     // --- `config::validate` (ticket 04) ---------------------------------
     //
     // One synchronous case per structural invariant `validate` owns — no
@@ -2917,6 +3198,110 @@ action = { type = "profile_switch", target = "Gaming" }
                         c.profiles.insert("   ".to_string(), Profile::default());
                     },
                     matches: |e| matches!(e, ConfigError::EmptyProfileName),
+                },
+                Case {
+                    invariant: "deep-stage entry on a non-Grid Input",
+                    break_it: |c| {
+                        profile(c).deep_base.insert(Input::ModeKey, keypress());
+                    },
+                    matches: |e| matches!(e, ConfigError::InvalidDeepStageInput(i) if i == "mode_key"),
+                },
+                Case {
+                    invariant: "deep stage release not below its own actuation",
+                    break_it: |c| {
+                        profile(c).deep_stages.insert(
+                            Input::Grid(1, 1),
+                            DeepStageConfig {
+                                actuation: ActuationPoint {
+                                    actuation: 200,
+                                    release: 220,
+                                },
+                                mode: StagingMode::Handoff,
+                            },
+                        );
+                    },
+                    matches: |e| matches!(e, ConfigError::DeepStageReleaseNotBelowActuation(i) if i == "grid_r1c1"),
+                },
+                Case {
+                    invariant: "deep stage band overlaps the primary stage's band",
+                    break_it: |c| {
+                        profile(c).deep_stages.insert(
+                            Input::Grid(1, 1),
+                            DeepStageConfig {
+                                actuation: ActuationPoint {
+                                    actuation: 150,
+                                    release: 100,
+                                },
+                                mode: StagingMode::Handoff,
+                            },
+                        );
+                    },
+                    matches: |e| matches!(e, ConfigError::DeepStageBandOverlapsPrimary(i) if i == "grid_r1c1"),
+                },
+                Case {
+                    invariant: "deep stage Binding with no primary Binding on the same Layer",
+                    break_it: |c| {
+                        profile(c).deep_base.insert(Input::Grid(1, 1), keypress());
+                    },
+                    matches: |e| matches!(e, ConfigError::DeepStageWithoutPrimary(i) if i == "grid_r1c1"),
+                },
+                Case {
+                    invariant: "deep stage Binding with no deep_stages entry",
+                    break_it: |c| {
+                        let p = profile(c);
+                        p.base.insert(Input::Grid(1, 1), keypress());
+                        p.deep_base.insert(Input::Grid(1, 1), keypress());
+                    },
+                    matches: |e| matches!(e, ConfigError::DeepStageMissingConfig(i) if i == "grid_r1c1"),
+                },
+                Case {
+                    invariant: "analog_repeat trigger on an Input with a functioning deep stage",
+                    break_it: |c| {
+                        let p = profile(c);
+                        p.base.insert(
+                            Input::Grid(1, 1),
+                            Binding {
+                                trigger: TriggerMode::AnalogRepeat,
+                                action: Action::Keypress {
+                                    modifiers: Modifiers::default(),
+                                    key: KeyCode::KEY_A,
+                                },
+                            },
+                        );
+                        p.deep_base.insert(Input::Grid(1, 1), keypress());
+                        p.deep_stages.insert(
+                            Input::Grid(1, 1),
+                            DeepStageConfig {
+                                actuation: ActuationPoint {
+                                    actuation: 220,
+                                    release: 200,
+                                },
+                                mode: StagingMode::Handoff,
+                            },
+                        );
+                    },
+                    matches: |e| matches!(e, ConfigError::AnalogRepeatOnDualStageKey(i) if i == "grid_r1c1"),
+                },
+                Case {
+                    invariant: "Input is both a Chord member and carries a deep stage on the same Layer",
+                    break_it: |c| {
+                        let p = profile(c);
+                        p.base.insert(Input::Grid(1, 1), keypress());
+                        p.deep_base.insert(Input::Grid(1, 1), keypress());
+                        p.deep_stages.insert(
+                            Input::Grid(1, 1),
+                            DeepStageConfig {
+                                actuation: ActuationPoint {
+                                    actuation: 220,
+                                    release: 200,
+                                },
+                                mode: StagingMode::Handoff,
+                            },
+                        );
+                        p.chords_base
+                            .insert(chord([Input::Grid(1, 1), Input::Grid(1, 2)]), keypress());
+                    },
+                    matches: |e| matches!(e, ConfigError::ChordMemberDeepStageConflict(i) if i == "grid_r1c1"),
                 },
             ];
 

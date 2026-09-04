@@ -23,9 +23,9 @@ use zbus::zvariant::{OwnedValue, Value};
 
 use crate::command::State;
 use crate::config::{
-    Action, ActuationPoint, AxisTarget, Binding, ChordKey, Config, Layer, MacroDef, MacroId,
-    MacroStepDto, ModeKeyRole, Modifiers, Profile, StatusLeds, StepDirection, StepperDef,
-    StepperId, StepperItem, TriggerMode,
+    Action, ActuationPoint, AxisTarget, Binding, ChordKey, Config, DeepStageConfig, Layer,
+    MacroDef, MacroId, MacroStepDto, ModeKeyRole, Modifiers, Profile, StagingMode, StatusLeds,
+    StepDirection, StepperDef, StepperId, StepperItem, TriggerMode,
 };
 
 /// The `a{sv}` shape every `Action`/`MacroStep`/`Binding`/`Config` entity
@@ -175,6 +175,28 @@ pub fn axis_target_from_str(s: &str) -> Result<AxisTarget, String> {
         "wheel_pos" => Ok(AxisTarget::WheelPos),
         "wheel_neg" => Ok(AxisTarget::WheelNeg),
         other => Err(format!("{other:?} is not a valid Axis target")),
+    }
+}
+
+/// `StagingMode` marshals as its own flat lowercase string (tartarus-
+/// dual-stage-keys ticket 01), the exact convention `axis_target_str`
+/// already uses.
+pub fn staging_mode_str(mode: StagingMode) -> &'static str {
+    match mode {
+        StagingMode::Handoff => "handoff",
+        StagingMode::NoReturn => "no_return",
+        StagingMode::Additive => "additive",
+        StagingMode::QuickSkip => "quick_skip",
+    }
+}
+
+pub fn staging_mode_from_str(s: &str) -> Result<StagingMode, String> {
+    match s {
+        "handoff" => Ok(StagingMode::Handoff),
+        "no_return" => Ok(StagingMode::NoReturn),
+        "additive" => Ok(StagingMode::Additive),
+        "quick_skip" => Ok(StagingMode::QuickSkip),
+        other => Err(format!("{other:?} is not a valid staging mode")),
     }
 }
 
@@ -361,6 +383,31 @@ fn actuation_overrides_to_dict(overrides: &HashMap<crate::input::Input, Actuatio
         .collect()
 }
 
+/// A `DeepStageConfig` marshals as a flat dict bundling its own
+/// `ActuationPoint` sub-dict plus the mode string (tartarus-dual-stage-keys
+/// ticket 01) — `actuation_point_to_dict`'s bundle-related-scalars
+/// convention, one level nested since `DeepStageConfig` itself bundles two
+/// things.
+fn deep_stage_config_to_dict(cfg: DeepStageConfig) -> Dict {
+    let mut dict = Dict::new();
+    dict.insert(
+        "actuation".to_string(),
+        scalar(actuation_point_to_dict(cfg.actuation)),
+    );
+    dict.insert(
+        "mode".to_string(),
+        scalar(staging_mode_str(cfg.mode).to_string()),
+    );
+    dict
+}
+
+fn deep_stages_to_dict(stages: &HashMap<crate::input::Input, DeepStageConfig>) -> Dict {
+    stages
+        .iter()
+        .map(|(input, cfg)| (input.to_string(), scalar(deep_stage_config_to_dict(*cfg))))
+        .collect()
+}
+
 /// A Profile's Chord Bindings marshal keyed by their `ChordKey`'s own
 /// `+`-joined `Display` string (e.g. `"grid_r1c1+grid_r1c2"`) — the GUI
 /// splits that string on `+` to recover the member `Input` list, the same
@@ -427,6 +474,18 @@ fn profile_to_dict(profile: &Profile) -> Dict {
     dict.insert(
         "status_leds".to_string(),
         scalar(status_leds_to_dict(profile.status_leds)),
+    );
+    dict.insert(
+        "deep_base".to_string(),
+        scalar(bindings_to_dict(&profile.deep_base)),
+    );
+    dict.insert(
+        "deep_held".to_string(),
+        scalar(bindings_to_dict(&profile.deep_held)),
+    );
+    dict.insert(
+        "deep_stages".to_string(),
+        scalar(deep_stages_to_dict(&profile.deep_stages)),
     );
     dict
 }
@@ -1115,6 +1174,112 @@ mod tests {
         assert!(bool::try_from(get(&status_leds, "blue").unwrap()).unwrap());
     }
 
+    /// tartarus-dual-stage-keys ticket 01: `config_to_dict` must serialize a
+    /// Profile's `deep_base`/`deep_held`/`deep_stages`, mirroring the
+    /// default-actuation/status-LEDs serialization tests above — `deep_base`
+    /// nests the same `binding_to_dict` shape `base` uses, `deep_stages`
+    /// nests `deep_stage_config_to_dict`'s `{ actuation: {..}, mode }` shape.
+    #[test]
+    fn config_to_dict_serializes_deep_stages() {
+        use crate::input::Input;
+        use std::collections::HashMap as StdHashMap;
+
+        let mut deep_base = StdHashMap::new();
+        deep_base.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::FireOnce,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: KeyCode::KEY_LEFTSHIFT,
+                },
+            },
+        );
+        let mut deep_stages = StdHashMap::new();
+        deep_stages.insert(
+            Input::Grid(1, 1),
+            DeepStageConfig {
+                actuation: ActuationPoint {
+                    actuation: 220,
+                    release: 200,
+                },
+                mode: StagingMode::NoReturn,
+            },
+        );
+        let mut profiles = StdHashMap::new();
+        profiles.insert(
+            "Default".to_string(),
+            Profile {
+                deep_base,
+                deep_stages,
+                ..Default::default()
+            },
+        );
+        let config = Config {
+            schema_version: 1,
+            active_profile: "Default".to_string(),
+            profiles,
+            force_digital: false,
+            macros: StdHashMap::new(),
+            steppers: StdHashMap::new(),
+        };
+
+        let dict = config_to_dict(&config);
+        let profiles_dict: Dict = get(&dict, "profiles").unwrap().clone().try_into().unwrap();
+        let default_profile: Dict = profiles_dict
+            .get("Default")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+
+        let deep_base_dict: Dict = get(&default_profile, "deep_base")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let deep_binding_dict: Dict = deep_base_dict
+            .get("grid_r1c1")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(dict_get_string(&deep_binding_dict, "type"), "keypress");
+
+        let deep_held_dict: Dict = get(&default_profile, "deep_held")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert!(deep_held_dict.is_empty());
+
+        let deep_stages_dict: Dict = get(&default_profile, "deep_stages")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let deep_stage_dict: Dict = deep_stages_dict
+            .get("grid_r1c1")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let deep_actuation: Dict = get(&deep_stage_dict, "actuation")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            u8::try_from(get(&deep_actuation, "actuation").unwrap()).unwrap(),
+            220
+        );
+        assert_eq!(
+            u8::try_from(get(&deep_actuation, "release").unwrap()).unwrap(),
+            200
+        );
+        assert_eq!(dict_get_string(&deep_stage_dict, "mode"), "no_return");
+    }
+
     /// Ticket 40: `config_to_dict` must serialize a Profile's Chord
     /// Bindings, keyed by their `+`-joined member string.
     #[test]
@@ -1327,5 +1492,23 @@ mod tests {
             let s = mode_key_role_str(role);
             assert_eq!(mode_key_role_from_str(s).unwrap(), role);
         }
+    }
+
+    #[test]
+    fn every_staging_mode_round_trips_through_its_wire_string() {
+        for mode in [
+            StagingMode::Handoff,
+            StagingMode::NoReturn,
+            StagingMode::Additive,
+            StagingMode::QuickSkip,
+        ] {
+            let s = staging_mode_str(mode);
+            assert_eq!(staging_mode_from_str(s).unwrap(), mode);
+        }
+    }
+
+    #[test]
+    fn staging_mode_from_str_rejects_an_unknown_string() {
+        assert!(staging_mode_from_str("not_a_mode").is_err());
     }
 }

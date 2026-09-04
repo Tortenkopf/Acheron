@@ -27,6 +27,9 @@ def test_fresh_stub_matches_the_seed_configs_shape():
                 "chords_held": {},
                 "axis_base": {},
                 "axis_held": {},
+                "deep_base": {},
+                "deep_held": {},
+                "deep_stages": {},
             }
         },
         "force_digital": False,
@@ -122,6 +125,9 @@ def test_create_profile_adds_an_empty_profile():
         "chords_held": {},
         "axis_base": {},
         "axis_held": {},
+        "deep_base": {},
+        "deep_held": {},
+        "deep_stages": {},
     }
     assert stub.calls == [("create_profile", "Gaming")]
 

@@ -87,6 +87,15 @@ class DaemonStub:
         # axis_map_to_dict`).
         "axis_base": {},
         "axis_held": {},
+        # tartarus-dual-stage-keys ticket 01: a Profile's deep-stage Bindings
+        # and per-Input deep-stage config, keyed the same way the real
+        # Daemon's wire shape does (`daemon/src/dbus/wire.rs::profile_to_
+        # dict`). No GUI mutation path exists yet (ticket 05) — this only
+        # seeds the shape so stub-backed GUI code sees the same `GetConfig`
+        # dict a real Daemon returns.
+        "deep_base": {},
+        "deep_held": {},
+        "deep_stages": {},
     }
 
     def __init__(self, active_profile: str = "Default"):
