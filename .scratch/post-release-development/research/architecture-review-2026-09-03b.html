@@ -1,0 +1,648 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Architecture review — Acheron (second pass)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+      mermaid.initialize({ startOnLoad: true, theme: "neutral", securityLevel: "loose", flowchart: { htmlLabels: true } });
+    </script>
+    <style>
+      .seam { stroke-dasharray: 5 4; }
+      .leak { stroke: #dc2626; }
+      body { -webkit-font-smoothing: antialiased; }
+      .schem { font-size: 0.65rem; letter-spacing: 0.08em; text-transform: uppercase; }
+      .mermaid { display: flex; justify-content: center; }
+      article { scroll-margin-top: 2rem; }
+    </style>
+  </head>
+  <body class="bg-stone-50 text-slate-900 font-sans">
+    <main class="max-w-5xl mx-auto px-6 py-14 space-y-14">
+
+      <header class="space-y-6 border-b border-slate-200 pb-10">
+        <div>
+          <p class="schem text-slate-400">Deepening review · second pass</p>
+          <h1 class="font-serif text-4xl text-slate-900 mt-1">Acheron — architectural friction</h1>
+          <p class="text-slate-500 mt-2 text-sm">2026-09-03 · <span class="font-mono">dev</span> branch · daemon <span class="font-mono">1.1.0</span> · follows the <a href="architecture-review-2026-09-03.html" class="underline">first pass</a></p>
+        </div>
+        <div class="grid sm:grid-cols-2 gap-x-8 gap-y-2 text-sm text-slate-600">
+          <p><span class="inline-block w-4 h-4 align-middle border-2 border-slate-800 mr-2"></span>solid box = module</p>
+          <p><svg class="inline align-middle mr-2" width="20" height="8"><line x1="0" y1="4" x2="20" y2="4" class="seam" stroke="#475569" stroke-width="2"/></svg>dashed line = seam</p>
+          <p><svg class="inline align-middle mr-2" width="20" height="8"><line x1="0" y1="4" x2="20" y2="4" class="leak" stroke-width="2"/></svg>red = leakage / duplication across a seam</p>
+          <p><span class="inline-block w-4 h-4 align-middle bg-slate-900 mr-2"></span>thick dark box = deep module</p>
+        </div>
+        <div class="text-sm text-slate-500 leading-relaxed space-y-3">
+          <p>
+            The first pass (2026-09-03) surfaced seven candidates. Candidate&nbsp;1 &mdash; the
+            <span class="font-mono">config::binding::check_binding</span> seam &mdash; shipped as post-release ticket&nbsp;14.
+            The other six were re-verified against current code for this pass; the line and site counts below
+            are corrected where the first pass was loose.
+          </p>
+          <p>
+            One force reshapes the priority order: the <span class="font-mono">tartarus-dual-stage-keys</span> effort,
+            now charting, will add a <strong>third Depth-fed engine</strong> (<span class="font-mono">stage::Engine</span>,
+            sibling to <span class="font-mono">axis</span> / <span class="font-mono">analog_repeat</span>) with its own
+            <span class="font-mono">StageKey</span>-keyed firing/toggle maps, its own <span class="font-mono">slot_for</span>,
+            and its own teardown fan-out. Two of the carried-forward candidates stop being insurance and become
+            <em>load-bearing before the dual-stage spec is even written</em>.
+          </p>
+          <p class="text-slate-400">
+            <span class="font-mono">dispatch.rs</span> is 4473 lines but implementation ends at line&nbsp;1127;
+            <span class="font-mono">config.rs</span> is 2935 lines, implementation ends at 1364. Neither is a monolith &mdash;
+            the friction is in <strong>duplicated runtime protocol</strong>, a <strong>mechanism trapped inside the wrong module</strong>,
+            and <strong>seams that were half-carved and stopped</strong>.
+          </p>
+        </div>
+      </header>
+
+      <!-- ============================ CANDIDATE 1 ============================ -->
+      <article id="c1" class="space-y-6">
+        <div class="flex items-baseline justify-between flex-wrap gap-2">
+          <h2 class="font-serif text-2xl">1 &nbsp;A <span class="font-mono text-xl">trigger::Slots&lt;K&gt;</span> module for the firing/toggle handle pair</h2>
+          <div class="flex gap-2 shrink-0">
+            <span class="text-xs font-semibold px-2 py-1 rounded bg-emerald-100 text-emerald-800">Strong</span>
+            <span class="text-xs px-2 py-1 rounded bg-slate-100 text-slate-600">in-process</span>
+            <span class="text-xs px-2 py-1 rounded bg-indigo-100 text-indigo-700">carried forward · #3</span>
+          </div>
+        </div>
+        <p class="font-mono text-sm text-slate-600">
+          daemon/src/dispatch.rs <span class="text-slate-400">trigger_ctx! (64&ndash;76), ChordRuntime (85&ndash;88),
+          DispatchState.&#123;toggles, in_flight&#125; (100&ndash;101), chord_slots (870&ndash;884), slot_for (895&ndash;908),
+          TriggerCtx + perform_trigger (918&ndash;974)</span> ·
+          daemon/src/chord.rs <span class="text-slate-400">feed(&hellip;, live: &amp;HashMap, &hellip;) (117&ndash;121)</span> ·
+          daemon/src/trigger.rs <span class="text-slate-400">Slot, TriggerDecision (42&ndash;60)</span> ·
+          <span class="text-slate-400">.scratch/tartarus-dual-stage-keys/issues/01 §2, §4</span>
+        </p>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">Before &mdash; the same pair open-coded 2&frac12; times</p>
+            <svg viewBox="0 0 330 260" class="w-full h-64">
+              <!-- three keyspaces -->
+              <rect x="8" y="16" width="150" height="52" fill="none" stroke="#475569" stroke-width="2" rx="3"/>
+              <text x="83" y="34" text-anchor="middle" class="schem" fill="#475569">DispatchState</text>
+              <text x="83" y="48" text-anchor="middle" font-size="8" fill="#64748b">toggles: Input &rarr; ActiveToggle</text>
+              <text x="83" y="60" text-anchor="middle" font-size="8" fill="#64748b">in_flight: Input &rarr; FiringHandle</text>
+
+              <rect x="8" y="80" width="150" height="52" fill="none" stroke="#475569" stroke-width="2" rx="3"/>
+              <text x="83" y="98" text-anchor="middle" class="schem" fill="#475569">ChordRuntime</text>
+              <text x="83" y="112" text-anchor="middle" font-size="8" fill="#64748b">toggles: ChordKey &rarr; &hellip;</text>
+              <text x="83" y="124" text-anchor="middle" font-size="8" fill="#64748b">firings: ChordKey &rarr; &hellip;</text>
+
+              <rect x="8" y="144" width="150" height="52" fill="none" stroke="#f59e0b" stroke-width="2" stroke-dasharray="4 3" rx="3"/>
+              <text x="83" y="162" text-anchor="middle" class="schem" fill="#b45309">stage::Engine</text>
+              <text x="83" y="176" text-anchor="middle" font-size="8" fill="#b45309">toggles: StageKey &rarr; &hellip;</text>
+              <text x="83" y="188" text-anchor="middle" font-size="8" fill="#b45309">firings: StageKey &rarr; &hellip; (coming)</text>
+
+              <!-- readers -->
+              <rect x="196" y="26" width="126" height="30" fill="#fef2f2" stroke="#fca5a5" rx="3"/>
+              <text x="259" y="41" text-anchor="middle" font-size="8">chord_slots()</text>
+              <text x="259" y="51" text-anchor="middle" font-size="7" fill="#dc2626">toggle-wins tie-break</text>
+
+              <rect x="196" y="66" width="126" height="30" fill="#fef2f2" stroke="#fca5a5" rx="3"/>
+              <text x="259" y="81" text-anchor="middle" font-size="8">slot_for() &times;3 sites</text>
+              <text x="259" y="91" text-anchor="middle" font-size="7" fill="#dc2626">firing-wins &mdash; inverse!</text>
+
+              <rect x="196" y="106" width="126" height="30" fill="#fef2f2" stroke="#fca5a5" rx="3"/>
+              <text x="259" y="121" text-anchor="middle" font-size="8">trigger_ctx! macro &times;3</text>
+              <text x="259" y="131" text-anchor="middle" font-size="7" fill="#dc2626">exists to dodge &amp;mut self</text>
+
+              <rect x="196" y="146" width="126" height="30" fill="#f1f5f9" stroke="#cbd5e1" rx="3"/>
+              <text x="259" y="161" text-anchor="middle" font-size="8">perform_trigger&lt;K&gt;</text>
+              <text x="259" y="171" text-anchor="middle" font-size="7" fill="#64748b">free fn, generic over K</text>
+
+              <line x1="158" y1="42" x2="196" y2="41" class="leak" stroke-width="1.4"/>
+              <line x1="158" y1="106" x2="196" y2="81" class="leak" stroke-width="1.4"/>
+              <line x1="158" y1="170" x2="196" y2="121" stroke="#f59e0b" stroke-width="1.4" stroke-dasharray="3 2"/>
+              <text x="165" y="230" fill="#dc2626" font-size="8">chord_slots rebuilt every PhysicalEvent</text>
+              <text x="165" y="244" fill="#b45309" font-size="8">dual-stage adds a 3rd keyspace + its own slot_for</text>
+            </svg>
+          </div>
+          <div class="rounded-lg border border-slate-300 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">After &mdash; one deep struct, three fields</p>
+            <svg viewBox="0 0 330 260" class="w-full h-64">
+              <rect x="70" y="24" width="190" height="96" fill="#0f172a" rx="4"/>
+              <text x="165" y="46" text-anchor="middle" fill="#fff" class="schem">trigger::Slots&lt;K&gt;</text>
+              <text x="165" y="66" text-anchor="middle" fill="#94a3b8" font-size="8">firings + toggles (private)</text>
+              <text x="165" y="80" text-anchor="middle" fill="#94a3b8" font-size="8">.slot(&amp;K) · .snapshot() · .perform(&hellip;)</text>
+              <text x="165" y="100" text-anchor="middle" fill="#64748b" font-size="8">one liveness precedence rule, named</text>
+
+              <rect x="14" y="150" width="90" height="30" fill="none" stroke="#475569" stroke-width="1.5" rx="3"/>
+              <text x="59" y="168" text-anchor="middle" font-size="8">Slots&lt;Input&gt;</text>
+              <rect x="120" y="150" width="90" height="30" fill="none" stroke="#475569" stroke-width="1.5" rx="3"/>
+              <text x="165" y="168" text-anchor="middle" font-size="8">Slots&lt;ChordKey&gt;</text>
+              <rect x="226" y="150" width="90" height="30" fill="none" stroke="#0f172a" stroke-width="1.5" rx="3"/>
+              <text x="271" y="164" text-anchor="middle" font-size="8">Slots&lt;StageKey&gt;</text>
+              <text x="271" y="175" text-anchor="middle" font-size="7" fill="#16a34a">free</text>
+
+              <line x1="120" y1="120" x2="59" y2="150" stroke="#94a3b8" stroke-width="1.2"/>
+              <line x1="165" y1="120" x2="165" y2="150" stroke="#94a3b8" stroke-width="1.2"/>
+              <line x1="210" y1="120" x2="271" y2="150" stroke="#94a3b8" stroke-width="1.2"/>
+
+              <text x="165" y="208" text-anchor="middle" font-size="8" fill="#16a34a">tie-break table-tested in trigger.rs</text>
+              <text x="165" y="222" text-anchor="middle" font-size="8" fill="#475569">trigger_ctx! macro deleted</text>
+              <text x="165" y="236" text-anchor="middle" font-size="8" fill="#475569">option (b): chord::feed drops its `live` arg</text>
+            </svg>
+          </div>
+        </div>
+
+        <div class="space-y-2 text-sm">
+          <p><strong>Problem.</strong> The <span class="font-mono">(HashMap&lt;K, FiringHandle&gt;, HashMap&lt;K, ActiveToggle&gt;)</span> pair and the three operations always done on it &mdash; read one key's liveness (<span class="font-mono">slot_for</span>), snapshot all of it (<span class="font-mono">chord_slots</span>), perform a decision (<span class="font-mono">perform_trigger</span>) &mdash; is a module that does not exist. It is open-coded twice today; <span class="font-mono">slot_for</span> and <span class="font-mono">chord_slots</span> carry <em>deliberately inverse</em> tie-breaks (firing-wins vs toggle-wins) whose only guard is a doc comment on <span class="font-mono">dispatch.rs:892</span>. The dual-stage spec adds a third copy.</p>
+          <p><strong>Solution.</strong> A <span class="font-mono">trigger::Slots&lt;K&gt;</span> owning both maps, with <span class="font-mono">slot</span> / <span class="font-mono">snapshot</span> / <span class="font-mono">perform</span> as methods. Two interface options for the grilling step: (a) the conservative struct &mdash; <span class="font-mono">dispatch</span>, <span class="font-mono">chord</span> and <span class="font-mono">stage</span> each hold one as a field; (b) the first-pass proposal &mdash; push it inside <span class="font-mono">chord</span>/<span class="font-mono">trigger</span> so <span class="font-mono">feed</span> loses its <span class="font-mono">live</span> parameter entirely.</p>
+          <ul class="list-disc list-inside text-slate-600 space-y-0.5 pt-1">
+            <li>locality: one precedence rule, next to its state</li>
+            <li>the <span class="font-mono">slot_for</span>/<span class="font-mono">chord_slots</span> divergence becomes one deliberate method (or two clearly-named ones)</li>
+            <li>leverage: <span class="font-mono">stage::Engine</span> becomes <span class="font-mono">Slots&lt;StageKey&gt;</span> for free</li>
+            <li>tie-break tested as a table in <span class="font-mono">trigger.rs</span>, not through a dispatch integration path</li>
+            <li>deletes the <span class="font-mono">trigger_ctx!</span> macro (a documented <span class="font-mono">&amp;mut self</span> workaround)</li>
+            <li>deletion test: delete <span class="font-mono">Slots</span> and the two-map bookkeeping + tie-break scatter back across three structs</li>
+          </ul>
+        </div>
+      </article>
+
+      <!-- ============================ CANDIDATE 2 ============================ -->
+      <article id="c2" class="space-y-6">
+        <div class="flex items-baseline justify-between flex-wrap gap-2">
+          <h2 class="font-serif text-2xl">2 &nbsp;One <span class="font-mono text-xl">ConnectionScopedTask&lt;S&gt;</span> behind the two disconnect races</h2>
+          <div class="flex gap-2 shrink-0">
+            <span class="text-xs font-semibold px-2 py-1 rounded bg-emerald-100 text-emerald-800">Strong</span>
+            <span class="text-xs px-2 py-1 rounded bg-slate-100 text-slate-600">in-process · mock</span>
+            <span class="text-xs px-2 py-1 rounded bg-indigo-100 text-indigo-700">carried forward · #2</span>
+          </div>
+        </div>
+        <p class="font-mono text-sm text-slate-600">
+          daemon/src/dbus/mod.rs <span class="text-slate-400">SuppressionState (81&ndash;84), DepthStreamState (94&ndash;98),
+          watch_disconnect (247&ndash;270, already shared), set_output_suppressed (337&ndash;344 / 357&ndash;365 / 375&ndash;380),
+          run_depth_stream tail (228&ndash;232), start_depth_stream (799&ndash;807 / 821&ndash;826), stop_depth_stream (838&ndash;844)</span>
+        </p>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">Before &mdash; the epoch guard spelled out six times</p>
+            <pre class="mermaid">
+flowchart TB
+  subgraph S["set_output_suppressed"]
+    direction TB
+    S1["bump epoch · abort old watcher"] --> S2["injector.set_suppressed"] --> S3["store handle IF epoch current"]
+    S3 --> S4["spawned watcher: clear IF epoch current"]
+  end
+  subgraph D["start / stop_depth_stream"]
+    direction TB
+    D1["bump epoch · abort old watcher"] --> D2["spawn run_depth_stream"] --> D3["store handle IF epoch current"]
+    D3 --> D4["run_depth_stream tail: clear IF epoch current"]
+  end
+  S -.identical epoch discipline, copied.- D
+  classDef dup stroke:#dc2626,stroke-width:2px,fill:#fef2f2;
+  class S,D dup
+            </pre>
+            <p class="text-[0.65rem] text-slate-500 leading-snug">Two hand-rolled <span class="font-mono">&#123; epoch: u64, watcher: Option&lt;JoinHandle&gt; &#125;</span> structs. First pass counted four sites; it is six.</p>
+          </div>
+          <div class="rounded-lg border border-slate-300 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">After &mdash; deep, one interface</p>
+            <pre class="mermaid">
+flowchart TB
+  A["set_output_suppressed"] --> M
+  B["start_depth_stream"] --> M
+  C["stop_depth_stream"] --> M
+  M["ConnectionScopedTask&lt;S&gt;<br/>arm(conn, sender, task, on_clear)<br/>disarm()"]:::deep
+  M --> I["epoch · supersede · disconnect-clear<br/>(internal, tested with fake tasks)"]:::faded
+  classDef deep fill:#0f172a,color:#fff,stroke:#0f172a;
+  classDef faded fill:#f1f5f9,color:#64748b,stroke:#cbd5e1;
+            </pre>
+            <p class="text-[0.65rem] text-slate-500 leading-snug">Each D-Bus method becomes one <span class="font-mono">arm(&hellip;)</span> / <span class="font-mono">disarm()</span> call. Last-writer-wins + epoch-guard lives in one module.</p>
+          </div>
+        </div>
+
+        <div class="rounded bg-slate-100 border border-slate-200 text-slate-700 text-sm px-4 py-3">
+          <strong>Re-verification note.</strong> The first pass argued a third connection-scoped subscription would make this three copies. The dual-stage effort (<span class="font-mono">map.md</span> Q14, ticket&nbsp;01) confirms <em>no new signal and no new <span class="font-mono">GetState()</span> field</em> &mdash; so this stays a two-copy duplication. Still Strong: six in-place copies of a subtle abort-and-supersede race is enough on its own.
+        </div>
+
+        <div class="space-y-2 text-sm">
+          <p><strong>Problem.</strong> <span class="font-mono">SuppressionState</span> and <span class="font-mono">DepthStreamState</span> are two hand-rolled copies of the same connection-scoped-resource-with-disconnect-cleanup protocol; the "bump epoch + abort in one locked section, then store/clear only if still current" rule is written out in six places.</p>
+          <p><strong>Solution.</strong> A <span class="font-mono">ConnectionScopedTask&lt;S&gt;</span> module owning epoch + watcher + the arm / supersede / disconnect-clear protocol.</p>
+          <ul class="list-disc list-inside text-slate-600 space-y-0.5 pt-1">
+            <li>locality: one subtle race, one module</li>
+            <li>the race is tested directly with fake tasks, not through a live <span class="font-mono">zbus</span> server</li>
+            <li>interface shrinks; the implementation absorbs the epoch discipline</li>
+            <li>six epoch-guard copies collapse to one</li>
+            <li>deletion test: complexity concentrates, not spreads</li>
+          </ul>
+        </div>
+      </article>
+
+      <!-- ============================ CANDIDATE 3 ============================ -->
+      <article id="c3" class="space-y-6">
+        <div class="flex items-baseline justify-between flex-wrap gap-2">
+          <h2 class="font-serif text-2xl">3 &nbsp;A <span class="font-mono text-xl">device_control</span> module for the Interface-2 channel</h2>
+          <div class="flex gap-2 shrink-0">
+            <span class="text-xs font-semibold px-2 py-1 rounded bg-amber-100 text-amber-800">Worth exploring</span>
+            <span class="text-xs px-2 py-1 rounded bg-slate-100 text-slate-600">ports &amp; adapters</span>
+            <span class="text-xs px-2 py-1 rounded bg-indigo-100 text-indigo-700">carried forward · #4 + B3</span>
+          </div>
+        </div>
+        <p class="font-mono text-sm text-slate-600">
+          daemon/src/capture/analog.rs <span class="text-slate-400">(1570 lines) build_razer_cmd + CRC (182), status_led_args (453),
+          open_control_fd (389), send_feature (404), feature_exchange (573), relock (437),
+          assert/clear_status_leds (489/502), read_device_info (645), DeviceInfo (521)</span> ·
+          consumers: led.rs (28, 46) · main.rs (203, 208) · capture/supervisor.rs (171, 241) ·
+          dispatch.rs (38, <span class="text-slate-400">imports DeviceInfo</span>) · executor.rs (25, 357, <span class="text-slate-400">read_kernel_auto_repeat</span>)
+        </p>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">Before &mdash; five modules reach into one 1570-line file</p>
+            <pre class="mermaid">
+flowchart LR
+  L[led.rs] -.-> A
+  M[main.rs] -.-> A
+  SUP[capture/supervisor.rs] -.-> A
+  DIS["dispatch.rs<br/>use analog::DeviceInfo"] -.-> A
+  EX["executor.rs<br/>read_kernel_auto_repeat"] -.-> A
+  subgraph A["capture::analog  (Analog Capture mode)"]
+    AS[AnalogCaptureSource + observe/relay]
+    FR["razer frame + CRC + fd + exchange"]
+    LED[assert_status_leds]
+    INFO[read_device_info / DeviceInfo]
+    RL[relock]
+  end
+  classDef leak stroke:#dc2626,stroke-width:2px;
+  class DIS,EX,L leak
+            </pre>
+          </div>
+          <div class="rounded-lg border border-slate-300 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">After &mdash; the mechanism is its own deep module</p>
+            <pre class="mermaid">
+flowchart TB
+  DC["device_control<br/>open fd · send_feature · feature_exchange · razer frame + CRC"]:::deep
+  LED2["led (LED frame)"] --> DC
+  INFO2["device_info (firmware/serial + DeviceInfo)"] --> DC
+  AN["capture::analog (unlock/relock + capture source only)"] --> DC
+  DIS2["dispatch imports DeviceInfo from device_info"] --> INFO2
+  classDef deep fill:#0f172a,color:#fff,stroke:#0f172a;
+            </pre>
+          </div>
+        </div>
+
+        <div class="rounded bg-amber-50 border border-amber-200 text-amber-900 text-sm px-4 py-3">
+          <strong>ADR-0006 check.</strong> ADR-0006 fixes <em>who drives</em> the Status LEDs (dispatch) and the <em>fd lifetime</em> (short-lived Interface-2 hidraw) &mdash; not where the frame builder lives. Moving the Razer-frame primitives into a shared <span class="font-mono">device_control</span> module is consistent with it, not a reopening. Confirm with the domain owner before acting.
+        </div>
+
+        <div class="space-y-2 text-sm">
+          <p><strong>Problem.</strong> Status-LED writing, firmware/serial reading, analog unlock/relock and kernel-autorepeat reading share only a mechanism &mdash; a short-lived Interface-2 hidraw fd plus a Razer command frame &mdash; yet that mechanism lives as private helpers inside the Analog <em>Capture mode</em> module. <span class="font-mono">dispatch</span> imports <span class="font-mono">DeviceInfo</span> and <span class="font-mono">executor</span> imports <span class="font-mono">read_kernel_auto_repeat</span> from <span class="font-mono">capture::analog</span> purely by accident of location.</p>
+          <p><strong>Solution.</strong> Extract the fd + frame + CRC + exchange primitives into a <span class="font-mono">device_control</span> module; move <span class="font-mono">DeviceInfo</span> into a <span class="font-mono">device_info</span> module beside it; <span class="font-mono">led</span>, <span class="font-mono">device_info</span> and <span class="font-mono">capture::analog</span> become thin callers.</p>
+          <ul class="list-disc list-inside text-slate-600 space-y-0.5 pt-1">
+            <li>the seam moves to where behaviour actually varies</li>
+            <li>the frame/CRC logic gets its own name and its own tests</li>
+            <li><span class="font-mono">DeviceInfo</span> stops living under <span class="font-mono">capture</span></li>
+            <li>deletion test: the primitives are used four ways &mdash; they would reappear</li>
+          </ul>
+        </div>
+      </article>
+
+      <!-- ============================ CANDIDATE 4 ============================ -->
+      <article id="c4" class="space-y-6">
+        <div class="flex items-baseline justify-between flex-wrap gap-2">
+          <h2 class="font-serif text-2xl">4 &nbsp;One plug-in contract for the Depth-fed engines</h2>
+          <div class="flex gap-2 shrink-0">
+            <span class="text-xs font-semibold px-2 py-1 rounded bg-amber-100 text-amber-800">Worth exploring</span>
+            <span class="text-xs px-2 py-1 rounded bg-slate-100 text-slate-600">in-process</span>
+            <span class="text-xs px-2 py-1 rounded bg-indigo-100 text-indigo-700">carried forward · #6, widened</span>
+          </div>
+        </div>
+        <p class="font-mono text-sm text-slate-600">
+          daemon/src/dispatch.rs <span class="text-slate-400">AxisWrite drain loop verbatim at 228&ndash;229, 403&ndash;404, 555&ndash;556, 577&ndash;578, 1018&ndash;1019 ·
+          engine teardown fan-out: handle_layer_switch (1001), handle_capture_mode_change (1057), run_effects stop-all (574&ndash;580), disconnect</span> ·
+          daemon/src/axis.rs <span class="text-slate-400">AxisWrite (56)</span> ·
+          daemon/src/analog_repeat.rs <span class="text-slate-400">stop_all</span> ·
+          <span class="text-slate-400">.scratch/tartarus-dual-stage-keys/issues/01 §5</span>
+        </p>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">Before &mdash; two duplications, one per engine, growing</p>
+            <div class="space-y-2 text-[0.62rem]">
+              <p class="schem text-slate-400">a &mdash; AxisWrite drain, 5 verbatim copies</p>
+              <div class="font-mono bg-amber-50 border border-amber-200 rounded px-2 py-1 text-amber-800">for w in axis.&lt;m&gt;(&hellip;) &#123; injector.set_axis_value(w.code, w.value).await &#125;</div>
+              <p class="text-slate-400 normal-case">handle_event · handle_depth_update · handle_layer_switch · RecomputeAxes · ResetAxisOutputs</p>
+              <p class="schem text-slate-400 pt-2">b &mdash; teardown fan-out, once per engine</p>
+              <div class="grid grid-cols-3 gap-1 text-center font-mono text-[0.58rem]">
+                <div class="bg-slate-100 border border-slate-200 rounded py-1">axis.reset()</div>
+                <div class="bg-slate-100 border border-slate-200 rounded py-1">analog_repeat.stop_all()</div>
+                <div class="bg-amber-50 border border-amber-300 rounded py-1 text-amber-800">stage.stop_all() (coming)</div>
+              </div>
+              <p class="text-slate-400 normal-case pt-1">&hellip; each hand-wired into the same 4 lifecycle points: layer switch, capture-mode flip, profile switch, disconnect.</p>
+            </div>
+          </div>
+          <div class="rounded-lg border border-slate-300 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">After &mdash; one emit path, one teardown call</p>
+            <div class="space-y-2 text-[0.62rem]">
+              <div class="font-mono bg-slate-900 text-white rounded px-2 py-1.5">injector.set_axis_values(&amp;[AxisWrite]) &mdash; batch, one home</div>
+              <div class="font-mono bg-white border border-slate-300 rounded px-2 py-1">all 5 sites &rarr; self.emit_axis(writes).await</div>
+              <div class="font-mono bg-slate-900 text-white rounded px-2 py-1.5 mt-2">self.depth_engines_reset().await &mdash; fans to axis + analog_repeat + stage</div>
+              <p class="text-slate-400 normal-case pt-1">The next Depth-fed engine plugs into one contract instead of four call sites.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="space-y-2 text-sm">
+          <p><strong>Problem.</strong> Every <span class="font-mono">axis::Engine</span> method returns <span class="font-mono">Vec&lt;AxisWrite&gt;</span> and dispatch runs the identical drain-to-injector loop at five sites; separately, each Depth-fed engine's teardown (<span class="font-mono">reset</span> / <span class="font-mono">stop_all</span>) is hand-wired into the same four dispatch lifecycle points. There is no single "a Depth engine plugs in here" contract &mdash; and <span class="font-mono">stage::Engine</span> is about to need one.</p>
+          <p><strong>Solution.</strong> Push <span class="font-mono">AxisWrite</span> into <span class="font-mono">injector</span> with <span class="font-mono">set_axis_values(&amp;[AxisWrite])</span> and give <span class="font-mono">DispatchState</span> one <span class="font-mono">emit_axis</span> method; then a single teardown fan-out method (or a small <span class="font-mono">DepthEngine</span> trait) the lifecycle points call once.</p>
+          <ul class="list-disc list-inside text-slate-600 space-y-0.5 pt-1">
+            <li>locality: the next axis-output or teardown change is one edit</li>
+            <li>leverage: <span class="font-mono">stage::Engine</span> registers once instead of at four call sites</li>
+            <li>one focused test instead of five integration paths</li>
+            <li>widened from the first pass's Speculative &mdash; the third engine makes it real</li>
+          </ul>
+        </div>
+      </article>
+
+      <!-- ============================ CANDIDATE 5 ============================ -->
+      <article id="c5" class="space-y-6">
+        <div class="flex items-baseline justify-between flex-wrap gap-2">
+          <h2 class="font-serif text-2xl">5 &nbsp;Finish the <span class="font-mono text-xl">config/</span> carve that ticket 14 started</h2>
+          <div class="flex gap-2 shrink-0">
+            <span class="text-xs font-semibold px-2 py-1 rounded bg-amber-100 text-amber-800">Worth exploring</span>
+            <span class="text-xs px-2 py-1 rounded bg-slate-100 text-slate-600">in-process</span>
+            <span class="text-xs px-2 py-1 rounded bg-emerald-100 text-emerald-700">new</span>
+          </div>
+        </div>
+        <p class="font-mono text-sm text-slate-600">
+          daemon/src/config.rs <span class="text-slate-400">(1364 impl lines, flat) &mdash; serde vocab (45&ndash;780), ChordKey 5 trait impls (288&ndash;357),
+          MacroId/StepperId newtypes (656&ndash;735), ConfigError (840&ndash;942, 40 variants) + Display (944&ndash;1043),
+          load_or_seed (1049), parse (1095), find_legacy_macro_bindings (1068), validate (1137), write (1329&ndash;1344)</span> ·
+          daemon/src/config/binding.rs <span class="text-slate-400">(already carved, ticket 14)</span> ·
+          daemon/src/edit.rs <span class="text-slate-400">From&lt;ConfigError&gt; for CommandError (793)</span>
+        </p>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">Before &mdash; three concerns nose-to-tail, one seam carved</p>
+            <svg viewBox="0 0 320 250" class="w-full h-60">
+              <rect x="30" y="14" width="200" height="210" fill="none" stroke="#475569" stroke-width="2"/>
+              <text x="130" y="30" text-anchor="middle" class="schem" fill="#475569">config.rs — flat, 1364 lines</text>
+
+              <rect x="44" y="42" width="172" height="52" fill="#f1f5f9" stroke="#cbd5e1"/>
+              <text x="130" y="60" text-anchor="middle" font-size="8">serde domain vocabulary (~700)</text>
+              <text x="130" y="72" text-anchor="middle" font-size="7" fill="#64748b">Config/Profile/Binding/Action/AxisTarget</text>
+              <text x="130" y="83" text-anchor="middle" font-size="7" fill="#64748b">ChordKey ×5 impls · MacroId/StepperId</text>
+
+              <rect x="44" y="102" width="172" height="46" fill="#fef2f2" stroke="#fca5a5"/>
+              <text x="130" y="120" text-anchor="middle" font-size="8">ConfigError (40) + Display (~200)</text>
+              <text x="130" y="132" text-anchor="middle" font-size="7" fill="#dc2626">7 variants raised in config/binding.rs</text>
+              <text x="130" y="142" text-anchor="middle" font-size="7" fill="#dc2626">From-conv lives in edit.rs</text>
+
+              <rect x="44" y="156" width="172" height="52" fill="#f1f5f9" stroke="#cbd5e1"/>
+              <text x="130" y="174" text-anchor="middle" font-size="8">load / parse / migrate / validate / write</text>
+              <text x="130" y="186" text-anchor="middle" font-size="7" fill="#64748b">raw toml::Value legacy walk</text>
+              <text x="130" y="197" text-anchor="middle" font-size="7" fill="#64748b">slug_base · unique_*_id</text>
+
+              <rect x="244" y="102" width="66" height="46" fill="#0f172a"/>
+              <text x="277" y="122" text-anchor="middle" fill="#fff" font-size="7">config/</text>
+              <text x="277" y="133" text-anchor="middle" fill="#fff" font-size="7">binding.rs</text>
+              <line x1="216" y1="125" x2="244" y2="125" class="seam" stroke="#16a34a" stroke-width="2"/>
+              <text x="277" y="160" text-anchor="middle" font-size="7" fill="#16a34a">only cut so far</text>
+            </svg>
+          </div>
+          <div class="rounded-lg border border-slate-300 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">After &mdash; the dir gets the rest of its modules</p>
+            <svg viewBox="0 0 320 250" class="w-full h-60">
+              <text x="160" y="24" text-anchor="middle" class="schem" fill="#475569">config/</text>
+              <rect x="18" y="40" width="132" height="40" fill="#0f172a" rx="3"/>
+              <text x="84" y="58" text-anchor="middle" fill="#fff" font-size="8">error.rs</text>
+              <text x="84" y="70" text-anchor="middle" fill="#94a3b8" font-size="7">ConfigError + Display + From</text>
+
+              <rect x="170" y="40" width="132" height="40" fill="#0f172a" rx="3"/>
+              <text x="236" y="58" text-anchor="middle" fill="#fff" font-size="8">io.rs</text>
+              <text x="236" y="70" text-anchor="middle" fill="#94a3b8" font-size="7">load · parse · migrate · write</text>
+
+              <rect x="18" y="96" width="132" height="40" fill="#1e293b" rx="3"/>
+              <text x="84" y="114" text-anchor="middle" fill="#fff" font-size="8">binding.rs (ticket 14)</text>
+
+              <rect x="170" y="96" width="132" height="40" fill="none" stroke="#475569" stroke-width="1.5" rx="3"/>
+              <text x="236" y="114" text-anchor="middle" font-size="8">mod.rs — serde types</text>
+              <text x="236" y="126" text-anchor="middle" font-size="7" fill="#64748b">+ validate (whole-Config)</text>
+
+              <text x="160" y="168" text-anchor="middle" font-size="8" fill="#16a34a">error catalog opens as a unit</text>
+              <text x="160" y="182" text-anchor="middle" font-size="8" fill="#16a34a">parse + migration tests split from validate tests</text>
+              <text x="160" y="196" text-anchor="middle" font-size="8" fill="#475569">schema.rs / binding.rs import config::error deliberately</text>
+            </svg>
+          </div>
+        </div>
+
+        <div class="rounded bg-slate-100 border border-slate-200 text-slate-700 text-sm px-4 py-3">
+          <strong>Honest weight.</strong> <span class="font-mono">config/error.rs</span> is a pure relocation &mdash; data plus a <span class="font-mono">Display</span> impl, so its deletion test is weak (it concentrates <em>knowledge</em>, not behaviour). The <span class="font-mono">config/io.rs</span> cut &mdash; <span class="font-mono">parse</span>, the raw <span class="font-mono">toml::Value</span> legacy-migration walk, <span class="font-mono">write</span> &mdash; is the one with real behaviour behind a small interface.
+        </div>
+
+        <div class="space-y-2 text-sm">
+          <p><strong>Problem.</strong> Ticket 14 created <span class="font-mono">config/</span> but moved only the per-binding rules into it. The parent file still holds the serde vocabulary, a self-contained 40-variant error catalog, and the load/parse/migrate/write pipeline nose-to-tail with no internal seam &mdash; and <span class="font-mono">ConfigError</span> is already consumed from <span class="font-mono">config/binding.rs</span> and <span class="font-mono">edit.rs</span>, across a boundary that does not formally exist.</p>
+          <p><strong>Solution.</strong> Continue the carve: <span class="font-mono">config/error.rs</span> (the catalog + <span class="font-mono">Display</span> + the <span class="font-mono">From</span> conversions) and <span class="font-mono">config/io.rs</span> (load / parse / migration / write / slug).</p>
+          <ul class="list-disc list-inside text-slate-600 space-y-0.5 pt-1">
+            <li>locality: "everything that can go wrong loading a config, and the words the user sees" is one file</li>
+            <li>the 1570-line <span class="font-mono">mod tests</span> splits along the same lines</li>
+            <li>leverage: <span class="font-mono">schema.rs</span> and <span class="font-mono">binding.rs</span> already import pieces &mdash; the module makes it deliberate</li>
+            <li>no ADR exposure; <span class="font-mono">config/</span> is already an established dir</li>
+          </ul>
+        </div>
+      </article>
+
+      <!-- ============================ CANDIDATE 6 ============================ -->
+      <article id="c6" class="space-y-6">
+        <div class="flex items-baseline justify-between flex-wrap gap-2">
+          <h2 class="font-serif text-2xl">6 &nbsp;A contract test for the D-Bus <span class="font-mono text-xl">a&#123;sv&#125;</span> wire shape</h2>
+          <div class="flex gap-2 shrink-0">
+            <span class="text-xs font-semibold px-2 py-1 rounded bg-amber-100 text-amber-800">Worth exploring</span>
+            <span class="text-xs px-2 py-1 rounded bg-slate-100 text-slate-600">mock</span>
+            <span class="text-xs px-2 py-1 rounded bg-indigo-100 text-indigo-700">carried forward · #5</span>
+          </div>
+        </div>
+        <p class="font-mono text-sm text-slate-600">
+          daemon/src/dbus/wire.rs <span class="text-slate-400">action_to_dict/_from_dict (242/277), profile_to_dict (391, encode-only),
+          config_to_dict (523), state_to_dict (550), "omit empty modifiers" test (638, daemon-side only)</span> ·
+          gui/acheron_gui/wire.py <span class="text-slate-400">*_to_variant (encode-only)</span> ·
+          gui/tests/test_wire.py <span class="text-slate-400">self round-trip only</span> ·
+          daemon/src/schema.rs <span class="text-slate-400">render_schema (263) — no encoded example dicts</span>
+        </p>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">Before &mdash; the contract stops short of the wire</p>
+            <svg viewBox="0 0 320 200" class="w-full h-48">
+              <rect x="10" y="20" width="120" height="50" fill="none" stroke="#334155" stroke-width="2"/>
+              <text x="70" y="42" text-anchor="middle" class="schem">wire.rs</text>
+              <text x="70" y="58" text-anchor="middle" font-size="8" fill="#64748b">encode + decode</text>
+              <rect x="190" y="20" width="120" height="50" fill="none" stroke="#334155" stroke-width="2"/>
+              <text x="250" y="42" text-anchor="middle" class="schem">wire.py</text>
+              <text x="250" y="58" text-anchor="middle" font-size="8" fill="#64748b">encode only</text>
+
+              <line x1="70" y1="70" x2="70" y2="118" class="seam" stroke="#16a34a" stroke-width="2"/>
+              <text x="70" y="138" text-anchor="middle" font-size="8" fill="#16a34a">rules.py contract</text>
+              <text x="70" y="150" text-anchor="middle" font-size="7" fill="#64748b">verdict matrix · catalogs · slug</text>
+
+              <line x1="130" y1="45" x2="190" y2="45" class="leak" stroke-width="2" stroke-dasharray="3 3"/>
+              <text x="160" y="36" text-anchor="middle" font-size="8" fill="#dc2626">tag strings, field names,</text>
+              <text x="160" y="90" text-anchor="middle" font-size="8" fill="#dc2626">"omit []" &mdash; checked by nobody</text>
+              <line x1="250" y1="70" x2="250" y2="110" class="seam" stroke="#94a3b8" stroke-width="2"/>
+              <text x="250" y="128" text-anchor="middle" font-size="8" fill="#94a3b8">self round-trip only</text>
+            </svg>
+          </div>
+          <div class="rounded-lg border border-slate-300 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">After &mdash; the deliberate copy is contract-tested end to end</p>
+            <svg viewBox="0 0 320 200" class="w-full h-48">
+              <rect x="10" y="20" width="120" height="40" fill="none" stroke="#334155" stroke-width="2"/>
+              <text x="70" y="44" text-anchor="middle" class="schem">wire.rs</text>
+              <rect x="190" y="20" width="120" height="40" fill="none" stroke="#334155" stroke-width="2"/>
+              <text x="250" y="44" text-anchor="middle" class="schem">wire.py</text>
+              <rect x="85" y="88" width="150" height="42" fill="#0f172a"/>
+              <text x="160" y="105" text-anchor="middle" fill="#fff" font-size="8">schema.rs emits encoded</text>
+              <text x="160" y="118" text-anchor="middle" fill="#fff" font-size="8">example a&#123;sv&#125; dicts, one per variant</text>
+              <line x1="70" y1="60" x2="130" y2="88" class="seam" stroke="#16a34a" stroke-width="2"/>
+              <line x1="250" y1="60" x2="190" y2="88" class="seam" stroke="#16a34a" stroke-width="2"/>
+              <text x="160" y="158" text-anchor="middle" font-size="8" fill="#16a34a">test_wire_contract.py: byte-identical both directions</text>
+            </svg>
+          </div>
+        </div>
+
+        <div class="rounded bg-amber-50 border border-amber-200 text-amber-900 text-sm px-4 py-3">
+          <strong>ADR-0003.</strong> The model is copied across the process seam on purpose &mdash; that is not the friction. The friction is a <em>partial</em> contract test that stops short of the wire shape, giving false confidence. This adds a contract test <em>of</em> the deliberate copy; it does not challenge the copy.
+        </div>
+
+        <div class="space-y-2 text-sm">
+          <p><strong>Problem.</strong> The <span class="font-mono">rules.py</span> contract covers the verdict matrix and the catalogs but not the <span class="font-mono">a&#123;sv&#125;</span> encoding &mdash; tag strings, field names, the "omit empty <span class="font-mono">modifiers</span>" rule &mdash; and no test runs <span class="font-mono">wire.py</span> output against <span class="font-mono">wire.rs</span> input.</p>
+          <p><strong>Solution.</strong> Have <span class="font-mono">schema.rs</span> emit fully-encoded example dicts per variant; a new <span class="font-mono">test_wire_contract.py</span> asserts <span class="font-mono">wire.py</span> matches them byte-for-byte and <span class="font-mono">wire.rs::*_from_dict</span> round-trips them.</p>
+          <ul class="list-disc list-inside text-slate-600 space-y-0.5 pt-1">
+            <li>closes the one cross-stack gap the language split leaves</li>
+            <li>a renamed tag fails a test, not a review</li>
+            <li><span class="font-mono">test_wire.py</span>'s self round-trip becomes a real contract</li>
+          </ul>
+        </div>
+      </article>
+
+      <!-- ============================ CANDIDATE 7 ============================ -->
+      <article id="c7" class="space-y-6">
+        <div class="flex items-baseline justify-between flex-wrap gap-2">
+          <h2 class="font-serif text-2xl">7 &nbsp;A typed read accessor over the <span class="font-mono text-xl">GetConfig</span> dict</h2>
+          <div class="flex gap-2 shrink-0">
+            <span class="text-xs font-semibold px-2 py-1 rounded bg-slate-200 text-slate-700">Speculative</span>
+            <span class="text-xs px-2 py-1 rounded bg-slate-100 text-slate-600">in-process</span>
+            <span class="text-xs px-2 py-1 rounded bg-indigo-100 text-indigo-700">carried forward · #7</span>
+          </div>
+        </div>
+        <p class="font-mono text-sm text-slate-600">
+          gui/acheron_gui/read_model.py <span class="text-slate-400">("deliberately not a read-model, ADR 0005")</span> ·
+          raw digs: device_overview.py (363, 364, 558, 770, 829, 838, 848) · binding_editor.py (279, 684, 881, 887) ·
+          library_view.py (509) · daemon_stub.py (223, 260, 313, 331, 351, 354, 358) ·
+          gui/acheron_gui/app.py <span class="text-slate-400">rebuild (~511), ui_state (~508)</span>
+        </p>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">Before &mdash; every view digs the raw dict</p>
+            <svg viewBox="0 0 320 210" class="w-full h-52">
+              <ellipse cx="160" cy="28" rx="92" ry="15" fill="#e2e8f0" stroke="#94a3b8"/>
+              <text x="160" y="32" text-anchor="middle" font-size="9" fill="#475569">GetConfig() dict[str, Any]</text>
+              <g font-size="7.5" font-family="monospace" fill="#dc2626">
+                <text x="24" y="78">config["profiles"][p][f"axis_&#123;layer&#125;"]</text>
+                <text x="24" y="98">config["profiles"][p][f"chords_&#123;layer&#125;"]</text>
+                <text x="24" y="118">.get(inp)   # is there a binding?</text>
+                <text x="24" y="138">config["profiles"][p]["status_leds"]</text>
+              </g>
+              <line x1="95" y1="40" x2="60" y2="66" stroke="#94a3b8"/>
+              <line x1="150" y1="42" x2="120" y2="88" stroke="#94a3b8"/>
+              <line x1="210" y1="42" x2="235" y2="108" stroke="#94a3b8"/>
+              <text x="160" y="172" text-anchor="middle" font-size="8" fill="#64748b">~12 sites in shipped GUI · ~7 more in daemon_stub</text>
+              <text x="160" y="190" text-anchor="middle" font-size="8" fill="#64748b">rebuild + ui_state bag threaded through nearly every build_*</text>
+            </svg>
+          </div>
+          <div class="rounded-lg border border-slate-300 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">After &mdash; one accessor absorbs the traversal</p>
+            <svg viewBox="0 0 320 210" class="w-full h-52">
+              <ellipse cx="160" cy="24" rx="78" ry="13" fill="#e2e8f0" stroke="#94a3b8"/>
+              <text x="160" y="28" text-anchor="middle" font-size="8" fill="#475569">GetConfig() dict</text>
+              <rect x="72" y="52" width="176" height="66" fill="#0f172a" rx="4"/>
+              <text x="160" y="72" text-anchor="middle" fill="#fff" class="schem">ConfigView</text>
+              <text x="160" y="90" text-anchor="middle" fill="#94a3b8" font-size="8">.profile(n).layer(l).binding(input)</text>
+              <text x="160" y="103" text-anchor="middle" fill="#94a3b8" font-size="8">.axis_assignment(input, l) · .status_leds()</text>
+              <line x1="160" y1="37" x2="160" y2="52" stroke="#94a3b8"/>
+              <g font-size="8" fill="#475569">
+                <text x="62" y="150" text-anchor="middle">device_overview</text>
+                <text x="160" y="150" text-anchor="middle">binding_editor</text>
+                <text x="258" y="150" text-anchor="middle">library_view</text>
+              </g>
+              <line x1="112" y1="118" x2="66" y2="138" stroke="#94a3b8"/>
+              <line x1="160" y1="118" x2="160" y2="138" stroke="#94a3b8"/>
+              <line x1="208" y1="118" x2="254" y2="138" stroke="#94a3b8"/>
+              <text x="160" y="182" text-anchor="middle" font-size="8" fill="#16a34a">views test against a small ConfigView fixture</text>
+            </svg>
+          </div>
+        </div>
+
+        <div class="rounded bg-amber-50 border border-amber-200 text-amber-900 text-sm px-4 py-3">
+          <strong>ADR-0005 flag.</strong> <span class="font-mono">read_model.py</span>'s docstring cites ADR-0005 to resist exactly this. ADR-0005 protects the GUI's hand-mirror of the daemon's stateful <em>edit validation</em> (<span class="font-mono">daemon_stub.py</span>). A read-only accessor over <span class="font-mono">GetConfig</span>'s own output is a different thing &mdash; but close enough to the ADR's spirit that it needs the domain owner's ruling before acting. This is why it drops to Speculative for this pass.
+        </div>
+
+        <div class="space-y-2 text-sm">
+          <p><strong>Problem.</strong> The config payload is an untyped dict whose schema is implicit; every view re-implements traversal with string-built keys (<span class="font-mono">f"axis_&#123;layer&#125;"</span>), and <span class="font-mono">rebuild</span> is threaded as the universal change signal through nearly every builder alongside an ad-hoc <span class="font-mono">ui_state</span> bag.</p>
+          <p><strong>Solution.</strong> A thin typed <span class="font-mono">ConfigView</span> read accessor over the wire payload &mdash; not the stateful edit mirror ADR-0005 protects &mdash; generalising the one scan <span class="font-mono">read_model.py</span> already does.</p>
+          <ul class="list-disc list-inside text-slate-600 space-y-0.5 pt-1">
+            <li>locality: the dict schema is known in one place</li>
+            <li>the <span class="font-mono">f"axis_&#123;layer&#125;"</span> typo surface collapses</li>
+            <li>views become testable against a fixture, not a full raw dict</li>
+          </ul>
+        </div>
+      </article>
+
+      <!-- ============================ CONSIDERED AND SET ASIDE ============================ -->
+      <section id="set-aside" class="border-t border-slate-200 pt-8 space-y-3">
+        <p class="schem text-slate-400">Investigated, not a candidate</p>
+        <div class="grid sm:grid-cols-2 gap-3 text-sm text-slate-600">
+          <div class="rounded border border-slate-200 bg-white p-3">
+            <p class="font-semibold text-slate-800"><span class="font-mono">edit::Effect</span> as a two-enum shuffle</p>
+            <p><span class="font-mono">Edit &rarr; plan &rarr; Outcome&#123;effects&#125; &rarr; run_effects</span> is <em>one</em> intermediate enum at a deliberate pure/impure seam. Each <span class="font-mono">run_effects</span> arm is short <em>because</em> <span class="font-mono">plan</span> already decided. This is the target shape.</p>
+          </div>
+          <div class="rounded border border-slate-200 bg-white p-3">
+            <p class="font-semibold text-slate-800"><span class="font-mono">dispatch::run</span>'s wide signature</p>
+            <p>Ticket 09 already carved <span class="font-mono">DispatchState</span> and added the <span class="font-mono">Seam</span> test helper. The wide <span class="font-mono">run</span> signature is pure channel wiring with a rationale comment. Addressed.</p>
+          </div>
+          <div class="rounded border border-slate-200 bg-white p-3">
+            <p class="font-semibold text-slate-800"><span class="font-mono">daemon_stub.py</span> drift</p>
+            <p><span class="font-mono">_validate_binding_action</span> already delegates the pure half to <span class="font-mono">rules.py</span>; only the ~150-line stateful half is hand-mirrored, which ADR-0005 explicitly chooses. Off-limits.</p>
+          </div>
+          <div class="rounded border border-slate-200 bg-white p-3">
+            <p class="font-semibold text-slate-800"><span class="font-mono">injector.rs</span> / <span class="font-mono">capture/supervisor.rs</span></p>
+            <p>Both genuinely deep: message-passing actor behind a handle, a real two-adapter seam (<span class="font-mono">InjectSink</span>, <span class="font-mono">CaptureSource</span>), swap protocols hidden inside. Examples of the target, not targets. <span class="font-mono">injector</span> only gains #4's batch method.</p>
+          </div>
+          <div class="rounded border border-slate-200 bg-white p-3">
+            <p class="font-semibold text-slate-800">No <span class="font-mono">daemon/tests/</span> directory</p>
+            <p>Every daemon module tests through an in-process seam (channels, <span class="font-mono">InjectSink</span>, <span class="font-mono">Seam</span>, a real <span class="font-mono">zbus</span> <span class="font-mono">TestServer</span>). Large test-line counts, but the seams exist and are exercised. Not a testability failure.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================ TOP RECOMMENDATION ============================ -->
+      <section id="top-recommendation" class="border-t border-slate-200 pt-10">
+        <p class="schem text-slate-400">Top recommendation</p>
+        <div class="mt-3 rounded-xl bg-slate-900 text-white p-8 space-y-4">
+          <h2 class="font-serif text-3xl">Start with <a href="#c1" class="underline decoration-emerald-400 decoration-2 underline-offset-4">#1 &mdash; <span class="font-mono">trigger::Slots&lt;K&gt;</span></a></h2>
+          <p class="text-slate-300 leading-relaxed max-w-3xl">
+            It is the one piece of friction the <span class="font-mono">tartarus-dual-stage-keys</span> effort actively
+            worsens <em>before its spec is written</em>: a third <span class="font-mono">firings</span>/<span class="font-mono">toggles</span>
+            keyspace, a third <span class="font-mono">slot_for</span>, a third <span class="font-mono">trigger_ctx!</span>.
+            The inverse tie-break between <span class="font-mono">slot_for</span> and <span class="font-mono">chord_slots</span> is
+            a real bug surface guarded only by a comment. The conservative <span class="font-mono">Slots&lt;K&gt;</span> cut has
+            a blast radius entirely inside <span class="font-mono">dispatch.rs</span> and <span class="font-mono">trigger.rs</span>,
+            no ADR exposure, and immediate test leverage &mdash; and it hands the dual-stage implementation a ready seam
+            instead of a fourth copy to write.
+          </p>
+          <p class="text-slate-400 text-sm">
+            Runner-up: <a href="#c2" class="underline">#2 &mdash; <span class="font-mono">ConnectionScopedTask</span></a>. Also Strong;
+            the abort-and-supersede race is copied across six sites today. Independent of the dual-stage schedule,
+            so it can land any time.
+          </p>
+        </div>
+      </section>
+
+    </main>
+  </body>
+</html>

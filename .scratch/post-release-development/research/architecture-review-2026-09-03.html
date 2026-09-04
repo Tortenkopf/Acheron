@@ -1,0 +1,542 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Architecture review — Acheron</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+      mermaid.initialize({ startOnLoad: true, theme: "neutral", securityLevel: "loose", flowchart: { htmlLabels: true } });
+    </script>
+    <style>
+      .seam { stroke-dasharray: 5 4; }
+      .leak { stroke: #dc2626; }
+      body { -webkit-font-smoothing: antialiased; }
+      .schem { font-size: 0.65rem; letter-spacing: 0.08em; text-transform: uppercase; }
+      .mermaid { display: flex; justify-content: center; }
+      article { scroll-margin-top: 2rem; }
+    </style>
+  </head>
+  <body class="bg-stone-50 text-slate-900 font-sans">
+    <main class="max-w-5xl mx-auto px-6 py-14 space-y-14">
+
+      <header class="space-y-6 border-b border-slate-200 pb-10">
+        <div>
+          <p class="schem text-slate-400">Deepening review</p>
+          <h1 class="font-serif text-4xl text-slate-900 mt-1">Acheron — architectural friction</h1>
+          <p class="text-slate-500 mt-2 text-sm">2026-09-03 · <span class="font-mono">dev</span> branch · daemon <span class="font-mono">1.1.0</span></p>
+        </div>
+        <div class="grid sm:grid-cols-2 gap-x-8 gap-y-2 text-sm text-slate-600">
+          <p><span class="inline-block w-4 h-4 align-middle border-2 border-slate-800 mr-2"></span>solid box = module</p>
+          <p><svg class="inline align-middle mr-2" width="20" height="8"><line x1="0" y1="4" x2="20" y2="4" class="seam" stroke="#475569" stroke-width="2"/></svg>dashed line = seam</p>
+          <p><svg class="inline align-middle mr-2" width="20" height="8"><line x1="0" y1="4" x2="20" y2="4" class="leak" stroke-width="2"/></svg>red = leakage across a seam</p>
+          <p><span class="inline-block w-4 h-4 align-middle bg-slate-900 mr-2"></span>thick dark box = deep module</p>
+        </div>
+        <p class="text-sm text-slate-500 leading-relaxed">
+          The post-release effort (tickets 05&ndash;13) already carved <span class="font-mono">chord</span>,
+          <span class="font-mono">trigger</span>, <span class="font-mono">stepper</span>,
+          <span class="font-mono">axis</span>, <span class="font-mono">analog_repeat</span> and the config-transaction
+          logic out of <span class="font-mono">dispatch.rs</span>. <span class="font-mono">dispatch.rs</span> is 4473 lines
+          but only lines 1&ndash;1127 are implementation &mdash; it is <em>not</em> a monolith. The friction that
+          remains is in the <strong>glue between dispatch and the pure modules</strong>, in
+          <strong>duplicated concurrency protocol</strong> on the D-Bus surface, and in a
+          <strong>monolithic validation walk</strong> that three other artifacts reconstruct by brute force.
+        </p>
+      </header>
+
+      <!-- ============================ CANDIDATE 1 ============================ -->
+      <article id="c1" class="space-y-6">
+        <div class="flex items-baseline justify-between flex-wrap gap-2">
+          <h2 class="font-serif text-2xl">1 &nbsp;Split <span class="font-mono text-xl">config::validate</span> at the per-binding seam</h2>
+          <div class="flex gap-2 shrink-0">
+            <span class="text-xs font-semibold px-2 py-1 rounded bg-emerald-100 text-emerald-800">Strong</span>
+            <span class="text-xs px-2 py-1 rounded bg-slate-100 text-slate-600">in-process</span>
+          </div>
+        </div>
+        <p class="font-mono text-sm text-slate-600">
+          daemon/src/config.rs <span class="text-slate-400">validate (1126&ndash;1348)</span> ·
+          daemon/src/schema.rs <span class="text-slate-400">trigger_verdict, action_kind_verdict (184&ndash;230)</span> ·
+          gui/acheron_gui/rules.py <span class="text-slate-400">valid_action_kinds, valid_triggers</span> ·
+          daemon/contract/daemon-schema.json
+        </p>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">Before &mdash; one 220-line walk</p>
+            <div class="space-y-1.5">
+              <div class="flex items-stretch gap-2">
+                <div class="w-28 shrink-0 bg-slate-900 text-white schem flex items-center justify-center rounded px-1 text-center">validate<br>&Config &rarr; Result</div>
+                <div class="flex-1 space-y-1">
+                  <div class="h-6 bg-amber-50 border border-amber-200 rounded text-[0.6rem] flex items-center px-2 text-amber-800">profile-switch trigger walk</div>
+                  <div class="h-6 bg-amber-50 border border-amber-200 rounded text-[0.6rem] flex items-center px-2 text-amber-800">controller-button code walk</div>
+                  <div class="h-6 bg-amber-50 border border-amber-200 rounded text-[0.6rem] flex items-center px-2 text-amber-800">controller-button trigger walk</div>
+                  <div class="h-6 bg-amber-50 border border-amber-200 rounded text-[0.6rem] flex items-center px-2 text-amber-800">dangling macro_id walk</div>
+                  <div class="h-6 bg-amber-50 border border-amber-200 rounded text-[0.6rem] flex items-center px-2 text-amber-800">dangling stepper_id walk</div>
+                  <div class="h-6 bg-amber-50 border border-amber-200 rounded text-[0.6rem] flex items-center px-2 text-amber-800">step-trigger walk</div>
+                  <div class="h-6 bg-amber-50 border border-amber-200 rounded text-[0.6rem] flex items-center px-2 text-amber-800">analog-repeat input walk</div>
+                  <div class="h-6 bg-slate-100 border border-slate-200 rounded text-[0.6rem] flex items-center px-2 text-slate-500">&hellip; ~13 more, order load-bearing</div>
+                </div>
+              </div>
+              <p class="text-[0.65rem] text-slate-500 pt-2 leading-snug">
+                <span class="font-mono">schema.rs</span> synthesizes a 2-profile <span class="font-mono">Config</span>,
+                inserts one binding, runs the whole wall, keeps one bit &mdash; per matrix cell.
+                <span class="font-mono">rules.py</span> hand-transcribes the same matrix as set algebra.
+              </p>
+            </div>
+          </div>
+          <div class="rounded-lg border border-slate-300 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">After &mdash; pure check + config pass</p>
+            <div class="space-y-2">
+              <div class="flex items-stretch gap-2">
+                <div class="w-28 shrink-0 bg-slate-900 text-white schem flex items-center justify-center rounded px-1 text-center">check_binding<br>Option&lt;Input&gt;, &Binding</div>
+                <div class="flex-1 bg-slate-900 rounded flex items-center justify-center text-white schem text-center px-2">every per-binding legality rule<br><span class="opacity-60 normal-case tracking-normal text-[0.6rem]">exhaustively table-tested, ~40 lines</span></div>
+              </div>
+              <div class="flex items-stretch gap-2">
+                <div class="w-28 shrink-0 bg-slate-700 text-white schem flex items-center justify-center rounded px-1 text-center">validate</div>
+                <div class="flex-1 space-y-1">
+                  <div class="h-6 bg-white border border-slate-300 rounded text-[0.6rem] flex items-center px-2 text-slate-600 font-mono">for b in all_bindings: check_binding(b)?</div>
+                  <div class="h-6 bg-white border border-slate-300 rounded text-[0.6rem] flex items-center px-2 text-slate-600">whole-Config pass (dangling refs, hysteresis)</div>
+                </div>
+              </div>
+              <p class="text-[0.65rem] text-slate-500 pt-1 leading-snug">
+                <span class="font-mono">schema.rs</span> calls <span class="font-mono">check_binding</span> per cell &mdash;
+                no synthetic <span class="font-mono">Config</span>. <span class="font-mono">rules.py</span> mirrors
+                one named function, not a matrix reverse-engineered from a monolith.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <div class="space-y-2 text-sm">
+          <p><strong>Problem.</strong> <span class="font-mono">validate</span> conflates pure per-binding legality with whole-<span class="font-mono">Config</span> reference checks, so the per-binding rule is an emergent property that <span class="font-mono">schema.rs</span> and <span class="font-mono">rules.py</span> each reconstruct by brute force.</p>
+          <p><strong>Solution.</strong> Extract a pure <span class="font-mono">check_binding(Option&lt;Input&gt;, &amp;Binding) &rarr; Result</span>; <span class="font-mono">validate</span> loops it and then runs the whole-<span class="font-mono">Config</span> checks as a separate pass.</p>
+          <ul class="list-disc list-inside text-slate-600 space-y-0.5 pt-1">
+            <li>locality: one binding rule, one place</li>
+            <li>leverage: daemon, schema, and GUI mirror share it</li>
+            <li>tests read as a truth table</li>
+            <li>contract fixture stops synthesizing Configs</li>
+            <li>deletion test: interface enforcement stays, monolith dissolves</li>
+          </ul>
+        </div>
+      </article>
+
+      <!-- ============================ CANDIDATE 2 ============================ -->
+      <article id="c2" class="space-y-6">
+        <div class="flex items-baseline justify-between flex-wrap gap-2">
+          <h2 class="font-serif text-2xl">2 &nbsp;One <span class="font-mono text-xl">ConnectionScopedTask</span> behind the two disconnect races</h2>
+          <div class="flex gap-2 shrink-0">
+            <span class="text-xs font-semibold px-2 py-1 rounded bg-emerald-100 text-emerald-800">Strong</span>
+            <span class="text-xs px-2 py-1 rounded bg-slate-100 text-slate-600">in-process · mock</span>
+          </div>
+        </div>
+        <p class="font-mono text-sm text-slate-600">
+          daemon/src/dbus/mod.rs <span class="text-slate-400">SuppressionState (74&ndash;84), DepthStreamState (86&ndash;98),
+          set_output_suppressed (320&ndash;384), start_depth_stream (785&ndash;828), run_depth_stream tail (224&ndash;233),
+          watch_disconnect (247&ndash;270)</span>
+        </p>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">Before &mdash; protocol copied twice</p>
+            <pre class="mermaid">
+flowchart TB
+  subgraph S["set_output_suppressed"]
+    direction TB
+    S1["bump epoch · abort old watcher"] --> S2["injector.set_suppressed"] --> S3["spawn watch_disconnect(epoch)"] --> S4["store handle IF epoch current"]
+  end
+  subgraph D["start_depth_stream"]
+    direction TB
+    D1["bump epoch · abort old watcher"] --> D2["spawn run_depth_stream"] --> D3["spawn watch_disconnect(epoch)"] --> D4["store handle IF epoch current"]
+  end
+  S -.identical epoch discipline.- D
+  classDef dup stroke:#dc2626,stroke-width:2px,fill:#fef2f2;
+  class S,D dup
+            </pre>
+            <p class="text-[0.65rem] text-slate-500 leading-snug">~25 lines of race commentary in <span class="font-mono">set_output_suppressed</span>, reproduced necessarily identically for depth. A 3rd subscription copies it again.</p>
+          </div>
+          <div class="rounded-lg border border-slate-300 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">After &mdash; deep, one interface</p>
+            <pre class="mermaid">
+flowchart TB
+  A["set_output_suppressed"] --> M
+  B["start_depth_stream"] --> M
+  M["ConnectionScopedTask&lt;S&gt;<br/>arm(conn, sender, task, on_clear)"]:::deep
+  M --> I["epoch · supersede · disconnect-clear<br/>(internal)"]:::faded
+  classDef deep fill:#0f172a,color:#fff,stroke:#0f172a;
+  classDef faded fill:#f1f5f9,color:#64748b,stroke:#cbd5e1;
+            </pre>
+            <p class="text-[0.65rem] text-slate-500 leading-snug">Two ~3-line call sites. The last-writer-wins + epoch-guard rule lives in one module, tested once with fake tasks.</p>
+          </div>
+        </div>
+
+        <div class="space-y-2 text-sm">
+          <p><strong>Problem.</strong> <span class="font-mono">SuppressionState</span> and <span class="font-mono">DepthStreamState</span> are two hand-rolled copies of the same connection-scoped-resource-with-disconnect-cleanup protocol, with the epoch guard spelled out in four places.</p>
+          <p><strong>Solution.</strong> A <span class="font-mono">ConnectionScopedTask&lt;S&gt;</span> module owning epoch + watcher + the arm / supersede / disconnect-clear protocol; each D-Bus method becomes one <span class="font-mono">arm(&hellip;)</span> call.</p>
+          <ul class="list-disc list-inside text-slate-600 space-y-0.5 pt-1">
+            <li>locality: subtle race, one module</li>
+            <li>leverage: next subscription is free</li>
+            <li>race tested directly with fake tasks</li>
+            <li>interface shrinks; implementation absorbs the epoch discipline</li>
+            <li>deletion test: complexity collapses, not spreads</li>
+          </ul>
+        </div>
+      </article>
+
+      <!-- ============================ CANDIDATE 3 ============================ -->
+      <article id="c3" class="space-y-6">
+        <div class="flex items-baseline justify-between flex-wrap gap-2">
+          <h2 class="font-serif text-2xl">3 &nbsp;Push the firing/toggle handles <em>into</em> the pure machines</h2>
+          <div class="flex gap-2 shrink-0">
+            <span class="text-xs font-semibold px-2 py-1 rounded bg-amber-100 text-amber-800">Worth exploring</span>
+            <span class="text-xs px-2 py-1 rounded bg-slate-100 text-slate-600">in-process</span>
+          </div>
+        </div>
+        <p class="font-mono text-sm text-slate-600">
+          daemon/src/dispatch.rs <span class="text-slate-400">DispatchState + ChordRuntime (84&ndash;156), chord_slots (870&ndash;884),
+          slot_for (895&ndash;908), trigger_ctx! macro (54&ndash;76), perform_trigger (935&ndash;974)</span> ·
+          daemon/src/chord.rs <span class="text-slate-400">feed/tick take live: &amp;HashMap</span> ·
+          daemon/src/trigger.rs <span class="text-slate-400">decide takes slot: Option&lt;Slot&gt;</span>
+        </p>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">Before &mdash; machine here, handles there</p>
+            <svg viewBox="0 0 320 240" class="w-full h-56">
+              <rect x="10" y="20" width="130" height="90" fill="#0f172a" rx="4"/>
+              <text x="75" y="45" text-anchor="middle" fill="#fff" class="schem">chord::ChordMachine</text>
+              <text x="75" y="65" text-anchor="middle" fill="#94a3b8" font-size="9">window + claimed set</text>
+              <text x="75" y="95" text-anchor="middle" fill="#94a3b8" font-size="9">feed(&hellip;, live, event)</text>
+
+              <rect x="180" y="20" width="130" height="200" fill="none" stroke="#475569" stroke-width="2" rx="4"/>
+              <text x="245" y="40" text-anchor="middle" fill="#475569" class="schem">DispatchState</text>
+              <rect x="192" y="52" width="106" height="24" fill="#f1f5f9" stroke="#cbd5e1"/>
+              <text x="245" y="68" text-anchor="middle" font-size="8">in_flight: FiringHandle</text>
+              <rect x="192" y="82" width="106" height="24" fill="#f1f5f9" stroke="#cbd5e1"/>
+              <text x="245" y="98" text-anchor="middle" font-size="8">toggles: ActiveToggle</text>
+              <rect x="192" y="112" width="106" height="24" fill="#fef2f2" stroke="#fca5a5"/>
+              <text x="245" y="124" text-anchor="middle" font-size="8">chord_slots()</text>
+              <text x="245" y="133" text-anchor="middle" font-size="7" fill="#dc2626">toggle-wins</text>
+              <rect x="192" y="142" width="106" height="24" fill="#fef2f2" stroke="#fca5a5"/>
+              <text x="245" y="154" text-anchor="middle" font-size="8">slot_for()</text>
+              <text x="245" y="163" text-anchor="middle" font-size="7" fill="#dc2626">firing-wins (inverse!)</text>
+              <rect x="192" y="172" width="106" height="24" fill="#fef2f2" stroke="#fca5a5"/>
+              <text x="245" y="188" text-anchor="middle" font-size="8">trigger_ctx! macro</text>
+
+              <line x1="140" y1="90" x2="192" y2="64" class="leak" stroke-width="1.5" marker-end="url(#ah)"/>
+              <line x1="140" y1="70" x2="192" y2="124" class="leak" stroke-width="1.5"/>
+              <text x="160" y="215" fill="#dc2626" font-size="8">rebuilt every PhysicalEvent</text>
+              <defs><marker id="ah" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#dc2626"/></marker></defs>
+            </svg>
+          </div>
+          <div class="rounded-lg border border-slate-300 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">After &mdash; one ring further out</p>
+            <svg viewBox="0 0 320 240" class="w-full h-56">
+              <rect x="40" y="30" width="240" height="150" fill="#0f172a" rx="4"/>
+              <text x="160" y="55" text-anchor="middle" fill="#fff" class="schem">chord / trigger</text>
+              <text x="160" y="78" text-anchor="middle" fill="#94a3b8" font-size="9">feed(chords, event) &rarr; Vec&lt;Effect&gt;</text>
+              <rect x="70" y="95" width="180" height="26" fill="#1e293b" stroke="#334155"/>
+              <text x="160" y="112" text-anchor="middle" fill="#64748b" font-size="8">FiringHandle / ActiveToggle (private)</text>
+              <rect x="70" y="128" width="180" height="26" fill="#1e293b" stroke="#334155"/>
+              <text x="160" y="145" text-anchor="middle" fill="#64748b" font-size="8">one liveness precedence rule</text>
+              <text x="160" y="205" text-anchor="middle" fill="#475569" font-size="9">dispatch just calls feed / tick</text>
+              <text x="160" y="222" text-anchor="middle" fill="#475569" font-size="9">trigger_ctx! macro deleted</text>
+            </svg>
+          </div>
+        </div>
+
+        <div class="space-y-2 text-sm">
+          <p><strong>Problem.</strong> The pure modules own their logic state but not the firing/toggle handles, so every call into them makes dispatch rebuild a liveness snapshot &mdash; via two readers (<span class="font-mono">chord_slots</span>, <span class="font-mono">slot_for</span>) with deliberately <em>inverse</em> tie-breaks, a real bug surface guarded only by a comment.</p>
+          <p><strong>Solution.</strong> Move the <span class="font-mono">ChordKey</span>-keyed handle maps into <span class="font-mono">chord</span>/<span class="font-mono">trigger</span> as private fields (or behind a one-impl <span class="font-mono">Liveness</span> trait), so <span class="font-mono">feed</span> loses its <span class="font-mono">live</span> parameter and the precedence rule has one home.</p>
+          <ul class="list-disc list-inside text-slate-600 space-y-0.5 pt-1">
+            <li>locality: one precedence rule, next to its state</li>
+            <li>the <span class="font-mono">slot_for</span>/<span class="font-mono">chord_slots</span> divergence becomes impossible</li>
+            <li>chord tests drive real liveness, not a reconstruction</li>
+            <li>interface shrinks: <span class="font-mono">feed</span> drops an argument</li>
+            <li>deletes the <span class="font-mono">trigger_ctx!</span> macro</li>
+          </ul>
+        </div>
+      </article>
+
+      <!-- ============================ CANDIDATE 4 ============================ -->
+      <article id="c4" class="space-y-6">
+        <div class="flex items-baseline justify-between flex-wrap gap-2">
+          <h2 class="font-serif text-2xl">4 &nbsp;A <span class="font-mono text-xl">device_control</span> module for the Interface-2 channel</h2>
+          <div class="flex gap-2 shrink-0">
+            <span class="text-xs font-semibold px-2 py-1 rounded bg-amber-100 text-amber-800">Worth exploring</span>
+            <span class="text-xs px-2 py-1 rounded bg-slate-100 text-slate-600">ports &amp; adapters</span>
+          </div>
+        </div>
+        <p class="font-mono text-sm text-slate-600">
+          daemon/src/capture/analog.rs <span class="text-slate-400">open_control_fd (389), send_feature (404), feature_exchange (573),
+          build_razer_cmd + CRC (182), relock (437), assert_status_leds, clear_status_leds, read_device_info (645), DeviceInfo</span> ·
+          consumers: led.rs, main.rs, capture/supervisor.rs, dispatch.rs
+        </p>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">Before &mdash; four features reach into one 1570-line module</p>
+            <pre class="mermaid">
+flowchart LR
+  L[led.rs] -.-> A
+  M[main.rs] -.-> A
+  SUP[capture/supervisor.rs] -.-> A
+  DIS["dispatch.rs<br/>imports DeviceInfo"] -.-> A
+  subgraph A["capture::analog  (1570 lines)"]
+    AS[AnalogCaptureSource]
+    FR["frame + CRC + fd helpers"]
+    LED[assert_status_leds]
+    INFO[read_device_info]
+    RL[relock]
+  end
+  classDef leak stroke:#dc2626,stroke-width:2px;
+  class DIS,L leak
+            </pre>
+          </div>
+          <div class="rounded-lg border border-slate-300 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">After &mdash; the mechanism is its own deep module</p>
+            <pre class="mermaid">
+flowchart TB
+  DC["device_control<br/>open_control_fd · send_feature · feature_exchange · razer frame"]:::deep
+  LED2["led (LED frame)"] --> DC
+  INFO2["device_info (firmware/serial)"] --> DC
+  AN["capture::analog (unlock/relock + capture source)"] --> DC
+  DIS2["dispatch imports DeviceInfo from device_info"] --> INFO2
+  classDef deep fill:#0f172a,color:#fff,stroke:#0f172a;
+            </pre>
+          </div>
+        </div>
+
+        <div class="rounded bg-amber-50 border border-amber-200 text-amber-900 text-sm px-4 py-3">
+          <strong>ADR-0006 check.</strong> ADR-0006 fixes <em>who drives</em> the Status LEDs (dispatch) and the <em>fd lifetime</em> (short-lived) &mdash; not where the frame builder lives. Moving the Razer-frame primitives into a shared <span class="font-mono">device_control</span> module is consistent with it, not a reopening. Confirm with the domain owner before acting.
+        </div>
+
+        <div class="space-y-2 text-sm">
+          <p><strong>Problem.</strong> Status-LED writing, firmware/serial reading, and analog unlock share only a mechanism &mdash; a short-lived Interface-2 hidraw fd plus a Razer command frame &mdash; yet that mechanism lives as private helpers inside the Analog <em>Capture mode</em> module, and <span class="font-mono">dispatch</span> imports <span class="font-mono">DeviceInfo</span> from <span class="font-mono">capture</span> purely by accident of location.</p>
+          <p><strong>Solution.</strong> Extract the fd + frame + CRC + exchange primitives into a <span class="font-mono">device_control</span> module; <span class="font-mono">led</span>, <span class="font-mono">device_info</span> and <span class="font-mono">capture::analog</span> become thin callers of it.</p>
+          <ul class="list-disc list-inside text-slate-600 space-y-0.5 pt-1">
+            <li>seam moves to where behaviour actually varies</li>
+            <li>the frame/CRC logic gets its own name and tests</li>
+            <li><span class="font-mono">DeviceInfo</span> stops living under <span class="font-mono">capture</span></li>
+            <li>deletion test: the primitives are used 4 ways &mdash; they'd reappear</li>
+          </ul>
+        </div>
+      </article>
+
+      <!-- ============================ CANDIDATE 5 ============================ -->
+      <article id="c5" class="space-y-6">
+        <div class="flex items-baseline justify-between flex-wrap gap-2">
+          <h2 class="font-serif text-2xl">5 &nbsp;A contract test for the D-Bus <span class="font-mono text-xl">a{sv}</span> wire shape</h2>
+          <div class="flex gap-2 shrink-0">
+            <span class="text-xs font-semibold px-2 py-1 rounded bg-amber-100 text-amber-800">Worth exploring</span>
+            <span class="text-xs px-2 py-1 rounded bg-slate-100 text-slate-600">mock</span>
+          </div>
+        </div>
+        <p class="font-mono text-sm text-slate-600">
+          daemon/src/dbus/wire.rs <span class="text-slate-400">action_to_dict/_from_dict (242&ndash;310), binding_to_dict, the "omit empty modifiers" rule</span> ·
+          gui/acheron_gui/wire.py <span class="text-slate-400">action_to_variant (encode only)</span> ·
+          gui/tests/test_wire.py <span class="text-slate-400">round-trips wire.py against itself</span>
+        </p>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">Before &mdash; the copy has a gap in its contract</p>
+            <svg viewBox="0 0 320 200" class="w-full h-48">
+              <rect x="10" y="20" width="120" height="50" fill="none" stroke="#334155" stroke-width="2"/>
+              <text x="70" y="42" text-anchor="middle" class="schem">wire.rs</text>
+              <text x="70" y="58" text-anchor="middle" font-size="8" fill="#64748b">encode + decode</text>
+              <rect x="190" y="20" width="120" height="50" fill="none" stroke="#334155" stroke-width="2"/>
+              <text x="250" y="42" text-anchor="middle" class="schem">wire.py</text>
+              <text x="250" y="58" text-anchor="middle" font-size="8" fill="#64748b">encode only</text>
+
+              <line x1="70" y1="70" x2="70" y2="120" class="seam" stroke="#16a34a" stroke-width="2"/>
+              <text x="70" y="140" text-anchor="middle" font-size="8" fill="#16a34a">rules.py contract</text>
+              <text x="70" y="152" text-anchor="middle" font-size="7" fill="#64748b">verdict matrix, catalogs, slug</text>
+
+              <line x1="130" y1="45" x2="190" y2="45" class="leak" stroke-width="2" stroke-dasharray="3 3"/>
+              <text x="160" y="38" text-anchor="middle" font-size="8" fill="#dc2626">tag strings,</text>
+              <text x="160" y="90" text-anchor="middle" font-size="8" fill="#dc2626">field names, "omit []"</text>
+              <text x="160" y="102" text-anchor="middle" font-size="8" fill="#dc2626">&mdash; checked by nobody</text>
+              <line x1="250" y1="70" x2="250" y2="110" class="seam" stroke="#94a3b8" stroke-width="2"/>
+              <text x="250" y="128" text-anchor="middle" font-size="8" fill="#94a3b8">self round-trip only</text>
+            </svg>
+          </div>
+          <div class="rounded-lg border border-slate-300 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">After &mdash; the deliberate copy is contract-tested end to end</p>
+            <svg viewBox="0 0 320 200" class="w-full h-48">
+              <rect x="10" y="20" width="120" height="50" fill="none" stroke="#334155" stroke-width="2"/>
+              <text x="70" y="42" text-anchor="middle" class="schem">wire.rs</text>
+              <rect x="190" y="20" width="120" height="50" fill="none" stroke="#334155" stroke-width="2"/>
+              <text x="250" y="42" text-anchor="middle" class="schem">wire.py</text>
+              <rect x="90" y="95" width="140" height="40" fill="#0f172a"/>
+              <text x="160" y="112" text-anchor="middle" fill="#fff" font-size="8">schema.rs emits encoded</text>
+              <text x="160" y="124" text-anchor="middle" fill="#fff" font-size="8">example dicts (one per variant)</text>
+              <line x1="70" y1="70" x2="140" y2="95" class="seam" stroke="#16a34a" stroke-width="2"/>
+              <line x1="250" y1="70" x2="180" y2="95" class="seam" stroke="#16a34a" stroke-width="2"/>
+              <text x="160" y="160" text-anchor="middle" font-size="8" fill="#16a34a">test_wire_contract.py: byte-identical both directions</text>
+            </svg>
+          </div>
+        </div>
+
+        <div class="rounded bg-amber-50 border border-amber-200 text-amber-900 text-sm px-4 py-3">
+          <strong>ADR-0003.</strong> The model is copied across the process seam on purpose &mdash; not the friction. The friction is a <em>partial</em> contract test that stops short of the wire shape, giving false confidence. This adds a contract test <em>of</em> the deliberate copy; it does not challenge the copy.
+        </div>
+
+        <div class="space-y-2 text-sm">
+          <p><strong>Problem.</strong> The <span class="font-mono">rules.py</span> contract covers the verdict matrix and catalogs but not the <span class="font-mono">a{sv}</span> encoding &mdash; tag strings, field names, the "omit empty <span class="font-mono">modifiers</span>" rule &mdash; and no test executes <span class="font-mono">wire.py</span> output against <span class="font-mono">wire.rs</span> input.</p>
+          <p><strong>Solution.</strong> Have <span class="font-mono">schema.rs</span> emit fully-encoded example dicts per variant; a new <span class="font-mono">test_wire_contract.py</span> asserts <span class="font-mono">wire.py</span> matches them byte-for-byte and <span class="font-mono">wire.rs::*_from_dict</span> round-trips them.</p>
+          <ul class="list-disc list-inside text-slate-600 space-y-0.5 pt-1">
+            <li>closes the one cross-stack gap the split leaves</li>
+            <li>a renamed tag fails a test, not review</li>
+            <li><span class="font-mono">test_wire.py</span>'s self round-trip becomes real</li>
+          </ul>
+        </div>
+      </article>
+
+      <!-- ============================ CANDIDATE 6 ============================ -->
+      <article id="c6" class="space-y-6">
+        <div class="flex items-baseline justify-between flex-wrap gap-2">
+          <h2 class="font-serif text-2xl">6 &nbsp;Give the <span class="font-mono text-xl">AxisWrite</span> emit loop one home</h2>
+          <div class="flex gap-2 shrink-0">
+            <span class="text-xs font-semibold px-2 py-1 rounded bg-slate-200 text-slate-700">Speculative</span>
+            <span class="text-xs px-2 py-1 rounded bg-slate-100 text-slate-600">in-process</span>
+          </div>
+        </div>
+        <p class="font-mono text-sm text-slate-600">
+          daemon/src/dispatch.rs <span class="text-slate-400">handle_event (226&ndash;233), handle_depth_update (403&ndash;405),
+          handle_layer_switch (1018&ndash;1020), run_effects RecomputeAxes (555&ndash;557) + ResetAxisOutputs (577&ndash;579)</span> ·
+          daemon/src/axis.rs <span class="text-slate-400">AxisWrite (55&ndash;59)</span>
+        </p>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">Before &mdash; the same 3 lines, 6 places</p>
+            <div class="space-y-1.5 font-mono text-[0.62rem] text-slate-600">
+              <div class="bg-amber-50 border border-amber-200 rounded px-2 py-1">handle_event &rarr; for w in writes { injector.set_axis_value(w).await }</div>
+              <div class="bg-amber-50 border border-amber-200 rounded px-2 py-1">handle_depth_update &rarr; for w in writes { &hellip; }</div>
+              <div class="bg-amber-50 border border-amber-200 rounded px-2 py-1">handle_layer_switch &rarr; for w in writes { &hellip; }</div>
+              <div class="bg-amber-50 border border-amber-200 rounded px-2 py-1">RecomputeAxes &rarr; for w in writes { &hellip; }</div>
+              <div class="bg-amber-50 border border-amber-200 rounded px-2 py-1">ResetAxisOutputs &rarr; for w in writes { &hellip; }</div>
+              <p class="text-slate-400 pt-1 normal-case">A sync frame / batching / suppression change = a 6-site edit.</p>
+            </div>
+          </div>
+          <div class="rounded-lg border border-slate-300 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">After &mdash; one emit method</p>
+            <div class="space-y-1.5 font-mono text-[0.62rem] text-slate-600">
+              <div class="bg-white border border-slate-300 rounded px-2 py-1">handle_event &rarr; self.emit_axis(writes).await</div>
+              <div class="bg-white border border-slate-300 rounded px-2 py-1">handle_depth_update &rarr; self.emit_axis(writes).await</div>
+              <div class="bg-white border border-slate-300 rounded px-2 py-1">&hellip; all 5 sites, one line each</div>
+              <div class="bg-slate-900 text-white rounded px-2 py-1.5 mt-2">emit_axis(&amp;self, Vec&lt;AxisWrite&gt;) &mdash; or injector.set_axis_values(&amp;[..])</div>
+              <p class="text-slate-400 pt-1 normal-case"><span class="font-mono">axis.rs</span> can own <span class="font-mono">AxisWrite</span> end to end.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="space-y-2 text-sm">
+          <p><strong>Problem.</strong> Every <span class="font-mono">axis::Engine</span> method returns <span class="font-mono">Vec&lt;AxisWrite&gt;</span> and dispatch does the identical drain-to-injector loop at ~6 sites; the <span class="font-mono">AxisWrite &rarr; injector</span> step has no single home.</p>
+          <p><strong>Solution.</strong> One <span class="font-mono">emit_axis_writes</span> method on <span class="font-mono">DispatchState</span>, or push <span class="font-mono">AxisWrite</span> into <span class="font-mono">injector</span> with a <span class="font-mono">set_axis_values(&amp;[AxisWrite])</span>.</p>
+          <ul class="list-disc list-inside text-slate-600 space-y-0.5 pt-1">
+            <li>locality: the next axis-output change is one edit</li>
+            <li>one focused test instead of 6 integration paths</li>
+            <li>small &mdash; real only as insurance</li>
+          </ul>
+        </div>
+      </article>
+
+      <!-- ============================ CANDIDATE 7 ============================ -->
+      <article id="c7" class="space-y-6">
+        <div class="flex items-baseline justify-between flex-wrap gap-2">
+          <h2 class="font-serif text-2xl">7 &nbsp;A typed read-model over the <span class="font-mono text-xl">GetConfig</span> dict</h2>
+          <div class="flex gap-2 shrink-0">
+            <span class="text-xs font-semibold px-2 py-1 rounded bg-amber-100 text-amber-800">Worth exploring</span>
+            <span class="text-xs px-2 py-1 rounded bg-slate-100 text-slate-600">in-process</span>
+          </div>
+        </div>
+        <p class="font-mono text-sm text-slate-600">
+          gui/acheron_gui/app.py <span class="text-slate-400">rebuild (511&ndash;554), ui_state (502)</span> ·
+          gui/acheron_gui/read_model.py <span class="text-slate-400">(38 lines, "deliberately not a read-model")</span> ·
+          raw digs in device_overview.py, binding_editor.py, library_view.py <span class="text-slate-400">(~17 sites)</span>
+        </p>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">Before &mdash; every view digs the raw dict</p>
+            <svg viewBox="0 0 320 210" class="w-full h-52">
+              <ellipse cx="160" cy="30" rx="90" ry="16" fill="#e2e8f0" stroke="#94a3b8"/>
+              <text x="160" y="34" text-anchor="middle" font-size="9" fill="#475569">GetConfig() dict[str, Any]</text>
+              <g font-size="7.5" font-family="monospace" fill="#dc2626">
+                <text x="30" y="80">config["profiles"][p][f"axis_{layer}"]</text>
+                <text x="30" y="100">config["profiles"][p][f"chords_{layer}"]</text>
+                <text x="30" y="120">.get(inp)  # is there a binding?</text>
+                <text x="30" y="140">config["profiles"][p]["status_leds"]</text>
+              </g>
+              <line x1="90" y1="42" x2="60" y2="70" stroke="#94a3b8"/>
+              <line x1="140" y1="44" x2="120" y2="90" stroke="#94a3b8"/>
+              <line x1="200" y1="44" x2="230" y2="110" stroke="#94a3b8"/>
+              <line x1="240" y1="42" x2="250" y2="130" stroke="#94a3b8"/>
+              <text x="160" y="175" text-anchor="middle" font-size="8" fill="#64748b">device_overview · binding_editor · library_view</text>
+              <text x="160" y="192" text-anchor="middle" font-size="8" fill="#64748b">rebuild threaded through nearly every build_*</text>
+            </svg>
+          </div>
+          <div class="rounded-lg border border-slate-300 bg-white p-4">
+            <p class="schem text-slate-400 mb-3">After &mdash; one accessor absorbs the traversal</p>
+            <svg viewBox="0 0 320 210" class="w-full h-52">
+              <ellipse cx="160" cy="26" rx="80" ry="14" fill="#e2e8f0" stroke="#94a3b8"/>
+              <text x="160" y="30" text-anchor="middle" font-size="8" fill="#475569">GetConfig() dict</text>
+              <rect x="70" y="55" width="180" height="70" fill="#0f172a" rx="4"/>
+              <text x="160" y="75" text-anchor="middle" fill="#fff" class="schem">ConfigView</text>
+              <text x="160" y="94" text-anchor="middle" fill="#94a3b8" font-size="8">.profile(n).layer(l).binding(input)</text>
+              <text x="160" y="108" text-anchor="middle" fill="#94a3b8" font-size="8">.axis_assignment(input, l) · .status_leds()</text>
+              <line x1="160" y1="40" x2="160" y2="55" stroke="#94a3b8"/>
+              <g font-size="8" fill="#475569">
+                <text x="60" y="155" text-anchor="middle">device_overview</text>
+                <text x="160" y="155" text-anchor="middle">binding_editor</text>
+                <text x="260" y="155" text-anchor="middle">library_view</text>
+              </g>
+              <line x1="110" y1="125" x2="65" y2="143" stroke="#94a3b8"/>
+              <line x1="160" y1="125" x2="160" y2="143" stroke="#94a3b8"/>
+              <line x1="210" y1="125" x2="255" y2="143" stroke="#94a3b8"/>
+              <text x="160" y="185" text-anchor="middle" font-size="8" fill="#16a34a">views test against a small ConfigView fixture</text>
+            </svg>
+          </div>
+        </div>
+
+        <div class="rounded bg-amber-50 border border-amber-200 text-amber-900 text-sm px-4 py-3">
+          <strong>ADR-0005 flag.</strong> <span class="font-mono">read_model.py</span>'s docstring cites ADR-0005 to resist exactly this. ADR-0005 protects the GUI's hand-mirror of the daemon's stateful <em>edit validation</em> (<span class="font-mono">daemon_stub.py</span>). A read-only accessor over <span class="font-mono">GetConfig</span>'s own output is a different thing &mdash; but close enough to the ADR's spirit that it needs the domain owner's ruling before acting.
+        </div>
+
+        <div class="space-y-2 text-sm">
+          <p><strong>Problem.</strong> The config payload is an untyped dict whose schema is implicit; every view re-implements traversal (<span class="font-mono">f"axis_{layer}"</span> string-built keys), and <span class="font-mono">rebuild</span> is threaded as the universal change signal through nearly every builder with an ad-hoc <span class="font-mono">ui_state</span> bag.</p>
+          <p><strong>Solution.</strong> A thin typed <span class="font-mono">ConfigView</span> read accessor over the wire payload &mdash; not the stateful edit mirror ADR-0005 protects &mdash; generalising the one scan <span class="font-mono">read_model.py</span> already does.</p>
+          <ul class="list-disc list-inside text-slate-600 space-y-0.5 pt-1">
+            <li>locality: dict schema known in one place</li>
+            <li>the <span class="font-mono">f"axis_{layer}"</span> typo surface collapses</li>
+            <li>views testable against a fixture, not a full raw dict</li>
+          </ul>
+        </div>
+      </article>
+
+      <!-- ============================ TOP RECOMMENDATION ============================ -->
+      <section id="top-recommendation" class="border-t border-slate-200 pt-10">
+        <p class="schem text-slate-400">Top recommendation</p>
+        <div class="mt-3 rounded-xl bg-slate-900 text-white p-8 space-y-4">
+          <h2 class="font-serif text-3xl">Start with <a href="#c1" class="underline decoration-emerald-400 decoration-2 underline-offset-4">#1 &mdash; split <span class="font-mono">config::validate</span></a></h2>
+          <p class="text-slate-300 leading-relaxed max-w-3xl">
+            It is the one <strong>Strong</strong> candidate whose payoff compounds: a pure
+            <span class="font-mono">check_binding</span> seam is the missing counterpart to the GUI's
+            <span class="font-mono">rules.py</span>, it lets <span class="font-mono">schema.rs</span> stop synthesizing
+            throwaway <span class="font-mono">Config</span>s, it makes per-binding legality testable as a truth table, and
+            &mdash; per the subagent's note &mdash; it may later let <span class="font-mono">daemon_stub.py</span> delegate
+            more of its hand-written surface to a contract-tested mirror, without touching what ADR-0005 protects.
+            No ADR conflict, contained blast radius, immediate test leverage.
+          </p>
+          <p class="text-slate-400 text-sm">
+            Runner-up: <a href="#c2" class="underline">#2 &mdash; <span class="font-mono">ConnectionScopedTask</span></a>. Also Strong;
+            the disconnect race is duplicated today and a third connection-scoped subscription makes it three.
+          </p>
+        </div>
+      </section>
+
+    </main>
+  </body>
+</html>

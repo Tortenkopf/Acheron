@@ -90,6 +90,26 @@ _Avoid_: trigger point, threshold
 **Release point**:
 The (lower) Depth at which a grid key's Binding is considered released (fires an Up), paired with its Actuation point so a single boundary doesn't chatter (hysteresis).
 
+**Actuation stage**:
+A `(ActuationPoint, Binding)` pair — an Actuation/Release point paired with a Binding it fires. Every grid key's ordinary Binding is its **primary stage**; a grid key may additionally carry a **deep stage**, a second Actuation stage whose band sits strictly deeper (`deep.release > primary.actuation` — the two bands are disjoint and stacked, never overlapping). A deep stage requires a primary stage on the same Input/Layer to exist at all — deleting the primary cascade-deletes the deep stage. Capped at two stages (primary + deep); key travel makes a third impractical. Silently inert in Digital Capture mode (no Depth to threshold against) — only the primary stage fires. The deep stage's Binding is scoped per-Input per-Layer, like the primary's; its Actuation/Release point and Staging mode are scoped per-Input per-Profile, shared across Base and Held, like the primary's own Actuation point. User-facing feature name: "Dual-stage keys."
+_Avoid_: sub-binding, second binding, layer (Actuation stage is a depth concept, unrelated to the Base/Held Layer)
+
+**Staging mode**:
+A per-Input, per-Profile choice governing how a grid key's primary and deep Actuation stages hand off as Depth crosses the deep band: Handoff, No-Return, Additive, or Quick-Skip. Shared across Base and Held, like the deep stage's own Actuation point — it interprets physical travel, not what either stage does when triggered. A key with no deep stage has no meaningful Staging mode.
+_Avoid_: transition mode, handoff mode (reserved for the Handoff mode specifically)
+
+**Handoff**:
+The Staging mode where crossing into the deep band releases the primary stage and presses the deep stage, and crossing back out releases the deep stage and re-presses the primary — exactly one stage held at a time, symmetric (the "camera shutter" model). The default Staging mode.
+
+**No-Return**:
+The Staging mode identical to Handoff on the way deeper, but the primary stage does not re-press on the way back up — once the deep stage has fired, the key stays quiet until fully released and pressed again.
+
+**Additive**:
+The Staging mode where both stages fire and are held simultaneously — reaching the deep band adds the deep stage's firing without releasing the primary.
+
+**Quick-Skip**:
+The Staging mode where the primary stage's Down is held back for a ~50ms window (the Chord-detection window's constant, reused): if the deep band is reached within that window, the primary is suppressed entirely for the rest of the press (never fires, and its eventual release does not fire it either — the release path behaves like No-Return); otherwise the primary fires late (delayed by up to the window) and the key runs as ordinary Handoff for the rest of the press. Costs up to 50ms of primary-Down latency by construction — the price of not knowing, at the moment of the primary crossing, whether the press will continue into the deep band.
+
 **Status LED**:
 One of the three fixed-colour (orange, green, blue) on/off indicator LEDs on the device's left side. On/off only — no brightness, no custom colour, no non-static effect (all hardware limits). Driven only by the active Profile's Status LED assignment, never by a Binding or a Layer.
 _Avoid_: profile LED, keymap indicator (Razer's Synapse term), Chroma (the separate per-key backlight)
