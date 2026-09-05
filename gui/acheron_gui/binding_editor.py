@@ -1688,10 +1688,13 @@ def build_binding_editor(
         panel_scroller.set_max_content_height(_dual_stage_scroller_max_height())
         panel_scroller.set_child(panel)
         box.append(panel_scroller)
-        btn_row = Gtk.Box(spacing=8)
-        btn_row.append(save_btn)
-        btn_row.append(apply_btn)
+        # Ticket 11: right-aligned, Save (the primary commit) in the corner —
+        # this row is a sibling of `panel_scroller`, not a child of it, so it
+        # stays visible however tall the panel grows or scrolls.
+        btn_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
         btn_row.append(clear_btn)
+        btn_row.append(apply_btn)
+        btn_row.append(save_btn)
         box.append(btn_row)
         return box
 
@@ -1700,7 +1703,8 @@ def build_binding_editor(
     )
     box.append(fields)
 
-    btn_row = Gtk.Box(spacing=8)
+    # Ticket 11: `[Clear Binding] [Save]`, right-aligned, Save in the corner.
+    btn_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
 
     def on_save(b):
         binding = get_binding()
@@ -1715,7 +1719,6 @@ def build_binding_editor(
         on_saved()
 
     save_btn.connect("clicked", on_save)
-    btn_row.append(save_btn)
 
     def on_clear(b):
         if current_axis_target is not None:
@@ -1739,6 +1742,7 @@ def build_binding_editor(
 
     clear_btn.connect("clicked", on_clear)
     btn_row.append(clear_btn)
+    btn_row.append(save_btn)
     box.append(btn_row)
 
     if is_grid_input(inp):
@@ -1869,11 +1873,12 @@ def build_chord_binding_dialog(
         on_saved()
 
     save_btn.connect("clicked", on_save)
-    btn_row = Gtk.Box(spacing=8)
-    btn_row.append(save_btn)
     cancel_btn = Gtk.Button(label="Cancel")
     cancel_btn.connect("clicked", lambda b: dialog.close())
+    # Ticket 11: `[Cancel] [Save Chord]`, right-aligned.
+    btn_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
     btn_row.append(cancel_btn)
+    btn_row.append(save_btn)
     outer.append(btn_row)
 
     return dialog

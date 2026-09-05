@@ -1758,6 +1758,67 @@ def test_apply_button_is_plain_while_save_keeps_the_accent():
     assert "suggested-action" in button_labeled(editor, "Save").get_css_classes()
 
 
+# --- consistent right-aligned button rows across the three editors
+#     (tartarus-dual-stage-keys ticket 11) ---
+
+
+def _button_row(root, *, save_label="Save"):
+    """The action-button row — the Gtk.Box holding the editor's Save/Apply/
+    Clear (or Cancel/Save Chord) buttons as direct children."""
+    return button_labeled(root, save_label).get_parent()
+
+
+def _row_button_labels(row):
+    labels = []
+    child = row.get_first_child()
+    while child is not None:
+        if isinstance(child, Gtk.Button):
+            labels.append(child.get_label())
+        child = child.get_next_sibling()
+    return labels
+
+
+def _has_ancestor_of_type(widget, typ):
+    parent = widget.get_parent()
+    while parent is not None:
+        if isinstance(parent, typ):
+            return True
+        parent = parent.get_parent()
+    return False
+
+
+def test_grid_editor_button_row_is_clear_apply_save_right_aligned():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+
+    row = _button_row(editor)
+    assert _row_button_labels(row) == ["Clear Binding", "Apply", "Save"]
+    assert row.get_halign() == Gtk.Align.END
+    # Outside the panel's scroll container — visible however tall the panel grows.
+    assert not _has_ancestor_of_type(row, Gtk.ScrolledWindow)
+    assert find_all(editor, lambda w: isinstance(w, Gtk.ScrolledWindow)) != []
+
+
+def test_non_grid_editor_button_row_is_clear_save_right_aligned():
+    stub = DaemonStub()
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "mode_key", lambda: None)
+
+    row = _button_row(editor)
+    assert _row_button_labels(row) == ["Clear Binding", "Save"]
+    assert row.get_halign() == Gtk.Align.END
+
+
+def test_chord_dialog_button_row_is_cancel_save_chord_right_aligned():
+    stub = DaemonStub()
+    dialog = build_chord_binding_dialog(
+        stub, stub.get_config(), "Default", "base", ["grid_r1c1", "grid_r1c2"], None, lambda: None, None
+    )
+
+    row = _button_row(dialog, save_label="Save Chord")
+    assert _row_button_labels(row) == ["Cancel", "Save Chord"]
+    assert row.get_halign() == Gtk.Align.END
+
+
 def test_non_grid_and_chord_editors_have_no_apply_button():
     stub = DaemonStub()
 
