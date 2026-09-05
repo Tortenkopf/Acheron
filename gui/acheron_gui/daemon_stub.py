@@ -60,6 +60,20 @@ _TRIGGER_LABELS = {
     "analog_repeat": "Analog-repeat",
 }
 
+# tartarus-dual-stage-keys ticket 05: matches `ActuationPoint::default()`
+# (daemon/src/config.rs) — what `DeepStageConfig::default()`'s `actuation`
+# field carries, so `set_staging_mode` can validate the same resolved
+# actuation/release pair a fresh `.entry(input).or_default()` on the real
+# Daemon would materialize.
+_DEEP_STAGE_DEFAULT_ACTUATION = {"actuation": 128, "release": 112}
+
+# tartarus-dual-stage-keys ticket 05: `daemon/src/dbus/wire.rs::staging_mode_
+# from_str`'s wire vocabulary — a wire-parse-boundary check, not a
+# `config::validate` rule, so it lives here (not `rules.py`, which mirrors
+# `validate` only) as the closest match to `set_axis_assignment`'s own
+# `rules.AXIS_TARGETS` membership check.
+_STAGING_MODES = frozenset({"handoff", "no_return", "additive", "quick_skip"})
+
 
 class DaemonStub:
     _SEED_PROFILE = {
@@ -90,9 +104,8 @@ class DaemonStub:
         # tartarus-dual-stage-keys ticket 01: a Profile's deep-stage Bindings
         # and per-Input deep-stage config, keyed the same way the real
         # Daemon's wire shape does (`daemon/src/dbus/wire.rs::profile_to_
-        # dict`). No GUI mutation path exists yet (ticket 05) — this only
-        # seeds the shape so stub-backed GUI code sees the same `GetConfig`
-        # dict a real Daemon returns.
+        # dict`). Mutated via `set_deep_stage`/`clear_deep_stage`/
+        # `set_deep_actuation`/`set_staging_mode` (ticket 05) below.
         "deep_base": {},
         "deep_held": {},
         "deep_stages": {},
@@ -612,6 +625,141 @@ class DaemonStub:
             "blue": blue,
         }
         self.calls.append(("set_status_leds", orange, green, blue))
+
+    # --- tartarus-dual-stage-keys ticket 05: deep-stage D-Bus surface -------
+    #
+    # Mirrors `daemon/src/edit.rs`'s `SetDeepStage`/`ClearDeepStage`/
+    # `SetDeepActuation`/`SetStagingMode` arms plus the seven
+    # `config::validate` rules those Edits can newly trip (ADR 0005 — hand-
+    # written, not shared/generated). `rules.py` gets nothing for these: all
+    # seven are whole-Config/cross-map checks, not pure functions of one
+    # Binding, so they live here as `_reject_if_*` guard clauses run before
+    # the mutate, the same shape `set_chord_binding`/`set_actuation_point`
+    # already use.
+
+    def _resolved_primary_actuation(self, input_str: str) -> dict:
+        """The Actuation/Release point governing `input_str`'s primary
+        stage — its per-key override if any, else the active Profile's
+        `default_actuation`. Mirrors `Profile::resolved_actuation_point`,
+        which `DeepStageBandOverlapsPrimary` checks against."""
+        profile = self._profiles[self._active_profile]
+        return profile["actuation_overrides"].get(input_str, profile["default_actuation"])
+
+    def _reject_if_not_grid_deep_stage_input(self, input_str: str) -> None:
+        # `ConfigError::InvalidDeepStageInput` — only Grid keys have Depth to
+        # threshold a deep stage against.
+        if not is_grid_input(input_str):
+            raise InvalidBindingError(f"{input_str!r} is not a Grid Input")
+
+    def _reject_if_deep_stage_hysteresis_invalid(self, actuation: int, release: int) -> None:
+        # `ConfigError::DeepStageReleaseNotBelowActuation` — the deep pair's
+        # own hysteresis; "at or above" defeats it too, same as the primary's.
+        if release >= actuation:
+            raise InvalidBindingError("deep stage release must be below deep stage actuation")
+
+    def _reject_if_deep_stage_band_overlaps_primary(self, input_str: str, release: int) -> None:
+        # `ConfigError::DeepStageBandOverlapsPrimary` — the disjoint-and-
+        # stacked constraint: the deep band's release must sit strictly
+        # above the resolved primary Actuation point.
+        primary = self._resolved_primary_actuation(input_str)
+        if release <= primary["actuation"]:
+            raise InvalidBindingError(
+                f"{input_str!r}'s deep stage release point must be strictly greater than its "
+                "primary actuation point"
+            )
+
+    def _reject_if_deep_stage_without_primary(self, input_str: str, layer: str) -> None:
+        # `ConfigError::DeepStageWithoutPrimary` — a deep Binding can never
+        # exist on a Layer with no primary Binding there.
+        if input_str not in self._profiles[self._active_profile][layer]:
+            raise InvalidBindingError(
+                f"{input_str!r} has no primary Binding on this Layer to carry a deep stage"
+            )
+
+    def _reject_if_deep_stage_missing_config(self, input_str: str) -> None:
+        # `ConfigError::DeepStageMissingConfig` — a deep Binding needs a
+        # matching `deep_stages` entry (Actuation point + Staging mode).
+        if input_str not in self._profiles[self._active_profile]["deep_stages"]:
+            raise InvalidBindingError(
+                f"{input_str!r} has no deep Actuation point / Staging mode configured"
+            )
+
+    def _reject_if_analog_repeat_on_dual_stage_key(
+        self, input_str: str, layer: str, deep_trigger: str | None
+    ) -> None:
+        # `ConfigError::AnalogRepeatOnDualStageKey` — neither stage of a
+        # dual-stage key may carry `analog_repeat`: the background task
+        # ignores Actuation points entirely and would fight the staging
+        # logic.
+        primary = self._profiles[self._active_profile][layer].get(input_str)
+        primary_is_analog_repeat = primary is not None and primary.get("trigger") == "analog_repeat"
+        if deep_trigger == "analog_repeat" or primary_is_analog_repeat:
+            raise InvalidBindingError(
+                f"{input_str!r} cannot use analog_repeat on either stage while it has a deep stage"
+            )
+
+    def _reject_if_chord_member_deep_stage_conflict(self, input_str: str, layer: str) -> None:
+        # `ConfigError::ChordMemberDeepStageConflict` — the two Depth
+        # interpretations tangle, so a Chord member can never also carry a
+        # deep stage.
+        chords = self._profiles[self._active_profile][f"chords_{layer}"]
+        if any(input_str in key.split("+") for key in chords):
+            raise InvalidBindingError(
+                f"{input_str!r} is a Chord member and cannot also carry a deep stage"
+            )
+
+    def set_deep_stage(self, input_str: str, layer: str, binding: dict) -> None:
+        # Order mirrors `config::validate`'s: the generic per-Action/Trigger
+        # pass (`binding::check_binding`, `_validate_binding_action` here)
+        # runs before the dual-stage-specific checks appended at the end of
+        # `validate` (`daemon/src/config.rs:1275` vs. `:1415`), so a payload
+        # that's both non-Grid *and* carries an unknown macro/stepper id
+        # surfaces the same first error the real Daemon would.
+        self._validate_binding_action(binding, input_str)
+        self._reject_if_not_grid_deep_stage_input(input_str)
+        self._reject_if_deep_stage_without_primary(input_str, layer)
+        self._reject_if_deep_stage_missing_config(input_str)
+        self._reject_if_analog_repeat_on_dual_stage_key(input_str, layer, binding.get("trigger"))
+        self._reject_if_chord_member_deep_stage_conflict(input_str, layer)
+        stored = copy.deepcopy(binding)
+        self._profiles[self._active_profile][f"deep_{layer}"][input_str] = stored
+        self.calls.append(("set_deep_stage", input_str, layer, copy.deepcopy(stored)))
+
+    def clear_deep_stage(self, input_str: str, layer: str) -> None:
+        deep = self._profiles[self._active_profile][f"deep_{layer}"]
+        if input_str not in deep:
+            raise NotFoundError(f"no deep Binding is set for {input_str!r}")
+        del deep[input_str]
+        self.calls.append(("clear_deep_stage", input_str, layer))
+
+    def set_deep_actuation(self, input_str: str, actuation: int, release: int) -> None:
+        self._reject_if_not_grid_deep_stage_input(input_str)
+        self._reject_if_deep_stage_hysteresis_invalid(actuation, release)
+        self._reject_if_deep_stage_band_overlaps_primary(input_str, release)
+        stages = self._profiles[self._active_profile]["deep_stages"]
+        cfg = stages.setdefault(
+            input_str, {"actuation": dict(_DEEP_STAGE_DEFAULT_ACTUATION), "mode": "handoff"}
+        )
+        cfg["actuation"] = {"actuation": actuation, "release": release}
+        self.calls.append(("set_deep_actuation", input_str, actuation, release))
+
+    def set_staging_mode(self, input_str: str, mode: str) -> None:
+        if mode not in _STAGING_MODES:
+            # Mirrors the real Daemon's `wire::staging_mode_from_str`
+            # rejecting an unknown mode string outright, before an `Edit` is
+            # even built.
+            raise InvalidBindingError(f"{mode!r} is not a valid Staging mode")
+        stages = self._profiles[self._active_profile]["deep_stages"]
+        existing = stages.get(input_str)
+        actuation = existing["actuation"] if existing else _DEEP_STAGE_DEFAULT_ACTUATION
+        self._reject_if_not_grid_deep_stage_input(input_str)
+        self._reject_if_deep_stage_hysteresis_invalid(
+            actuation["actuation"], actuation["release"]
+        )
+        self._reject_if_deep_stage_band_overlaps_primary(input_str, actuation["release"])
+        cfg = stages.setdefault(input_str, {"actuation": dict(actuation), "mode": "handoff"})
+        cfg["mode"] = mode
+        self.calls.append(("set_staging_mode", input_str, mode))
 
     def start_depth_stream(self, input_str: str, on_depth: Callable[[int], None]) -> None:
         self._depth_target = input_str

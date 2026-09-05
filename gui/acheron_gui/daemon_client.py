@@ -144,6 +144,14 @@ class DaemonClient(Protocol):
 
     def set_status_leds(self, orange: bool, green: bool, blue: bool) -> None: ...
 
+    def set_deep_stage(self, input_str: str, layer: str, binding: dict) -> None: ...
+
+    def clear_deep_stage(self, input_str: str, layer: str) -> None: ...
+
+    def set_deep_actuation(self, input_str: str, actuation: int, release: int) -> None: ...
+
+    def set_staging_mode(self, input_str: str, mode: str) -> None: ...
+
     def start_depth_stream(self, input_str: str, on_depth: Callable[[int], None]) -> None: ...
 
     def stop_depth_stream(self, input_str: str) -> None: ...
@@ -290,6 +298,21 @@ class DBusDaemonClient:
 
     def set_status_leds(self, orange: bool, green: bool, blue: bool) -> None:
         self._call("SetStatusLeds", GLib.Variant("(bbb)", (orange, green, blue)))
+
+    def set_deep_stage(self, input_str: str, layer: str, binding: dict) -> None:
+        parameters = GLib.Variant(
+            "(ssa{sv})", (input_str, layer, wire.binding_to_variant(binding))
+        )
+        self._call("SetDeepStage", parameters)
+
+    def clear_deep_stage(self, input_str: str, layer: str) -> None:
+        self._call("ClearDeepStage", GLib.Variant("(ss)", (input_str, layer)))
+
+    def set_deep_actuation(self, input_str: str, actuation: int, release: int) -> None:
+        self._call("SetDeepActuation", GLib.Variant("(syy)", (input_str, actuation, release)))
+
+    def set_staging_mode(self, input_str: str, mode: str) -> None:
+        self._call("SetStagingMode", GLib.Variant("(ss)", (input_str, mode)))
 
     def start_depth_stream(self, input_str: str, on_depth: Callable[[int], None]) -> None:
         """Starts (or retargets) live depth streaming for `input_str`,

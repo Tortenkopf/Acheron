@@ -12,9 +12,9 @@ surface".
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Four new `edit` module `Edit` variants:
+- [x] Four new `edit` module `Edit` variants:
   - `SetDeepStage { input, layer, binding }` — creates/edits the deep Binding on
     `layer`. Mirrors `SetBinding` one level deeper. Relies entirely on the trailing
     `config::validate(&next)?` (no inline check) for `DeepStageWithoutPrimary`/
@@ -33,17 +33,17 @@ surface".
     creation, no `Effect`.
   - All four `plan` arms rely solely on the trailing `config::validate(&next)?` —
     no inline checks, no new `Effect`s.
-- [ ] Four thin D-Bus method wrappers on `com.acheron.Daemon`, shaped exactly like
+- [x] Four thin D-Bus method wrappers on `com.acheron.Daemon`, shaped exactly like
       `set_axis_assignment`/`set_actuation_point` (parse wire args, build the
       `Edit`, `self.apply(...)`): `SetDeepStage(input, layer, binding_dict)`,
       `ClearDeepStage(input, layer)`, `SetDeepActuation(input, u8, u8)`,
       `SetStagingMode(input, string)`.
-- [ ] **No new signal.** These four emit nothing, following `SetBinding`/
+- [x] **No new signal.** These four emit nothing, following `SetBinding`/
       `SetActuationPoint`'s existing precedent — the GUI rebuilds from `GetConfig`
       after its own calls.
-- [ ] `daemon_client.py`: four new methods + `Protocol` stubs, mechanical mirror of
+- [x] `daemon_client.py`: four new methods + `Protocol` stubs, mechanical mirror of
       `set_axis_assignment`/`set_actuation_point`.
-- [ ] `daemon_stub.py`: matching methods following `set_chord_binding`/
+- [x] `daemon_stub.py`: matching methods following `set_chord_binding`/
       `set_actuation_point`'s guard-clause-before-mutate shape — a Grid-input check,
       the deep-pair hysteresis check (`release < actuation`), the disjoint-band
       check against the resolved primary Actuation point, `_validate_binding_action`
@@ -51,13 +51,13 @@ surface".
       (`DeepStageWithoutPrimary`/`DeepStageMissingConfig`), and
       `AnalogRepeatOnDualStageKey`/`ChordMemberDeepStageConflict` as
       `_reject_if_*`-style helpers.
-- [ ] `wire.py`/`read_model.py` surface `deep_base`/`deep_held`/`deep_stages` in the
+- [x] `wire.py`/`read_model.py` surface `deep_base`/`deep_held`/`deep_stages` in the
       config dict the GUI reads.
-- [ ] `rules.py` gets nothing — all seven new rules are whole-`Config`/cross-map
+- [x] `rules.py` gets nothing — all seven new rules are whole-`Config`/cross-map
       checks, not pure functions of one Binding; they land in `daemon_stub.py` only
       (a deep Binding's own payload/Trigger-mode legality is already covered for
       free via `_validate_binding_action`).
-- [ ] Tests: a unit test per new `Edit` variant confirming it mutates the right
+- [x] Tests: a unit test per new `Edit` variant confirming it mutates the right
       field and relies on `validate` rather than an inline check; `daemon_stub.py`
       contract tests for all seven rejection paths, contract-tested the same way
       existing `daemon_stub` rules are; a D-Bus round-trip test (`SetDeepStage`/

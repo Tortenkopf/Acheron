@@ -25,7 +25,8 @@ use std::path::Path;
 
 use crate::config::{
     self, Action, ActuationPoint, AxisTarget, Binding, ChordKey, Config, Layer, MacroId,
-    MacroStepDto, ModeKeyRole, Profile, StatusLeds, StepDirection, StepperId, StepperItem,
+    MacroStepDto, ModeKeyRole, Profile, StagingMode, StatusLeds, StepDirection, StepperId,
+    StepperItem,
 };
 use crate::input::Input;
 
@@ -233,6 +234,40 @@ pub enum Edit {
         green: bool,
         blue: bool,
     },
+    /// Creates or edits the deep Binding on the active Profile's `layer`
+    /// for a dual-stage grid key (tartarus-dual-stage-keys ticket 05 —
+    /// CONTEXT.md: Actuation stage). Mirrors `SetBinding` one level deeper.
+    /// Relies entirely on the trailing `config::validate(&next)?` (no
+    /// inline check) for `DeepStageWithoutPrimary`/`DeepStageMissingConfig`
+    /// — sequencing across the primary Binding, the deep Binding, and the
+    /// `deep_stages` config is the caller's job, the same way
+    /// `SetAxisAssignment` leaves "was there already a Binding here" to
+    /// `validate`'s reachable states.
+    SetDeepStage {
+        input: Input,
+        layer: Layer,
+        binding: Binding,
+    },
+    /// Removes the deep Binding on `layer`. Fails `NotFound` if `input` has
+    /// no deep Binding there. Does **not** cascade-clear `deep_stages` or
+    /// force-release a live slot — that's a runtime-teardown concern a
+    /// later ticket owns.
+    ClearDeepStage { input: Input, layer: Layer },
+    /// Sets a grid key's deep Actuation/Release point pair on the active
+    /// Profile, `.entry(input).or_default()`-creating a fresh
+    /// `DeepStageConfig` (mode defaulting to `StagingMode::Handoff`) if none
+    /// exists yet. **No `Effect`** — unlike `SetActuationPoint`, nothing
+    /// needs a live snapshot pushed to it: `stage::Engine` lives in dispatch
+    /// and reads `Config` directly each tick.
+    SetDeepActuation {
+        input: Input,
+        actuation: u8,
+        release: u8,
+    },
+    /// Sets a grid key's Staging mode on the active Profile, the same
+    /// `.or_default()`-creation as `SetDeepActuation`. No `Effect`, same
+    /// reasoning.
+    SetStagingMode { input: Input, mode: StagingMode },
 }
 
 /// A post-commit effect the caller must run — described here by `plan`,
@@ -620,6 +655,42 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
                 blue,
             };
             effects.push(Effect::AssertStatusLeds);
+        }
+        Edit::SetDeepStage {
+            input,
+            layer,
+            binding,
+        } => {
+            active_profile_mut(&mut next)
+                .deep_layer_mut(layer)
+                .insert(input, binding);
+        }
+        Edit::ClearDeepStage { input, layer } => {
+            if active_profile_mut(&mut next)
+                .deep_layer_mut(layer)
+                .remove(&input)
+                .is_none()
+            {
+                return Err(CommandError::NotFound);
+            }
+        }
+        Edit::SetDeepActuation {
+            input,
+            actuation,
+            release,
+        } => {
+            active_profile_mut(&mut next)
+                .deep_stages
+                .entry(input)
+                .or_default()
+                .actuation = ActuationPoint { actuation, release };
+        }
+        Edit::SetStagingMode { input, mode } => {
+            active_profile_mut(&mut next)
+                .deep_stages
+                .entry(input)
+                .or_default()
+                .mode = mode;
         }
     }
 
@@ -1474,6 +1545,169 @@ mod tests {
         ));
     }
 
+    // --- deep-stage Edit variants (tartarus-dual-stage-keys ticket 05) --------
+
+    fn with_primary_and_deep_stage(input: Input) -> Config {
+        let mut config = seed();
+        active(&mut config).base.insert(input, keypress());
+        active(&mut config).deep_stages.insert(
+            input,
+            crate::config::DeepStageConfig {
+                actuation: ActuationPoint {
+                    actuation: 220,
+                    release: 200,
+                },
+                mode: StagingMode::Handoff,
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn set_deep_stage_inserts_into_the_active_profiles_deep_layer_and_relies_on_validate() {
+        let config = with_primary_and_deep_stage(Input::Grid(1, 1));
+        let (next, outcome) = plan_ok(
+            &config,
+            Edit::SetDeepStage {
+                input: Input::Grid(1, 1),
+                layer: Layer::Base,
+                binding: keypress(),
+            },
+        );
+        assert_eq!(
+            next.profiles[DEFAULT_PROFILE_NAME].deep_base[&Input::Grid(1, 1)],
+            keypress()
+        );
+        assert!(outcome.effects.is_empty());
+
+        // No inline "needs a primary" check in `plan` itself — `validate`
+        // alone rejects this (`DeepStageWithoutPrimary`/`DeepStageMissingConfig`).
+        assert!(matches!(
+            plan_err(
+                &seed(),
+                Edit::SetDeepStage {
+                    input: Input::Grid(1, 1),
+                    layer: Layer::Base,
+                    binding: keypress(),
+                }
+            ),
+            CommandError::InvalidRequest(_)
+        ));
+    }
+
+    #[test]
+    fn clear_deep_stage_removes_it_and_rejects_an_absent_one() {
+        let mut config = with_primary_and_deep_stage(Input::Grid(1, 1));
+        active(&mut config)
+            .deep_base
+            .insert(Input::Grid(1, 1), keypress());
+
+        let (next, _) = plan_ok(
+            &config,
+            Edit::ClearDeepStage {
+                input: Input::Grid(1, 1),
+                layer: Layer::Base,
+            },
+        );
+        assert!(next.profiles[DEFAULT_PROFILE_NAME].deep_base.is_empty());
+
+        assert!(matches!(
+            plan_err(
+                &seed(),
+                Edit::ClearDeepStage {
+                    input: Input::Grid(1, 1),
+                    layer: Layer::Base,
+                }
+            ),
+            CommandError::NotFound
+        ));
+    }
+
+    #[test]
+    fn set_deep_actuation_creates_a_fresh_deep_stage_config_defaulting_to_handoff() {
+        let (next, outcome) = plan_ok(
+            &seed(),
+            Edit::SetDeepActuation {
+                input: Input::Grid(1, 1),
+                actuation: 220,
+                release: 200,
+            },
+        );
+        assert_eq!(
+            next.profiles[DEFAULT_PROFILE_NAME].deep_stages[&Input::Grid(1, 1)],
+            crate::config::DeepStageConfig {
+                actuation: ActuationPoint {
+                    actuation: 220,
+                    release: 200,
+                },
+                mode: StagingMode::Handoff,
+            }
+        );
+        assert!(outcome.effects.is_empty());
+    }
+
+    #[test]
+    fn set_deep_actuation_on_an_existing_entry_leaves_its_mode_untouched() {
+        let mut config = seed();
+        active(&mut config).deep_stages.insert(
+            Input::Grid(1, 1),
+            crate::config::DeepStageConfig {
+                actuation: ActuationPoint {
+                    actuation: 220,
+                    release: 200,
+                },
+                mode: StagingMode::Additive,
+            },
+        );
+
+        let (next, _) = plan_ok(
+            &config,
+            Edit::SetDeepActuation {
+                input: Input::Grid(1, 1),
+                actuation: 230,
+                release: 210,
+            },
+        );
+        let cfg = next.profiles[DEFAULT_PROFILE_NAME].deep_stages[&Input::Grid(1, 1)];
+        assert_eq!(
+            cfg.actuation,
+            ActuationPoint {
+                actuation: 230,
+                release: 210,
+            }
+        );
+        assert_eq!(cfg.mode, StagingMode::Additive);
+    }
+
+    #[test]
+    fn set_staging_mode_creates_a_fresh_deep_stage_config_and_only_writes_mode() {
+        // A low primary override keeps the fresh `DeepStageConfig`'s
+        // default `ActuationPoint` (128/112) from overlapping the primary
+        // band — `SetStagingMode` itself writes no `actuation` field, so
+        // that has to come from somewhere for `validate` to accept this.
+        let mut config = seed();
+        active(&mut config).actuation_overrides.insert(
+            Input::Grid(1, 1),
+            ActuationPoint {
+                actuation: 50,
+                release: 40,
+            },
+        );
+
+        let (next, outcome) = plan_ok(
+            &config,
+            Edit::SetStagingMode {
+                input: Input::Grid(1, 1),
+                mode: StagingMode::QuickSkip,
+            },
+        );
+        assert_eq!(
+            next.profiles[DEFAULT_PROFILE_NAME].deep_stages[&Input::Grid(1, 1)].mode,
+            StagingMode::QuickSkip
+        );
+        assert!(outcome.effects.is_empty());
+    }
+
     // --- preconditions and invariants, one row each ---------------------------
 
     struct Case {
@@ -1775,6 +2009,22 @@ mod tests {
                     target: AxisTarget::LeftTrigger,
                 },
                 matches: |e| is_invalid(e, "only Grid Inputs"),
+            },
+            Case {
+                name: "SetDeepStage: no primary Binding on the layer (invariant)",
+                setup: |_| {},
+                edit: || Edit::SetDeepStage {
+                    input: Input::Grid(1, 1),
+                    layer: Layer::Base,
+                    binding: Binding {
+                        trigger: TriggerMode::HoldToRepeat,
+                        action: Action::Keypress {
+                            modifiers: Modifiers::default(),
+                            key: KeyCode::KEY_A,
+                        },
+                    },
+                },
+                matches: |e| is_invalid(e, "no primary Binding"),
             },
         ];
 

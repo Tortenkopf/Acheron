@@ -670,6 +670,77 @@ impl Daemon {
         .await
     }
 
+    /// Creates or edits the deep Binding on `layer` for a dual-stage grid
+    /// key (tartarus-dual-stage-keys ticket 05 — CONTEXT.md: Actuation
+    /// stage) — atomic/immediately-applied/immediately-persisted, mirroring
+    /// `set_binding` exactly but one stage deeper. Errors `InvalidBinding`
+    /// if the Action/Trigger combination or the resulting `Config` fails
+    /// `config::validate` (including `DeepStageWithoutPrimary`/
+    /// `DeepStageMissingConfig` — sequencing across the primary Binding,
+    /// the deep Binding, and the deep Actuation/Staging-mode config is the
+    /// caller's job).
+    async fn set_deep_stage(
+        &self,
+        input: String,
+        layer: String,
+        binding: HashMap<String, OwnedValue>,
+    ) -> Result<(), DaemonError> {
+        let input = Self::parse_input(&input)?;
+        let layer = wire::layer_from_str(&layer).map_err(DaemonError::InvalidBinding)?;
+        let binding = wire::binding_from_dict(&binding).map_err(DaemonError::InvalidBinding)?;
+
+        self.apply(Edit::SetDeepStage {
+            input,
+            layer,
+            binding,
+        })
+        .await
+    }
+
+    /// Removes the deep Binding on `layer`. Errors `NotFound` if `input`
+    /// has no deep Binding there. Does not cascade-clear the deep
+    /// Actuation/Staging-mode config or force-release a live slot.
+    async fn clear_deep_stage(&self, input: String, layer: String) -> Result<(), DaemonError> {
+        let input = Self::parse_input(&input)?;
+        let layer = wire::layer_from_str(&layer).map_err(DaemonError::InvalidBinding)?;
+
+        self.apply(Edit::ClearDeepStage { input, layer }).await
+    }
+
+    /// Sets a grid key's deep Actuation/Release point pair on the active
+    /// Profile, creating a fresh deep-stage config (Staging mode defaulting
+    /// to Handoff) if none exists yet. Errors `InvalidBinding` if the
+    /// resulting `Config` fails `config::validate` (a non-Grid `input`, the
+    /// pair's own hysteresis, or the disjoint-band constraint against the
+    /// resolved primary Actuation point).
+    async fn set_deep_actuation(
+        &self,
+        input: String,
+        actuation: u8,
+        release: u8,
+    ) -> Result<(), DaemonError> {
+        let input = Self::parse_input(&input)?;
+
+        self.apply(Edit::SetDeepActuation {
+            input,
+            actuation,
+            release,
+        })
+        .await
+    }
+
+    /// Sets a grid key's Staging mode on the active Profile, creating a
+    /// fresh deep-stage config (Actuation/Release defaulting to
+    /// `ActuationPoint::default()`) if none exists yet. Errors
+    /// `InvalidBinding` if `mode` doesn't parse or the resulting `Config`
+    /// fails `config::validate`.
+    async fn set_staging_mode(&self, input: String, mode: String) -> Result<(), DaemonError> {
+        let input = Self::parse_input(&input)?;
+        let mode = wire::staging_mode_from_str(&mode).map_err(DaemonError::InvalidBinding)?;
+
+        self.apply(Edit::SetStagingMode { input, mode }).await
+    }
+
     /// Starts (or retargets) live depth streaming for `input` — the GUI's
     /// Actuation & release editor's `DepthChanged` feed (ticket 19/26).
     /// Connection-scoped and last-write-wins, mirroring
@@ -861,6 +932,15 @@ mod tests {
         fn reset_actuation_points(&self) -> zbus::Result<()>;
         fn set_force_digital(&self, force: bool) -> zbus::Result<()>;
         fn set_status_leds(&self, orange: bool, green: bool, blue: bool) -> zbus::Result<()>;
+        fn set_deep_stage(
+            &self,
+            input: &str,
+            layer: &str,
+            binding: HashMap<String, OwnedValue>,
+        ) -> zbus::Result<()>;
+        fn clear_deep_stage(&self, input: &str, layer: &str) -> zbus::Result<()>;
+        fn set_deep_actuation(&self, input: &str, actuation: u8, release: u8) -> zbus::Result<()>;
+        fn set_staging_mode(&self, input: &str, mode: &str) -> zbus::Result<()>;
         fn start_depth_stream(&self, input: &str) -> zbus::Result<()>;
         fn stop_depth_stream(&self, input: &str) -> zbus::Result<()>;
 
@@ -2769,6 +2849,132 @@ mod tests {
 
         assert!(on_disk.contains("[profiles.Default.status_leds]"));
         assert!(on_disk.contains("orange = true"));
+    }
+
+    /// tartarus-dual-stage-keys ticket 05's core requirement: `SetDeepStage`/
+    /// `SetDeepActuation`/`SetStagingMode`/`ClearDeepStage` each persist to
+    /// `config.toml` and are visible via `GetConfig`, mirroring
+    /// `set_status_leds_over_real_dbus_persists_the_triple_and_surfaces_it_via_get_config`.
+    #[tokio::test]
+    async fn deep_stage_edits_over_real_dbus_persist_and_surface_via_get_config() {
+        let server = TestServer::start().await;
+
+        // A deep stage needs a primary Binding on the same Input/Layer
+        // first (`config::validate`'s `DeepStageWithoutPrimary`).
+        let mut primary = wire::action_to_dict(&crate::config::Action::Keypress {
+            modifiers: crate::config::Modifiers::default(),
+            key: evdev::KeyCode::KEY_A,
+        });
+        primary.insert(
+            "trigger".to_string(),
+            OwnedValue::try_from(zbus::zvariant::Value::new("hold_to_repeat".to_string())).unwrap(),
+        );
+        server
+            .proxy
+            .set_binding("grid_r1c1", "base", primary)
+            .await
+            .expect("SetBinding over D-Bus must succeed");
+
+        server
+            .proxy
+            .set_deep_actuation("grid_r1c1", 220, 200)
+            .await
+            .expect("SetDeepActuation over D-Bus must succeed");
+        server
+            .proxy
+            .set_staging_mode("grid_r1c1", "additive")
+            .await
+            .expect("SetStagingMode over D-Bus must succeed");
+
+        let mut deep = wire::action_to_dict(&crate::config::Action::Keypress {
+            modifiers: crate::config::Modifiers::default(),
+            key: evdev::KeyCode::KEY_B,
+        });
+        deep.insert(
+            "trigger".to_string(),
+            OwnedValue::try_from(zbus::zvariant::Value::new("fire_once".to_string())).unwrap(),
+        );
+        server
+            .proxy
+            .set_deep_stage("grid_r1c1", "base", deep)
+            .await
+            .expect("SetDeepStage over D-Bus must succeed");
+
+        let get_default_profile = |config: &HashMap<String, OwnedValue>| -> wire::Dict {
+            let profiles: wire::Dict = config.get("profiles").unwrap().clone().try_into().unwrap();
+            profiles
+                .get(DEFAULT_PROFILE_NAME)
+                .unwrap()
+                .clone()
+                .try_into()
+                .unwrap()
+        };
+
+        let config = server.proxy.get_config().await.unwrap();
+        let default_profile = get_default_profile(&config);
+        let deep_base: wire::Dict = default_profile
+            .get("deep_base")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert!(deep_base.contains_key("grid_r1c1"));
+        let deep_stages: wire::Dict = default_profile
+            .get("deep_stages")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let deep_stage: wire::Dict = deep_stages
+            .get("grid_r1c1")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let deep_actuation: wire::Dict = deep_stage
+            .get("actuation")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let actuation: u8 = deep_actuation
+            .get("actuation")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let release: u8 = deep_actuation
+            .get("release")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!((actuation, release), (220, 200));
+        let mode: String = deep_stage.get("mode").unwrap().clone().try_into().unwrap();
+        assert_eq!(mode, "additive");
+
+        let on_disk_before = std::fs::read_to_string(&server.config_path).unwrap();
+        assert!(on_disk_before.contains("[profiles.Default.deep_base.grid_r1c1]"));
+        assert!(on_disk_before.contains("[profiles.Default.deep_stages.grid_r1c1]"));
+        assert!(on_disk_before.contains("mode = \"additive\""));
+
+        server
+            .proxy
+            .clear_deep_stage("grid_r1c1", "base")
+            .await
+            .expect("ClearDeepStage over D-Bus must succeed");
+
+        let config = server.proxy.get_config().await.unwrap();
+        let default_profile = get_default_profile(&config);
+        let deep_base: wire::Dict = default_profile
+            .get("deep_base")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert!(!deep_base.contains_key("grid_r1c1"));
+
+        server.shut_down().await;
     }
 
     #[tokio::test]
