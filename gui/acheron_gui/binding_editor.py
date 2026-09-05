@@ -975,8 +975,10 @@ def build_dual_stage_panel(
     available_action_types: list[tuple[str, str]],
     save_btn: Gtk.Button,
     clear_btn: Gtk.Button,
+    apply_btn: Gtk.Button,
     show_error: Callable[[Exception], None],
     on_saved: Callable[[], None],
+    on_commit: Callable[[], None],
 ) -> Gtk.Widget:
     """The dual-stage grid-key editor — the whole editor for *any* Grid key
     (ticket 09), whether or not it already carries a primary Binding, once
@@ -988,15 +990,27 @@ def build_dual_stage_panel(
     `+ Add deep stage` and `Clear Binding` both disabled until a primary is
     committed.
 
-    `save_btn`/`clear_btn` are the caller's own buttons; this panel rewires
-    their `clicked` handlers to the currently-selected stage on every
-    rebuild. Structural edits (add / remove a deep stage, swap the toggled
-    stage, pick a Staging mode) mutate the passed-in `config` snapshot in
-    place and rebuild the panel locally — the window stays open (the "+ New
-    Macro" in-place-snapshot precedent, and the same "this edit only touches
-    this one key" reasoning that keeps `set_actuation_point` from popping the
-    popover down). Save / Clear go through the shared `on_saved` like the
-    rest of the editor.
+    `save_btn`/`clear_btn`/`apply_btn` are the caller's own buttons; this
+    panel wires their `clicked` handlers once. Structural edits (add / remove
+    a deep stage, swap the toggled stage, pick a Staging mode) mutate the
+    passed-in `config` snapshot in place and rebuild the panel locally — the
+    window stays open (the "+ New Macro" in-place-snapshot precedent, and the
+    same "this edit only touches this one key" reasoning that keeps
+    `set_actuation_point` from popping the popover down). Save / Clear go
+    through the shared `on_saved` (commit, then close) like the rest of the
+    editor.
+
+    **Apply** (tartarus-dual-stage-keys ticket 10) commits exactly what Save
+    commits — both stages, the on-screen stage's draft folded in first,
+    primary then deep, each pushed only when it differs from the snapshot —
+    then mutates the snapshot and rebuilds the panel in place *without*
+    closing, so an unbound→bound transition (the `Primary — …` summary
+    filling in, `+ Add deep stage` / `Clear Binding` enabling) is visible
+    live and a deep stage can be added in the same window session. `apply_btn`
+    tracks `save_btn`'s sensitivity (the same "no editor for this Action
+    kind" / "empty Macro or Stepper library" disables). `on_commit` is called
+    the first time any Save/Apply push actually lands — the caller uses it to
+    arm its close-request handler's one deferred full-app rebuild.
 
     The primary Binding is read from the `config` snapshot for this Input/
     Layer on every rebuild — the same way the deep Binding already is — not
@@ -1096,6 +1110,13 @@ def build_dual_stage_panel(
         return {"actuation": {"actuation": d_act, "release": d_rel}, "mode": "handoff"}
 
     # --- structural edits: hit the Daemon, mutate the snapshot, rebuild ---
+    #
+    # Each of these commits real Daemon state and then rebuilds the panel
+    # locally (the window stays open, like Apply). They call `on_commit()`
+    # on success for the same reason Apply does — so dismissing the window
+    # afterwards drives the one deferred `on_change()` that refreshes every
+    # other cached editor's snapshot, even if the user never touches
+    # Save/Apply/Clear.
 
     def on_add_deep() -> None:
         if not has_primary():
@@ -1118,6 +1139,7 @@ def build_dual_stage_panel(
             show_error(exc)
             return
         profile_dict["deep_stages"][inp] = cfg
+        on_commit()
         try:
             client.set_deep_stage(inp, layer, default_deep)
         except DaemonError as exc:
@@ -1140,6 +1162,7 @@ def build_dual_stage_panel(
             show_error(exc)
             return
         deep_map().pop(inp, None)
+        on_commit()
         drafts["deep"] = None
         ui["stage"] = "primary"
         rebuild()
@@ -1152,15 +1175,28 @@ def build_dual_stage_panel(
             rebuild()  # snap the toggle group back to the snapshot's mode
             return
         profile_dict["deep_stages"].setdefault(inp, default_deep_cfg())["mode"] = mode
+        on_commit()
 
-    def on_save_stage() -> None:
-        # Save commits *both* stages, not just the one on screen — whichever
-        # stage the user was last editing is folded in by `capture_draft`,
-        # and each stage is pushed only if its draft actually differs from
-        # the snapshot (an unedited stage is left alone). Primary first: a
-        # replacement primary the Daemon rejects (`analog_repeat`, a Chord
-        # member) must fail before the deep push, and never leaves a
-        # half-applied pair the user didn't ask for.
+    def commit_stages() -> bool:
+        # The shared commit path behind both Save and Apply: push *both*
+        # stages, not just the one on screen — whichever stage the user was
+        # last editing is folded in by `capture_draft`, and each stage is
+        # pushed only if its draft actually differs from the snapshot (an
+        # unedited stage is left alone). Primary first: a replacement primary
+        # the Daemon rejects (`analog_repeat`, a Chord member) must fail
+        # before the deep push, and never leaves a half-applied pair the user
+        # didn't ask for.
+        #
+        # Every landed push also mutates the in-memory `config` snapshot (the
+        # "+ New Macro" precedent) and clears that stage's draft, so a local
+        # rebuild — Apply's, or a later structural edit's — reflects the
+        # freshly-committed stage straight from the snapshot. `on_commit()`
+        # is fired the first time any push lands (idempotent — it just arms
+        # the caller's deferred rebuild).
+        #
+        # Returns True when the commit completed with no Daemon rejection
+        # (whether or not anything actually needed pushing); False when a
+        # rejection was surfaced (Save then stays open).
         capture_draft()
         primary_target = drafts["primary"] if drafts["primary"] is not None else primary_binding()
         deep_target = drafts["deep"] if drafts["deep"] is not None else deep_binding()
@@ -1171,14 +1207,45 @@ def build_dual_stage_panel(
             if not has_primary() or primary_target != primary_binding():
                 if primary_target.get("type") == "axis":
                     client.set_axis_assignment(inp, layer, primary_target["target"])
+                    profile_dict[f"axis_{layer}"][inp] = primary_target["target"]
+                    profile_dict[layer].pop(inp, None)
                 else:
                     client.set_binding(inp, layer, primary_target)
+                    profile_dict[layer][inp] = primary_target
+                drafts["primary"] = None
+                on_commit()
             if has_deep() and deep_target is not None and deep_target != deep_binding():
                 client.set_deep_stage(inp, layer, deep_target)
+                deep_map()[inp] = deep_target
+                drafts["deep"] = None
+                on_commit()
         except DaemonError as exc:
             show_error(exc)
+            return False
+        return True
+
+    def on_save_stage() -> None:
+        if commit_stages():
+            on_saved()
+
+    def on_apply_stage() -> None:
+        # Apply commits like Save but keeps the window open: the snapshot
+        # mutation in `commit_stages` plus this local rebuild turn an unbound
+        # key into its bound layout in place (the `Primary — …` summary fills
+        # in, `+ Add deep stage` / `Clear Binding` enable), and a deep stage
+        # can then be added in the same session. A redundant Apply is a
+        # harmless no-op (nothing differs → nothing pushed → nothing armed).
+        ok = commit_stages()
+        if ok and profile_dict[f"axis_{layer}"].get(inp) is not None:
+            # The primary was just committed as an Axis *assignment*, which is
+            # not a Binding and has no representation in this swap panel — a
+            # local rebuild would strand the editor on the synthetic-primary
+            # layout with `Clear Binding` disabled. Fall back to Save's
+            # close-and-reopen; the reopened editor takes the plain axis path
+            # (`current_axis_target is not None`).
+            on_saved()
             return
-        on_saved()
+        rebuild()
 
     def on_clear_stage() -> None:
         if ui["stage"] != "deep" and not has_primary():
@@ -1211,6 +1278,7 @@ def build_dual_stage_panel(
             show_error(exc)
             return
         profile_dict["actuation_overrides"].pop(inp, None)
+        on_commit()
         rebuild()
 
     def on_set_default() -> None:
@@ -1305,6 +1373,7 @@ def build_dual_stage_panel(
                         "actuation": da_,
                         "release": dr,
                     }
+                on_commit()
             except DaemonError as exc:
                 show_error(exc)
 
@@ -1396,11 +1465,11 @@ def build_dual_stage_panel(
         else:
             add_btn = Gtk.Button(label="+ Add deep stage")
             # A deep stage requires a primary Binding to exist at all — until
-            # one is committed, disable the button and say why. (Ticket 10
-            # adds an "Apply" button and widens this to "Save or Apply …".)
+            # one is committed (via Save or Apply), disable the button and
+            # say why.
             add_btn.set_sensitive(has_primary())
             if not has_primary():
-                add_btn.set_tooltip_text("Save a primary Action first")
+                add_btn.set_tooltip_text("Save or Apply a primary Action first")
             add_btn.connect("clicked", lambda _b: on_add_deep())
             toggle_row.append(add_btn)
         panel.append(toggle_row)
@@ -1487,11 +1556,23 @@ def build_dual_stage_panel(
         force_digital_check.connect("toggled", lambda b: client.set_force_digital(b.get_active()))
         panel.append(force_digital_check)
 
-    # Save/Clear are wired once — `on_save_stage` reads `drafts`/`slot` and
-    # `on_clear_stage` reads `ui["stage"]` at click time, so neither depends
-    # on the current rebuild's closures.
+    # Save/Apply/Clear are wired once — `on_save_stage`/`on_apply_stage` read
+    # `drafts`/`slot` and `on_clear_stage` reads `ui["stage"]` at click time,
+    # so none depend on the current rebuild's closures.
     save_btn.connect("clicked", lambda _b: on_save_stage())
+    apply_btn.connect("clicked", lambda _b: on_apply_stage())
     clear_btn.connect("clicked", lambda _b: on_clear_stage())
+
+    # Apply carries the same disabled conditions as Save (an Action kind with
+    # no editor here, an empty Macro/Stepper library) — `build_action_and_
+    # trigger_fields` already drives `save_btn.set_sensitive` for exactly
+    # those, so mirror it rather than re-deriving the matrix. `save_btn`
+    # outlives every rebuild, so this connects once.
+    def _sync_apply_sensitivity(*_a) -> None:
+        apply_btn.set_sensitive(save_btn.get_sensitive())
+
+    save_btn.connect("notify::sensitive", _sync_apply_sensitivity)
+    _sync_apply_sensitivity()
 
     # Live depth only while the panel is on screen (the `build_actuation_
     # section` precedent) — `build_binding_editor` is rebuilt eagerly for
@@ -1512,7 +1593,15 @@ def build_binding_editor(
     inp: str,
     on_saved: Callable[[], None],
     capture_mode: str = "digital",
+    on_commit: Callable[[], None] = lambda: None,
 ) -> Gtk.Widget:
+    """`on_saved` closes the editor window (and, via its close-request
+    handler, drives the one deferred full-app rebuild). `on_commit`
+    (tartarus-dual-stage-keys ticket 10) is fired by the grid-key panel's
+    **Apply** the first time a push lands, so a commit that never closes the
+    window still arms that same deferred rebuild for whenever it is finally
+    dismissed. Only the grid-key dual-stage panel has an Apply button — the
+    non-grid and version-skew paths below, and the Chord dialog, do not."""
     bindings = config["profiles"][profile][layer]
     existing = bindings.get(inp)
     # Ticket 71: an Axis-assigned Input never has a `binding` at all (ticket
@@ -1583,9 +1672,15 @@ def build_binding_editor(
         and current_axis_target is None
         and "deep_base" in config["profiles"][profile]
     ):
+        # tartarus-dual-stage-keys ticket 10: a plain (non-accent) "Apply"
+        # that commits without closing — built (and parented) only here, in
+        # the grid-key dual-stage branch, never the non-grid / version-skew /
+        # Chord paths.
+        apply_btn = Gtk.Button(label="Apply")
         panel = build_dual_stage_panel(
             client, config, profile, layer, inp, capture_mode,
-            available_action_types, save_btn, clear_btn, show_error, on_saved,
+            available_action_types, save_btn, clear_btn, apply_btn, show_error,
+            on_saved, on_commit,
         )
         panel_scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
         panel_scroller.set_propagate_natural_width(True)
@@ -1595,6 +1690,7 @@ def build_binding_editor(
         box.append(panel_scroller)
         btn_row = Gtk.Box(spacing=8)
         btn_row.append(save_btn)
+        btn_row.append(apply_btn)
         btn_row.append(clear_btn)
         box.append(btn_row)
         return box

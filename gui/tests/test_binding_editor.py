@@ -1255,7 +1255,7 @@ def test_unbound_grid_key_shows_the_unified_panel_with_a_synthetic_primary_stage
 
     add_btn = find_one(editor, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "+ Add deep stage")
     assert not add_btn.get_sensitive()
-    assert add_btn.get_tooltip_text() == "Save a primary Action first"
+    assert add_btn.get_tooltip_text() == "Save or Apply a primary Action first"
     assert not button_labeled(editor, "Clear Binding").get_sensitive()
 
     # One picker mounted (the synthetic primary's), not also a plain editor.
@@ -1723,3 +1723,205 @@ def test_add_deep_stage_uses_the_offset_when_no_profile_default_is_set():
     _add_deep_stage(editor)
 
     assert ("set_deep_actuation", "grid_r1c1", 183, 148) in stub.calls
+
+
+# --- "Apply": commit the binding without closing the editor
+#     (tartarus-dual-stage-keys ticket 10) ---
+
+
+def _grid_editor_button(stub, *, layer="base", capture_mode="analog"):
+    """A `make_input_button` for grid_r1c1 (so the real window + close-request
+    handler are in play) plus a `changed` list counting `on_change()` calls.
+    Clears `stub.calls` first so a test only sees what it drives."""
+    stub.calls.clear()
+    changed = []
+    btn = make_input_button(
+        stub, stub.get_config(), "Default", layer, "grid_r1c1",
+        lambda: changed.append(1), capture_mode=capture_mode,
+    )
+    return btn, changed
+
+
+def _dismiss(btn):
+    # `Gtk.Window.close()` only emits `close-request` for a realized window,
+    # which a headless test never has — emit it directly, standing in for the
+    # WM close button / Escape / Save's own `window.close()`.
+    btn.binding_editor_window.emit("close-request")
+
+
+def test_apply_button_is_plain_while_save_keeps_the_accent():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+
+    apply_btn = button_labeled(editor, "Apply")
+    assert "suggested-action" not in apply_btn.get_css_classes()
+    assert "suggested-action" in button_labeled(editor, "Save").get_css_classes()
+
+
+def test_non_grid_and_chord_editors_have_no_apply_button():
+    stub = DaemonStub()
+
+    non_grid = build_binding_editor(stub, stub.get_config(), "Default", "base", "mode_key", lambda: None)
+    assert find_all(non_grid, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Apply") == []
+
+    chord = build_chord_binding_dialog(
+        stub, stub.get_config(), "Default", "base", ["grid_r1c1", "grid_r1c2"], None, lambda: None, None
+    )
+    assert find_all(chord, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Apply") == []
+
+
+def test_apply_on_an_unbound_key_creates_the_binding_and_keeps_the_window_open():
+    stub = DaemonStub()
+    btn, changed = _grid_editor_button(stub)
+    editor = editor_content(btn)
+
+    _pick_key(editor, "Key", "F1")
+    button_labeled(editor, "Apply").emit("clicked")
+
+    assert stub.calls == [
+        (
+            "set_binding",
+            "grid_r1c1",
+            "base",
+            {"trigger": "hold_to_repeat", "type": "keypress", "key": "KEY_F1", "modifiers": []},
+        )
+    ]
+    # No full-app rebuild yet — the window stays open.
+    assert changed == []
+
+    # The panel rebuilt in place into the bound layout.
+    editor = editor_content(btn)
+    assert button_labeled(editor, "+ Add deep stage").get_sensitive()
+    assert button_labeled(editor, "Clear Binding").get_sensitive()
+    primary_toggle = _toggles_startswith(editor, "Primary")[0]
+    assert "F1" in primary_toggle.get_label()
+    assert primary_toggle.get_label() != "Primary — 1"
+
+
+def test_apply_then_add_deep_stage_works_in_one_window_session():
+    stub = DaemonStub()
+    btn, changed = _grid_editor_button(stub)
+
+    button_labeled(editor_content(btn), "Apply").emit("clicked")  # binds the KEY_A placeholder
+    button_labeled(editor_content(btn), "+ Add deep stage").emit("clicked")
+
+    assert [c[0] for c in stub.calls] == ["set_binding", "set_deep_actuation", "set_deep_stage"]
+    assert len(_toggles_startswith(editor_content(btn), "Deep")) == 1
+    # Still no full-app rebuild while the window is open.
+    assert changed == []
+
+
+def test_close_after_apply_drives_exactly_one_on_change():
+    stub = DaemonStub()
+    btn, changed = _grid_editor_button(stub)
+
+    button_labeled(editor_content(btn), "Apply").emit("clicked")
+    button_labeled(editor_content(btn), "Apply").emit("clicked")  # redundant no-op push
+    assert changed == []
+
+    _dismiss(btn)
+    assert changed == [1]
+
+    _dismiss(btn)  # a second dismissal must not re-fire
+    assert changed == [1]
+
+
+def test_open_and_close_with_no_commit_drives_no_on_change():
+    stub = DaemonStub()
+    btn, changed = _grid_editor_button(stub)
+
+    _dismiss(btn)
+
+    assert changed == []
+    assert stub.calls == []
+
+
+def test_save_after_apply_still_commits_and_closes_once():
+    stub = DaemonStub()
+    btn, changed = _grid_editor_button(stub)
+
+    _pick_key(editor_content(btn), "Key", "F1")
+    button_labeled(editor_content(btn), "Apply").emit("clicked")
+    assert changed == []
+
+    # A second edit, then Save: it commits the delta and drives the one rebuild.
+    _pick_key(editor_content(btn), "Key", "F2")
+    button_labeled(editor_content(btn), "Save").emit("clicked")
+
+    assert stub.calls[-1] == (
+        "set_binding",
+        "grid_r1c1",
+        "base",
+        {"trigger": "hold_to_repeat", "type": "keypress", "key": "KEY_F2", "modifiers": []},
+    )
+    assert changed == [1]
+    _dismiss(btn)  # nothing left to flush
+    assert changed == [1]
+
+
+def test_apply_is_insensitive_under_the_same_conditions_as_save():
+    stub = DaemonStub()  # empty Macro library
+    editor = _dual_stage_editor(stub)
+
+    action_dd = _dropdown_labeled(editor, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("macro"))
+
+    assert not button_labeled(editor, "Save").get_sensitive()
+    assert not button_labeled(editor, "Apply").get_sensitive()
+
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("keypress"))
+    assert button_labeled(editor, "Save").get_sensitive()
+    assert button_labeled(editor, "Apply").get_sensitive()
+
+
+def test_apply_that_pushes_nothing_does_not_arm_the_deferred_rebuild():
+    stub = DaemonStub()
+    stub.set_binding(
+        "grid_r1c1", "base",
+        {"trigger": "hold_to_repeat", "type": "keypress", "key": "KEY_A", "modifiers": []},
+    )
+    btn, changed = _grid_editor_button(stub)
+
+    button_labeled(editor_content(btn), "Apply").emit("clicked")  # nothing edited
+
+    assert stub.calls == []
+    _dismiss(btn)
+    assert changed == []
+
+
+def test_apply_with_an_axis_primary_falls_back_to_close_and_reopen():
+    # An Axis assignment has no representation in the swap panel — Apply
+    # commits it (like Save) and then closes rather than stranding the editor
+    # on the synthetic-primary layout with Clear disabled.
+    stub = DaemonStub()
+    btn, changed = _grid_editor_button(stub)
+    editor = editor_content(btn)
+
+    action_dd = _dropdown_labeled(editor, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("axis"))
+    _click_axis_target(editor_content(btn), "Left Trigger")
+
+    button_labeled(editor_content(btn), "Apply").emit("clicked")
+
+    assert any(c[0] == "set_axis_assignment" for c in stub.calls)
+    assert changed == [1]  # the close-and-reopen fallback drove the rebuild
+
+
+def test_add_deep_stage_then_dismiss_drives_exactly_one_on_change():
+    # A structural edit that commits real Daemon state also arms the deferred
+    # rebuild, so closing the window afterwards refreshes the other cached
+    # editors even though Save/Apply/Clear were never clicked.
+    stub = DaemonStub()
+    stub.set_binding(
+        "grid_r1c1", "base",
+        {"trigger": "hold_to_repeat", "type": "keypress", "key": "KEY_A", "modifiers": []},
+    )
+    btn, changed = _grid_editor_button(stub)
+
+    button_labeled(editor_content(btn), "+ Add deep stage").emit("clicked")
+    assert changed == []  # still open, no full rebuild yet
+
+    _dismiss(btn)
+    assert changed == [1]
+    _dismiss(btn)
+    assert changed == [1]

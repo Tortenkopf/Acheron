@@ -234,8 +234,9 @@ stage** gives it a second, independent Binding that fires only when you press
 half-throttle and pushing it to the floor is full-throttle, or a camera
 shutter that focuses on a half-press and shoots on a full press.
 
-Open a bound grid key's editor and, in the **Actuation & release** panel,
-click **+ Add deep stage**. The depth bar grows two more markers (the deep
+Open a grid key's editor and click **+ Add deep stage** (bind a primary Action
+first — **Apply** commits it without closing the editor, so you can add the
+deep stage in the same window). The depth bar grows two more markers (the deep
 stage's own actuation and release points, always stacked above the primary's),
 and a **Primary / Deep** toggle swaps which stage the Trigger / Action /
 picker below it edits. A **Staging mode** row chooses how the two hand off as
