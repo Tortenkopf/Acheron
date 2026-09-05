@@ -1271,9 +1271,9 @@ def build_dual_stage_panel(
             return
         on_saved()
 
-    # --- primary-actuation profile-default controls (unchanged behaviour
-    #     carried over from `build_actuation_section` — they only ever touch
-    #     the primary) ---
+    # --- actuation profile-default controls (carried over from
+    #     `build_actuation_section`; "Reset to Profile default" also returns
+    #     the deep band when this key has a deep stage) ---
 
     def on_reset_primary() -> None:
         try:
@@ -1283,6 +1283,22 @@ def build_dual_stage_panel(
             return
         profile_dict["actuation_overrides"].pop(inp, None)
         on_commit()
+        # With a deep stage on this key, "Reset to Profile default" also
+        # returns its band to the Profile's remembered deep default (ticket
+        # 08's `default_deep_actuation`), recomputed against the just-reset
+        # primary — `default_deep_cfg()` is exactly that (remembered band
+        # clamped disjoint, else the +20/+35 offset). The deep band has no
+        # daemon-side override/default split like the primary's, so this is a
+        # fresh `set_deep_actuation` push rather than a "clear".
+        if has_deep():
+            band = default_deep_cfg()["actuation"]
+            try:
+                client.set_deep_actuation(inp, band["actuation"], band["release"])
+            except DaemonError as exc:
+                show_error(exc)
+                rebuild()
+                return
+            profile_dict["deep_stages"][inp]["actuation"] = dict(band)
         rebuild()
 
     def on_set_default() -> None:

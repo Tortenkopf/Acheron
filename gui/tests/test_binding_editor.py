@@ -1521,6 +1521,54 @@ def test_swap_panel_keeps_the_primary_actuation_profile_default_controls():
     assert any(c[0] == "set_default_actuation" for c in stub.calls)
 
 
+def test_reset_to_profile_default_also_returns_the_deep_band():
+    stub = DaemonStub()
+    stub.set_default_deep_actuation(210, 190)  # the Profile's remembered deep band
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)
+
+    # drag the deep band away from the remembered default
+    track = find_one(editor, lambda w: isinstance(w, DepthTrack))
+    d_act_i = next(i for i, m in enumerate(track.markers) if "marker-deep-actuation" in m["css"])
+    d_rel_i = next(i for i, m in enumerate(track.markers) if "marker-deep-release" in m["css"])
+    track.markers[d_act_i]["value"] = 250
+    track.on_drag_end(d_act_i, 250)
+    track.markers[d_rel_i]["value"] = 230
+    track.on_drag_end(d_rel_i, 230)
+    stub.calls.clear()
+
+    button_labeled(editor, "Reset to Profile default").emit("clicked")
+
+    # primary override cleared *and* the deep band returned to the remembered
+    # default (recomputed disjoint from the reset primary).
+    assert ("clear_actuation_point", "grid_r1c1") in stub.calls
+    assert ("set_deep_actuation", "grid_r1c1", 210, 190) in stub.calls
+    assert stub.get_config()["profiles"]["Default"]["deep_stages"]["grid_r1c1"]["actuation"] == {
+        "actuation": 210,
+        "release": 190,
+    }
+    # the rebuilt bar shows the reset band, not the dragged one
+    fresh_track = find_one(editor, lambda w: isinstance(w, DepthTrack))
+    by_kind = {
+        ("d_act" if "marker-deep-actuation" in m["css"] else "d_rel"): m["value"]
+        for m in fresh_track.markers
+        if "deep" in m["css"]
+    }
+    assert by_kind == {"d_act": 210, "d_rel": 190}
+
+
+def test_reset_to_profile_default_with_no_deep_stage_touches_only_the_primary():
+    stub = DaemonStub()
+    stub.set_actuation_point("grid_r1c1", 200, 180)
+    editor = _dual_stage_editor(stub)
+    stub.calls.clear()
+
+    button_labeled(editor, "Reset to Profile default").emit("clicked")
+
+    assert [c for c in stub.calls if c[0] == "set_deep_actuation"] == []
+    assert ("clear_actuation_point", "grid_r1c1") in stub.calls
+
+
 def test_swap_panel_persists_a_deep_marker_drag_across_a_stage_toggle():
     stub = DaemonStub()
     editor = _dual_stage_editor(stub)
