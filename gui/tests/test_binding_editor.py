@@ -1191,3 +1191,268 @@ def test_chord_dialog_does_not_offer_axis_as_an_action_kind():
     )
     action_dd = _dropdown_labeled(dialog, "Action")
     assert "Axis" not in [action_dd.get_model().get_string(i) for i in range(action_dd.get_model().get_n_items())]
+
+
+# --- Dual-stage grid keys (tartarus-dual-stage-keys ticket 07) ---
+
+
+def _dual_stage_editor(stub, *, layer="base", capture_mode="analog", key="KEY_A"):
+    """A `build_binding_editor` for a Grid key that already carries a primary
+    Binding — the state that swaps the plain editor for the dual-stage swap
+    panel. Clears `stub.calls` so a test only sees what the panel itself
+    sends."""
+    stub.set_binding(
+        "grid_r1c1", layer, {"trigger": "hold_to_repeat", "type": "keypress", "key": key, "modifiers": []}
+    )
+    stub.calls.clear()
+    return build_binding_editor(
+        stub, stub.get_config(), "Default", layer, "grid_r1c1", lambda: None, capture_mode=capture_mode
+    )
+
+
+def _toggles_startswith(root, prefix):
+    return find_all(
+        root, lambda w: isinstance(w, Gtk.ToggleButton) and (w.get_label() or "").startswith(prefix)
+    )
+
+
+def _picker_panels(root):
+    return find_all(root, lambda w: "picker-panel" in w.get_css_classes())
+
+
+def _staging_rows(root):
+    return find_all(root, lambda w: isinstance(w, Gtk.Box) and "staging-mode-row" in w.get_css_classes())
+
+
+def _markers(root, *css):
+    wanted = set(css) if css else {
+        "marker-actuation", "marker-release", "marker-deep-actuation", "marker-deep-release"
+    }
+    return find_all(root, lambda w: bool(wanted & set(w.get_css_classes())))
+
+
+def _add_deep_stage(editor):
+    button_labeled(editor, "+ Add deep stage").emit("clicked")
+
+
+def test_unbound_grid_key_shows_the_bind_primary_first_gate_and_no_deep_affordance():
+    stub = DaemonStub()
+
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    assert find_one(editor, lambda w: isinstance(w, Gtk.Label) and "Bind a primary Action first" in w.get_label())
+    assert find_all(editor, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "+ Add deep stage") == []
+    assert _toggles_startswith(editor, "Primary") == []
+
+
+def test_a_bound_grid_key_gets_the_swap_panel_with_a_single_editor_slot_and_no_deep_stage():
+    stub = DaemonStub()
+
+    editor = _dual_stage_editor(stub)
+
+    assert find_one(editor, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "+ Add deep stage")
+    assert len(_toggles_startswith(editor, "Primary")) == 1
+    assert _toggles_startswith(editor, "Deep") == []
+    assert _staging_rows(editor) == []
+    # "never two pickers on screen at once" — only the primary's fields are
+    # mounted, not also a plain top-level editor.
+    assert len(_picker_panels(editor)) == 1
+    assert len(_markers(editor)) == 2
+
+
+def test_adding_a_deep_stage_wires_the_daemon_and_reveals_the_deep_row_and_staging_row():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+
+    _add_deep_stage(editor)
+
+    assert [c[0] for c in stub.calls] == ["set_deep_actuation", "set_deep_stage"]
+    assert len(_toggles_startswith(editor, "Deep")) == 1
+    assert len(_staging_rows(editor)) == 1
+    assert find_all(editor, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "+ Add deep stage") == []
+    assert len(find_all(editor, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "✕")) == 1
+    # the shared bar gains the two deep markers, still one editor slot.
+    assert len(_markers(editor, "marker-deep-actuation", "marker-deep-release")) == 2
+    assert len(_markers(editor)) == 4
+    assert len(_picker_panels(editor)) == 1
+
+
+def test_removing_the_deep_stage_calls_clear_deep_stage_and_restores_the_add_button():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)
+    stub.calls.clear()
+
+    button_labeled(editor, "✕").emit("clicked")
+
+    assert stub.calls == [("clear_deep_stage", "grid_r1c1", "base")]
+    assert find_one(editor, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "+ Add deep stage")
+    assert _toggles_startswith(editor, "Deep") == []
+    assert _staging_rows(editor) == []
+    assert len(_markers(editor)) == 2
+
+
+def test_only_one_stage_picker_is_ever_mounted_across_the_swap_toggle():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    assert len(_picker_panels(editor)) == 1
+
+    _add_deep_stage(editor)  # lands on the Deep stage
+    assert len(_picker_panels(editor)) == 1
+
+    _toggles_startswith(editor, "Primary")[0].set_active(True)
+    assert len(_picker_panels(editor)) == 1
+
+    _toggles_startswith(editor, "Deep")[0].set_active(True)
+    assert len(_picker_panels(editor)) == 1
+
+
+def test_the_deep_stages_picker_carries_the_deep_picker_class_only_while_selected():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    assert find_all(editor, lambda w: "deep-picker" in w.get_css_classes()) == []
+
+    _add_deep_stage(editor)
+    assert len(find_all(editor, lambda w: "deep-picker" in w.get_css_classes())) == 1
+
+    _toggles_startswith(editor, "Primary")[0].set_active(True)
+    assert find_all(editor, lambda w: "deep-picker" in w.get_css_classes()) == []
+
+
+def test_picking_a_staging_mode_calls_set_staging_mode():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)
+    stub.calls.clear()
+
+    find_one(editor, lambda w: isinstance(w, Gtk.ToggleButton) and w.get_label() == "Additive").set_active(True)
+
+    assert ("set_staging_mode", "grid_r1c1", "additive") in stub.calls
+
+
+def test_saving_the_deep_stage_sends_set_deep_stage_with_the_edited_binding():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)  # lands on the Deep stage
+    stub.calls.clear()
+
+    _pick_key(editor, "Key", "F1")
+    button_labeled(editor, "Save").emit("clicked")
+
+    assert stub.calls[-1] == (
+        "set_deep_stage",
+        "grid_r1c1",
+        "base",
+        {"trigger": "hold_to_repeat", "type": "keypress", "key": "KEY_F1", "modifiers": []},
+    )
+
+
+def test_clearing_the_primary_cascades_the_deep_stage_away():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)
+    _toggles_startswith(editor, "Primary")[0].set_active(True)
+
+    button_labeled(editor, "Clear Binding").emit("clicked")
+
+    assert ("clear_binding", "grid_r1c1", "base") in stub.calls
+    profile = stub.get_config()["profiles"]["Default"]
+    assert profile["base"] == {}
+    assert profile["deep_base"] == {}
+    # ticket 06's cascade also drops the deep display: a fresh editor lands
+    # back on the bind-primary-first gate.
+    fresh = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+    assert find_one(fresh, lambda w: isinstance(w, Gtk.Label) and "Bind a primary Action first" in w.get_label())
+    assert _toggles_startswith(fresh, "Deep") == []
+
+
+def test_digital_mode_greys_the_bar_and_the_staging_row():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub, capture_mode="digital")
+
+    assert find_all(editor, lambda w: "depth-track-dim" in w.get_css_classes())
+    bar_note = find_one(
+        editor, lambda w: "digital-note-overlay" in w.get_css_classes() and "No depth" in w.get_label()
+    )
+    assert bar_note.get_visible()
+
+    _add_deep_stage(editor)
+
+    assert find_one(
+        editor, lambda w: "digital-note-overlay" in w.get_css_classes() and "Requires analog" in w.get_label()
+    )
+    for mode_btn in find_all(editor, lambda w: isinstance(w, Gtk.ToggleButton) and w.get_label() == "Handoff"):
+        assert not mode_btn.get_sensitive()
+
+
+def test_adding_a_deep_stage_to_a_chord_member_surfaces_the_daemon_rejection():
+    stub = DaemonStub()
+    stub.set_chord_binding(
+        ["grid_r1c1", "grid_r1c2"], "base",
+        {"trigger": "fire_once", "type": "keypress", "key": "KEY_A", "modifiers": []},
+    )
+    editor = _dual_stage_editor(stub)
+
+    _add_deep_stage(editor)
+
+    err = find_one(editor, lambda w: "error" in w.get_css_classes() and w.get_visible())
+    assert "Chord member" in err.get_label()
+    assert stub.get_config()["profiles"]["Default"]["deep_base"] == {}
+
+
+def test_adding_a_deep_stage_to_an_analog_repeat_primary_surfaces_the_daemon_rejection():
+    stub = DaemonStub()
+    stub.set_binding(
+        "grid_r1c1", "base",
+        {"trigger": "analog_repeat", "type": "keypress", "key": "KEY_A", "modifiers": []},
+    )
+    stub.calls.clear()
+    editor = build_binding_editor(
+        stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None, capture_mode="analog"
+    )
+
+    _add_deep_stage(editor)
+
+    err = find_one(editor, lambda w: "error" in w.get_css_classes() and w.get_visible())
+    assert "analog_repeat" in err.get_label()
+
+
+def test_building_the_dual_stage_panel_does_not_start_a_depth_stream_at_construction_time():
+    stub = DaemonStub()
+
+    _dual_stage_editor(stub)
+
+    assert stub._depth_target is None
+
+
+def test_swap_panel_keeps_the_primary_actuation_profile_default_controls():
+    stub = DaemonStub()
+    stub.set_actuation_point("grid_r1c1", 200, 180)
+    editor = _dual_stage_editor(stub)
+
+    button_labeled(editor, "Reset to Profile default").emit("clicked")
+    assert ("clear_actuation_point", "grid_r1c1") in stub.calls
+
+    button_labeled(editor, "Set as Profile default").emit("clicked")
+    assert any(c[0] == "set_default_actuation" for c in stub.calls)
+
+
+def test_swap_panel_persists_a_deep_marker_drag_across_a_stage_toggle():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)
+    stub.calls.clear()
+
+    track = find_one(editor, lambda w: isinstance(w, DepthTrack))
+    d_act_index = next(i for i, m in enumerate(track.markers) if "marker-deep-actuation" in m["css"])
+    track.markers[d_act_index]["value"] = 240
+    track.on_drag_end(d_act_index, 240)
+    assert any(c[0] == "set_deep_actuation" for c in stub.calls)
+
+    # toggling to Primary and back rebuilds the bar from the snapshot — the
+    # dragged value must survive rather than snapping back.
+    _toggles_startswith(editor, "Primary")[0].set_active(True)
+    _toggles_startswith(editor, "Deep")[0].set_active(True)
+    track = find_one(editor, lambda w: isinstance(w, DepthTrack))
+    d_act = next(m["value"] for m in track.markers if "marker-deep-actuation" in m["css"])
+    assert d_act == 240

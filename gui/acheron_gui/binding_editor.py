@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from gi.repository import Gtk, GLib
+from gi.repository import Gdk, Gtk, GLib
 
 from . import rules
 from .daemon_client import DaemonError
@@ -130,21 +130,32 @@ class DepthTrack(Gtk.Overlay):
     addition is `on_drag_end`, since the prototype had nothing to persist a
     drag to."""
 
-    def __init__(self, markers: list[dict], on_marker_moved, on_drag_end, height: int = 16):
+    def __init__(self, markers: list[dict], on_marker_moved, on_drag_end, height: int = 16,
+                 fixed_width: int | None = None):
         super().__init__()
         self.markers = markers
         self.on_marker_moved = on_marker_moved
         self.on_drag_end = on_drag_end
         self.height = height
         self.live_value: int | None = None
-        # _DEPTH_TRACK_WIDTH is only a pre-realize fallback — the bar
-        # hexpands to fill its container, and all pixel math below reads the
-        # real allocated width via `_track_width()`.
-        self.set_size_request(_DEPTH_TRACK_WIDTH, height)
-        self.set_hexpand(True)
+        # `fixed_width` is the dual-stage 4-marker bar's mode
+        # (tartarus-dual-stage-keys ticket 07): the prototype found a live
+        # `hexpand` width made every marker jump the instant one was picked
+        # up (a `get_width()` read inside the drag handler races the
+        # container's layout, and even the 200ms resync below couldn't fully
+        # hide it), so that bar pins its width instead of tracking the
+        # window. `None` keeps the original hexpand behaviour every other
+        # caller relies on; `_DEPTH_TRACK_WIDTH` is only a pre-realize
+        # fallback there, with all pixel math reading `_track_width()`.
+        self.fixed_width = fixed_width
+        width = fixed_width or _DEPTH_TRACK_WIDTH
+        self.set_size_request(width, height)
+        self.set_hexpand(fixed_width is None)
+        if fixed_width is not None:
+            self.set_halign(Gtk.Align.START)
 
-        track_bg = Gtk.Box(css_classes=["depth-track-bg"], hexpand=True)
-        track_bg.set_size_request(_DEPTH_TRACK_WIDTH, height)
+        track_bg = Gtk.Box(css_classes=["depth-track-bg"], hexpand=fixed_width is None)
+        track_bg.set_size_request(width, height)
         self.set_child(track_bg)
 
         self.fill = Gtk.Box(css_classes=["depth-track-fill"], halign=Gtk.Align.START, valign=Gtk.Align.FILL)
@@ -194,6 +205,8 @@ class DepthTrack(Gtk.Overlay):
         self.sync_markers()
 
     def _track_width(self) -> int:
+        if self.fixed_width is not None:
+            return self.fixed_width
         return self.get_width() or _DEPTH_TRACK_WIDTH
 
     def set_live_value(self, v: int | None) -> None:
@@ -458,6 +471,7 @@ def build_action_and_trigger_fields(
     available_action_types: list[tuple[str, str]] = ACTION_TYPES,
     inp: str | None = None,
     layer: str | None = None,
+    picker_css_class: str | None = None,
 ) -> tuple[Gtk.Widget, Gtk.DropDown, Callable[[], dict]]:
     """The Trigger-mode/Action editor core — everything below a Binding's
     own heading, shared verbatim by `build_binding_editor`'s per-Input
@@ -484,6 +498,13 @@ def build_action_and_trigger_fields(
     caller's own Save button — this function only ever toggles its
     `set_sensitive`, never builds or places it, so each caller keeps full
     control of its own button row.
+
+    `picker_css_class` (tartarus-dual-stage-keys ticket 07) is added to the
+    Key / Controller-button picker widget when set — the dual-stage editor
+    passes `"deep-picker"` for the deep stage so its picker's "current pick"
+    highlight paints in the deep-actuation marker's blue rather than the
+    theme's generic accent, making which stage's picker is on screen
+    unambiguous.
     """
     fields = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
 
@@ -628,6 +649,8 @@ def build_action_and_trigger_fields(
             key_picker, refresh_key_warning = build_inline_key_picker(
                 draft["keypress"].get("key", "KEY_A"), on_key_changed, key_warn_predicate
             )
+            if picker_css_class:
+                key_picker.add_css_class(picker_css_class)
             editor_slot.append(labeled_row("Key", key_picker))
             _trigger_handler["id"] = trigger_dd.connect("notify::selected", lambda *_: refresh_key_warning())
 
@@ -669,6 +692,8 @@ def build_action_and_trigger_fields(
             controller_picker = build_inline_controller_picker(
                 draft["controller_button"].get("button", "BTN_SOUTH"), on_button_changed
             )
+            if picker_css_class:
+                controller_picker.add_css_class(picker_css_class)
             editor_slot.append(labeled_row("Button", controller_picker))
         elif kind == "axis":
             def on_axis_changed(target: str) -> None:
@@ -869,6 +894,515 @@ def build_action_and_trigger_fields(
     return fields, trigger_dd, get_binding
 
 
+# --- Dual-stage grid keys (tartarus-dual-stage-keys ticket 07) -----------
+#
+# "Variant A — swap toggle", prototyped at
+# `prototype/04-dual-stage-binding-editor-layout/prototype.py` and confirmed
+# by Charon ("the layout I want the current binding editor to be replaced
+# with"). For a Grid key that already carries a primary Binding, this panel
+# *is* the whole editor: one shared 4-marker Actuation bar, a Primary/Deep
+# swap toggle, a Staging-mode row, and a single editor slot holding
+# whichever stage is toggled — so only one key/controller-button picker is
+# ever mounted in the tree at once (spec §"GUI binding-editor layout", the
+# hard Q12 constraint, met structurally rather than by CSS-hiding a second
+# picker).
+
+# The deep stage's second colour pair — blue actuation / purple release,
+# stacked strictly above the primary green/amber band (`.marker-deep-*` in
+# `app.py::CSS`).
+_DEEP_ACTUATION_CSS = "marker-deep-actuation"
+_DEEP_RELEASE_CSS = "marker-deep-release"
+
+# The shared 4-marker bar pins its width (see `DepthTrack.__init__`'s
+# `fixed_width` note). ~560px is close to the real inline key picker's own
+# natural width so the bar still lines up roughly flush with the picker row
+# beneath it, and the panel's `Gtk.ScrolledWindow` (hscrollbar NEVER)
+# absorbs any residual mismatch rather than the window widening to chase it.
+_DUAL_STAGE_TRACK_WIDTH = 560
+
+# Staging modes: wire key -> (button label, one-line tooltip). Order and
+# vocabulary match `daemon/src/config.rs::StagingMode` /
+# `dbus/wire.rs::staging_mode_from_str`.
+STAGING_MODES: list[tuple[str, str, str]] = [
+    (
+        "handoff",
+        "Handoff",
+        "Crossing into the deep band releases the primary and presses the deep; "
+        "crossing back releases the deep and re-presses the primary. One stage "
+        "held at a time (the camera-shutter model).",
+    ),
+    (
+        "no_return",
+        "No-Return",
+        "Like Handoff on the way in — but coming back up, the primary never re-fires.",
+    ),
+    (
+        "additive",
+        "Additive",
+        "The deeper press adds the deep stage on top; the primary stays held. "
+        "Both fire and release together.",
+    ),
+    (
+        "quick_skip",
+        "Quick-Skip",
+        "Reaching the deep band within ~50 ms of the primary point suppresses the "
+        "primary's Down entirely; otherwise the primary fires (up to 50 ms late) "
+        "and the key behaves as Handoff for the rest of the press.",
+    ),
+]
+
+# The deep stage's Action-kind menu — the three kinds that emit one discrete
+# event (spec §"GUI binding-editor layout" step 4). Macro / Stepper / Axis
+# are deliberately not offered for a deep stage.
+_DEEP_ACTION_TYPES = [
+    e for e in ACTION_TYPES if e[0] in ("keypress", "controller_button", "profile_switch")
+]
+
+
+def _enforce_ascending(values: list[int], moved: int) -> None:
+    """Keep `values` strictly increasing — the disjoint, stacked hysteresis
+    bands the deep stage requires (`primary release < primary actuation <
+    deep release < deep actuation`, so `deep.release > primary.actuation`).
+    The N-marker generalisation of `build_actuation_section`'s own 2-marker
+    anti-cross clamp: after the moved marker lands, push the chain of
+    neighbours it collided with rather than letting any pair touch."""
+    for j in range(moved + 1, len(values)):
+        if values[j] <= values[j - 1]:
+            values[j] = min(255, values[j - 1] + 1)
+    for j in range(moved - 1, -1, -1):
+        if values[j] >= values[j + 1]:
+            values[j] = max(0, values[j + 1] - 1)
+
+
+def _dual_stage_scroller_max_height() -> int:
+    """The dual-stage panel wraps its whole self in a `Gtk.ScrolledWindow`
+    that only actually scrolls once the content would run past the screen
+    edge (ticket 04's "window behaviour" note) — `propagate_natural_height`
+    lets the window hug the content below that. Sized to the active monitor
+    minus a chrome allowance, mirroring the prototype's `_max_scroller_
+    height`; falls back to a fixed value when there's no display (headless
+    tests)."""
+    display = Gdk.Display.get_default()
+    if display is not None:
+        monitors = display.get_monitors()
+        if monitors.get_n_items() > 0:
+            return max(360, monitors.get_item(0).get_geometry().height - 280)
+    return 560
+
+
+def build_dual_stage_panel(
+    client,
+    config: dict,
+    profile: str,
+    layer: str,
+    inp: str,
+    capture_mode: str,
+    primary_binding: dict,
+    available_action_types: list[tuple[str, str]],
+    save_btn: Gtk.Button,
+    clear_btn: Gtk.Button,
+    show_error: Callable[[Exception], None],
+    on_saved: Callable[[], None],
+) -> Gtk.Widget:
+    """The dual-stage grid-key editor. Replaces both the plain Trigger/Action
+    fields and `build_actuation_section` for a Grid key that already carries
+    a primary Binding. `save_btn`/`clear_btn` are the caller's own buttons;
+    this panel rewires their `clicked` handlers to the currently-selected
+    stage on every rebuild. Structural edits (add / remove a deep stage,
+    swap the toggled stage, pick a Staging mode) mutate the passed-in
+    `config` snapshot in place and rebuild the panel locally — the window
+    stays open (the "+ New Macro" in-place-snapshot precedent, and the same
+    "this edit only touches this one key" reasoning that keeps
+    `set_actuation_point` from popping the popover down). Save / Clear go
+    through the shared `on_saved` like the rest of the editor.
+    """
+    profile_dict = config["profiles"][profile]
+    default_actuation = profile_dict["default_actuation"]
+    macros = config.get("macros", {})
+    steppers = config.get("steppers")
+    digital = capture_mode == "digital"
+
+    ui = {"stage": "primary"}
+    handlers: dict = {"save": None, "clear": None}
+    track_holder: dict = {"track": None, "live": None}
+
+    panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    panel.add_css_class("actuation-section")
+
+    def resolved_primary() -> dict:
+        return profile_dict["actuation_overrides"].get(inp, default_actuation)
+
+    def deep_binding() -> dict | None:
+        return profile_dict[f"deep_{layer}"].get(inp)
+
+    def deep_cfg() -> dict | None:
+        return profile_dict["deep_stages"].get(inp)
+
+    def has_deep() -> bool:
+        return deep_binding() is not None
+
+    # --- structural edits: hit the Daemon, mutate the snapshot, rebuild ---
+
+    def on_add_deep() -> None:
+        p = resolved_primary()
+        d_rel = min(255, p["actuation"] + 20)
+        d_act = min(255, d_rel + 35)
+        default_deep = {
+            "trigger": default_trigger_for(inp),
+            "type": "keypress",
+            "key": "KEY_A",
+            "modifiers": [],
+        }
+        try:
+            client.set_deep_actuation(inp, d_act, d_rel)
+        except DaemonError as exc:
+            show_error(exc)
+            return
+        profile_dict["deep_stages"][inp] = {
+            "actuation": {"actuation": d_act, "release": d_rel},
+            "mode": "handoff",
+        }
+        try:
+            client.set_deep_stage(inp, layer, default_deep)
+        except DaemonError as exc:
+            # An inert `deep_stages` entry with no matching deep Binding is
+            # legal (spec) — leave it, surface the rejection, and rebuild so
+            # the bar reflects the snapshot (still no deep stage, since a
+            # deep stage *is* its Binding).
+            show_error(exc)
+            rebuild()
+            return
+        profile_dict[f"deep_{layer}"][inp] = default_deep
+        ui["stage"] = "deep"
+        rebuild()
+
+    def on_remove_deep() -> None:
+        try:
+            client.clear_deep_stage(inp, layer)
+        except DaemonError as exc:
+            show_error(exc)
+            return
+        profile_dict[f"deep_{layer}"].pop(inp, None)
+        ui["stage"] = "primary"
+        rebuild()
+
+    def on_pick_mode(mode: str) -> None:
+        try:
+            client.set_staging_mode(inp, mode)
+        except DaemonError as exc:
+            show_error(exc)
+            rebuild()  # snap the toggle group back to the snapshot's mode
+            return
+        cfg = profile_dict["deep_stages"].setdefault(
+            inp, {"actuation": dict(resolved_primary()), "mode": "handoff"}
+        )
+        cfg["mode"] = mode
+
+    def on_save_stage(get_binding: Callable[[], dict]) -> None:
+        binding = get_binding()
+        try:
+            if ui["stage"] == "deep":
+                client.set_deep_stage(inp, layer, binding)
+            elif binding.get("type") == "axis":
+                client.set_axis_assignment(inp, layer, binding["target"])
+            else:
+                client.set_binding(inp, layer, binding)
+        except DaemonError as exc:
+            show_error(exc)
+            return
+        on_saved()
+
+    def on_clear_stage() -> None:
+        try:
+            if ui["stage"] == "deep":
+                client.clear_deep_stage(inp, layer)
+            else:
+                # Ticket 06's cascade: clearing the primary drops the deep
+                # Binding too, so the reopened editor lands on the plain
+                # bind-primary-first path.
+                client.clear_binding(inp, layer)
+        except DaemonError as exc:
+            show_error(exc)
+            return
+        on_saved()
+
+    # --- primary-actuation profile-default controls (unchanged behaviour
+    #     carried over from `build_actuation_section` — they only ever touch
+    #     the primary) ---
+
+    def on_reset_primary() -> None:
+        try:
+            client.clear_actuation_point(inp)
+        except DaemonError as exc:
+            show_error(exc)
+            return
+        profile_dict["actuation_overrides"].pop(inp, None)
+        rebuild()
+
+    def on_set_default() -> None:
+        p = resolved_primary()
+        try:
+            client.set_default_actuation(p["actuation"], p["release"])
+        except DaemonError as exc:
+            show_error(exc)
+            return
+        on_saved()
+
+    def on_reset_all() -> None:
+        try:
+            client.reset_actuation_points()
+        except DaemonError as exc:
+            show_error(exc)
+            return
+        on_saved()
+
+    def on_depth(depth: int) -> None:
+        track_holder["live"] = depth
+        if track_holder["track"] is not None:
+            track_holder["track"].set_live_value(depth)
+
+    def rebuild() -> None:
+        clear_children(panel)
+
+        # 1. Header + shared 4-marker Actuation bar.
+        header = Gtk.Box(spacing=6)
+        header.append(Gtk.Label(label="Actuation & release", css_classes=["sub-heading"]))
+        badge = Gtk.Label(css_classes=["badge", "badge-digital" if digital else "badge-analog"])
+        badge.set_label("digital" if digital else "analog")
+        header.append(badge)
+        panel.append(header)
+
+        p = resolved_primary()
+        markers = [
+            {"value": p["release"], "css": "marker-release", "draggable": not digital, "kind": "p_rel"},
+            {"value": p["actuation"], "css": "marker-actuation", "draggable": not digital, "kind": "p_act"},
+        ]
+        dcfg = deep_cfg()
+        if has_deep() and dcfg is not None:
+            da = dcfg["actuation"]
+            markers += [
+                {"value": da["release"], "css": _DEEP_RELEASE_CSS, "draggable": not digital, "kind": "d_rel"},
+                {"value": da["actuation"], "css": _DEEP_ACTUATION_CSS, "draggable": not digital, "kind": "d_act"},
+            ]
+
+        value_label = Gtk.Label(xalign=0, css_classes=["dim"])
+
+        def refresh_value() -> None:
+            pr = next(m["value"] for m in markers if m["kind"] == "p_rel")
+            pa = next(m["value"] for m in markers if m["kind"] == "p_act")
+            value_label.set_label(
+                f"Actuation {round(pa / 255 * 100)}%   Release {round(pr / 255 * 100)}%"
+            )
+
+        def on_marker_moved(i: int, v: int) -> None:
+            vals = [m["value"] for m in markers]
+            vals[i] = max(0, min(255, v))
+            _enforce_ascending(vals, i)
+            for m, nv in zip(markers, vals):
+                m["value"] = nv
+            track.sync_markers()
+            refresh_value()
+
+        def on_marker_drag_end(i: int, v: int) -> None:
+            kind = markers[i]["kind"]
+            try:
+                if kind in ("p_rel", "p_act"):
+                    pa = next(m["value"] for m in markers if m["kind"] == "p_act")
+                    pr = next(m["value"] for m in markers if m["kind"] == "p_rel")
+                    client.set_actuation_point(inp, pa, pr)
+                    profile_dict["actuation_overrides"][inp] = {"actuation": pa, "release": pr}
+                else:
+                    da_ = next(m["value"] for m in markers if m["kind"] == "d_act")
+                    dr = next(m["value"] for m in markers if m["kind"] == "d_rel")
+                    client.set_deep_actuation(inp, da_, dr)
+                    profile_dict["deep_stages"][inp]["actuation"] = {"actuation": da_, "release": dr}
+            except DaemonError as exc:
+                show_error(exc)
+
+        track = DepthTrack(
+            markers,
+            on_marker_moved=on_marker_moved,
+            on_drag_end=on_marker_drag_end,
+            fixed_width=_DUAL_STAGE_TRACK_WIDTH,
+        )
+        track_holder["track"] = track
+        if track_holder["live"] is not None:
+            track.set_live_value(track_holder["live"])
+        if digital:
+            track.add_css_class("depth-track-dim")
+        track.set_sensitive(not digital)
+
+        track_overlay = Gtk.Overlay(hexpand=True)
+        track_overlay.set_child(track)
+        digital_note = Gtk.Label(
+            label="No depth — analog capture unavailable",
+            wrap=True,
+            halign=Gtk.Align.CENTER,
+            valign=Gtk.Align.CENTER,
+            css_classes=["digital-note-overlay"],
+        )
+        digital_note.set_visible(digital)
+        track_overlay.add_overlay(digital_note)
+        panel.append(track_overlay)
+
+        legend = Gtk.Label(xalign=0, use_markup=True, css_classes=["marker-legend"])
+        legend_markup = (
+            '<span foreground="#e6991a">■</span> primary release   '
+            '<span foreground="#2ecc71">■</span> primary actuation'
+        )
+        if has_deep():
+            legend_markup += (
+                '   <span foreground="#9b59b6">■</span> deep release   '
+                '<span foreground="#3498db">■</span> deep actuation'
+            )
+        legend.set_markup(legend_markup)
+        panel.append(legend)
+
+        refresh_value()
+        panel.append(value_label)
+
+        # 2. Primary/Deep toggle row.
+        toggle_row = Gtk.Box(spacing=6)
+        primary_toggle = Gtk.ToggleButton(
+            label=f"Primary — {action_summary(primary_binding, inp, macros, steppers)}"
+        )
+        primary_toggle.set_active(ui["stage"] == "primary")
+
+        def on_primary_toggled(b: Gtk.ToggleButton) -> None:
+            if b.get_active():
+                ui["stage"] = "primary"
+                rebuild()
+
+        primary_toggle.connect("toggled", on_primary_toggled)
+        toggle_row.append(primary_toggle)
+
+        if has_deep():
+            deep_toggle = Gtk.ToggleButton(
+                label=f"Deep — {action_summary(deep_binding(), inp, macros, steppers)}"
+            )
+            deep_toggle.set_group(primary_toggle)
+            deep_toggle.set_active(ui["stage"] == "deep")
+
+            def on_deep_toggled(b: Gtk.ToggleButton) -> None:
+                if b.get_active():
+                    ui["stage"] = "deep"
+                    rebuild()
+
+            deep_toggle.connect("toggled", on_deep_toggled)
+            toggle_row.append(deep_toggle)
+
+            remove_btn = Gtk.Button(
+                label="✕",
+                tooltip_text="Remove deep stage",
+                css_classes=["destructive-action", "icon-btn"],
+            )
+            remove_btn.connect("clicked", lambda _b: on_remove_deep())
+            toggle_row.append(remove_btn)
+        else:
+            add_btn = Gtk.Button(label="+ Add deep stage")
+            add_btn.connect("clicked", lambda _b: on_add_deep())
+            toggle_row.append(add_btn)
+        panel.append(toggle_row)
+
+        # 3. Staging-mode row — only once a deep stage exists (nothing to
+        #    hand off between until then).
+        if has_deep():
+            panel.append(Gtk.Label(label="Staging mode", xalign=0, css_classes=["sub-heading"]))
+            current_mode = (deep_cfg() or {}).get("mode", "handoff")
+            staging_row = Gtk.Box(spacing=4, css_classes=["staging-mode-row"])
+            leader: Gtk.ToggleButton | None = None
+            for key, label, tip in STAGING_MODES:
+                btn = Gtk.ToggleButton(label=label, tooltip_text=tip)
+                if leader is None:
+                    leader = btn
+                else:
+                    btn.set_group(leader)
+                btn.set_active(key == current_mode)
+                btn.set_sensitive(not digital)
+                btn.connect(
+                    "toggled", lambda b, k=key: on_pick_mode(k) if b.get_active() else None
+                )
+                staging_row.append(btn)
+            staging_overlay = Gtk.Overlay(hexpand=True)
+            staging_overlay.set_child(staging_row)
+            if digital:
+                staging_note = Gtk.Label(
+                    label="Requires analog capture",
+                    halign=Gtk.Align.CENTER,
+                    valign=Gtk.Align.CENTER,
+                    css_classes=["digital-note-overlay"],
+                )
+                staging_overlay.add_overlay(staging_note)
+            panel.append(staging_overlay)
+
+        # 4. Editor slot — the selected stage's Trigger/Action fields. Only
+        #    one stage's fields (and so one picker) is ever mounted here.
+        if ui["stage"] == "deep" and has_deep():
+            if digital:
+                panel.append(
+                    Gtk.Label(
+                        label="Deep stage is inert in Digital capture mode — it needs analog capture to fire.",
+                        xalign=0,
+                        wrap=True,
+                        css_classes=["dim"],
+                    )
+                )
+            fields, _td, get_binding = build_action_and_trigger_fields(
+                client, config, profile, deep_binding(), save_btn,
+                _DEEP_ACTION_TYPES, inp, layer, picker_css_class="deep-picker",
+            )
+        else:
+            fields, _td, get_binding = build_action_and_trigger_fields(
+                client, config, profile, primary_binding, save_btn,
+                available_action_types, inp, layer,
+            )
+        panel.append(fields)
+
+        # 5. Primary-actuation profile-default controls.
+        reset_row = Gtk.Box(spacing=8)
+        reset_btn = Gtk.Button(label="Reset to Profile default")
+        reset_btn.connect("clicked", lambda _b: on_reset_primary())
+        reset_row.append(reset_btn)
+        panel.append(reset_row)
+
+        profile_row = Gtk.Box(spacing=8)
+        set_default_btn = Gtk.Button(label="Set as Profile default", css_classes=["dim"])
+        set_default_btn.connect("clicked", lambda _b: on_set_default())
+        profile_row.append(set_default_btn)
+        reset_all_btn = Gtk.Button(label="Reset all keys to Profile default", css_classes=["dim"])
+        reset_all_btn.connect("clicked", lambda _b: on_reset_all())
+        profile_row.append(reset_all_btn)
+        panel.append(profile_row)
+
+        force_digital_check = Gtk.CheckButton(
+            label="Force digital capture (disable analog)", css_classes=["dim"]
+        )
+        force_digital_check.set_active(config.get("force_digital", False))
+        force_digital_check.connect("toggled", lambda b: client.set_force_digital(b.get_active()))
+        panel.append(force_digital_check)
+
+        # Rewire the caller's Save/Clear to the currently-selected stage —
+        # disconnecting the previous rebuild's handlers first so they don't
+        # pile up (the `_trigger_handler` precedent in
+        # `build_action_and_trigger_fields`).
+        if handlers["save"] is not None:
+            save_btn.disconnect(handlers["save"])
+        if handlers["clear"] is not None:
+            clear_btn.disconnect(handlers["clear"])
+        handlers["save"] = save_btn.connect("clicked", lambda _b: on_save_stage(get_binding))
+        handlers["clear"] = clear_btn.connect("clicked", lambda _b: on_clear_stage())
+
+    # Live depth only while the panel is on screen (the `build_actuation_
+    # section` precedent) — `build_binding_editor` is rebuilt eagerly for
+    # every Grid key on every app rebuild, so this must not run at
+    # construction.
+    panel.connect("map", lambda *_: client.start_depth_stream(inp, on_depth))
+    panel.connect("unmap", lambda *_: client.stop_depth_stream(inp))
+
+    rebuild()
+    return panel
+
+
 def build_binding_editor(
     client,
     config: dict,
@@ -922,15 +1456,39 @@ def build_binding_editor(
 
     save_btn = Gtk.Button(label="Save")
     save_btn.add_css_class("suggested-action")
+    clear_btn = Gtk.Button(label="Clear Binding")
+
+    def show_error(exc: Exception):
+        error_label.set_label(str(exc))
+        error_label.set_visible(True)
+
+    # tartarus-dual-stage-keys ticket 07: a Grid key that already carries a
+    # primary Binding gets the "swap toggle" dual-stage panel as its whole
+    # editor — it owns the sole Trigger/Action editor slot (primary or deep,
+    # never both) plus the shared 4-marker Actuation bar. An unbound Grid key
+    # keeps the plain editor below, with a bind-primary-first note where the
+    # deep-stage affordance will appear once a primary exists.
+    if is_grid_input(inp) and existing is not None and current_axis_target is None:
+        panel = build_dual_stage_panel(
+            client, config, profile, layer, inp, capture_mode, existing,
+            available_action_types, save_btn, clear_btn, show_error, on_saved,
+        )
+        panel_scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        panel_scroller.set_propagate_natural_width(True)
+        panel_scroller.set_propagate_natural_height(True)
+        panel_scroller.set_max_content_height(_dual_stage_scroller_max_height())
+        panel_scroller.set_child(panel)
+        box.append(panel_scroller)
+        btn_row = Gtk.Box(spacing=8)
+        btn_row.append(save_btn)
+        btn_row.append(clear_btn)
+        box.append(btn_row)
+        return box
 
     fields, _trigger_dd, get_binding = build_action_and_trigger_fields(
         client, config, profile, starting, save_btn, available_action_types, inp, layer
     )
     box.append(fields)
-
-    def show_error(exc: Exception):
-        error_label.set_label(str(exc))
-        error_label.set_visible(True)
 
     btn_row = Gtk.Box(spacing=8)
 
@@ -948,8 +1506,6 @@ def build_binding_editor(
 
     save_btn.connect("clicked", on_save)
     btn_row.append(save_btn)
-
-    clear_btn = Gtk.Button(label="Clear Binding")
 
     def on_clear(b):
         if current_axis_target is not None:
@@ -995,6 +1551,20 @@ def build_binding_editor(
         actuation_scroller.set_max_content_height(320)
         actuation_scroller.set_child(build_actuation_section(client, config, profile, inp, capture_mode, on_saved))
         box.append(actuation_scroller)
+
+        if current_axis_target is None:
+            # tartarus-dual-stage-keys ticket 07: no primary Binding yet, so
+            # a deep stage can't exist (it requires one). Point the user at
+            # the Trigger/Action fields above — the full swap-toggle panel
+            # replaces this whole section the moment a primary is saved.
+            box.append(
+                Gtk.Label(
+                    label="Bind a primary Action first to add a deep stage.",
+                    xalign=0,
+                    wrap=True,
+                    css_classes=["dim"],
+                )
+            )
 
     return box
 
