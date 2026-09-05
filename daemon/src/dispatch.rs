@@ -272,6 +272,25 @@ impl DispatchState {
             }
         }
 
+        // `tartarus-dual-stage-keys`: while the stage machine has handed this
+        // key's primary off to the deep stage (Handoff/No-Return crossed
+        // into the deep band), the primary band is still physically Down so
+        // `capture::analog` keeps synthesizing `Repeat`s for it — swallow
+        // them here so a Hold-to-repeat primary genuinely stops rather than
+        // machine-gunning under the deep stage. Gated on `depth.is_some()`
+        // like the diverts above (Digital mode has no deep stage). Only
+        // `Repeat` is swallowed: a `Down` can't arrive while the band is
+        // already Down, and the primary's real `Up` still passes through so
+        // the ordinary release runs. `stage::Engine` clears the flag on
+        // `RepressPrimary` (Handoff back out) and when the primary band
+        // itself goes Up, so repeats resume exactly when they should.
+        if event.state == EventState::Repeat
+            && event.depth.is_some()
+            && self.stage.primary_handed_off(event.input)
+        {
+            return Ok(Vec::new());
+        }
+
         // Real firing for an Analog-repeat Binding while Depth is available comes
         // entirely from `update_analog_repeats`'s own depth-driven background task
         // (ticket 20/39) — this Analog-sourced edge event (synthesized from the
@@ -4813,6 +4832,112 @@ mod tests {
             "No-Return must never repress the primary on the way back out — \
              the key stays quiet until a fresh press"
         );
+    }
+
+    #[tokio::test]
+    async fn dual_stage_handoff_suppresses_the_hold_to_repeat_primary_under_the_deep_stage() {
+        // The primary band stays physically Down through a Handoff hand-off,
+        // so `capture::analog` keeps synthesizing the primary's Hold-to-
+        // repeat `Repeat` pulses — every one must be swallowed while the deep
+        // stage holds the press, then resume the instant `RepressPrimary`
+        // hands it back.
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.repeat_analog(Input::Grid(1, 1), 150).await;
+        settle().await;
+        assert!(
+            !harness.sink.batches().is_empty(),
+            "the primary taps normally on Down + Repeat before any hand-off"
+        );
+
+        // Into the deep band: `[ReleasePrimary, FireDeep]`.
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        let after_handoff = harness.sink.batches().len();
+
+        for _ in 0..3 {
+            harness.repeat_analog(Input::Grid(1, 1), 250).await;
+            settle().await;
+        }
+        assert_eq!(
+            harness.sink.batches().len(),
+            after_handoff,
+            "the handed-off Hold-to-repeat primary must stop tapping under the deep stage"
+        );
+
+        // Back out: `RepressPrimary` re-fires it, and its Repeats resume.
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.repeat_analog(Input::Grid(1, 1), 150).await;
+        settle().await;
+        assert!(
+            harness.sink.batches().len() > after_handoff,
+            "the primary must tap again once the deep band releases"
+        );
+
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn dual_stage_no_return_keeps_the_hold_to_repeat_primary_suppressed_past_the_deep_band() {
+        // No-Return doesn't repress on the way out, so its primary stays
+        // suppressed even after the deep band releases — until a full
+        // physical release and a fresh press.
+        let config = dual_stage_config(
+            StagingMode::NoReturn,
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        let after_handoff = harness.sink.batches().len();
+
+        // Out of the deep band (No-Return: `[ReleaseDeep]`, no repress), then
+        // several synthesized primary Repeats — all still swallowed.
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        for _ in 0..3 {
+            harness.repeat_analog(Input::Grid(1, 1), 150).await;
+            settle().await;
+        }
+        assert_eq!(
+            harness.sink.batches().len(),
+            after_handoff,
+            "No-Return keeps the primary silent after the deep band releases, until a fresh press"
+        );
+
+        // Full release, then a fresh press — the primary taps again.
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        assert!(
+            harness.sink.batches().len() > after_handoff,
+            "a fresh press after full release taps the primary again"
+        );
+
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+        harness.shut_down().await;
     }
 
     #[tokio::test]

@@ -160,3 +160,21 @@ directions, Handoff Toggle-primary/Fire-once-deep producing a fresh loop on
 `RepressPrimary`, Additive's independent untouched cadences, No-Return's no-repress
 row, Digital-mode inertness, QuickSkip's unaffected-primary-only scoping, and the two
 teardown/regression fixes above.
+
+## Correction (ticket 07 follow-up, 2026-09-05)
+
+`StageOp::ReleasePrimary` force-released the primary's firing/Toggle but did nothing to
+stop `capture::analog`'s *synthesized* Hold-to-repeat `Repeat` stream, which keeps
+arriving while the primary band is physically Down through a Handoff/No-Return hand-off
+— so a **Hold-to-repeat primary kept machine-gunning under the deep stage** (reported
+from the GUI). The `advance` tables were right; the gap was in `handle_event`, which
+still ran every synthesized primary `Repeat` through the individual path.
+
+Fixed: `KeyRuntime` gained a `primary_handed_off` flag (`Engine::update` sets it on a
+`ReleasePrimary` not yet followed by `FirePrimary`/`RepressPrimary`, clears it when the
+primary band itself goes Up). `handle_event` now swallows a dual-stage key's
+depth-sourced primary `Repeat` while `Engine::primary_handed_off` is set — mirroring
+the QuickSkip divert just above it. Additive never emits an inner `ReleasePrimary`, so
+its primary keeps repeating untouched (existing test still passes). Two new
+`dispatch.rs` integration tests: Handoff suppresses-then-resumes on repress, No-Return
+stays suppressed past the deep-band exit until a fresh press. 464 daemon tests pass.

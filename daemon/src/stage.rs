@@ -357,6 +357,17 @@ struct KeyRuntime {
     /// tables' own `(Up, Up)` rows), not a reset artifact, so it still gets
     /// `advance`'s ordinary full-replay treatment.
     just_reset: bool,
+    /// The stage machine currently holds this key's primary *released* — a
+    /// `ReleasePrimary` op not yet followed by `FirePrimary`/`RepressPrimary`
+    /// (Handoff/No-Return have handed the press to the deep stage). The
+    /// primary band is still physically Down through that hand-off, so
+    /// `capture::analog` keeps synthesizing `Repeat`s for it — `handle_event`
+    /// queries `Engine::primary_handed_off` to swallow them, so a
+    /// Hold-to-repeat primary genuinely stops rather than machine-gunning
+    /// under the deep stage. Cleared the moment the primary band itself
+    /// crosses back Up (the press is over). Additive never emits an inner
+    /// `ReleasePrimary`, so its primary keeps repeating for free.
+    primary_handed_off: bool,
 }
 
 /// `dispatch_individual_down`'s exact Down-side logic — get, short-circuit
@@ -564,6 +575,21 @@ impl Engine {
             }
             let (ops, quick_skip) = advance(prev, next, deep_cfg.mode, rt.quick_skip);
             rt.quick_skip = quick_skip;
+            // Track the primary hand-off across every op this tick emits
+            // (last write wins), then clear it whenever the primary band
+            // itself went Up. See `KeyRuntime::primary_handed_off`.
+            for op in &ops {
+                match op {
+                    StageOp::ReleasePrimary => rt.primary_handed_off = true,
+                    StageOp::FirePrimary | StageOp::RepressPrimary => {
+                        rt.primary_handed_off = false;
+                    }
+                    _ => {}
+                }
+            }
+            if new_primary == KeyState::Up {
+                rt.primary_handed_off = false;
+            }
             if ops.len() == 1 && matches!(ops[0], StageOp::FirePrimary | StageOp::ReleasePrimary) {
                 continue;
             }
@@ -768,6 +794,18 @@ impl Engine {
             self.runtime.get(&input).and_then(|rt| rt.quick_skip),
             Some(QuickSkipPhase::Late)
         )
+    }
+
+    /// Whether the stage machine currently holds `input`'s primary released
+    /// (a Handoff/No-Return hand-off to the deep stage). `handle_event`
+    /// swallows the primary's capture-synthesized `Repeat`s while this is
+    /// set — the primary band is still physically Down, so they keep
+    /// arriving, but a Hold-to-repeat primary must stay silent under the
+    /// deep stage rather than machine-gun. See `KeyRuntime::primary_handed_off`.
+    pub(crate) fn primary_handed_off(&self, input: Input) -> bool {
+        self.runtime
+            .get(&input)
+            .is_some_and(|rt| rt.primary_handed_off)
     }
 
     /// The earliest still-armed Quick-Skip deadline across every tracked
