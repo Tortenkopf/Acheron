@@ -20,8 +20,10 @@ standalone-test-harness pixel numbers).
 **Status:** resolved
 
 - [x] The Actuation section becomes a shared **4-marker** bar — primary green/amber
-      + deep blue (`#3498db`) actuation / purple release, fixed-width sized to
-      match the real key-picker row's own natural width (not `hexpand`), marker
+      + deep blue (`#3498db`) actuation / purple release, ~~fixed-width sized to
+      match the real key-picker row's own natural width (not `hexpand`)~~
+      **superseded — see the Answer: shipped `hexpand`, the fixed-width bar
+      clipped the deep markers on a narrow window**, marker
       order left-to-right: primary release, primary actuation, deep release, deep
       actuation. Legend uses real colour swatches in the same order. Greys with a
       "No depth — analog capture unavailable" note in Digital mode (deep markers
