@@ -53,3 +53,16 @@ asserting each editor's row order + `halign` + (grid) that the row has no
 use label-based lookup), so none changed. Full GUI suite 478 pass.
 `gui/tools/shot_binding_editor.py` re-run: all six PNGs still produced, the
 three rows visibly right-aligned.
+
+## Comments
+
+**Follow-up (830b5b1):** while reviewing the shots Charon noticed the Key
+picker always highlighted `A` green on an unbound key, even where that key's
+passthrough default is something else. Fixed separately: new
+`inputs.default_key_code_for()` / `INPUT_DEFAULT_KEY_CODE` (mirroring
+`daemon/src/input.rs::key_code_for_input`); the synthetic primary stage, the
+plain non-grid editor's fresh binding, and the non-keypress→Keypress draft
+fallback now seed the Key field from the Input's own default (`grid_r1c1` →
+`KEY_1`, Mode key → Left Alt, thumbstick Up → `KEY_UP`, wheel middle →
+`BTN_MIDDLE`; scroll directions + a Chord's Binding keep `KEY_A`). Saving an
+unbound key with no edits now commits that default. GUI suite 481 pass.
