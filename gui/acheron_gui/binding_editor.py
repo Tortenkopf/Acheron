@@ -1481,7 +1481,17 @@ def build_binding_editor(
     # never both) plus the shared 4-marker Actuation bar. An unbound Grid key
     # keeps the plain editor below, with a bind-primary-first note where the
     # deep-stage affordance will appear once a primary exists.
-    if is_grid_input(inp) and existing is not None and current_axis_target is None:
+    #
+    # `"deep_base" in profile_dict` guards a Daemon/GUI version skew: a
+    # pre-dual-stage Daemon's `GetConfig()` has no `deep_base`/`deep_held`/
+    # `deep_stages` keys, so the panel would `KeyError` — fall back to the
+    # plain editor rather than break the whole editor window.
+    if (
+        is_grid_input(inp)
+        and existing is not None
+        and current_axis_target is None
+        and "deep_base" in config["profiles"][profile]
+    ):
         panel = build_dual_stage_panel(
             client, config, profile, layer, inp, capture_mode, existing,
             available_action_types, save_btn, clear_btn, show_error, on_saved,

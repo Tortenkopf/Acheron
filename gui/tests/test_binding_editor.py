@@ -1483,3 +1483,24 @@ def test_dragging_the_primary_actuation_marker_is_clamped_below_the_deep_band():
     track.on_marker_moved(p_act_i, 255)
 
     assert track.markers[p_act_i]["value"] == track.markers[d_rel_i]["value"] - 1
+
+
+def test_a_pre_dual_stage_daemon_config_falls_back_to_the_plain_editor():
+    # Version skew: a Daemon built before the dual-stage feature has no
+    # deep_base/deep_held/deep_stages keys in GetConfig(). The editor must
+    # fall back to the plain layout rather than KeyError on the panel.
+    stub = DaemonStub()
+    stub.set_binding(
+        "grid_r1c1", "base", {"trigger": "hold_to_repeat", "type": "keypress", "key": "KEY_A", "modifiers": []}
+    )
+    config = stub.get_config()
+    for key in ("deep_base", "deep_held", "deep_stages"):
+        config["profiles"]["Default"].pop(key, None)
+
+    editor = build_binding_editor(stub, config, "Default", "base", "grid_r1c1", lambda: None)
+
+    assert _toggles_startswith(editor, "Primary") == []
+    assert find_all(editor, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "+ Add deep stage") == []
+    # the plain Trigger/Action editor + actuation section are still there
+    assert _dropdown_labeled(editor, "Trigger mode")
+    assert find_one(editor, lambda w: "sub-heading" in w.get_css_classes() and w.get_label() == "Actuation & release")
