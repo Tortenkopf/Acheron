@@ -1235,14 +1235,76 @@ def _add_deep_stage(editor):
     button_labeled(editor, "+ Add deep stage").emit("clicked")
 
 
-def test_unbound_grid_key_shows_the_bind_primary_first_gate_and_no_deep_affordance():
+def test_unbound_grid_key_shows_the_unified_panel_with_a_synthetic_primary_stage():
+    # Ticket 09: an unbound grid key opens the same swap-toggle panel a bound
+    # one does — a synthetic primary stage (Keypress on the Input's default
+    # Trigger mode), the `Primary — …` toggle showing the passthrough-default
+    # label, `+ Add deep stage` and `Clear Binding` both disabled, and no
+    # "Bind a primary Action first" line anywhere.
     stub = DaemonStub()
 
     editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
 
-    assert find_one(editor, lambda w: isinstance(w, Gtk.Label) and "Bind a primary Action first" in w.get_label())
-    assert find_all(editor, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "+ Add deep stage") == []
-    assert _toggles_startswith(editor, "Primary") == []
+    assert find_all(editor, lambda w: isinstance(w, Gtk.Label) and "Bind a primary Action first" in (w.get_label() or "")) == []
+
+    primary_toggles = _toggles_startswith(editor, "Primary")
+    assert len(primary_toggles) == 1
+    # The passthrough-default label for grid_r1c1 ("1"), not the synthetic KEY_A.
+    assert primary_toggles[0].get_label() == "Primary — 1"
+    assert _toggles_startswith(editor, "Deep") == []
+
+    add_btn = find_one(editor, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "+ Add deep stage")
+    assert not add_btn.get_sensitive()
+    assert add_btn.get_tooltip_text() == "Save a primary Action first"
+    assert not button_labeled(editor, "Clear Binding").get_sensitive()
+
+    # One picker mounted (the synthetic primary's), not also a plain editor.
+    assert len(_picker_panels(editor)) == 1
+    assert len(_markers(editor)) == 2
+
+    # The synthetic primary stage is a Keypress on the Input's default
+    # Trigger mode (Hold-to-repeat for a grid key).
+    assert _dropdown_labeled(editor, "Action").get_model().get_string(
+        _dropdown_labeled(editor, "Action").get_selected()
+    ) == "Keypress"
+    trigger_dd = _dropdown_labeled(editor, "Trigger mode")
+    assert TRIGGER_OPTIONS[trigger_dd.get_selected()][0] == "hold_to_repeat"
+
+
+def test_unbound_grid_key_add_deep_stage_is_inert_while_disabled():
+    # The disabled `+ Add deep stage` must not reach the Daemon even if its
+    # "clicked" is emitted directly (a deep stage structurally requires a
+    # primary Binding).
+    stub = DaemonStub()
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    button_labeled(editor, "+ Add deep stage").emit("clicked")
+
+    assert stub.calls == []
+    assert _toggles_startswith(editor, "Deep") == []
+
+
+def test_unbound_grid_key_save_with_no_edits_still_creates_the_placeholder_binding():
+    # The synthetic primary is committed unconditionally on Save (matching
+    # the old plain editor's "Save always calls set_binding"): opening an
+    # unbound key and hitting Save binds it to the KEY_A placeholder.
+    stub = DaemonStub()
+    changed = []
+
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
+    popover = editor_content(btn)
+
+    button_labeled(popover, "Save").emit("clicked")
+
+    assert stub.calls == [
+        (
+            "set_binding",
+            "grid_r1c1",
+            "base",
+            {"trigger": "hold_to_repeat", "type": "keypress", "key": "KEY_A", "modifiers": []},
+        )
+    ]
+    assert changed == [1]
 
 
 def test_a_bound_grid_key_gets_the_swap_panel_with_a_single_editor_slot_and_no_deep_stage():
@@ -1360,10 +1422,13 @@ def test_clearing_the_primary_cascades_the_deep_stage_away():
     assert profile["base"] == {}
     assert profile["deep_base"] == {}
     # ticket 06's cascade also drops the deep display: a fresh editor lands
-    # back on the bind-primary-first gate.
+    # back on the synthetic-primary state — no deep toggle, `+ Add deep
+    # stage` disabled again.
     fresh = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
-    assert find_one(fresh, lambda w: isinstance(w, Gtk.Label) and "Bind a primary Action first" in w.get_label())
     assert _toggles_startswith(fresh, "Deep") == []
+    assert not find_one(
+        fresh, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "+ Add deep stage"
+    ).get_sensitive()
 
 
 def test_digital_mode_greys_the_bar_and_the_staging_row():

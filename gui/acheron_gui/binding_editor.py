@@ -950,15 +950,18 @@ def _dual_stage_scroller_max_height() -> int:
     """The dual-stage panel wraps its whole self in a `Gtk.ScrolledWindow`
     that only actually scrolls once the content would run past the screen
     edge (ticket 04's "window behaviour" note) — `propagate_natural_height`
-    lets the window hug the content below that. Sized to the active monitor
-    minus a chrome allowance, mirroring the prototype's `_max_scroller_
-    height`; falls back to a fixed value when there's no display (headless
-    tests)."""
+    lets the window hug the content below that, so a short editor stays
+    compact and only a tall one (deep stage + an expanded key picker) grows
+    toward the screen edge and then scrolls. Sized to the active monitor
+    minus a chrome allowance (ticket 09: roughly a titlebar's worth, ~96px,
+    down from the earlier ~280px, so the panel reaches nearer full height
+    before scrolling); mirrors the prototype's `_max_scroller_height`; falls
+    back to a fixed value when there's no display (headless tests)."""
     display = Gdk.Display.get_default()
     if display is not None:
         monitors = display.get_monitors()
         if monitors.get_n_items() > 0:
-            return max(360, monitors.get_item(0).get_geometry().height - 280)
+            return max(360, monitors.get_item(0).get_geometry().height - 96)
     return 560
 
 
@@ -969,30 +972,63 @@ def build_dual_stage_panel(
     layer: str,
     inp: str,
     capture_mode: str,
-    primary_binding: dict,
     available_action_types: list[tuple[str, str]],
     save_btn: Gtk.Button,
     clear_btn: Gtk.Button,
     show_error: Callable[[Exception], None],
     on_saved: Callable[[], None],
 ) -> Gtk.Widget:
-    """The dual-stage grid-key editor. Replaces both the plain Trigger/Action
-    fields and `build_actuation_section` for a Grid key that already carries
-    a primary Binding. `save_btn`/`clear_btn` are the caller's own buttons;
-    this panel rewires their `clicked` handlers to the currently-selected
-    stage on every rebuild. Structural edits (add / remove a deep stage,
-    swap the toggled stage, pick a Staging mode) mutate the passed-in
-    `config` snapshot in place and rebuild the panel locally — the window
-    stays open (the "+ New Macro" in-place-snapshot precedent, and the same
-    "this edit only touches this one key" reasoning that keeps
-    `set_actuation_point` from popping the popover down). Save / Clear go
-    through the shared `on_saved` like the rest of the editor.
+    """The dual-stage grid-key editor — the whole editor for *any* Grid key
+    (ticket 09), whether or not it already carries a primary Binding, once
+    the Daemon's `GetConfig()` carries the dual-stage keys. It replaces both
+    the plain Trigger/Action fields and `build_actuation_section`. A grid key
+    with no primary Binding yet renders a *synthetic* primary stage (a
+    Keypress on the Input's default Trigger mode, `KEY_A` placeholder Action,
+    the `Primary — …` toggle showing the passthrough-default label) with
+    `+ Add deep stage` and `Clear Binding` both disabled until a primary is
+    committed.
+
+    `save_btn`/`clear_btn` are the caller's own buttons; this panel rewires
+    their `clicked` handlers to the currently-selected stage on every
+    rebuild. Structural edits (add / remove a deep stage, swap the toggled
+    stage, pick a Staging mode) mutate the passed-in `config` snapshot in
+    place and rebuild the panel locally — the window stays open (the "+ New
+    Macro" in-place-snapshot precedent, and the same "this edit only touches
+    this one key" reasoning that keeps `set_actuation_point` from popping the
+    popover down). Save / Clear go through the shared `on_saved` like the
+    rest of the editor.
+
+    The primary Binding is read from the `config` snapshot for this Input/
+    Layer on every rebuild — the same way the deep Binding already is — not
+    from a fixed constructor argument, so a freshly committed primary
+    (ticket 10's in-place rebuild) is reflected without reconstruction.
     """
     profile_dict = config["profiles"][profile]
     default_actuation = profile_dict["default_actuation"]
     macros = config.get("macros", {})
     steppers = config.get("steppers")
     digital = capture_mode == "digital"
+
+    # The synthetic primary stage shown for a grid key that has no primary
+    # Binding yet (ticket 09): a Keypress on the Input's own default Trigger
+    # mode with a `KEY_A` placeholder Action. The `Primary — …` toggle shows
+    # `action_summary(None, …)` — the passthrough-default label — instead,
+    # matching what the key actually does while unbound.
+    synthetic_primary = {
+        "trigger": default_trigger_for(inp),
+        "type": "keypress",
+        "key": "KEY_A",
+        "modifiers": [],
+    }
+
+    def primary_snapshot() -> dict | None:
+        return profile_dict[layer].get(inp)
+
+    def has_primary() -> bool:
+        return primary_snapshot() is not None
+
+    def primary_binding() -> dict:
+        return primary_snapshot() or synthetic_primary
 
     ui = {"stage": "primary"}
     track_holder: dict = {"track": None, "live": None}
@@ -1025,7 +1061,7 @@ def build_dual_stage_panel(
         return deep_binding() is not None
 
     def stage_snapshot(stage: str) -> dict | None:
-        return primary_binding if stage == "primary" else deep_binding()
+        return primary_binding() if stage == "primary" else deep_binding()
 
     def stage_starting(stage: str) -> dict | None:
         # The dict the editor slot builds from: this stage's live draft if
@@ -1062,6 +1098,11 @@ def build_dual_stage_panel(
     # --- structural edits: hit the Daemon, mutate the snapshot, rebuild ---
 
     def on_add_deep() -> None:
+        if not has_primary():
+            # `+ Add deep stage` is disabled in this state (a deep stage
+            # requires a primary Binding to exist at all) — guard the
+            # handler too.
+            return
         cfg = default_deep_cfg()
         d_act = cfg["actuation"]["actuation"]
         d_rel = cfg["actuation"]["release"]
@@ -1121,10 +1162,13 @@ def build_dual_stage_panel(
         # member) must fail before the deep push, and never leaves a
         # half-applied pair the user didn't ask for.
         capture_draft()
-        primary_target = drafts["primary"] if drafts["primary"] is not None else primary_binding
+        primary_target = drafts["primary"] if drafts["primary"] is not None else primary_binding()
         deep_target = drafts["deep"] if drafts["deep"] is not None else deep_binding()
         try:
-            if primary_target != primary_binding:
+            # With no primary Binding yet the stage is synthetic — commit it
+            # unconditionally (matching the old plain editor's "Save always
+            # calls set_binding" behaviour); otherwise push only a real edit.
+            if not has_primary() or primary_target != primary_binding():
                 if primary_target.get("type") == "axis":
                     client.set_axis_assignment(inp, layer, primary_target["target"])
                 else:
@@ -1137,6 +1181,12 @@ def build_dual_stage_panel(
         on_saved()
 
     def on_clear_stage() -> None:
+        if ui["stage"] != "deep" and not has_primary():
+            # `Clear Binding` is disabled with nothing bound — guard the
+            # handler too, matching the old plain path's already-unbound
+            # no-op (close, no D-Bus call).
+            on_saved()
+            return
         try:
             if ui["stage"] == "deep":
                 client.clear_deep_stage(inp, layer)
@@ -1299,10 +1349,17 @@ def build_dual_stage_panel(
         refresh_value()
         panel.append(value_label)
 
+        # `Clear Binding` clears the primary — nothing to clear while the
+        # primary stage is still synthetic.
+        clear_btn.set_sensitive(has_primary())
+
         # 2. Primary/Deep toggle row.
         toggle_row = Gtk.Box(spacing=6)
+        # `action_summary(primary_snapshot(), …)` shows the real Binding's
+        # summary once one exists, else the passthrough-default label for
+        # the synthetic stage.
         primary_toggle = Gtk.ToggleButton(
-            label=f"Primary — {action_summary(primary_binding, inp, macros, steppers)}"
+            label=f"Primary — {action_summary(primary_snapshot(), inp, macros, steppers)}"
         )
         primary_toggle.set_active(ui["stage"] == "primary")
 
@@ -1338,6 +1395,12 @@ def build_dual_stage_panel(
             toggle_row.append(remove_btn)
         else:
             add_btn = Gtk.Button(label="+ Add deep stage")
+            # A deep stage requires a primary Binding to exist at all — until
+            # one is committed, disable the button and say why. (Ticket 10
+            # adds an "Apply" button and widens this to "Save or Apply …".)
+            add_btn.set_sensitive(has_primary())
+            if not has_primary():
+                add_btn.set_tooltip_text("Save a primary Action first")
             add_btn.connect("clicked", lambda _b: on_add_deep())
             toggle_row.append(add_btn)
         panel.append(toggle_row)
@@ -1500,25 +1563,28 @@ def build_binding_editor(
         error_label.set_label(str(exc))
         error_label.set_visible(True)
 
-    # tartarus-dual-stage-keys ticket 07: a Grid key that already carries a
-    # primary Binding gets the "swap toggle" dual-stage panel as its whole
-    # editor — it owns the sole Trigger/Action editor slot (primary or deep,
-    # never both) plus the shared 4-marker Actuation bar. An unbound Grid key
-    # keeps the plain editor below, with a bind-primary-first note where the
-    # deep-stage affordance will appear once a primary exists.
+    # tartarus-dual-stage-keys ticket 09: *every* Grid key — bound or not —
+    # gets the "swap toggle" dual-stage panel as its whole editor (it owns
+    # the sole Trigger/Action editor slot, primary or deep, never both, plus
+    # the shared 4-marker Actuation bar). An unbound Grid key renders a
+    # synthetic primary stage inside the same panel rather than a separate
+    # plain layout; `build_dual_stage_panel` reads the primary Binding from
+    # the `config` snapshot itself. An Axis-assigned key keeps the plain
+    # editor below (a deep stage and an Axis assignment are mutually
+    # exclusive on a Layer).
     #
     # `"deep_base" in profile_dict` guards a Daemon/GUI version skew: a
     # pre-dual-stage Daemon's `GetConfig()` has no `deep_base`/`deep_held`/
     # `deep_stages` keys, so the panel would `KeyError` — fall back to the
-    # plain editor rather than break the whole editor window.
+    # plain editor (plus the standalone Actuation section) rather than break
+    # the whole editor window.
     if (
         is_grid_input(inp)
-        and existing is not None
         and current_axis_target is None
         and "deep_base" in config["profiles"][profile]
     ):
         panel = build_dual_stage_panel(
-            client, config, profile, layer, inp, capture_mode, existing,
+            client, config, profile, layer, inp, capture_mode,
             available_action_types, save_btn, clear_btn, show_error, on_saved,
         )
         panel_scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
@@ -1580,39 +1646,26 @@ def build_binding_editor(
     box.append(btn_row)
 
     if is_grid_input(inp):
-        # Ticket 70 follow-up, live-verified: on first open, the window
-        # this sits in (device_overview.make_input_button) should always
-        # be tall enough to show everything above this point — heading,
-        # error, the Trigger/Action fields including the inline key/
-        # mouse-button picker's full expanded shape, and the Save/Clear
-        # row — without scrolling, since the user always wants those
-        # reachable. Only the Actuation & release section (this one, grid-
-        # Inputs only) is deferred behind its own scroll: it's needed less
-        # often, and it's the section whose live depth bar/marker controls
-        # can push the window past the screen if left unbounded. Wrapping
-        # just this section, rather than the whole editor (as an earlier
-        # pass here did), keeps the rest of the window sized to its own
-        # natural height instead of being capped along with it.
+        # Reached only for the fallbacks now (ticket 09): an Axis-assigned
+        # grid key, or a pre-dual-stage Daemon whose `GetConfig()` has no
+        # `deep_base` keys — every other grid key takes `build_dual_stage_
+        # panel` above, which carries its own Actuation bar. Ticket 70
+        # follow-up, live-verified: on first open, the window this sits in
+        # (device_overview.make_input_button) should always be tall enough
+        # to show everything above this point — heading, error, the
+        # Trigger/Action fields including the inline key/mouse-button
+        # picker's full expanded shape, and the Save/Clear row — without
+        # scrolling, since the user always wants those reachable. Only the
+        # Actuation & release section is deferred behind its own scroll:
+        # it's needed less often, and it's the section whose live depth
+        # bar/marker controls can push the window past the screen if left
+        # unbounded.
         actuation_scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
         actuation_scroller.set_propagate_natural_width(True)
         actuation_scroller.set_propagate_natural_height(True)
         actuation_scroller.set_max_content_height(320)
         actuation_scroller.set_child(build_actuation_section(client, config, profile, inp, capture_mode, on_saved))
         box.append(actuation_scroller)
-
-        if current_axis_target is None:
-            # tartarus-dual-stage-keys ticket 07: no primary Binding yet, so
-            # a deep stage can't exist (it requires one). Point the user at
-            # the Trigger/Action fields above — the full swap-toggle panel
-            # replaces this whole section the moment a primary is saved.
-            box.append(
-                Gtk.Label(
-                    label="Bind a primary Action first to add a deep stage.",
-                    xalign=0,
-                    wrap=True,
-                    css_classes=["dim"],
-                )
-            )
 
     return box
 
