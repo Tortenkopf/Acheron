@@ -86,6 +86,46 @@ INPUT_DEFAULT_LABEL.update(
 )
 
 
+# The default evdev key code each keyed Input passes through with no Binding
+# — mirrors `daemon/src/input.rs`'s `GRID_KEYS` / `key_code_for_input` table
+# (a fixed hardware fact, no D-Bus call to fetch it, ticket 06). Kept
+# alongside `INPUT_DEFAULT_LABEL` above, which carries the *display* form of
+# the same facts. `wheel_scroll_up`/`wheel_scroll_down` inject as `EV_REL`
+# scroll with no discrete keycode (the Daemon's `key_code_for_input` returns
+# `None` for them too) — deliberately absent here.
+_GRID_DEFAULT_CODES = [
+    ["KEY_1", "KEY_2", "KEY_3", "KEY_4", "KEY_5"],
+    ["KEY_TAB", "KEY_Q", "KEY_W", "KEY_E", "KEY_R"],
+    ["KEY_CAPSLOCK", "KEY_A", "KEY_S", "KEY_D", "KEY_F"],
+    ["KEY_LEFTSHIFT", "KEY_Z", "KEY_X", "KEY_C", "KEY_SPACE"],
+]
+INPUT_DEFAULT_KEY_CODE = {
+    grid_input(r, c): _GRID_DEFAULT_CODES[r - 1][c - 1]
+    for r in range(1, GRID_ROWS + 1)
+    for c in range(1, GRID_COLS + 1)
+}
+INPUT_DEFAULT_KEY_CODE.update(
+    {
+        "mode_key": "KEY_LEFTALT",
+        "thumbstick_up": "KEY_UP",
+        "thumbstick_down": "KEY_DOWN",
+        "thumbstick_left": "KEY_LEFT",
+        "thumbstick_right": "KEY_RIGHT",
+        "wheel_middle": "BTN_MIDDLE",
+    }
+)
+
+
+def default_key_code_for(inp: str | None) -> str:
+    """The evdev code a freshly-created Keypress Binding on `inp` seeds its
+    Key field with — the Input's own passthrough default, so opening the
+    editor on an as-yet-unbound Input highlights the key that Input already
+    produces rather than a fixed `KEY_A`. Falls back to `KEY_A` for the two
+    scroll-wheel directions (no discrete default keycode) and for `inp is
+    None` (a Chord's own Binding, which has no single Input)."""
+    return INPUT_DEFAULT_KEY_CODE.get(inp, "KEY_A")
+
+
 def is_grid_input(inp: str) -> bool:
     """Only Grid keys have depth/Actuation points (ticket 17 §3/ticket 26) —
     the Mode key, thumbstick directions, and wheel events are all-or-nothing

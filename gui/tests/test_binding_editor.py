@@ -1287,7 +1287,9 @@ def test_unbound_grid_key_add_deep_stage_is_inert_while_disabled():
 def test_unbound_grid_key_save_with_no_edits_still_creates_the_placeholder_binding():
     # The synthetic primary is committed unconditionally on Save (matching
     # the old plain editor's "Save always calls set_binding"): opening an
-    # unbound key and hitting Save binds it to the KEY_A placeholder.
+    # unbound key and hitting Save binds it to the placeholder — which seeds
+    # from the Input's own passthrough default (grid_r1c1 → KEY_1), not a
+    # fixed KEY_A.
     stub = DaemonStub()
     changed = []
 
@@ -1301,10 +1303,27 @@ def test_unbound_grid_key_save_with_no_edits_still_creates_the_placeholder_bindi
             "set_binding",
             "grid_r1c1",
             "base",
-            {"trigger": "hold_to_repeat", "type": "keypress", "key": "KEY_A", "modifiers": []},
+            {"trigger": "hold_to_repeat", "type": "keypress", "key": "KEY_1", "modifiers": []},
         )
     ]
     assert changed == [1]
+
+
+def test_unbound_editor_seeds_the_key_picker_from_the_inputs_own_default():
+    # Ticket 11 follow-up: opening the editor on an as-yet-unbound Input
+    # highlights the key that Input already passes through, not a fixed "A".
+    stub = DaemonStub()
+
+    grid = editor_content(
+        make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c2", lambda: None)
+    )
+    grid_summary = find_one(grid, lambda w: "key-picker-summary" in w.get_css_classes())
+    assert grid_summary.get_label() == "Selected: 2"  # grid_r1c2 passes through KEY_2
+
+    # Non-grid plain editor takes the same default (Mode key → Left Alt).
+    mode = build_binding_editor(stub, stub.get_config(), "Default", "base", "mode_key", lambda: None)
+    mode_summary = find_one(mode, lambda w: "key-picker-summary" in w.get_css_classes())
+    assert mode_summary.get_label() == "Selected: Left Alt"
 
 
 def test_a_bound_grid_key_gets_the_swap_panel_with_a_single_editor_slot_and_no_deep_stage():
@@ -1863,7 +1882,7 @@ def test_apply_then_add_deep_stage_works_in_one_window_session():
     stub = DaemonStub()
     btn, changed = _grid_editor_button(stub)
 
-    button_labeled(editor_content(btn), "Apply").emit("clicked")  # binds the KEY_A placeholder
+    button_labeled(editor_content(btn), "Apply").emit("clicked")  # binds the grid_r1c1 default (KEY_1) placeholder
     button_labeled(editor_content(btn), "+ Add deep stage").emit("clicked")
 
     assert [c[0] for c in stub.calls] == ["set_binding", "set_deep_actuation", "set_deep_stage"]

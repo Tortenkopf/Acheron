@@ -30,6 +30,7 @@ from .inputs import (
     INPUT_DEFAULT_LABEL,
     TRIGGER_OPTIONS,
     TRIGGER_SHORT,
+    default_key_code_for,
     default_trigger_for,
     input_label,
     is_grid_input,
@@ -547,7 +548,7 @@ def build_action_and_trigger_fields(
     draft = {
         "keypress": {"key": starting.get("key", "KEY_A"), "modifiers": list(starting.get("modifiers", []))}
         if starting["type"] == "keypress"
-        else {"key": "KEY_A", "modifiers": []},
+        else {"key": default_key_code_for(inp), "modifiers": []},
         "macro": {"macro_id": starting.get("macro_id")} if starting["type"] == "macro" else {"macro_id": None},
         "step": {
             "stepper_id": starting.get("stepper_id"),
@@ -1031,7 +1032,10 @@ def build_dual_stage_panel(
     synthetic_primary = {
         "trigger": default_trigger_for(inp),
         "type": "keypress",
-        "key": "KEY_A",
+        # The Input's own passthrough default, not a fixed `KEY_A` — so the
+        # key-picker highlight on an as-yet-unbound key matches what the key
+        # already does (grid_r1c1 → "1", the Mode key → Alt, …).
+        "key": default_key_code_for(inp),
         "modifiers": [],
     }
 
@@ -1620,7 +1624,10 @@ def build_binding_editor(
         starting = existing or {
             "trigger": default_trigger_for(inp),
             "type": "keypress",
-            "key": "KEY_A",
+            # The Input's own passthrough default (ticket 11 follow-up) — a
+            # freshly-opened unbound editor highlights the key the Input
+            # already produces, not a fixed `KEY_A`.
+            "key": default_key_code_for(inp),
             "modifiers": [],
         }
     # "Axis" is offered only for grid keys (ticket 60's Answer) — non-grid
