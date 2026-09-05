@@ -130,32 +130,26 @@ class DepthTrack(Gtk.Overlay):
     addition is `on_drag_end`, since the prototype had nothing to persist a
     drag to."""
 
-    def __init__(self, markers: list[dict], on_marker_moved, on_drag_end, height: int = 16,
-                 fixed_width: int | None = None):
+    def __init__(self, markers: list[dict], on_marker_moved, on_drag_end, height: int = 16):
         super().__init__()
         self.markers = markers
         self.on_marker_moved = on_marker_moved
         self.on_drag_end = on_drag_end
         self.height = height
         self.live_value: int | None = None
-        # `fixed_width` is the dual-stage 4-marker bar's mode
-        # (tartarus-dual-stage-keys ticket 07): the prototype found a live
-        # `hexpand` width made every marker jump the instant one was picked
-        # up (a `get_width()` read inside the drag handler races the
-        # container's layout, and even the 200ms resync below couldn't fully
-        # hide it), so that bar pins its width instead of tracking the
-        # window. `None` keeps the original hexpand behaviour every other
-        # caller relies on; `_DEPTH_TRACK_WIDTH` is only a pre-realize
-        # fallback there, with all pixel math reading `_track_width()`.
-        self.fixed_width = fixed_width
-        width = fixed_width or _DEPTH_TRACK_WIDTH
-        self.set_size_request(width, height)
-        self.set_hexpand(fixed_width is None)
-        if fixed_width is not None:
-            self.set_halign(Gtk.Align.START)
+        # _DEPTH_TRACK_WIDTH is only a pre-realize fallback — the bar
+        # hexpands to fill its container, and all pixel math below reads the
+        # real allocated width via `_track_width()`. (The dual-stage 4-marker
+        # bar used a pinned width for a while — the prototype found a live
+        # `hexpand` read made markers jump mid-drag — but that clipped the
+        # deep markers out of reach on a narrow popover, and the 200ms resync
+        # already covers the jump in the real editor, unlike the prototype's
+        # standalone harness.)
+        self.set_size_request(_DEPTH_TRACK_WIDTH, height)
+        self.set_hexpand(True)
 
-        track_bg = Gtk.Box(css_classes=["depth-track-bg"], hexpand=fixed_width is None)
-        track_bg.set_size_request(width, height)
+        track_bg = Gtk.Box(css_classes=["depth-track-bg"], hexpand=True)
+        track_bg.set_size_request(_DEPTH_TRACK_WIDTH, height)
         self.set_child(track_bg)
 
         self.fill = Gtk.Box(css_classes=["depth-track-fill"], halign=Gtk.Align.START, valign=Gtk.Align.FILL)
@@ -205,8 +199,6 @@ class DepthTrack(Gtk.Overlay):
         self.sync_markers()
 
     def _track_width(self) -> int:
-        if self.fixed_width is not None:
-            return self.fixed_width
         return self.get_width() or _DEPTH_TRACK_WIDTH
 
     def set_live_value(self, v: int | None) -> None:
@@ -913,24 +905,6 @@ def build_action_and_trigger_fields(
 _DEEP_ACTUATION_CSS = "marker-deep-actuation"
 _DEEP_RELEASE_CSS = "marker-deep-release"
 
-_TRACK_WIDTH_CACHE: dict = {"value": None}
-
-
-def _dual_stage_track_width() -> int:
-    """The shared 4-marker bar is fixed-width (see `DepthTrack.__init__`'s
-    `fixed_width` note — a live `hexpand` width made markers jump mid-drag),
-    lined up flush with the `key_picker` row beneath it in the editor slot.
-    Measured from a throwaway inline key picker (the wider of the two real
-    pickers) plus `labeled_row`'s own 90px label column + 8px spacing, rather
-    than a hardcoded pixel guess the spec warns against. Cached — a picker's
-    natural width doesn't change over a session."""
-    if _TRACK_WIDTH_CACHE["value"] is None:
-        probe, _ = build_inline_key_picker("KEY_A", lambda _c: None)
-        picker_natural = probe.measure(Gtk.Orientation.HORIZONTAL, -1)[1]
-        _TRACK_WIDTH_CACHE["value"] = max(320, picker_natural + 90 + 8)
-    return _TRACK_WIDTH_CACHE["value"]
-
-
 # Staging modes: wire key -> (button label, one-line tooltip). Order and
 # vocabulary match `daemon/src/config.rs::StagingMode` /
 # `dbus/wire.rs::staging_mode_from_str`.
@@ -1262,7 +1236,10 @@ def build_dual_stage_panel(
                     da_ = next(m["value"] for m in markers if m["kind"] == "d_act")
                     dr = next(m["value"] for m in markers if m["kind"] == "d_rel")
                     client.set_deep_actuation(inp, da_, dr)
-                    profile_dict["deep_stages"][inp]["actuation"] = {"actuation": da_, "release": dr}
+                    profile_dict["deep_stages"].setdefault(inp, default_deep_cfg())["actuation"] = {
+                        "actuation": da_,
+                        "release": dr,
+                    }
             except DaemonError as exc:
                 show_error(exc)
 
@@ -1270,7 +1247,6 @@ def build_dual_stage_panel(
             markers,
             on_marker_moved=on_marker_moved,
             on_drag_end=on_marker_drag_end,
-            fixed_width=_dual_stage_track_width(),
         )
         track_holder["track"] = track
         if track_holder["live"] is not None:

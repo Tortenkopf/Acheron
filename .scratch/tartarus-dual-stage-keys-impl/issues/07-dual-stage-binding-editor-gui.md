@@ -107,14 +107,19 @@ prototype left room:
   valid; Axis is not a Binding at all). The deep picker carries `.deep-picker` so its
   selection paints in the deep-actuation blue (`#3498db`, `background-image: none` to
   beat the theme accent).
-- **4-marker bar** is `DepthTrack` with a new `fixed_width` mode (the prototype's
-  finding that a live `hexpand` width made markers jump mid-drag) — width is *measured*
-  from a throwaway `build_inline_key_picker` (573px natural) + `labeled_row`'s 90px
-  label column + 8px, not a hardcoded guess. Marker drags clamp the moved marker
-  between its immediate neighbours (the N-marker form of `build_actuation_section`'s own
-  2-marker anti-cross clamp), so a drag never has to persist a pair it didn't touch.
-  Digital mode greys the bar (`depth-track-dim` + insensitive, so the deep markers grey
-  with it) and the staging-mode row, each with its own centred note.
+- **4-marker bar** is the existing `DepthTrack`, left `hexpand` like the primary-only
+  bar. (It was pinned to a fixed width for a while — the prototype's "markers jump
+  mid-drag" finding — but a fixed 671px bar in the popover's `hscrollbar=NEVER`
+  scroller clipped the deep markers out of reach on a narrower window, and the
+  production `DepthTrack`'s 200ms resync already covers the jump the prototype's
+  standalone harness hit. Deviation from the ticket's "not `hexpand`" bullet, taken
+  because the fix caused a worse bug.) Marker drags clamp the moved marker between its
+  immediate neighbours (the N-marker form of `build_actuation_section`'s own 2-marker
+  anti-cross clamp), so a drag never has to persist a pair it didn't touch, and a
+  drag-end persists via `set_actuation_point` / `set_deep_actuation` and mirrors into
+  the snapshot so a later panel rebuild keeps it. Digital mode greys the bar
+  (`depth-track-dim` + insensitive, so the deep markers grey with it) and the
+  staging-mode row, each with its own centred note.
 
 Code review (two-axis, since `f3bc269`) flagged: ticket 07 — the hardcoded bar width
 and the over-narrow deep Action menu (both fixed above), plus a partial "seven

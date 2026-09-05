@@ -1552,3 +1552,40 @@ def test_save_with_no_edits_pushes_nothing():
     button_labeled(editor, "Save").emit("clicked")
 
     assert stub.calls == []
+
+
+def test_deep_actuation_marker_drag_persists_across_a_full_editor_rebuild():
+    # Regression: a deep-marker drag must survive the editor being torn down
+    # and rebuilt from a fresh GetConfig (an app rebuild), exactly the way a
+    # primary-marker drag does.
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)
+    stub.calls.clear()
+
+    track = find_one(editor, lambda w: isinstance(w, DepthTrack))
+    d_act_i = next(i for i, m in enumerate(track.markers) if "marker-deep-actuation" in m["css"])
+    d_rel_i = next(i for i, m in enumerate(track.markers) if "marker-deep-release" in m["css"])
+    track.markers[d_act_i]["value"] = 240
+    track.on_drag_end(d_act_i, 240)
+    track.markers[d_rel_i]["value"] = 205
+    track.on_drag_end(d_rel_i, 205)
+
+    assert ("set_deep_actuation", "grid_r1c1", 240, 205) in stub.calls
+    assert stub.get_config()["profiles"]["Default"]["deep_stages"]["grid_r1c1"]["actuation"] == {
+        "actuation": 240,
+        "release": 205,
+    }
+
+    # A brand-new editor built from the daemon's current config (what an app
+    # rebuild does) shows the dragged deep band, not the seeded default.
+    fresh = build_binding_editor(
+        stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None, capture_mode="analog"
+    )
+    fresh_track = find_one(fresh, lambda w: isinstance(w, DepthTrack))
+    by_kind = {
+        ("d_act" if "marker-deep-actuation" in m["css"] else "d_rel"): m["value"]
+        for m in fresh_track.markers
+        if "deep" in m["css"]
+    }
+    assert by_kind == {"d_act": 240, "d_rel": 205}
