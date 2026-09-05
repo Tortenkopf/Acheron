@@ -973,6 +973,28 @@ def test_set_deep_actuation_rejects_a_band_overlapping_the_primary_actuation():
         stub.set_deep_actuation("grid_r1c1", 150, 128)
 
 
+def test_set_default_deep_actuation_records_the_seed_on_the_active_profile():
+    # tartarus-dual-stage-keys ticket 08: the remembered deep-band seed.
+    # Absent from a fresh Profile (matching a fresh Daemon's `None`).
+    stub = DaemonStub()
+    assert "default_deep_actuation" not in stub.get_config()["profiles"]["Default"]
+
+    stub.set_default_deep_actuation(240, 205)
+
+    assert stub.get_config()["profiles"]["Default"]["default_deep_actuation"] == {
+        "actuation": 240,
+        "release": 205,
+    }
+    assert stub.calls[-1] == ("set_default_deep_actuation", 240, 205)
+
+
+def test_set_default_deep_actuation_rejects_release_at_or_above_actuation():
+    stub = DaemonStub()
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_default_deep_actuation(200, 200)
+
+
 def test_set_staging_mode_creates_a_fresh_config_and_only_writes_mode():
     # A low primary override keeps the fresh config's default
     # `ActuationPoint` (128/112) from overlapping the primary band —

@@ -1589,3 +1589,72 @@ def test_deep_actuation_marker_drag_persists_across_a_full_editor_rebuild():
         if "deep" in m["css"]
     }
     assert by_kind == {"d_act": 240, "d_rel": 205}
+
+
+def test_set_as_profile_default_records_the_current_deep_band():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)
+
+    # move the deep band, then "Set as Profile default"
+    track = find_one(editor, lambda w: isinstance(w, DepthTrack))
+    d_act_i = next(i for i, m in enumerate(track.markers) if "marker-deep-actuation" in m["css"])
+    d_rel_i = next(i for i, m in enumerate(track.markers) if "marker-deep-release" in m["css"])
+    track.markers[d_act_i]["value"] = 244
+    track.on_drag_end(d_act_i, 244)
+    track.markers[d_rel_i]["value"] = 208
+    track.on_drag_end(d_rel_i, 208)
+    stub.calls.clear()
+
+    button_labeled(editor, "Set as Profile default").emit("clicked")
+
+    kinds = [c[0] for c in stub.calls]
+    assert "set_default_actuation" in kinds
+    assert ("set_default_deep_actuation", 244, 208) in stub.calls
+    assert stub.get_config()["profiles"]["Default"]["default_deep_actuation"] == {
+        "actuation": 244,
+        "release": 208,
+    }
+
+
+def test_add_deep_stage_seeds_from_the_profile_default_deep_band():
+    stub = DaemonStub()
+    stub.set_default_deep_actuation(244, 208)
+    editor = _dual_stage_editor(stub)
+
+    _add_deep_stage(editor)
+
+    # the seeded band is the remembered one, not the +20/+35 offset off the
+    # primary default (128 -> 148 / 183).
+    assert ("set_deep_actuation", "grid_r1c1", 244, 208) in stub.calls
+    track = find_one(editor, lambda w: isinstance(w, DepthTrack))
+    by_kind = {
+        ("d_act" if "marker-deep-actuation" in m["css"] else "d_rel"): m["value"]
+        for m in track.markers
+        if "deep" in m["css"]
+    }
+    assert by_kind == {"d_act": 244, "d_rel": 208}
+
+
+def test_add_deep_stage_clamps_a_remembered_band_that_would_overlap_this_keys_primary():
+    stub = DaemonStub()
+    # a per-key primary override sitting above the remembered deep release
+    stub.set_actuation_point("grid_r1c1", 220, 200)
+    stub.set_default_deep_actuation(210, 190)  # release 190 < this key's primary actuation 220
+    editor = _dual_stage_editor(stub, key="KEY_A")
+
+    _add_deep_stage(editor)
+
+    # the seed is clamped so release > 220 (disjoint from this key's primary).
+    call = next(c for c in stub.calls if c[0] == "set_deep_actuation")
+    _, _, d_act, d_rel = call
+    assert d_rel > 220 and d_act > d_rel
+
+
+def test_add_deep_stage_uses_the_offset_when_no_profile_default_is_set():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)  # primary default 128/112, no remembered band
+
+    _add_deep_stage(editor)
+
+    assert ("set_deep_actuation", "grid_r1c1", 183, 148) in stub.calls

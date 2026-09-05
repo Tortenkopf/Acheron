@@ -210,6 +210,17 @@ pub struct Profile {
     /// Binding) — illegal the other way around.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub deep_stages: HashMap<Input, DeepStageConfig>,
+    /// A remembered deep Actuation/Release pair the GUI seeds a *new* deep
+    /// stage from (`tartarus-dual-stage-keys` ticket 08 — set by "Set as
+    /// Profile default" alongside `default_actuation`). `None` (a fresh
+    /// Profile, or a pre-feature `config.toml`) means "compute an offset off
+    /// the key's own primary Actuation point" instead. Purely a GUI-authoring
+    /// convenience — the runtime never reads it; each live deep stage carries
+    /// its own `deep_stages` entry. Only hysteresis-validated (`release <
+    /// actuation`) when `Some`; no disjoint-from-primary check, since the
+    /// per-key `deep_stages` entry it seeds is still checked in full.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_deep_actuation: Option<ActuationPoint>,
 }
 
 impl Profile {
@@ -1348,6 +1359,14 @@ pub(crate) fn validate(config: &Config) -> Result<(), ConfigError> {
     let release_not_below_actuation = config.profiles.values().find_map(|profile| {
         if profile.default_actuation.release >= profile.default_actuation.actuation {
             return Some("default".to_string());
+        }
+        // Ticket 08: the remembered deep-band seed is hysteresis-checked too
+        // when set, the same as `default_actuation`.
+        if profile
+            .default_deep_actuation
+            .is_some_and(|deep| deep.release >= deep.actuation)
+        {
+            return Some("default deep".to_string());
         }
         profile
             .actuation_overrides

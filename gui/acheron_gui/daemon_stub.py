@@ -749,6 +749,19 @@ class DaemonStub:
         cfg["actuation"] = {"actuation": actuation, "release": release}
         self.calls.append(("set_deep_actuation", input_str, actuation, release))
 
+    def set_default_deep_actuation(self, actuation: int, release: int) -> None:
+        # tartarus-dual-stage-keys ticket 08: the remembered deep-band seed
+        # for `+ Add deep stage`. Only hysteresis-checked (matching the real
+        # Daemon's `ReleaseNotBelowActuation` with locus "default deep") —
+        # no disjoint-from-primary check, since it's only a GUI seed.
+        if release >= actuation:
+            raise InvalidBindingError("release must be below actuation")
+        self._profiles[self._active_profile]["default_deep_actuation"] = {
+            "actuation": actuation,
+            "release": release,
+        }
+        self.calls.append(("set_default_deep_actuation", actuation, release))
+
     def set_staging_mode(self, input_str: str, mode: str) -> None:
         if mode not in _STAGING_MODES:
             # Mirrors the real Daemon's `wire::staging_mode_from_str`

@@ -632,6 +632,18 @@ impl Daemon {
             .await
     }
 
+    /// Records the active Profile's remembered deep-band seed (ticket 08) —
+    /// what `+ Add deep stage` starts a new deep stage from. Errors
+    /// `InvalidBinding` if `release > actuation`.
+    async fn set_default_deep_actuation(
+        &self,
+        actuation: u8,
+        release: u8,
+    ) -> Result<(), DaemonError> {
+        self.apply(Edit::SetDefaultDeepActuation { actuation, release })
+            .await
+    }
+
     /// Clears every per-key override on the active Profile in one call/one
     /// `config.toml` rewrite — the GUI's "reset all keys to Profile
     /// default" affordance (ticket 17 §5). Never fails on validation
@@ -940,6 +952,7 @@ mod tests {
         ) -> zbus::Result<()>;
         fn clear_deep_stage(&self, input: &str, layer: &str) -> zbus::Result<()>;
         fn set_deep_actuation(&self, input: &str, actuation: u8, release: u8) -> zbus::Result<()>;
+        fn set_default_deep_actuation(&self, actuation: u8, release: u8) -> zbus::Result<()>;
         fn set_staging_mode(&self, input: &str, mode: &str) -> zbus::Result<()>;
         fn start_depth_stream(&self, input: &str) -> zbus::Result<()>;
         fn stop_depth_stream(&self, input: &str) -> zbus::Result<()>;
@@ -2735,6 +2748,50 @@ mod tests {
 
         assert!(on_disk.contains("140"));
         assert!(on_disk.contains("120"));
+    }
+
+    #[tokio::test]
+    async fn set_default_deep_actuation_over_real_dbus_persists_and_surfaces_via_get_config() {
+        let server = TestServer::start().await;
+
+        server
+            .proxy
+            .set_default_deep_actuation(240, 205)
+            .await
+            .expect("SetDefaultDeepActuation over D-Bus must succeed");
+
+        let config = server.proxy.get_config().await.unwrap();
+        let profiles: wire::Dict = config.get("profiles").unwrap().clone().try_into().unwrap();
+        let default_profile: wire::Dict = profiles
+            .get(DEFAULT_PROFILE_NAME)
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let deep: wire::Dict = default_profile
+            .get("default_deep_actuation")
+            .expect("default_deep_actuation must be present once set")
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(u8::try_from(deep.get("actuation").unwrap()).unwrap(), 240);
+        assert_eq!(u8::try_from(deep.get("release").unwrap()).unwrap(), 205);
+
+        let on_disk = std::fs::read_to_string(&server.config_path).unwrap();
+        server.shut_down().await;
+        assert!(on_disk.contains("default_deep_actuation"));
+
+        // A rejected pair leaves nothing behind.
+        let server = TestServer::start().await;
+        let err = server
+            .proxy
+            .set_default_deep_actuation(200, 200)
+            .await
+            .expect_err("release >= actuation must be rejected");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.InvalidBinding")
+        );
+        server.shut_down().await;
     }
 
     #[tokio::test]

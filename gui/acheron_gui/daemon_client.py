@@ -150,6 +150,8 @@ class DaemonClient(Protocol):
 
     def set_deep_actuation(self, input_str: str, actuation: int, release: int) -> None: ...
 
+    def set_default_deep_actuation(self, actuation: int, release: int) -> None: ...
+
     def set_staging_mode(self, input_str: str, mode: str) -> None: ...
 
     def start_depth_stream(self, input_str: str, on_depth: Callable[[int], None]) -> None: ...
@@ -310,6 +312,9 @@ class DBusDaemonClient:
 
     def set_deep_actuation(self, input_str: str, actuation: int, release: int) -> None:
         self._call("SetDeepActuation", GLib.Variant("(syy)", (input_str, actuation, release)))
+
+    def set_default_deep_actuation(self, actuation: int, release: int) -> None:
+        self._call("SetDefaultDeepActuation", GLib.Variant("(yy)", (actuation, release)))
 
     def set_staging_mode(self, input_str: str, mode: str) -> None:
         self._call("SetStagingMode", GLib.Variant("(ss)", (input_str, mode)))

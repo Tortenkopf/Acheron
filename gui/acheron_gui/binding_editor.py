@@ -1041,12 +1041,21 @@ def build_dual_stage_panel(
             drafts[slot["stage"]] = slot["get_binding"]()
 
     def default_deep_cfg() -> dict:
-        # A fresh `deep_stages` entry seeded with a band disjoint from and
-        # stacked above the primary's (`deep.release > primary.actuation`),
-        # mode defaulting to Handoff — mirrors `DeepStageConfig::default()`
-        # resolved against this key's primary Actuation point.
-        p = resolved_primary()
-        d_rel = min(255, p["actuation"] + 20)
+        # A fresh `deep_stages` entry, mode Handoff, with a band disjoint from
+        # and stacked above *this key's* primary (`deep.release >
+        # primary.actuation`). Prefers the Profile's remembered deep band
+        # (ticket 08 — "Set as Profile default"), clamped so it stays disjoint
+        # from this key's resolved primary (the stored band may pre-date a
+        # per-key primary override); falls back to a `+20 / +35` offset when
+        # there's no remembered band or the clamp would collapse it.
+        p_act = resolved_primary()["actuation"]
+        remembered = profile_dict.get("default_deep_actuation")
+        if remembered is not None:
+            d_rel = max(remembered["release"], p_act + 1)
+            d_act = max(remembered["actuation"], d_rel + 1)
+            if d_act <= 255:
+                return {"actuation": {"actuation": d_act, "release": d_rel}, "mode": "handoff"}
+        d_rel = min(255, p_act + 20)
         d_act = min(255, d_rel + 35)
         return {"actuation": {"actuation": d_act, "release": d_rel}, "mode": "handoff"}
 
@@ -1158,6 +1167,12 @@ def build_dual_stage_panel(
         p = resolved_primary()
         try:
             client.set_default_actuation(p["actuation"], p["release"])
+            # Ticket 08: with a deep stage on this key, "Set as Profile
+            # default" also records its band as the seed for `+ Add deep
+            # stage` on other keys of this Profile.
+            if has_deep():
+                da = deep_cfg()["actuation"]
+                client.set_default_deep_actuation(da["actuation"], da["release"])
         except DaemonError as exc:
             show_error(exc)
             return

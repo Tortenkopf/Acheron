@@ -467,6 +467,14 @@ fn profile_to_dict(profile: &Profile) -> Dict {
         "default_actuation".to_string(),
         scalar(actuation_point_to_dict(profile.default_actuation)),
     );
+    // Ticket 08: the remembered deep-band seed — emitted only when set, so a
+    // fresh Profile has no key and the GUI computes the offset instead.
+    if let Some(deep) = profile.default_deep_actuation {
+        dict.insert(
+            "default_deep_actuation".to_string(),
+            scalar(actuation_point_to_dict(deep)),
+        );
+    }
     dict.insert(
         "actuation_overrides".to_string(),
         scalar(actuation_overrides_to_dict(&profile.actuation_overrides)),
@@ -1278,6 +1286,60 @@ mod tests {
             200
         );
         assert_eq!(dict_get_string(&deep_stage_dict, "mode"), "no_return");
+    }
+
+    /// Ticket 08: `default_deep_actuation` is serialized only when `Some` —
+    /// a fresh Profile has no key, a Profile with a remembered band has a
+    /// nested `actuation`/`release` dict.
+    #[test]
+    fn config_to_dict_serializes_default_deep_actuation_only_when_set() {
+        use std::collections::HashMap as StdHashMap;
+
+        let mut profiles = StdHashMap::new();
+        profiles.insert("Fresh".to_string(), Profile::default());
+        profiles.insert(
+            "Remembered".to_string(),
+            Profile {
+                default_deep_actuation: Some(ActuationPoint {
+                    actuation: 240,
+                    release: 205,
+                }),
+                ..Default::default()
+            },
+        );
+        let config = Config {
+            schema_version: 1,
+            active_profile: "Fresh".to_string(),
+            profiles,
+            force_digital: false,
+            macros: StdHashMap::new(),
+            steppers: StdHashMap::new(),
+        };
+
+        let dict = config_to_dict(&config);
+        let profiles_dict: Dict = get(&dict, "profiles").unwrap().clone().try_into().unwrap();
+
+        let fresh: Dict = profiles_dict
+            .get("Fresh")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert!(!fresh.contains_key("default_deep_actuation"));
+
+        let remembered: Dict = profiles_dict
+            .get("Remembered")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let deep: Dict = get(&remembered, "default_deep_actuation")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(u8::try_from(get(&deep, "actuation").unwrap()).unwrap(), 240);
+        assert_eq!(u8::try_from(get(&deep, "release").unwrap()).unwrap(), 205);
     }
 
     /// Ticket 40: `config_to_dict` must serialize a Profile's Chord

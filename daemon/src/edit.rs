@@ -104,6 +104,13 @@ pub enum Edit {
     /// point every Grid key uses unless it has its own override. Fails
     /// `InvalidRequest` if `release > actuation`.
     SetDefaultActuation { actuation: u8, release: u8 },
+    /// Sets the active Profile's `default_deep_actuation` (ticket 08) — the
+    /// deep Actuation/Release pair the GUI seeds a *new* deep stage from.
+    /// Relies on the trailing `config::validate` for the hysteresis check
+    /// (`ConfigError::ReleaseNotBelowActuation`, locus `"default deep"`). No
+    /// `Effect` — the runtime never reads this field, only `+ Add deep
+    /// stage` does.
+    SetDefaultDeepActuation { actuation: u8, release: u8 },
     /// Clears every per-key override on the active Profile in one
     /// `config.toml` rewrite — the GUI's "reset all keys to Profile default"
     /// affordance (ticket 17 §5), not 20 individual `ClearActuationPoint`
@@ -506,6 +513,10 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
         Edit::SetDefaultActuation { actuation, release } => {
             active_profile_mut(&mut next).default_actuation = ActuationPoint { actuation, release };
             effects.push(Effect::RepublishActuation);
+        }
+        Edit::SetDefaultDeepActuation { actuation, release } => {
+            active_profile_mut(&mut next).default_deep_actuation =
+                Some(ActuationPoint { actuation, release });
         }
         Edit::ResetActuationPoints => {
             active_profile_mut(&mut next).actuation_overrides.clear();
@@ -1441,6 +1452,28 @@ mod tests {
     }
 
     #[test]
+    fn set_default_deep_actuation_records_it_with_no_effect() {
+        // Ticket 08: a GUI-authoring seed — persisted, but the runtime never
+        // reads it, so no `Effect` (unlike `SetDefaultActuation`'s
+        // `RepublishActuation`).
+        let (next, outcome) = plan_ok(
+            &seed(),
+            Edit::SetDefaultDeepActuation {
+                actuation: 240,
+                release: 205,
+            },
+        );
+        assert_eq!(
+            next.profiles[DEFAULT_PROFILE_NAME].default_deep_actuation,
+            Some(ActuationPoint {
+                actuation: 240,
+                release: 205,
+            })
+        );
+        assert!(outcome.effects.is_empty());
+    }
+
+    #[test]
     fn set_force_digital_writes_the_flag_and_signals_the_supervisor() {
         let (next, outcome) = plan_ok(&seed(), Edit::SetForceDigital { force: true });
         assert!(next.force_digital);
@@ -1982,6 +2015,15 @@ mod tests {
                     release: 100,
                 },
                 matches: |e| is_invalid(e, "default"),
+            },
+            Case {
+                name: "SetDefaultDeepActuation: release >= actuation (invariant)",
+                setup: |_| {},
+                edit: || Edit::SetDefaultDeepActuation {
+                    actuation: 200,
+                    release: 200,
+                },
+                matches: |e| is_invalid(e, "default deep"),
             },
             Case {
                 name: "CreateMacro: blank name (precondition)",
