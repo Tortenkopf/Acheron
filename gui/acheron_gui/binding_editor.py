@@ -913,12 +913,23 @@ def build_action_and_trigger_fields(
 _DEEP_ACTUATION_CSS = "marker-deep-actuation"
 _DEEP_RELEASE_CSS = "marker-deep-release"
 
-# The shared 4-marker bar pins its width (see `DepthTrack.__init__`'s
-# `fixed_width` note). ~560px is close to the real inline key picker's own
-# natural width so the bar still lines up roughly flush with the picker row
-# beneath it, and the panel's `Gtk.ScrolledWindow` (hscrollbar NEVER)
-# absorbs any residual mismatch rather than the window widening to chase it.
-_DUAL_STAGE_TRACK_WIDTH = 560
+_TRACK_WIDTH_CACHE: dict = {"value": None}
+
+
+def _dual_stage_track_width() -> int:
+    """The shared 4-marker bar is fixed-width (see `DepthTrack.__init__`'s
+    `fixed_width` note — a live `hexpand` width made markers jump mid-drag),
+    lined up flush with the `key_picker` row beneath it in the editor slot.
+    Measured from a throwaway inline key picker (the wider of the two real
+    pickers) plus `labeled_row`'s own 90px label column + 8px spacing, rather
+    than a hardcoded pixel guess the spec warns against. Cached — a picker's
+    natural width doesn't change over a session."""
+    if _TRACK_WIDTH_CACHE["value"] is None:
+        probe, _ = build_inline_key_picker("KEY_A", lambda _c: None)
+        picker_natural = probe.measure(Gtk.Orientation.HORIZONTAL, -1)[1]
+        _TRACK_WIDTH_CACHE["value"] = max(320, picker_natural + 90 + 8)
+    return _TRACK_WIDTH_CACHE["value"]
+
 
 # Staging modes: wire key -> (button label, one-line tooltip). Order and
 # vocabulary match `daemon/src/config.rs::StagingMode` /
@@ -951,27 +962,14 @@ STAGING_MODES: list[tuple[str, str, str]] = [
     ),
 ]
 
-# The deep stage's Action-kind menu — the three kinds that emit one discrete
-# event (spec §"GUI binding-editor layout" step 4). Macro / Stepper / Axis
-# are deliberately not offered for a deep stage.
-_DEEP_ACTION_TYPES = [
-    e for e in ACTION_TYPES if e[0] in ("keypress", "controller_button", "profile_switch")
-]
-
-
-def _enforce_ascending(values: list[int], moved: int) -> None:
-    """Keep `values` strictly increasing — the disjoint, stacked hysteresis
-    bands the deep stage requires (`primary release < primary actuation <
-    deep release < deep actuation`, so `deep.release > primary.actuation`).
-    The N-marker generalisation of `build_actuation_section`'s own 2-marker
-    anti-cross clamp: after the moved marker lands, push the chain of
-    neighbours it collided with rather than letting any pair touch."""
-    for j in range(moved + 1, len(values)):
-        if values[j] <= values[j - 1]:
-            values[j] = min(255, values[j - 1] + 1)
-    for j in range(moved - 1, -1, -1):
-        if values[j] >= values[j + 1]:
-            values[j] = max(0, values[j + 1] - 1)
+def _deep_action_types(available_action_types: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """A deep stage is a full `Binding` — every per-Action rule applies to it
+    independently (spec.md §"Solution": "each stage is a full Binding"), so
+    the deep editor slot offers the primary's whole Action menu minus
+    **Axis**, which is not a Binding at all (ticket 59 §2's mutual
+    exclusion — a deep stage crosses a Depth band, it does not drive a
+    continuous value)."""
+    return [e for e in available_action_types if e[0] != "axis"]
 
 
 def _dual_stage_scroller_max_height() -> int:
@@ -1032,8 +1030,13 @@ def build_dual_stage_panel(
     def resolved_primary() -> dict:
         return profile_dict["actuation_overrides"].get(inp, default_actuation)
 
+    def deep_map() -> dict:
+        # The per-Layer deep-Binding map, mirroring the Daemon's own
+        # `Profile::deep_layer_mut(layer)` accessor.
+        return profile_dict[f"deep_{layer}"]
+
     def deep_binding() -> dict | None:
-        return profile_dict[f"deep_{layer}"].get(inp)
+        return deep_map().get(inp)
 
     def deep_cfg() -> dict | None:
         return profile_dict["deep_stages"].get(inp)
@@ -1041,12 +1044,22 @@ def build_dual_stage_panel(
     def has_deep() -> bool:
         return deep_binding() is not None
 
-    # --- structural edits: hit the Daemon, mutate the snapshot, rebuild ---
-
-    def on_add_deep() -> None:
+    def default_deep_cfg() -> dict:
+        # A fresh `deep_stages` entry seeded with a band disjoint from and
+        # stacked above the primary's (`deep.release > primary.actuation`),
+        # mode defaulting to Handoff — mirrors `DeepStageConfig::default()`
+        # resolved against this key's primary Actuation point.
         p = resolved_primary()
         d_rel = min(255, p["actuation"] + 20)
         d_act = min(255, d_rel + 35)
+        return {"actuation": {"actuation": d_act, "release": d_rel}, "mode": "handoff"}
+
+    # --- structural edits: hit the Daemon, mutate the snapshot, rebuild ---
+
+    def on_add_deep() -> None:
+        cfg = default_deep_cfg()
+        d_act = cfg["actuation"]["actuation"]
+        d_rel = cfg["actuation"]["release"]
         default_deep = {
             "trigger": default_trigger_for(inp),
             "type": "keypress",
@@ -1058,10 +1071,7 @@ def build_dual_stage_panel(
         except DaemonError as exc:
             show_error(exc)
             return
-        profile_dict["deep_stages"][inp] = {
-            "actuation": {"actuation": d_act, "release": d_rel},
-            "mode": "handoff",
-        }
+        profile_dict["deep_stages"][inp] = cfg
         try:
             client.set_deep_stage(inp, layer, default_deep)
         except DaemonError as exc:
@@ -1072,7 +1082,7 @@ def build_dual_stage_panel(
             show_error(exc)
             rebuild()
             return
-        profile_dict[f"deep_{layer}"][inp] = default_deep
+        deep_map()[inp] = default_deep
         ui["stage"] = "deep"
         rebuild()
 
@@ -1082,7 +1092,7 @@ def build_dual_stage_panel(
         except DaemonError as exc:
             show_error(exc)
             return
-        profile_dict[f"deep_{layer}"].pop(inp, None)
+        deep_map().pop(inp, None)
         ui["stage"] = "primary"
         rebuild()
 
@@ -1093,10 +1103,7 @@ def build_dual_stage_panel(
             show_error(exc)
             rebuild()  # snap the toggle group back to the snapshot's mode
             return
-        cfg = profile_dict["deep_stages"].setdefault(
-            inp, {"actuation": dict(resolved_primary()), "mode": "handoff"}
-        )
-        cfg["mode"] = mode
+        profile_dict["deep_stages"].setdefault(inp, default_deep_cfg())["mode"] = mode
 
     def on_save_stage(get_binding: Callable[[], dict]) -> None:
         binding = get_binding()
@@ -1195,11 +1202,16 @@ def build_dual_stage_panel(
             )
 
         def on_marker_moved(i: int, v: int) -> None:
-            vals = [m["value"] for m in markers]
-            vals[i] = max(0, min(255, v))
-            _enforce_ascending(vals, i)
-            for m, nv in zip(markers, vals):
-                m["value"] = nv
+            # Clamp the moved marker between its immediate neighbours rather
+            # than pushing them — the N-marker form of
+            # `build_actuation_section`'s own 2-marker anti-cross clamp
+            # (`binding_editor.py`'s `on_moved`). Because every marker only
+            # ever moves under its own drag, `on_marker_drag_end` never has
+            # to persist a pair it didn't touch, and the strictly-stacked
+            # order (`p_rel < p_act < d_rel < d_act`) always holds.
+            lo = markers[i - 1]["value"] + 1 if i > 0 else 0
+            hi = markers[i + 1]["value"] - 1 if i < len(markers) - 1 else 255
+            markers[i]["value"] = max(lo, min(hi, max(0, min(255, v))))
             track.sync_markers()
             refresh_value()
 
@@ -1223,7 +1235,7 @@ def build_dual_stage_panel(
             markers,
             on_marker_moved=on_marker_moved,
             on_drag_end=on_marker_drag_end,
-            fixed_width=_DUAL_STAGE_TRACK_WIDTH,
+            fixed_width=_dual_stage_track_width(),
         )
         track_holder["track"] = track
         if track_holder["live"] is not None:
@@ -1349,7 +1361,8 @@ def build_dual_stage_panel(
                 )
             fields, _td, get_binding = build_action_and_trigger_fields(
                 client, config, profile, deep_binding(), save_btn,
-                _DEEP_ACTION_TYPES, inp, layer, picker_css_class="deep-picker",
+                _deep_action_types(available_action_types), inp, layer,
+                picker_css_class="deep-picker",
             )
         else:
             fields, _td, get_binding = build_action_and_trigger_fields(

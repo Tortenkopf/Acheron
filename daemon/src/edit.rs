@@ -381,21 +381,7 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             active_profile_mut(&mut next)
                 .layer_mut(layer)
                 .insert(input, binding);
-            // Ticket 06's "Cascade-delete": overwriting a primary Binding
-            // that carried a live deep Binding on this Layer orphans it — a
-            // deep Binding can never exist without a matching primary
-            // (`ConfigError::DeepStageWithoutPrimary`), so its presence here
-            // is proof this `SetBinding` replaced, not freshly created, the
-            // primary. `deep_stages` (the Actuation/mode config) is
-            // deliberately left untouched — legal and inert with no matching
-            // `deep_base`/`deep_held` entry.
-            if active_profile_mut(&mut next)
-                .deep_layer_mut(layer)
-                .remove(&input)
-                .is_some()
-            {
-                effects.push(Effect::StopStage(input));
-            }
+            cascade_orphaned_deep_stage(&mut next, layer, input, &mut effects);
         }
         Edit::ClearBinding { input, layer } => {
             if active_profile_mut(&mut next)
@@ -405,14 +391,7 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             {
                 return Err(CommandError::NotFound);
             }
-            // Same cascade as `SetBinding` above.
-            if active_profile_mut(&mut next)
-                .deep_layer_mut(layer)
-                .remove(&input)
-                .is_some()
-            {
-                effects.push(Effect::StopStage(input));
-            }
+            cascade_orphaned_deep_stage(&mut next, layer, input, &mut effects);
         }
         Edit::SetModeKeyRole { role } => {
             active_profile_mut(&mut next).mode_key_role = role;
@@ -758,6 +737,31 @@ pub(crate) async fn apply(
     config::persist(&next, path).await?;
     *config = next;
     Ok(outcome)
+}
+
+/// `tartarus-dual-stage-keys` ticket 06's "Cascade-delete": an edit that
+/// removes or overwrites `input`'s primary Binding on `layer` orphans any
+/// deep Binding it carried there — a deep Binding can never exist without a
+/// matching primary (`ConfigError::DeepStageWithoutPrimary`), so its
+/// presence is proof the edit replaced, not freshly created, the primary.
+/// Drops the deep Binding and pushes `Effect::StopStage(input)` so a live
+/// slot force-releases immediately rather than waiting for a next Up that
+/// may never come. `deep_stages` (the Actuation/mode config) is left
+/// untouched — legal and inert with no matching `deep_base`/`deep_held`
+/// entry.
+fn cascade_orphaned_deep_stage(
+    next: &mut Config,
+    layer: Layer,
+    input: Input,
+    effects: &mut Vec<Effect>,
+) {
+    if active_profile_mut(next)
+        .deep_layer_mut(layer)
+        .remove(&input)
+        .is_some()
+    {
+        effects.push(Effect::StopStage(input));
+    }
 }
 
 /// The `Default` Profile always exists — `load_or_seed` refuses to start a

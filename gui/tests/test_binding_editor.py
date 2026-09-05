@@ -1456,3 +1456,30 @@ def test_swap_panel_persists_a_deep_marker_drag_across_a_stage_toggle():
     track = find_one(editor, lambda w: isinstance(w, DepthTrack))
     d_act = next(m["value"] for m in track.markers if "marker-deep-actuation" in m["css"])
     assert d_act == 240
+
+
+def test_deep_stage_action_menu_offers_the_full_binding_menu_minus_axis():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)  # lands on the Deep stage
+
+    action_dd = _dropdown_labeled(editor, "Action")
+    labels = [action_dd.get_model().get_string(i) for i in range(action_dd.get_model().get_n_items())]
+    assert "Keypress" in labels
+    assert "Macro" in labels
+    assert "Stepper" in labels
+    assert "Switch Profile" in labels
+    assert "Axis" not in labels
+
+
+def test_dragging_the_primary_actuation_marker_is_clamped_below_the_deep_band():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)
+
+    track = find_one(editor, lambda w: isinstance(w, DepthTrack))
+    p_act_i = next(i for i, m in enumerate(track.markers) if "marker-actuation" in m["css"])
+    d_rel_i = next(i for i, m in enumerate(track.markers) if "marker-deep-release" in m["css"])
+    track.on_marker_moved(p_act_i, 255)
+
+    assert track.markers[p_act_i]["value"] == track.markers[d_rel_i]["value"] - 1

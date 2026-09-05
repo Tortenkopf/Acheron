@@ -96,26 +96,39 @@ prototype left room:
   (`DeepStageMissingConfig`). A `set_deep_stage` rejection (Chord member,
   `analog_repeat` primary, …) surfaces on the shared error label and leaves the inert
   `deep_stages` entry, which spec.md permits.
-- **Deep Action-kind menu** is Keypress / Controller Button / Switch Profile only
-  (`_DEEP_ACTION_TYPES`); the deep picker carries `.deep-picker` so its selection paints
-  in the deep-actuation blue (`#3498db`, `background-image: none` to beat the theme
-  accent).
+- **Deep Action-kind menu** is the primary's whole menu minus **Axis** (`_deep_action_
+  types` — a deep stage is a full `Binding`, so Macro/Stepper/Switch-Profile are all
+  valid; Axis is not a Binding at all). The deep picker carries `.deep-picker` so its
+  selection paints in the deep-actuation blue (`#3498db`, `background-image: none` to
+  beat the theme accent).
 - **4-marker bar** is `DepthTrack` with a new `fixed_width` mode (the prototype's
-  finding that a live `hexpand` width made markers jump mid-drag); `_enforce_ascending`
-  is the N-marker generalisation of the existing 2-marker anti-cross clamp. Digital mode
-  greys the bar (`depth-track-dim` + insensitive, so the deep markers grey with it) and
-  the staging-mode row, each with its own centred note.
+  finding that a live `hexpand` width made markers jump mid-drag) — width is *measured*
+  from a throwaway `build_inline_key_picker` (573px natural) + `labeled_row`'s 90px
+  label column + 8px, not a hardcoded guess. Marker drags clamp the moved marker
+  between its immediate neighbours (the N-marker form of `build_actuation_section`'s own
+  2-marker anti-cross clamp), so a drag never has to persist a pair it didn't touch.
+  Digital mode greys the bar (`depth-track-dim` + insensitive, so the deep markers grey
+  with it) and the staging-mode row, each with its own centred note.
+
+Code review (two-axis, since `f3bc269`) flagged: ticket 06 clean; ticket 07 — the
+hardcoded bar width and the over-narrow deep Action menu (both fixed above), plus a
+partial "seven validation rules" checkbox (five of the seven are structurally
+unreachable from the panel — only Grid keys with a primary Binding reach it, and the
+marker clamp keeps the two band-order rules satisfied; the two reachable ones,
+`ChordMemberDeepStageConflict` / `AnalogRepeatOnDualStageKey`, are tested).
 
 New CSS in `app.py::CSS`: `.marker-deep-actuation` / `.marker-deep-release`,
-`.deep-picker …`, `.staging-mode-row button`, `.icon-btn`. `STAGING_MODES` and
-`_DEEP_ACTION_TYPES` live in `binding_editor.py`. README gains a **Dual-stage keys**
-Features bullet and a `### Dual-stage keys` Usage subsection (driving-sim
-half-throttle / full-throttle framing, per spec.md's Out-of-Scope note).
+`.deep-picker …`, `.staging-mode-row button`, `.icon-btn`. `STAGING_MODES` lives in
+`binding_editor.py`. README gains a **Dual-stage keys** Features bullet and a
+`### Dual-stage keys` Usage subsection (driving-sim half-throttle / full-throttle
+framing, per spec.md's Out-of-Scope note).
 
-Tests: `gui/tests/test_binding_editor.py` gained 20 cases covering the bind-primary-first
+Tests: `gui/tests/test_binding_editor.py` gained 22 cases covering the bind-primary-first
 gate, add/remove toggling the Deep row + staging row + marker count, the
-one-picker-mounted invariant across every toggle, the `.deep-picker` class, staging-mode
-wiring, deep-stage Save, the primary-clear cascade, Digital-mode greying, the
-Chord-member / `analog_repeat` rejections surfacing on the error label, marker-drag
-persistence, and no depth stream at construction. 449 GUI tests pass; 463 daemon tests,
-`cargo clippy`/`fmt` unchanged and clean.
+one-picker-mounted invariant across every toggle, the `.deep-picker` class, the deep
+Action menu (full-minus-Axis), staging-mode wiring, deep-stage Save, the primary-clear
+cascade, Digital-mode greying, the Chord-member / `analog_repeat` rejections surfacing
+on the error label, the primary-marker clamp against the deep band, marker-drag
+persistence, and no depth stream at construction. 451 GUI tests pass; 463 daemon tests
+pass, `cargo clippy --all-targets` / `cargo fmt --check` clean (the ticket 06 cascade
+extracted to a shared `cascade_orphaned_deep_stage` helper in `edit.rs`).
