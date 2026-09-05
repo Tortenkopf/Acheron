@@ -302,6 +302,13 @@ class DaemonStub:
         # back into this stub's stored state.
         stored = copy.deepcopy(binding)
         self._profiles[self._active_profile][layer][input_str] = stored
+        # `tartarus-dual-stage-keys` ticket 06's cascade-delete, mirrored:
+        # overwriting a primary Binding that carried a live deep Binding on
+        # this Layer orphans it (a deep Binding can never outlive the
+        # primary it requires) — drop the deep Binding too, but leave
+        # `deep_stages` (the Actuation/mode config) untouched, same as the
+        # real Daemon's `edit::plan`.
+        self._profiles[self._active_profile][f"deep_{layer}"].pop(input_str, None)
         self.calls.append(("set_binding", input_str, layer, copy.deepcopy(stored)))
 
     @staticmethod
@@ -388,6 +395,8 @@ class DaemonStub:
         if input_str not in bindings:
             raise NotFoundError(f"no Binding is set for {input_str!r}")
         del bindings[input_str]
+        # Same cascade as `set_binding` above.
+        self._profiles[self._active_profile][f"deep_{layer}"].pop(input_str, None)
         self.calls.append(("clear_binding", input_str, layer))
 
     def set_mode_key_role(self, role: str) -> None:

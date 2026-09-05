@@ -250,8 +250,10 @@ pub enum Edit {
     },
     /// Removes the deep Binding on `layer`. Fails `NotFound` if `input` has
     /// no deep Binding there. Does **not** cascade-clear `deep_stages` or
-    /// force-release a live slot — that's a runtime-teardown concern a
-    /// later ticket owns.
+    /// force-release a live slot — ticket 06's runtime-teardown sweep covers
+    /// only a *primary* Binding's removal cascading the deep one away
+    /// (`SetBinding`/`ClearBinding` below); editing the deep Binding directly
+    /// isn't one of spec.md's five listed transitions, so this stays as-is.
     ClearDeepStage { input: Input, layer: Layer },
     /// Sets a grid key's deep Actuation/Release point pair on the active
     /// Profile, `.entry(input).or_default()`-creating a fresh
@@ -294,6 +296,18 @@ pub(crate) enum Effect {
     StopAllToggles,
     /// Force-stop every running Analog-repeat task.
     StopAllAnalogRepeats,
+    /// Force-release every live dual-stage deep slot and reset `stage::
+    /// Engine`'s per-key runtime state (`stage::Engine::stop_all()`) —
+    /// `SwitchProfile`'s own share of `tartarus-dual-stage-keys` ticket 06's
+    /// runtime teardown, alongside `StopAllToggles`/`StopAllAnalogRepeats`.
+    StopAllStages,
+    /// Force-release the given Input's live dual-stage deep slot immediately
+    /// (`stage::Engine::stop_stage`) — pushed by `SetBinding`/`ClearBinding`
+    /// when the edit cascades away an orphaned `deep_base`/`deep_held` entry
+    /// (ticket 06's "Cascade-delete": a live deep stage must not survive its
+    /// primary Binding's removal, and can't wait for a next Up that may
+    /// never come).
+    StopStage(Input),
     /// Center every live axis output and clear the axis engine's state.
     ResetAxisOutputs,
     /// Reconcile the given Stepper's Daemon-side runtime cursor against the
@@ -367,6 +381,21 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             active_profile_mut(&mut next)
                 .layer_mut(layer)
                 .insert(input, binding);
+            // Ticket 06's "Cascade-delete": overwriting a primary Binding
+            // that carried a live deep Binding on this Layer orphans it — a
+            // deep Binding can never exist without a matching primary
+            // (`ConfigError::DeepStageWithoutPrimary`), so its presence here
+            // is proof this `SetBinding` replaced, not freshly created, the
+            // primary. `deep_stages` (the Actuation/mode config) is
+            // deliberately left untouched — legal and inert with no matching
+            // `deep_base`/`deep_held` entry.
+            if active_profile_mut(&mut next)
+                .deep_layer_mut(layer)
+                .remove(&input)
+                .is_some()
+            {
+                effects.push(Effect::StopStage(input));
+            }
         }
         Edit::ClearBinding { input, layer } => {
             if active_profile_mut(&mut next)
@@ -375,6 +404,14 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
                 .is_none()
             {
                 return Err(CommandError::NotFound);
+            }
+            // Same cascade as `SetBinding` above.
+            if active_profile_mut(&mut next)
+                .deep_layer_mut(layer)
+                .remove(&input)
+                .is_some()
+            {
+                effects.push(Effect::StopStage(input));
             }
         }
         Edit::SetModeKeyRole { role } => {
@@ -449,6 +486,15 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             effects.push(Effect::RepublishActuation);
             effects.push(Effect::ResetAxisOutputs);
             effects.push(Effect::StopAllAnalogRepeats);
+            // Ticket 06: a live dual-stage deep press must not survive a
+            // Profile switch either — same reasoning as the Toggle/Analog-
+            // repeat stops just above. Safe to run after this firing's own
+            // `Edit::SwitchProfile` was already produced: `update_stages`/
+            // `begin_quick_skip` fully complete (and this `Edit` is returned)
+            // before `commit_input_edits` ever reaches `edit::apply`, so the
+            // triggering firing itself is never interrupted by its own
+            // consequence.
+            effects.push(Effect::StopAllStages);
             // The physical indicator follows the active Profile deterministically
             // (`tartarus-status-leds` ticket 03). Order is irrelevant — the LEDs
             // are independent of Toggles / axes / Analog-repeat.
@@ -980,6 +1026,36 @@ mod tests {
     }
 
     #[test]
+    fn set_binding_overwriting_a_primary_with_a_live_deep_binding_cascades_it_away() {
+        // Ticket 06's "Cascade-delete": overwriting a primary Binding that
+        // carried a live `deep_base` entry orphans it — a deep Binding can
+        // never outlive the primary it requires (`DeepStageWithoutPrimary`).
+        let mut config = with_primary_and_deep_stage(Input::Grid(1, 1));
+        active(&mut config)
+            .deep_base
+            .insert(Input::Grid(1, 1), keypress());
+
+        let (next, outcome) = plan_ok(
+            &config,
+            Edit::SetBinding {
+                input: Input::Grid(1, 1),
+                layer: Layer::Base,
+                binding: keypress(),
+            },
+        );
+        assert!(
+            next.profiles[DEFAULT_PROFILE_NAME].deep_base.is_empty(),
+            "the orphaned deep Binding must be cascaded away"
+        );
+        assert!(
+            !next.profiles[DEFAULT_PROFILE_NAME].deep_stages.is_empty(),
+            "deep_stages (Actuation/mode config) is never touched by the cascade — \
+             legal and inert with no matching deep_base/deep_held entry"
+        );
+        assert_eq!(outcome.effects, vec![Effect::StopStage(Input::Grid(1, 1))]);
+    }
+
+    #[test]
     fn set_binding_with_a_step_action_steals_the_direction_off_its_old_input() {
         let mut config = seed();
         with_stepper(&mut config, "wep");
@@ -1100,6 +1176,29 @@ mod tests {
             ),
             CommandError::NotFound
         ));
+    }
+
+    #[test]
+    fn clear_binding_removing_a_primary_with_a_live_deep_binding_cascades_it_away() {
+        let mut config = with_primary_and_deep_stage(Input::Grid(1, 1));
+        active(&mut config)
+            .deep_base
+            .insert(Input::Grid(1, 1), keypress());
+
+        let (next, outcome) = plan_ok(
+            &config,
+            Edit::ClearBinding {
+                input: Input::Grid(1, 1),
+                layer: Layer::Base,
+            },
+        );
+        assert!(next.profiles[DEFAULT_PROFILE_NAME].base.is_empty());
+        assert!(
+            next.profiles[DEFAULT_PROFILE_NAME].deep_base.is_empty(),
+            "the orphaned deep Binding must be cascaded away"
+        );
+        assert!(!next.profiles[DEFAULT_PROFILE_NAME].deep_stages.is_empty());
+        assert_eq!(outcome.effects, vec![Effect::StopStage(Input::Grid(1, 1))]);
     }
 
     #[test]
@@ -1273,6 +1372,7 @@ mod tests {
                 Effect::RepublishActuation,
                 Effect::ResetAxisOutputs,
                 Effect::StopAllAnalogRepeats,
+                Effect::StopAllStages,
                 Effect::AssertStatusLeds,
                 Effect::AnnounceProfileChange("Gaming".to_string()),
             ]

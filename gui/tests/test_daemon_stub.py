@@ -88,6 +88,46 @@ def test_clear_binding_on_an_unbound_input_raises_not_found():
         stub.clear_binding("grid_r1c1", "base")
 
 
+def test_clear_binding_removing_a_primary_with_a_live_deep_binding_cascades_it_away():
+    # `tartarus-dual-stage-keys` ticket 06's cascade-delete, mirrored: a
+    # `deep_base`/`deep_held` entry can never outlive the primary Binding it
+    # requires, so removing the primary drops the orphaned deep Binding too
+    # — but never `deep_stages` (the Actuation/mode config stays legal and
+    # inert with no matching entry).
+    stub = DaemonStub()
+    _with_primary_and_deep_stage(stub)
+    stub.set_deep_stage("grid_r1c1", "base", _keypress(key="KEY_B"))
+
+    stub.clear_binding("grid_r1c1", "base")
+
+    profile = stub.get_config()["profiles"]["Default"]
+    assert "grid_r1c1" not in profile["base"]
+    assert "grid_r1c1" not in profile["deep_base"]
+    assert "grid_r1c1" in profile["deep_stages"]
+
+
+def test_set_binding_overwriting_a_primary_with_a_live_deep_binding_cascades_it_away():
+    stub = DaemonStub()
+    _with_primary_and_deep_stage(stub)
+    stub.set_deep_stage("grid_r1c1", "base", _keypress(key="KEY_B"))
+
+    stub.set_binding("grid_r1c1", "base", _keypress(key="KEY_C"))
+
+    profile = stub.get_config()["profiles"]["Default"]
+    assert profile["base"]["grid_r1c1"] == _keypress(key="KEY_C")
+    assert "grid_r1c1" not in profile["deep_base"]
+    assert "grid_r1c1" in profile["deep_stages"]
+
+
+def test_set_binding_on_a_fresh_input_with_no_deep_binding_leaves_deep_state_untouched():
+    stub = DaemonStub()
+
+    stub.set_binding("grid_r1c1", "base", _keypress())
+
+    profile = stub.get_config()["profiles"]["Default"]
+    assert profile["deep_base"] == {}
+
+
 def test_set_mode_key_role_updates_the_active_profile():
     stub = DaemonStub()
 

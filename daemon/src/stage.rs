@@ -880,6 +880,40 @@ impl Engine {
             };
         }
     }
+
+    /// Force-releases one key's live deep firing/Toggle and drops its
+    /// runtime tracking entirely — `tartarus-dual-stage-keys` ticket 06's
+    /// `Effect::StopStage`, wired into `run_effects` for the cascade-delete
+    /// case (`edit::plan`'s `SetBinding`/`ClearBinding` arms, when the edit
+    /// orphans a live `deep_base`/`deep_held` entry). Scoped to `input`
+    /// alone, unlike `stop_all`'s whole-`Engine` sweep — every other key's
+    /// tracking is untouched. Runs **immediately** on commit rather than
+    /// waiting for `input`'s next Up: nothing guarantees one ever arrives
+    /// once the deep Binding backing it is gone from `Config`. The runtime
+    /// entry is removed outright (not reset-and-kept, unlike `stop_all`'s
+    /// per-key `just_reset` dance) because `Engine::update`'s own `profile.
+    /// deep_layer(active_layer).contains_key(&input)` guard already skips
+    /// this `input` for good the moment the cascade lands — there's no next
+    /// tick left to hand a stale entry to.
+    pub(crate) async fn stop_stage(&mut self, input: Input, injector: &Injector) {
+        let key = StageKey(input);
+        self.slots.stop_toggle(&key).await;
+        self.slots.force_release(&key, injector).await;
+        self.runtime.remove(&input);
+    }
+
+    /// Drains every live deep Toggle without touching firings or per-key
+    /// `KeyState`/Quick-Skip tracking — the GUI-focus `Command::
+    /// StopAllToggles` escape hatch's own share of ticket 06's runtime
+    /// teardown, extending it to also drain `Slots<StageKey>` alongside the
+    /// individual path's `Slots<Input>`. Deliberately more aggressive than
+    /// the Chord-toggle-survives-a-Profile-switch precedent (this is a
+    /// manual, not automatic, teardown) but narrower than `stop_all` — a
+    /// manual "attention just moved to the GUI" tap must not also reset a
+    /// still-physically-held key's band tracking out from under it.
+    pub(crate) async fn stop_all_toggles(&mut self) {
+        self.slots.stop_all_toggles().await;
+    }
 }
 
 #[cfg(test)]

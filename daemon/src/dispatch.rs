@@ -632,6 +632,10 @@ impl DispatchState {
                 }
                 edit::Effect::StopAllToggles => self.individual.stop_all_toggles().await,
                 edit::Effect::StopAllAnalogRepeats => self.analog_repeat.stop_all().await,
+                edit::Effect::StopAllStages => self.stage.stop_all(&self.injector).await,
+                edit::Effect::StopStage(input) => {
+                    self.stage.stop_stage(input, &self.injector).await;
+                }
                 edit::Effect::ResetAxisOutputs => {
                     for w in self.axis.reset() {
                         let _ = self.injector.set_axis_value(w.code, w.value).await;
@@ -723,6 +727,12 @@ impl DispatchState {
             }
             Command::StopAllToggles { reply } => {
                 self.individual.stop_all_toggles().await;
+                // `tartarus-dual-stage-keys` ticket 06: the manual "attention
+                // just moved to the GUI" escape hatch also drains the deep
+                // stage's own `Slots<StageKey>` toggles — deliberately more
+                // aggressive than the Chord-toggle-survives-a-Profile-switch
+                // precedent, since this is a manual, not automatic, teardown.
+                self.stage.stop_all_toggles().await;
                 let _ = reply.send(());
             }
             Command::Apply { edit, reply } => {
@@ -875,6 +885,8 @@ pub async fn run(
                         handle_connection_change(
                             &mut state.device_connected,
                             &state.signal_emitter,
+                            &mut state.stage,
+                            &state.injector,
                             connected,
                         )
                         .await;
@@ -1006,16 +1018,29 @@ async fn handle_layer_switch(
 /// emits `DeviceConnectionChanged` only on an actual transition — mirrors
 /// `handle_layer_switch`'s pattern for `ActiveLayerChanged` above, including
 /// skipping the push when `signal_emitter` is `None` (unit tests with no
-/// live D-Bus connection).
+/// live D-Bus connection). A transition to `connected == false` is
+/// `tartarus-dual-stage-keys` ticket 06's new, explicit disconnect hook: no
+/// generic one exists anywhere else in the daemon today (Analog-repeat has
+/// no dropout handling at all — a pre-existing gap this ticket doesn't fix,
+/// spec.md's "Out of Scope"), so `stage::Engine::stop_all()` force-releases
+/// every live deep slot and resets its per-key `KeyState`/Quick-Skip runtime
+/// state here, independent of capture's own synthetic-Up trick for the
+/// primary band (`relay_grid_blocking`, `analog.rs`), which only ever covers
+/// the primary.
 async fn handle_connection_change(
     device_connected: &mut bool,
     signal_emitter: &Option<SignalEmitter<'static>>,
+    stage: &mut stage::Engine,
+    injector: &Injector,
     connected: bool,
 ) {
     if connected == *device_connected {
         return;
     }
     *device_connected = connected;
+    if !connected {
+        stage.stop_all(injector).await;
+    }
     if let Some(emitter) = signal_emitter {
         let _ = Daemon::device_connection_changed(emitter, connected).await;
     }
@@ -5392,5 +5417,327 @@ mod tests {
 
         harness.release(Input::ModeKey).await;
         harness.shut_down().await;
+    }
+
+    // ── `tartarus-dual-stage-keys` ticket 06: runtime teardown ─────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_profile_switch_mid_press_force_releases_a_live_deep_toggle() {
+        let mut config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            toggle_binding(evdev::KeyCode::KEY_B),
+        );
+        config
+            .profiles
+            .insert("Gaming".to_string(), Profile::default());
+        let harness = CommandHarness::spawn(config);
+
+        // Hand off into the deep Toggle.
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        tokio::time::advance(executor::MIN_TOGGLE_LAP * 3).await;
+        settle().await;
+        let running_count = harness.sink.batches().len();
+        assert!(
+            running_count > 0,
+            "the deep Toggle loop must already be tapping"
+        );
+
+        // A Profile switch mid-press: `Effect::StopAllStages` joins
+        // `SwitchProfile`'s effect list alongside `StopAllToggles`/
+        // `StopAllAnalogRepeats`, force-releasing the live deep Toggle.
+        harness.switch_profile("Gaming").await.unwrap();
+        settle().await;
+        let stopped_count = harness.sink.batches().len();
+
+        tokio::time::advance(executor::MIN_TOGGLE_LAP * 5).await;
+        settle().await;
+        assert_eq!(
+            harness.sink.batches().len(),
+            stopped_count,
+            "the deep Toggle must be genuinely stopped by the Profile switch, not paused"
+        );
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_quick_skip_profile_switch_while_armed_cancels_the_buffered_primary() {
+        // The Profile-switch call site's own share of the Layer-switch/
+        // capture-mode-flip Quick-Skip-cancellation tests above.
+        let mut config = dual_stage_config(
+            StagingMode::QuickSkip,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        config
+            .profiles
+            .insert("Gaming".to_string(), Profile::default());
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+
+        harness.switch_profile("Gaming").await.unwrap();
+        settle().await;
+
+        // Advancing well past the original window fires nothing — the
+        // buffered primary was dropped by `stop_all()`, not merely deferred.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        settle().await;
+
+        let batches = harness.shut_down().await;
+        assert!(
+            batches.is_empty(),
+            "a Profile switch while Armed must cancel the buffered primary outright"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_deep_actions_own_profile_switch_completes_before_its_teardown() {
+        // spec.md: "A Profile switch fired by the deep stage's own Action
+        // completes that firing ... before the resulting Edit::SwitchProfile
+        // applies and tears the stage state down" — the triggering firing is
+        // never itself interrupted by its own consequence.
+        let mut config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            Binding {
+                trigger: TriggerMode::FireOnce,
+                action: Action::ProfileSwitch {
+                    target: "Gaming".to_string(),
+                },
+            },
+        );
+        config
+            .profiles
+            .insert("Gaming".to_string(), Profile::default());
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        // Hand off into the deep stage, whose own Action is a Profile
+        // switch — this firing must resolve against the pre-switch Profile
+        // and complete (`active_profile` actually flips) rather than being
+        // torn down by the `Effect::StopAllStages` it itself schedules.
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+
+        let state = harness.get_state().await;
+        assert_eq!(state.profile, "Gaming");
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_clearing_the_primary_binding_force_releases_a_live_deep_toggle_immediately()
+    {
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            toggle_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        tokio::time::advance(executor::MIN_TOGGLE_LAP * 3).await;
+        settle().await;
+        let running_count = harness.sink.batches().len();
+        assert!(
+            running_count > 0,
+            "the deep Toggle loop must already be tapping"
+        );
+
+        // Cascade-delete: clearing the primary Binding on this Layer orphans
+        // the live `deep_base` entry — `edit::plan` cascades it away and
+        // pushes `Effect::StopStage`, force-releasing the deep Toggle
+        // immediately, not on the key's next Up (which may never come once
+        // the deep Binding backing it is gone).
+        harness
+            .clear_binding(Input::Grid(1, 1), Layer::Base)
+            .await
+            .unwrap();
+        settle().await;
+        let stopped_count = harness.sink.batches().len();
+
+        tokio::time::advance(executor::MIN_TOGGLE_LAP * 5).await;
+        settle().await;
+        assert_eq!(
+            harness.sink.batches().len(),
+            stopped_count,
+            "the deep Toggle must be genuinely stopped by the cascade-delete, not paused"
+        );
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_overwriting_the_primary_binding_force_releases_a_live_deep_toggle_immediately()
+     {
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            toggle_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        tokio::time::advance(executor::MIN_TOGGLE_LAP * 3).await;
+        settle().await;
+        let running_count = harness.sink.batches().len();
+        assert!(
+            running_count > 0,
+            "the deep Toggle loop must already be tapping"
+        );
+
+        // Same cascade as the `ClearBinding` test above, but via `SetBinding`
+        // overwriting the primary instead of removing it outright.
+        harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                keypress_binding(evdev::KeyCode::KEY_C),
+            )
+            .await
+            .unwrap();
+        settle().await;
+        let stopped_count = harness.sink.batches().len();
+
+        tokio::time::advance(executor::MIN_TOGGLE_LAP * 5).await;
+        settle().await;
+        assert_eq!(
+            harness.sink.batches().len(),
+            stopped_count,
+            "the deep Toggle must be genuinely stopped by overwriting the primary, not paused"
+        );
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_stop_all_toggles_command_drains_a_live_deep_toggle_too() {
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            toggle_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        tokio::time::advance(executor::MIN_TOGGLE_LAP * 3).await;
+        settle().await;
+        let running_count = harness.sink.batches().len();
+        assert!(
+            running_count > 0,
+            "the deep Toggle loop must already be tapping"
+        );
+
+        // The GUI-focus escape hatch — deliberately more aggressive than
+        // the Chord-toggle-survives-a-Profile-switch precedent — also drains
+        // `stage::Engine`'s own `Slots<StageKey>` toggles now, alongside the
+        // individual path's.
+        harness.stop_all_toggles().await;
+        settle().await;
+        let stopped_count = harness.sink.batches().len();
+
+        tokio::time::advance(executor::MIN_TOGGLE_LAP * 5).await;
+        settle().await;
+        assert_eq!(
+            harness.sink.batches().len(),
+            stopped_count,
+            "Command::StopAllToggles must also drain the deep stage's own Slots<StageKey> toggles"
+        );
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_disconnect_force_releases_a_live_deep_toggle_and_resets_runtime_state() {
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            toggle_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        tokio::time::advance(executor::MIN_TOGGLE_LAP * 3).await;
+        settle().await;
+        let running_count = harness.sink.batches().len();
+        assert!(
+            running_count > 0,
+            "the deep Toggle loop must already be tapping"
+        );
+
+        // The device drops out mid-press: ticket 06's new, explicit
+        // disconnect hook force-releases every live deep slot and resets
+        // `stage::Engine`'s per-key runtime state — independent of capture's
+        // own synthetic-Up trick for the primary band, which only ever
+        // covers the primary.
+        harness.set_device_connected(false).await;
+        settle().await;
+        let stopped_count = harness.sink.batches().len();
+
+        tokio::time::advance(executor::MIN_TOGGLE_LAP * 5).await;
+        settle().await;
+        assert_eq!(
+            harness.sink.batches().len(),
+            stopped_count,
+            "the deep Toggle must be genuinely stopped by the disconnect, not paused"
+        );
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_quick_skip_disconnect_while_armed_cancels_the_buffered_primary() {
+        // The disconnect hook's own share of the Layer-switch/capture-mode-
+        // flip/Profile-switch Quick-Skip-cancellation tests above.
+        let config = dual_stage_config(
+            StagingMode::QuickSkip,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+
+        harness.set_device_connected(false).await;
+        settle().await;
+
+        // Advancing well past the original window fires nothing — the
+        // buffered primary was dropped by `stop_all()`, not merely deferred.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        settle().await;
+
+        let batches = harness.shut_down().await;
+        assert!(
+            batches.is_empty(),
+            "a disconnect while Armed must cancel the buffered primary outright"
+        );
     }
 }
