@@ -5581,52 +5581,13 @@ mod tests {
         harness.shut_down().await;
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn dual_stage_overwriting_the_primary_binding_force_releases_a_live_deep_toggle_immediately()
-     {
-        let config = dual_stage_config(
-            StagingMode::Handoff,
-            keypress_binding(evdev::KeyCode::KEY_A),
-            toggle_binding(evdev::KeyCode::KEY_B),
-        );
-        let harness = CommandHarness::spawn(config);
-
-        harness.press_analog(Input::Grid(1, 1), 150).await;
-        harness.push_depth([(Input::Grid(1, 1), 150)]);
-        settle().await;
-        harness.push_depth([(Input::Grid(1, 1), 250)]);
-        settle().await;
-        tokio::time::advance(executor::MIN_TOGGLE_LAP * 3).await;
-        settle().await;
-        let running_count = harness.sink.batches().len();
-        assert!(
-            running_count > 0,
-            "the deep Toggle loop must already be tapping"
-        );
-
-        // Same cascade as the `ClearBinding` test above, but via `SetBinding`
-        // overwriting the primary instead of removing it outright.
-        harness
-            .set_binding(
-                Input::Grid(1, 1),
-                Layer::Base,
-                keypress_binding(evdev::KeyCode::KEY_C),
-            )
-            .await
-            .unwrap();
-        settle().await;
-        let stopped_count = harness.sink.batches().len();
-
-        tokio::time::advance(executor::MIN_TOGGLE_LAP * 5).await;
-        settle().await;
-        assert_eq!(
-            harness.sink.batches().len(),
-            stopped_count,
-            "the deep Toggle must be genuinely stopped by overwriting the primary, not paused"
-        );
-
-        harness.shut_down().await;
-    }
+    // Overwriting (not removing) a primary Binding no longer tears its deep
+    // stage down — covered as a `plan` unit test
+    // (`edit::tests::set_binding_overwriting_a_primary_keeps_its_live_deep_binding`),
+    // not here: a dispatch-harness test would have to run the deep Toggle
+    // live *through* `shut_down`, and the paused-time harness starves the
+    // dispatch loop's channel-close check against a perpetually-ready Toggle
+    // tick.
 
     #[tokio::test(start_paused = true)]
     async fn dual_stage_stop_all_toggles_command_drains_a_live_deep_toggle_too() {

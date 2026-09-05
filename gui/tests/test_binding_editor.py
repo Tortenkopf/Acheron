@@ -1504,3 +1504,51 @@ def test_a_pre_dual_stage_daemon_config_falls_back_to_the_plain_editor():
     # the plain Trigger/Action editor + actuation section are still there
     assert _dropdown_labeled(editor, "Trigger mode")
     assert find_one(editor, lambda w: "sub-heading" in w.get_css_classes() and w.get_label() == "Actuation & release")
+
+
+def test_save_commits_both_stages_regardless_of_which_one_is_on_screen():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)  # primary = KEY_A
+    _add_deep_stage(editor)  # lands on the Deep stage (default KEY_A)
+
+    _pick_key(editor, "Key", "F1")  # edit the deep binding
+    _toggles_startswith(editor, "Primary")[0].set_active(True)
+    _pick_key(editor, "Key", "F2")  # edit the primary binding
+    stub.calls.clear()
+
+    button_labeled(editor, "Save").emit("clicked")
+
+    kinds = {c[0] for c in stub.calls}
+    assert "set_binding" in kinds and "set_deep_stage" in kinds
+    profile = stub.get_config()["profiles"]["Default"]
+    assert profile["base"]["grid_r1c1"]["key"] == "KEY_F2"
+    assert profile["deep_base"]["grid_r1c1"]["key"] == "KEY_F1"
+
+
+def test_editing_only_the_primary_keeps_the_deep_stage_and_pushes_only_set_binding():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)
+    _toggles_startswith(editor, "Primary")[0].set_active(True)
+    _pick_key(editor, "Key", "F2")
+    stub.calls.clear()
+
+    button_labeled(editor, "Save").emit("clicked")
+
+    assert [c[0] for c in stub.calls] == ["set_binding"]
+    profile = stub.get_config()["profiles"]["Default"]
+    assert profile["base"]["grid_r1c1"]["key"] == "KEY_F2"
+    assert "grid_r1c1" in profile["deep_base"]
+
+
+def test_save_with_no_edits_pushes_nothing():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)
+    _toggles_startswith(editor, "Primary")[0].set_active(True)
+    _toggles_startswith(editor, "Deep")[0].set_active(True)
+    stub.calls.clear()
+
+    button_labeled(editor, "Save").emit("clicked")
+
+    assert stub.calls == []

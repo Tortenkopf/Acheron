@@ -302,13 +302,10 @@ class DaemonStub:
         # back into this stub's stored state.
         stored = copy.deepcopy(binding)
         self._profiles[self._active_profile][layer][input_str] = stored
-        # `tartarus-dual-stage-keys` ticket 06's cascade-delete, mirrored:
-        # overwriting a primary Binding that carried a live deep Binding on
-        # this Layer orphans it (a deep Binding can never outlive the
-        # primary it requires) — drop the deep Binding too, but leave
-        # `deep_stages` (the Actuation/mode config) untouched, same as the
-        # real Daemon's `edit::plan`.
-        self._profiles[self._active_profile][f"deep_{layer}"].pop(input_str, None)
+        # No deep-stage cascade on an *overwrite* — the primary stays in
+        # place, so its deep stage stays valid and is kept (the GUI edits
+        # either stage and Saves both). Only `clear_binding` below, which
+        # *removes* the primary, cascades the orphaned deep Binding away.
         self.calls.append(("set_binding", input_str, layer, copy.deepcopy(stored)))
 
     @staticmethod

@@ -86,9 +86,15 @@ prototype left room:
   panel locally — the window stays open (the `+ New Macro` in-place-snapshot precedent,
   and the same "this edit only touches this one key" reasoning that keeps
   `set_actuation_point` from popping the popover down). Marker drags persist to the
-  snapshot on drag-end so a later stage-toggle rebuild doesn't snap them back. Save /
-  Clear still go through the shared `on_saved` (close + app rebuild) like the rest of
-  the editor; clearing the primary rides ticket 06's stub cascade back to the
+  snapshot on drag-end so a later stage-toggle rebuild doesn't snap them back.
+- **Save commits *both* stages.** Each stage's editor fields are folded into a per-stage
+  `drafts` dict (`capture_draft`) on every panel rebuild, so an unsaved edit to one
+  stage survives swapping to the other; **Save** then pushes whichever stages actually
+  changed (`set_binding` and/or `set_deep_stage`), primary first, regardless of which
+  stage is on screen. It no longer matters which toggle is selected when you hit Save.
+  This required ticket 06's cascade to stop firing on a primary *overwrite* (it wiped
+  the deep Binding on a `set_binding` — see that ticket's Correction); it still fires
+  on a `ClearBinding`, so clearing the primary rides the cascade back to the
   bind-primary-first gate.
 - **`+ Add deep stage`** seeds a disjoint band (`deep.release = primary.actuation + 20`,
   `deep.actuation = deep.release + 35`, clamped) via `set_deep_actuation` *then*
@@ -110,12 +116,13 @@ prototype left room:
   Digital mode greys the bar (`depth-track-dim` + insensitive, so the deep markers grey
   with it) and the staging-mode row, each with its own centred note.
 
-Code review (two-axis, since `f3bc269`) flagged: ticket 06 clean; ticket 07 — the
-hardcoded bar width and the over-narrow deep Action menu (both fixed above), plus a
-partial "seven validation rules" checkbox (five of the seven are structurally
-unreachable from the panel — only Grid keys with a primary Binding reach it, and the
-marker clamp keeps the two band-order rules satisfied; the two reachable ones,
-`ChordMemberDeepStageConflict` / `AnalogRepeatOnDualStageKey`, are tested).
+Code review (two-axis, since `f3bc269`) flagged: ticket 07 — the hardcoded bar width
+and the over-narrow deep Action menu (both fixed above), plus a partial "seven
+validation rules" checkbox (five of the seven are structurally unreachable from the
+panel — only Grid keys with a primary Binding reach it, and the marker clamp keeps the
+two band-order rules satisfied; the two reachable ones, `ChordMemberDeepStageConflict`
+/ `AnalogRepeatOnDualStageKey`, are tested). Ticket 06 passed both axes, but building
+07 surfaced the `SetBinding`-overwrite cascade problem corrected there afterwards.
 
 New CSS in `app.py::CSS`: `.marker-deep-actuation` / `.marker-deep-release`,
 `.deep-picker …`, `.staging-mode-row button`, `.icon-btn`. `STAGING_MODES` lives in
@@ -123,12 +130,14 @@ New CSS in `app.py::CSS`: `.marker-deep-actuation` / `.marker-deep-release`,
 `### Dual-stage keys` Usage subsection (driving-sim half-throttle / full-throttle
 framing, per spec.md's Out-of-Scope note).
 
-Tests: `gui/tests/test_binding_editor.py` gained 22 cases covering the bind-primary-first
+Tests: `gui/tests/test_binding_editor.py` gained 26 cases covering the bind-primary-first
 gate, add/remove toggling the Deep row + staging row + marker count, the
 one-picker-mounted invariant across every toggle, the `.deep-picker` class, the deep
-Action menu (full-minus-Axis), staging-mode wiring, deep-stage Save, the primary-clear
-cascade, Digital-mode greying, the Chord-member / `analog_repeat` rejections surfacing
-on the error label, the primary-marker clamp against the deep band, marker-drag
-persistence, and no depth stream at construction. 451 GUI tests pass; 463 daemon tests
-pass, `cargo clippy --all-targets` / `cargo fmt --check` clean (the ticket 06 cascade
-extracted to a shared `cascade_orphaned_deep_stage` helper in `edit.rs`).
+Action menu (full-minus-Axis), staging-mode wiring, deep-stage Save, **Save committing
+both stages / editing only the primary / a no-op Save**, the primary-clear cascade,
+Digital-mode greying, the Chord-member / `analog_repeat` rejections surfacing on the
+error label, the primary-marker clamp against the deep band, marker-drag persistence,
+the pre-dual-stage-Daemon fallback, and no depth stream at construction. 455 GUI tests
+pass; 462 daemon tests pass, `cargo clippy --all-targets` / `cargo fmt --check` clean
+(the ticket 06 cascade extracted to a shared `cascade_orphaned_deep_stage` helper in
+`edit.rs`, and narrowed to `ClearBinding` only — see that ticket's Correction).

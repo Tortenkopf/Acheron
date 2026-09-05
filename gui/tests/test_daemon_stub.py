@@ -106,7 +106,10 @@ def test_clear_binding_removing_a_primary_with_a_live_deep_binding_cascades_it_a
     assert "grid_r1c1" in profile["deep_stages"]
 
 
-def test_set_binding_overwriting_a_primary_with_a_live_deep_binding_cascades_it_away():
+def test_set_binding_overwriting_a_primary_keeps_its_live_deep_binding():
+    # An *overwrite* leaves a primary in place, so the deep stage stays
+    # valid and is kept — the GUI edits either stage and Saves both. Only
+    # `clear_binding` (a removal) cascades the orphaned deep Binding away.
     stub = DaemonStub()
     _with_primary_and_deep_stage(stub)
     stub.set_deep_stage("grid_r1c1", "base", _keypress(key="KEY_B"))
@@ -115,7 +118,7 @@ def test_set_binding_overwriting_a_primary_with_a_live_deep_binding_cascades_it_
 
     profile = stub.get_config()["profiles"]["Default"]
     assert profile["base"]["grid_r1c1"] == _keypress(key="KEY_C")
-    assert "grid_r1c1" not in profile["deep_base"]
+    assert profile["deep_base"]["grid_r1c1"] == _keypress(key="KEY_B")
     assert "grid_r1c1" in profile["deep_stages"]
 
 

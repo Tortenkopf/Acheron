@@ -381,7 +381,14 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             active_profile_mut(&mut next)
                 .layer_mut(layer)
                 .insert(input, binding);
-            cascade_orphaned_deep_stage(&mut next, layer, input, &mut effects);
+            // No deep-stage cascade here: *overwriting* a primary Binding
+            // leaves a primary in place, so the deep stage stays valid and
+            // is deliberately kept (the GUI edits either stage and Saves
+            // both — a trigger tweak to the primary must not wipe the deep
+            // Binding). Only *removing* the primary orphans the deep stage —
+            // see `ClearBinding` below. A replacement primary that would
+            // make the deep stage illegal (`analog_repeat`, a Chord member)
+            // is already rejected by the trailing `config::validate(&next)`.
         }
         Edit::ClearBinding { input, layer } => {
             if active_profile_mut(&mut next)
@@ -739,16 +746,15 @@ pub(crate) async fn apply(
     Ok(outcome)
 }
 
-/// `tartarus-dual-stage-keys` ticket 06's "Cascade-delete": an edit that
-/// removes or overwrites `input`'s primary Binding on `layer` orphans any
-/// deep Binding it carried there — a deep Binding can never exist without a
-/// matching primary (`ConfigError::DeepStageWithoutPrimary`), so its
-/// presence is proof the edit replaced, not freshly created, the primary.
-/// Drops the deep Binding and pushes `Effect::StopStage(input)` so a live
-/// slot force-releases immediately rather than waiting for a next Up that
-/// may never come. `deep_stages` (the Actuation/mode config) is left
-/// untouched — legal and inert with no matching `deep_base`/`deep_held`
-/// entry.
+/// `tartarus-dual-stage-keys` ticket 06's "Cascade-delete": `ClearBinding`
+/// removing `input`'s primary Binding on `layer` orphans any deep Binding it
+/// carried there — a deep Binding can never exist without a matching primary
+/// (`ConfigError::DeepStageWithoutPrimary`), so the removal would otherwise
+/// be rejected outright by the trailing `config::validate`. Drops the deep
+/// Binding and pushes `Effect::StopStage(input)` so a live slot
+/// force-releases immediately rather than waiting for a next Up that may
+/// never come. `deep_stages` (the Actuation/mode config) is left untouched —
+/// legal and inert with no matching `deep_base`/`deep_held` entry.
 fn cascade_orphaned_deep_stage(
     next: &mut Config,
     layer: Layer,
@@ -1030,10 +1036,12 @@ mod tests {
     }
 
     #[test]
-    fn set_binding_overwriting_a_primary_with_a_live_deep_binding_cascades_it_away() {
-        // Ticket 06's "Cascade-delete": overwriting a primary Binding that
-        // carried a live `deep_base` entry orphans it — a deep Binding can
-        // never outlive the primary it requires (`DeepStageWithoutPrimary`).
+    fn set_binding_overwriting_a_primary_keeps_its_live_deep_binding() {
+        // A primary Binding stays in place across an *overwrite*, so its
+        // deep stage stays valid and is deliberately kept — the GUI edits
+        // either stage and Saves both, and a trigger tweak to the primary
+        // must not wipe the deep Binding. Only *removing* the primary
+        // (`ClearBinding`) orphans the deep stage.
         let mut config = with_primary_and_deep_stage(Input::Grid(1, 1));
         active(&mut config)
             .deep_base
@@ -1044,19 +1052,25 @@ mod tests {
             Edit::SetBinding {
                 input: Input::Grid(1, 1),
                 layer: Layer::Base,
-                binding: keypress(),
+                binding: Binding {
+                    trigger: TriggerMode::Toggle,
+                    action: Action::Keypress {
+                        modifiers: Modifiers::default(),
+                        key: KeyCode::KEY_B,
+                    },
+                },
             },
         );
         assert!(
-            next.profiles[DEFAULT_PROFILE_NAME].deep_base.is_empty(),
-            "the orphaned deep Binding must be cascaded away"
+            next.profiles[DEFAULT_PROFILE_NAME]
+                .deep_base
+                .contains_key(&Input::Grid(1, 1)),
+            "the deep Binding must survive an overwrite of its primary"
         );
         assert!(
-            !next.profiles[DEFAULT_PROFILE_NAME].deep_stages.is_empty(),
-            "deep_stages (Actuation/mode config) is never touched by the cascade — \
-             legal and inert with no matching deep_base/deep_held entry"
+            outcome.effects.is_empty(),
+            "no teardown on a mere overwrite"
         );
-        assert_eq!(outcome.effects, vec![Effect::StopStage(Input::Grid(1, 1))]);
     }
 
     #[test]

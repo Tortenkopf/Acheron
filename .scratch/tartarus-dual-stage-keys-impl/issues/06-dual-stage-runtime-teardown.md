@@ -119,3 +119,21 @@ immediately, `Command::StopAllToggles` draining a deep Toggle, and the disconnec
 hook force-releasing a live deep Toggle. `gui/tests/test_daemon_stub.py` gained
 matching cascade-delete coverage for the stub. 463 daemon + 434 GUI tests pass;
 `cargo clippy --all-targets` and `cargo fmt --check` are clean.
+
+## Correction (ticket 07 follow-up, 2026-09-05)
+
+The cascade-delete was originally wired into **both** the `SetBinding` (overwrite)
+and `ClearBinding` (removal) arms of `plan`. Building ticket 07 showed that's wrong
+for `SetBinding`: the GUI's primary-stage editor Saves via `SetBinding`, so a mere
+trigger/key tweak to the primary was silently wiping the deep stage's Binding.
+spec.md only says *"deleting the primary cascade-deletes the deep stage"* — an
+overwrite leaves a primary in place, so the deep stage stays valid.
+
+Fixed: `cascade_orphaned_deep_stage` is now called **only** from the `ClearBinding`
+arm (where it's load-bearing — otherwise `config::validate` rejects the removal with
+`DeepStageWithoutPrimary`). The `SetBinding` arm keeps the deep stage; a replacement
+primary that would make it illegal (`analog_repeat`, a Chord member) is still
+rejected by the trailing `config::validate`. `daemon_stub.py`'s `set_binding` mirror
+dropped its `pop` too. The `edit::tests` overwrite case now asserts the deep Binding
+**survives**; the hard-to-test-without-a-hang dispatch integration case was removed
+(the `plan` unit test covers it). 462 daemon tests pass.

@@ -1021,8 +1021,14 @@ def build_dual_stage_panel(
     digital = capture_mode == "digital"
 
     ui = {"stage": "primary"}
-    handlers: dict = {"save": None, "clear": None}
     track_holder: dict = {"track": None, "live": None}
+    # Per-stage editor drafts. `None` means "not edited — read the snapshot".
+    # The currently-mounted stage's fields are captured here whenever the
+    # panel rebuilds (a stage swap, + Add deep stage, …) so an unsaved edit
+    # to one stage survives switching to the other, and Save then commits
+    # *both* stages at once regardless of which is on screen.
+    drafts: dict = {"primary": None, "deep": None}
+    slot: dict = {"get_binding": None, "stage": None}
 
     panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
     panel.add_css_class("actuation-section")
@@ -1043,6 +1049,22 @@ def build_dual_stage_panel(
 
     def has_deep() -> bool:
         return deep_binding() is not None
+
+    def stage_snapshot(stage: str) -> dict | None:
+        return primary_binding if stage == "primary" else deep_binding()
+
+    def stage_starting(stage: str) -> dict | None:
+        # The dict the editor slot builds from: this stage's live draft if
+        # it has one, else the snapshot.
+        return drafts[stage] if drafts[stage] is not None else stage_snapshot(stage)
+
+    def capture_draft() -> None:
+        # Fold the currently-mounted stage's fields into `drafts` before the
+        # widgets are torn down. Skipped while Save is disabled (an
+        # unsupported Action kind, an empty Macro library) — those states
+        # can't be saved anyway, so there's nothing worth preserving.
+        if slot["get_binding"] is not None and save_btn.get_sensitive():
+            drafts[slot["stage"]] = slot["get_binding"]()
 
     def default_deep_cfg() -> dict:
         # A fresh `deep_stages` entry seeded with a band disjoint from and
@@ -1083,6 +1105,7 @@ def build_dual_stage_panel(
             rebuild()
             return
         deep_map()[inp] = default_deep
+        drafts["deep"] = None
         ui["stage"] = "deep"
         rebuild()
 
@@ -1093,6 +1116,7 @@ def build_dual_stage_panel(
             show_error(exc)
             return
         deep_map().pop(inp, None)
+        drafts["deep"] = None
         ui["stage"] = "primary"
         rebuild()
 
@@ -1105,15 +1129,25 @@ def build_dual_stage_panel(
             return
         profile_dict["deep_stages"].setdefault(inp, default_deep_cfg())["mode"] = mode
 
-    def on_save_stage(get_binding: Callable[[], dict]) -> None:
-        binding = get_binding()
+    def on_save_stage() -> None:
+        # Save commits *both* stages, not just the one on screen — whichever
+        # stage the user was last editing is folded in by `capture_draft`,
+        # and each stage is pushed only if its draft actually differs from
+        # the snapshot (an unedited stage is left alone). Primary first: a
+        # replacement primary the Daemon rejects (`analog_repeat`, a Chord
+        # member) must fail before the deep push, and never leaves a
+        # half-applied pair the user didn't ask for.
+        capture_draft()
+        primary_target = drafts["primary"] if drafts["primary"] is not None else primary_binding
+        deep_target = drafts["deep"] if drafts["deep"] is not None else deep_binding()
         try:
-            if ui["stage"] == "deep":
-                client.set_deep_stage(inp, layer, binding)
-            elif binding.get("type") == "axis":
-                client.set_axis_assignment(inp, layer, binding["target"])
-            else:
-                client.set_binding(inp, layer, binding)
+            if primary_target != primary_binding:
+                if primary_target.get("type") == "axis":
+                    client.set_axis_assignment(inp, layer, primary_target["target"])
+                else:
+                    client.set_binding(inp, layer, primary_target)
+            if has_deep() and deep_target is not None and deep_target != deep_binding():
+                client.set_deep_stage(inp, layer, deep_target)
         except DaemonError as exc:
             show_error(exc)
             return
@@ -1169,6 +1203,7 @@ def build_dual_stage_panel(
             track_holder["track"].set_live_value(depth)
 
     def rebuild() -> None:
+        capture_draft()
         clear_children(panel)
 
         # 1. Header + shared 4-marker Actuation bar.
@@ -1347,9 +1382,12 @@ def build_dual_stage_panel(
                 staging_overlay.add_overlay(staging_note)
             panel.append(staging_overlay)
 
-        # 4. Editor slot — the selected stage's Trigger/Action fields. Only
-        #    one stage's fields (and so one picker) is ever mounted here.
-        if ui["stage"] == "deep" and has_deep():
+        # 4. Editor slot — the selected stage's Trigger/Action fields, built
+        #    from that stage's live draft if it has one (an unsaved edit made
+        #    before the last swap) else the snapshot. Only one stage's fields
+        #    (and so one picker) is ever mounted here.
+        editing = "deep" if (ui["stage"] == "deep" and has_deep()) else "primary"
+        if editing == "deep":
             if digital:
                 panel.append(
                     Gtk.Label(
@@ -1360,15 +1398,16 @@ def build_dual_stage_panel(
                     )
                 )
             fields, _td, get_binding = build_action_and_trigger_fields(
-                client, config, profile, deep_binding(), save_btn,
+                client, config, profile, stage_starting("deep"), save_btn,
                 _deep_action_types(available_action_types), inp, layer,
                 picker_css_class="deep-picker",
             )
         else:
             fields, _td, get_binding = build_action_and_trigger_fields(
-                client, config, profile, primary_binding, save_btn,
+                client, config, profile, stage_starting("primary"), save_btn,
                 available_action_types, inp, layer,
             )
+        slot["get_binding"], slot["stage"] = get_binding, editing
         panel.append(fields)
 
         # 5. Primary-actuation profile-default controls.
@@ -1394,16 +1433,11 @@ def build_dual_stage_panel(
         force_digital_check.connect("toggled", lambda b: client.set_force_digital(b.get_active()))
         panel.append(force_digital_check)
 
-        # Rewire the caller's Save/Clear to the currently-selected stage —
-        # disconnecting the previous rebuild's handlers first so they don't
-        # pile up (the `_trigger_handler` precedent in
-        # `build_action_and_trigger_fields`).
-        if handlers["save"] is not None:
-            save_btn.disconnect(handlers["save"])
-        if handlers["clear"] is not None:
-            clear_btn.disconnect(handlers["clear"])
-        handlers["save"] = save_btn.connect("clicked", lambda _b: on_save_stage(get_binding))
-        handlers["clear"] = clear_btn.connect("clicked", lambda _b: on_clear_stage())
+    # Save/Clear are wired once — `on_save_stage` reads `drafts`/`slot` and
+    # `on_clear_stage` reads `ui["stage"]` at click time, so neither depends
+    # on the current rebuild's closures.
+    save_btn.connect("clicked", lambda _b: on_save_stage())
+    clear_btn.connect("clicked", lambda _b: on_clear_stage())
 
     # Live depth only while the panel is on screen (the `build_actuation_
     # section` precedent) — `build_binding_editor` is rebuilt eagerly for
