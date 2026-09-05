@@ -178,3 +178,22 @@ the QuickSkip divert just above it. Additive never emits an inner `ReleasePrimar
 its primary keeps repeating untouched (existing test still passes). Two new
 `dispatch.rs` integration tests: Handoff suppresses-then-resumes on repress, No-Return
 stays suppressed past the deep-band exit until a fresh press. 464 daemon tests pass.
+
+### Second correction (2026-09-05): deep-stage Hold-to-repeat never repeated
+
+`FireDeep` runs `trigger::decide(&deep_binding, Down)` once, on the band crossing — and
+the deep band has no `Repeat` source (`capture::analog`'s `RepeatSchedule` only
+synthesizes against the *primary's* Actuation point), so a **Hold-to-repeat deep
+Binding fired once and then behaved exactly like Fire-once** (the original
+`dual_stage_additive_holds_both_stages…` test even codified it). A deep Toggle was
+fine — it runs its own `MIN_TOGGLE_LAP` loop.
+
+Fixed: `stage::Engine::deep_repeat` re-fires the deep stage (`decide(Repeat)` against
+`Slots<StageKey>`) whenever the deep band is currently Down and the deep Binding is
+Hold-to-repeat. The deep band sits strictly above the primary's, so every synthesized
+primary `Repeat` pulse that keeps the primary held keeps the deep band held too —
+`handle_event` calls `deep_repeat` on each such pulse (and in the Quick-Skip
+`Repeat`-divert, for the `Skipped`-as-Handoff phase). No new timer: the deep stage
+simply rides the same `RepeatSchedule` cadence the primary already does. Additive test
+updated to expect both stages tapping; new `dual_stage_handoff_deep_stage_hold_to_
+repeat_actually_repeats`. 465 daemon tests pass.

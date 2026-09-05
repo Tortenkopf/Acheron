@@ -265,30 +265,59 @@ impl DispatchState {
                     };
                     return self.stage.begin_quick_skip(deps, event.input, depth).await;
                 }
-                EventState::Up | EventState::Repeat if !self.stage.is_late(event.input) => {
+                EventState::Repeat if !self.stage.is_late(event.input) => {
+                    // Quick-Skip's `Skipped` phase runs as Handoff for the
+                    // rest of the press — the deep stage's own Hold-to-repeat
+                    // still needs driving off this pulse (a no-op during
+                    // `Armed`, before the deep band is reached).
+                    let deps = stage::EngineDeps {
+                        config,
+                        active_layer: self.active_layer,
+                        individual: &mut self.individual,
+                        injector: &self.injector,
+                        cursors: &mut self.stepper,
+                        toggle_lap_target: self.toggle_lap_target,
+                    };
+                    self.stage.deep_repeat(deps, event.input).await?;
+                    return Ok(Vec::new());
+                }
+                EventState::Up if !self.stage.is_late(event.input) => {
                     return Ok(Vec::new());
                 }
                 EventState::Up | EventState::Repeat => {}
             }
         }
 
-        // `tartarus-dual-stage-keys`: while the stage machine has handed this
-        // key's primary off to the deep stage (Handoff/No-Return crossed
-        // into the deep band), the primary band is still physically Down so
-        // `capture::analog` keeps synthesizing `Repeat`s for it — swallow
-        // them here so a Hold-to-repeat primary genuinely stops rather than
-        // machine-gunning under the deep stage. Gated on `depth.is_some()`
-        // like the diverts above (Digital mode has no deep stage). Only
-        // `Repeat` is swallowed: a `Down` can't arrive while the band is
-        // already Down, and the primary's real `Up` still passes through so
-        // the ordinary release runs. `stage::Engine` clears the flag on
-        // `RepressPrimary` (Handoff back out) and when the primary band
-        // itself goes Up, so repeats resume exactly when they should.
-        if event.state == EventState::Repeat
-            && event.depth.is_some()
-            && self.stage.primary_handed_off(event.input)
-        {
-            return Ok(Vec::new());
+        // `tartarus-dual-stage-keys`: a synthesized primary `Repeat` pulse
+        // also drives a Hold-to-repeat *deep* stage's own repeat cadence
+        // while the deep band is engaged — the deep band has no independent
+        // `Repeat` source (see `stage::Engine::deep_repeat`). Runs for every
+        // Staging mode; a no-op unless the deep band is currently Down and
+        // the deep Binding is Hold-to-repeat. Gated on `depth.is_some()`
+        // like the diverts above (Digital mode has no deep stage).
+        if event.state == EventState::Repeat && event.depth.is_some() {
+            let deps = stage::EngineDeps {
+                config,
+                active_layer: self.active_layer,
+                individual: &mut self.individual,
+                injector: &self.injector,
+                cursors: &mut self.stepper,
+                toggle_lap_target: self.toggle_lap_target,
+            };
+            self.stage.deep_repeat(deps, event.input).await?;
+            // Then, if the stage machine has handed this key's primary off to
+            // the deep stage (Handoff/No-Return crossed into the deep band),
+            // swallow the pulse for the primary itself — the primary band is
+            // still physically Down, so `capture::analog` keeps synthesizing
+            // these, but a Hold-to-repeat primary must stay silent under the
+            // deep stage rather than machine-gun. Additive leaves
+            // `primary_handed_off` false, so its primary repeats through the
+            // ordinary path below, untouched. `stage::Engine` clears the flag
+            // on `RepressPrimary` (Handoff back out) and when the primary
+            // band itself goes Up, so repeats resume exactly when they should.
+            if self.stage.primary_handed_off(event.input) {
+                return Ok(Vec::new());
+            }
         }
 
         // Real firing for an Analog-repeat Binding while Depth is available comes
@@ -4764,21 +4793,16 @@ mod tests {
         harness.push_depth([(Input::Grid(1, 1), 250)]);
         settle().await;
 
-        // The primary's Repeat cadence is completely unaffected by the deep
-        // stage engaging — capture keeps emitting it exactly as it would
-        // for a single-stage key, and Additive never suppresses it: each
-        // stage repeats on its own, mutually untouched, cadence.
-        harness.repeat_analog(Input::Grid(1, 1), 250).await;
-        settle().await;
-
-        harness.release_analog(Input::Grid(1, 1), 0).await;
-        harness.push_depth([(Input::Grid(1, 1), 0)]);
-        settle().await;
-
-        let batches = harness.shut_down().await;
-        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        // The first three firings, in order: primary Down, primary Repeat,
+        // then `FireDeep` on the crossing.
+        let opening: Vec<_> = harness
+            .sink
+            .batches()
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect();
         assert_eq!(
-            events,
+            opening,
             vec![
                 (evdev::KeyCode::KEY_A, 1),
                 (evdev::KeyCode::KEY_A, 0),
@@ -4786,11 +4810,34 @@ mod tests {
                 (evdev::KeyCode::KEY_A, 0),
                 (evdev::KeyCode::KEY_B, 1),
                 (evdev::KeyCode::KEY_B, 0),
+            ],
+        );
+
+        // One synthesized primary Repeat pulse while both bands are engaged:
+        // Additive never suppresses the primary, and the same pulse drives
+        // the deep stage's own Hold-to-repeat too — both stages tap, each a
+        // full Down/Up pair (the two are fire-and-forget, so their own pairs
+        // may interleave — assert the multiset).
+        harness.repeat_analog(Input::Grid(1, 1), 250).await;
+        settle().await;
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+
+        let batches = harness.shut_down().await;
+        let after: Vec<_> = batches[opening.len()..]
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect();
+        assert_eq!(
+            event_counts(&after),
+            event_counts(&[
                 (evdev::KeyCode::KEY_A, 1),
                 (evdev::KeyCode::KEY_A, 0),
-            ],
-            "primary Down, primary Repeat, FireDeep, then primary's Repeat again \
-             while the deep band stays engaged — untouched by it"
+                (evdev::KeyCode::KEY_B, 1),
+                (evdev::KeyCode::KEY_B, 0),
+            ]),
+            "both stages repeat off the one primary pulse while the deep band stays engaged"
         );
     }
 
@@ -4832,6 +4879,60 @@ mod tests {
             "No-Return must never repress the primary on the way back out — \
              the key stays quiet until a fresh press"
         );
+    }
+
+    #[tokio::test]
+    async fn dual_stage_handoff_deep_stage_hold_to_repeat_actually_repeats() {
+        // A Hold-to-repeat deep Binding must keep tapping while the deep
+        // band stays engaged — `FireDeep` only fires on the crossing, so the
+        // repeat cadence rides `capture::analog`'s synthesized primary
+        // `Repeat` pulses (the deep band is strictly above the primary's, so
+        // every pulse that holds the primary holds the deep band too).
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        let after_crossing = harness.sink.batches().len();
+        assert!(after_crossing > 0, "FireDeep taps once on the crossing");
+
+        // Synthesized primary Repeat pulses while both bands stay engaged:
+        // the deep Hold-to-repeat re-fires on every one.
+        for _ in 0..3 {
+            harness.repeat_analog(Input::Grid(1, 1), 250).await;
+            settle().await;
+        }
+        assert!(
+            harness.sink.batches().len() >= after_crossing + 3,
+            "the deep Hold-to-repeat must tap on every pulse, not act like Fire-once"
+        );
+        for b in &harness.sink.batches()[after_crossing..] {
+            assert_eq!(key_and_value(b[0]).0, evdev::KeyCode::KEY_B);
+        }
+
+        // Back out of the deep band: `ReleaseDeep` stops it.
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        let after_release = harness.sink.batches().len();
+        harness.repeat_analog(Input::Grid(1, 1), 150).await;
+        settle().await;
+        assert_eq!(
+            harness.sink.batches().len(),
+            after_release,
+            "no more deep taps once the deep band releases"
+        );
+
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+        harness.shut_down().await;
     }
 
     #[tokio::test]

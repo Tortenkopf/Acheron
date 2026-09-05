@@ -48,7 +48,7 @@ use tokio::time::Instant;
 
 use crate::capture::EventState;
 use crate::capture::analog::{self, KeyState};
-use crate::config::{Action, Binding, Config, Layer, StagingMode};
+use crate::config::{Action, Binding, Config, Layer, StagingMode, TriggerMode};
 use crate::edit::Edit;
 use crate::injector::Injector;
 use crate::input::Input;
@@ -806,6 +806,59 @@ impl Engine {
         self.runtime
             .get(&input)
             .is_some_and(|rt| rt.primary_handed_off)
+    }
+
+    /// Drive `input`'s deep stage's own Hold-to-repeat cadence off a
+    /// synthesized primary `Repeat` pulse. The deep band has no independent
+    /// repeat source — `capture::analog`'s `RepeatSchedule` only synthesizes
+    /// `Repeat`s against the primary's own Actuation point, and
+    /// `Engine::update` only fires `FireDeep` on the band *crossing* — so
+    /// without this a Hold-to-repeat deep Binding fires exactly once and then
+    /// behaves like Fire-once. The deep band sits strictly above the
+    /// primary's (`deep.release > primary.actuation`), so every pulse that
+    /// keeps the primary held also keeps the deep band held: re-firing the
+    /// deep stage on each is the deep equivalent of what the primary already
+    /// gets for free. Re-fires only while the deep band is currently Down and
+    /// the deep Binding is Hold-to-repeat — Fire-once fired once on the
+    /// crossing, and a deep Toggle runs its own `MIN_TOGGLE_LAP` loop. A
+    /// no-op for a non-dual-stage key (no deep Binding on this Layer).
+    pub(crate) async fn deep_repeat(
+        &mut self,
+        deps: EngineDeps<'_>,
+        input: Input,
+    ) -> io::Result<()> {
+        let EngineDeps {
+            config,
+            active_layer,
+            injector,
+            cursors,
+            toggle_lap_target,
+            individual: _,
+        } = deps;
+        if !self
+            .runtime
+            .get(&input)
+            .is_some_and(|rt| rt.deep == KeyState::Down)
+        {
+            return Ok(());
+        }
+        let profile = config
+            .active_profile()
+            .expect("load_or_seed validates active_profile names a real profile");
+        let Some(deep_binding) = profile.deep_layer(active_layer).get(&input) else {
+            return Ok(());
+        };
+        if deep_binding.trigger != TriggerMode::HoldToRepeat {
+            return Ok(());
+        }
+        let deep_binding = deep_binding.clone();
+        let key = StageKey(input);
+        let slot = self.slots.slot(&key);
+        let decision = trigger::decide(&deep_binding, EventState::Repeat, slot);
+        let perform_deps = PerformDeps::new(injector, config, cursors, toggle_lap_target);
+        self.slots
+            .perform(decision, key, &deep_binding, perform_deps)
+            .await
     }
 
     /// The earliest still-armed Quick-Skip deadline across every tracked
