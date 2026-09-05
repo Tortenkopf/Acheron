@@ -39,7 +39,8 @@ use crate::capture::{CaptureMode, EventState, PhysicalEvent};
 use crate::chord;
 use crate::command::{Command, State};
 use crate::config::{
-    self, Action, ActuationPoint, ChordKey, Config, Layer, ModeKeyRole, StatusLeds, TriggerMode,
+    self, Action, ActuationPoint, ChordKey, Config, Layer, ModeKeyRole, StagingMode, StatusLeds,
+    TriggerMode,
 };
 use crate::dbus::Daemon;
 use crate::edit;
@@ -226,6 +227,50 @@ impl DispatchState {
 
         let bindings = profile.layer(self.active_layer);
         let binding = bindings.get(&event.input).cloned();
+
+        // `tartarus-dual-stage-keys` ticket 04: Quick-Skip's dispatch-side
+        // primary-suppression buffer diverts here, gated on `event.depth.
+        // is_some()` exactly like the AnalogRepeat swallow just below — a
+        // Digital-mode primary press never diverts (the deep stage is inert
+        // for free in Digital mode), and Handoff/No-Return/Additive keys are
+        // entirely unaffected (this only ever matches a `QuickSkip`-mode
+        // Input carrying a live deep Binding on this Layer). `Down` always
+        // diverts — `stage::Engine::begin_quick_skip` arms the ~50ms window
+        // (or resolves synchronously to Skipped if the deep band is already
+        // hot on this same report) instead of firing the primary
+        // immediately. `Up`/`Repeat` divert too, unless this press already
+        // resolved to `Late` (the deadline already fired the primary
+        // retroactively): from `Late` on the key runs as ordinary Handoff, so
+        // its real events must reach the ordinary path below to actually
+        // release/repeat it.
+        let quick_skip_key = event.depth.is_some()
+            && profile
+                .deep_stages
+                .get(&event.input)
+                .is_some_and(|deep_cfg| deep_cfg.mode == StagingMode::QuickSkip)
+            && profile
+                .deep_layer(self.active_layer)
+                .contains_key(&event.input);
+        if quick_skip_key {
+            match event.state {
+                EventState::Down => {
+                    let depth = event.depth.expect("checked by `quick_skip_key` above");
+                    let deps = stage::EngineDeps {
+                        config,
+                        active_layer: self.active_layer,
+                        individual: &mut self.individual,
+                        injector: &self.injector,
+                        cursors: &mut self.stepper,
+                        toggle_lap_target: self.toggle_lap_target,
+                    };
+                    return self.stage.begin_quick_skip(deps, event.input, depth).await;
+                }
+                EventState::Up | EventState::Repeat if !self.stage.is_late(event.input) => {
+                    return Ok(Vec::new());
+                }
+                EventState::Up | EventState::Repeat => {}
+            }
+        }
 
         // Real firing for an Analog-repeat Binding while Depth is available comes
         // entirely from `update_analog_repeats`'s own depth-driven background task
@@ -522,6 +567,28 @@ impl DispatchState {
         self.stage.update(deps, snapshot).await
     }
 
+    /// Fires Quick-Skip's ~50ms window timeout (`tartarus-dual-stage-keys`
+    /// ticket 04) — the `run` loop's fourth `select!` arm,
+    /// `wait_for_stage_deadline`, mirroring `wait_for_chord_deadline`/
+    /// `chord::tick`'s own shape. A no-op call before any key's deadline has
+    /// actually elapsed (the same spurious-call tolerance `chord::tick`
+    /// extends). On a genuine elapse with the deep band never reached,
+    /// `stage::Engine::tick` fires the buffered primary retroactively
+    /// (`dispatch_individual_down`'s exact logic, via `stage`'s own `fire`
+    /// helper) and flips that key to Late — plain Handoff for the rest of
+    /// the press.
+    async fn tick_stages(&mut self, config: &Config, now: Instant) -> io::Result<Vec<edit::Edit>> {
+        let deps = stage::EngineDeps {
+            config,
+            active_layer: self.active_layer,
+            individual: &mut self.individual,
+            injector: &self.injector,
+            cursors: &mut self.stepper,
+            toggle_lap_target: self.toggle_lap_target,
+        };
+        self.stage.tick(deps, now).await
+    }
+
     /// Runs each `edit::Effect` an `edit::plan` derived, in order, against the
     /// `DispatchState` fields it touches (ticket 05). `config` is the
     /// just-committed `Config` — every effect that reads the new state
@@ -796,6 +863,12 @@ pub async fn run(
                     state.commit_input_edits(edits, &mut config, &config_path).await;
                 }
             }
+            () = wait_for_stage_deadline(state.stage.next_deadline()) => {
+                let edits = state.tick_stages(&config, Instant::now()).await?;
+                if !edits.is_empty() {
+                    state.commit_input_edits(edits, &mut config, &config_path).await;
+                }
+            }
             connected = rx_connection.recv(), if connection_open => {
                 match connected {
                     Some(connected) => {
@@ -865,6 +938,19 @@ pub async fn run(
 /// `sleep_until` against the same absolute `Instant` doesn't lose progress).
 /// Replaces the old `chord_window_deadline`.
 async fn wait_for_chord_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Quick-Skip's own deadline-timeout wait (`tartarus-dual-stage-keys` ticket
+/// 04) — mirrors `wait_for_chord_deadline`'s exact shape one line above.
+/// `state.stage.next_deadline()` takes the earliest still-armed deadline
+/// across every Quick-Skip key (unlike Chord's single global window), so
+/// re-creating this future every loop iteration picks up a freshly-armed,
+/// cancelled, or elapsed deadline for any key on the very next iteration.
+async fn wait_for_stage_deadline(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending().await,
@@ -4729,12 +4815,53 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn dual_stage_quick_skip_key_is_an_unaffected_primary_only_key_for_now() {
-        // Ticket 03's own scoping: a `QuickSkip` dual-stage key is accepted
-        // by config (ticket 01) but not yet specially handled here — it
-        // behaves as an ordinary primary-only key, deep never engaging, even
-        // while physically crossing the deep band. Ticket 04 completes it.
+    // ── `tartarus-dual-stage-keys` ticket 04: Quick-Skip's dispatch-side
+    // primary-suppression buffer ──────────────────────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_quick_skip_fast_full_press_skips_the_primary_entirely() {
+        // A single hidraw report jumping straight from released past the
+        // deep Actuation point — the real primary `Down` PhysicalEvent
+        // carries `depth: Some(250)`, already past the deep band's own
+        // threshold (220/200). `begin_quick_skip` resolves this
+        // synchronously from that event's own depth field: `KEY_A` (primary)
+        // must never appear at all, only `KEY_B` (deep).
+        let config = dual_stage_config(
+            StagingMode::QuickSkip,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 250).await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+
+        // Advancing well past the window produces nothing further — this
+        // press already resolved to Skipped, not merely still Armed.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        settle().await;
+
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+
+        let batches = harness.shut_down().await;
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![(evdev::KeyCode::KEY_B, 1), (evdev::KeyCode::KEY_B, 0)],
+            "the primary's Down (and its eventual Up) must be skipped entirely"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_quick_skip_deep_reached_within_the_window_becomes_skipped() {
+        // A slower press: the primary crosses first (a separate report),
+        // arming the ~50ms window; the deep band is reached shortly after,
+        // still inside the window — resolved to Skipped via `stage::
+        // Engine::update`'s own `rx_depth` path this time, not the
+        // synchronous same-report check.
         let config = dual_stage_config(
             StagingMode::QuickSkip,
             keypress_binding(evdev::KeyCode::KEY_A),
@@ -4746,8 +4873,61 @@ mod tests {
         harness.push_depth([(Input::Grid(1, 1), 150)]);
         settle().await;
 
-        // Straight through the deep band and back — `stage::Engine` skips
-        // every `QuickSkip`-mode Input entirely, so `KEY_B` never fires.
+        tokio::time::advance(Duration::from_millis(10)).await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+
+        // The window's own deadline elapsing afterward changes nothing —
+        // this key already resolved to Skipped, not Armed.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        settle().await;
+
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+
+        let batches = harness.shut_down().await;
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![(evdev::KeyCode::KEY_B, 1), (evdev::KeyCode::KEY_B, 0)],
+            "the primary must never fire once the deep band is reached inside the window"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_quick_skip_deadline_elapses_fires_primary_late_then_runs_as_handoff() {
+        // The primary crosses, but the deep band is never reached inside the
+        // window — the buffered primary fires retroactively once the
+        // deadline elapses, and the rest of the press runs as ordinary
+        // Handoff from there.
+        let config = dual_stage_config(
+            StagingMode::QuickSkip,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        assert!(
+            harness.sink.batches().is_empty(),
+            "the primary must stay buffered, not fire immediately"
+        );
+
+        tokio::time::advance(Duration::from_millis(60)).await;
+        settle().await;
+        assert_eq!(
+            harness.sink.batches().len(),
+            2,
+            "the deadline elapsing must fire the primary retroactively (a Fire-once \
+             keypress self-completes as its own Down+Up pair, two batches)"
+        );
+
+        // From here on, plain Handoff: deep engages (releases the now-Late
+        // primary, fires deep), then disengages (releases deep, represses a
+        // *fresh* primary).
         harness.push_depth([(Input::Grid(1, 1), 250)]);
         settle().await;
         harness.push_depth([(Input::Grid(1, 1), 150)]);
@@ -4761,8 +4941,215 @@ mod tests {
         let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
         assert_eq!(
             events,
-            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
-            "a QuickSkip dual-stage key must behave as an unaffected primary-only key"
+            vec![
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 0),
+                (evdev::KeyCode::KEY_B, 1),
+                (evdev::KeyCode::KEY_B, 0),
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 0),
+            ],
+            "Late fires the buffered primary retroactively, then the rest of the \
+             press runs as ordinary Handoff — including the final real Up landing \
+             as a no-op against an already self-released Fire-once"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_quick_skip_early_up_cancels_with_nothing_emitted() {
+        // The primary crosses and arms the window, but the key is released
+        // again before the deadline elapses and before the deep band is ever
+        // reached — cancelled outright: neither stage ever fires.
+        let config = dual_stage_config(
+            StagingMode::QuickSkip,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+
+        tokio::time::advance(Duration::from_millis(10)).await;
+        harness.release_analog(Input::Grid(1, 1), 50).await;
+        harness.push_depth([(Input::Grid(1, 1), 50)]);
+        settle().await;
+
+        // Advancing well past the window confirms it was genuinely
+        // cancelled, not merely still Armed and about to fire Late.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        settle().await;
+
+        let batches = harness.shut_down().await;
+        assert!(
+            batches.is_empty(),
+            "an early Up before either the deadline or the deep band must emit nothing"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_quick_skip_layer_switch_while_armed_cancels_the_buffered_primary() {
+        // A Layer/Profile switch or capture-mode flip to Digital while Armed
+        // cancels outright via `stage::Engine::stop_all()` (already wired at
+        // those call sites from ticket 03) — this exercises the Layer-switch
+        // call site specifically (the capture-mode-flip call site gets its
+        // own sibling test right below); `dual_stage_layer_switch_mid_
+        // press_...`/`dual_stage_digital_mode_flip_mid_press_...` above
+        // already cover `stop_all()` itself for Handoff, so these only need
+        // to confirm the Quick-Skip buffer specifically is included in what
+        // it clears.
+        let config = dual_stage_config(
+            StagingMode::QuickSkip,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+
+        harness.press(Input::ModeKey).await;
+        settle().await;
+
+        // Advancing well past the original window fires nothing — the
+        // buffered primary was dropped by `stop_all()`, not merely deferred.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        settle().await;
+
+        harness.release(Input::ModeKey).await;
+        let batches = harness.shut_down().await;
+        assert!(
+            batches.is_empty(),
+            "a Layer switch while Armed must cancel the buffered primary outright"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_quick_skip_capture_mode_flip_while_armed_cancels_the_buffered_primary() {
+        // The capture-mode-flip-to-Digital call site's own share of the
+        // Layer-switch test above — `handle_capture_mode_change`'s existing
+        // Digital-transition branch (ticket 03) already calls `stage::
+        // Engine::stop_all()`; this confirms the Quick-Skip buffer
+        // specifically is included in what that clears too. Raw `run()`
+        // setup, mirroring `dual_stage_digital_mode_flip_mid_press_...`
+        // above, since `DispatchState::new` starts `capture_mode` at
+        // `Digital` and must flip to `Analog` first.
+        let config = dual_stage_config(
+            StagingMode::QuickSkip,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let (_conn_tx, conn_rx) = mpsc::channel(8);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (depth_tx, depth_rx) = watch::channel(HashMap::new());
+        let (capture_mode_tx, capture_mode_rx) = mpsc::channel(8);
+        let dispatch_handle = tokio::spawn(run(
+            event_rx,
+            conn_rx,
+            cmd_rx,
+            inj.clone(),
+            config,
+            unused_config_path(),
+            None,
+            actuation_channel(),
+            capture_mode_rx,
+            capture_control_channel(),
+            executor::MIN_TOGGLE_LAP,
+            depth_rx,
+            device_info_channel(),
+            led_channel(),
+        ));
+
+        capture_mode_tx.send(CaptureMode::Analog).await.unwrap();
+        settle().await;
+
+        event_tx
+            .send(PhysicalEvent {
+                input: Input::Grid(1, 1),
+                state: EventState::Down,
+                depth: Some(150),
+            })
+            .await
+            .unwrap();
+        depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), 150)]));
+        settle().await;
+
+        // The Analog->Digital transition while Armed cancels the buffered
+        // primary outright via `stage::Engine::stop_all()`.
+        capture_mode_tx.send(CaptureMode::Digital).await.unwrap();
+        settle().await;
+
+        // Advancing well past the original window fires nothing — the
+        // buffered primary was dropped by `stop_all()`, not merely deferred.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        settle().await;
+
+        drop(event_tx);
+        drop(depth_tx);
+        drop(capture_mode_tx);
+        dispatch_handle.await.unwrap().unwrap();
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+
+        assert!(
+            sink.batches().is_empty(),
+            "a capture-mode flip to Digital while Armed must cancel the buffered \
+             primary outright"
+        );
+    }
+
+    #[tokio::test]
+    async fn dual_stage_quick_skip_reordered_depth_tick_still_resolves_skipped_not_late() {
+        // Code-review finding on this ticket: `rx_depth` is a coalescing
+        // `watch` while `rx_events` is a non-lossy `mpsc` — under load the
+        // two can reorder, so `update`'s own bypassed shadow-band tracking
+        // can observe a *later*, larger depth sample before this key's
+        // still-queued primary `Down` event (carrying an earlier, smaller
+        // depth) is ever drained. Drives `DispatchState` directly (the
+        // `Seam` seam, ticket 09) so this specific ordering — `update_stages`
+        // before `handle_event` — is deterministic rather than left to
+        // `tokio::select!`'s fairness draw. `begin_quick_skip` must defer to
+        // `update`'s already-tracked `rt.deep` in that case, not the event's
+        // own stale depth field, or a fast full press would wrongly Arm (and
+        // later fire Late) instead of resolving Skipped.
+        let config = dual_stage_config(
+            StagingMode::QuickSkip,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let mut seam = Seam::new(config);
+
+        let edits = seam
+            .state
+            .update_stages(&seam.config, &HashMap::from([(Input::Grid(1, 1), 250)]))
+            .await
+            .unwrap();
+        assert!(
+            edits.is_empty(),
+            "the bypassed tick must decide no op itself"
+        );
+
+        let edits = seam
+            .feed(PhysicalEvent {
+                input: Input::Grid(1, 1),
+                state: EventState::Down,
+                depth: Some(150),
+            })
+            .await;
+        assert!(edits.is_empty());
+
+        let batches = seam.finish().await;
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![(evdev::KeyCode::KEY_B, 1), (evdev::KeyCode::KEY_B, 0)],
+            "a reordered depth tick must not roll a genuine deep-band crossing back \
+             to Armed — the primary must still be skipped, not fired Late"
         );
     }
 

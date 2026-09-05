@@ -119,11 +119,6 @@ pub(crate) enum QuickSkipPhase {
     Skipped,
     /// The deadline elapsed first — `tick` already emitted the retroactive
     /// `RepressPrimary`; the rest of this press runs plain Handoff.
-    // Ticket 03's `Engine` filters Quick-Skip dual-stage keys out entirely
-    // (ticket 04's job), so nothing outside `#[cfg(test)]` constructs this
-    // yet. Remove this `allow` once ticket 04's dispatch-side buffer reaches
-    // the deadline and does.
-    #[allow(dead_code)]
     Late,
 }
 
@@ -151,12 +146,10 @@ pub(crate) fn advance(
 }
 
 /// The Quick-Skip timeout's deadline, or `None` if no Quick-Skip press is
-/// currently Armed — mirroring `chord::next_deadline`'s exact shape. The
-/// `run` loop's `select!` timeout branch (ticket 04) arms on this.
-// No caller outside `#[cfg(test)]` yet — ticket 03's `Engine` filters
-// Quick-Skip dual-stage keys out entirely; ticket 04's dispatch-side buffer
-// is what actually drives a `select!` arm off this. Remove once that lands.
-#[allow(dead_code)]
+/// currently Armed — mirroring `chord::next_deadline`'s exact shape.
+/// `Engine::next_deadline` (ticket 04) calls this once per tracked key and
+/// takes the earliest, since — unlike Chord's single global window — every
+/// Quick-Skip key arms its own independent deadline.
 pub(crate) fn next_deadline(quick_skip: Option<QuickSkipPhase>) -> Option<Instant> {
     match quick_skip {
         Some(QuickSkipPhase::Armed { deadline }) => Some(deadline),
@@ -168,13 +161,10 @@ pub(crate) fn next_deadline(quick_skip: Option<QuickSkipPhase>) -> Option<Instan
 /// `Instant` / outcome-producing signature convention). A no-op unless
 /// Armed and `now` has reached `deadline`: on the real deadline elapsing
 /// with the deep band never reached, the primary fires retroactively
-/// (`RepressPrimary`, performed via `dispatch_individual_down` by ticket
-/// 03's `Engine`) and the key flips to Late — plain Handoff for the rest of
-/// the press. `now` guards a spurious call before the deadline, same as
-/// `chord::tick`.
-// Same status as `next_deadline` above — ticket 04's job to call this from a
-// real `select!` arm.
-#[allow(dead_code)]
+/// (`RepressPrimary`, performed via `dispatch_individual_down`'s exact logic
+/// by `Engine::tick`, ticket 04) and the key flips to Late — plain Handoff
+/// for the rest of the press. `now` guards a spurious call before the
+/// deadline, same as `chord::tick`.
 pub(crate) fn tick(
     quick_skip: Option<QuickSkipPhase>,
     now: Instant,
@@ -337,20 +327,19 @@ fn unreachable_transition(prev: Bands, next: Bands) -> Vec<StageOp> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// `Engine` — ticket 03's non-pure dispatch-side shell (Handoff / No-Return /
-// Additive only; Quick-Skip dual-stage keys are accepted by config but left
-// as an unaffected primary-only key until ticket 04's dispatch-side buffer
-// lands — forward progress, not a regression).
+// `Engine` — ticket 03's non-pure dispatch-side shell, completed by ticket
+// 04's Quick-Skip primary-suppression buffer (`begin_quick_skip`/`tick`
+// below).
 // ─────────────────────────────────────────────────────────────────────────
 
 /// One key's combined runtime state the `Engine` tracks across depth ticks:
 /// a shadow primary-band `KeyState` (fed by the same raw `rx_depth` stream
 /// as the deep band, never the primary's own `PhysicalEvent` — ADR-0007),
-/// the deep-band `KeyState`, and Quick-Skip's own per-press phase (always
-/// `None` for every mode `Engine::update` acts on in this ticket, since
-/// Quick-Skip inputs are filtered out before it's ever read or written).
-/// `Default` is a fresh key that has never crossed either band — equivalent
-/// to `(Band::Up, Band::Up)`.
+/// the deep-band `KeyState`, and Quick-Skip's own per-press phase (`None` for
+/// every mode but `QuickSkip`, and for a `QuickSkip` key at rest between
+/// presses — ticket 04's `begin_quick_skip`/`tick` are the only writers of a
+/// `Some` value here). `Default` is a fresh key that has never crossed
+/// either band — equivalent to `(Band::Up, Band::Up)`.
 #[derive(Debug, Clone, Copy, Default)]
 struct KeyRuntime {
     primary: KeyState,
@@ -522,10 +511,6 @@ impl Engine {
             .expect("load_or_seed validates active_profile names a real profile");
         let mut edits = Vec::new();
         for (&input, deep_cfg) in &profile.deep_stages {
-            // Ticket 04's job — an unaffected primary-only key until then.
-            if deep_cfg.mode == StagingMode::QuickSkip {
-                continue;
-            }
             // Existence only, no clone yet (code-review finding: the actual
             // `Binding` — cloned below, only once a real transition is
             // confirmed — carries a heap-allocated `String` for
@@ -554,6 +539,27 @@ impl Engine {
             rt.primary = new_primary;
             rt.deep = new_deep;
             if prev == next {
+                continue;
+            }
+            if deep_cfg.mode == StagingMode::QuickSkip && rt.quick_skip.is_none() {
+                // Ticket 04: a Quick-Skip key's outer Up->Down edge is owned
+                // entirely by `begin_quick_skip` — armed directly off the
+                // real primary `Down` event (`rx_events`), not this
+                // coalescing `rx_depth` tick, so the ~50ms window starts at
+                // the physically precise moment and the same-report
+                // double-crossing ordinarily resolves synchronously from the
+                // event's own depth field (see `begin_quick_skip`'s doc). No
+                // op is ever decided here for this edge — the same way the
+                // other three modes leave their own lone `FirePrimary`/
+                // `ReleasePrimary` transitions to the real event path below
+                // rather than double-performing them — but shadow-band
+                // tracking above still stays live regardless, unconditionally
+                // (`rt.primary`/`rt.deep` were just written above), precisely
+                // so `begin_quick_skip` can detect when *this* loop has
+                // raced ahead of that still-queued `Down` event (`rx_events`
+                // vs. the coalescing `rx_depth` watch can reorder under
+                // load) and defer to `rt.deep` instead of the event's own,
+                // by-then-stale depth reading.
                 continue;
             }
             let (ops, quick_skip) = advance(prev, next, deep_cfg.mode, rt.quick_skip);
@@ -632,20 +638,221 @@ impl Engine {
                         self.slots.stop_toggle(&key).await;
                         self.slots.force_release(&key, injector).await;
                     }
-                    StageOp::SuppressPrimary => {
-                        // Reachable only if a future change relaxes the
-                        // `QuickSkip` filter above without also revisiting
-                        // this arm — degrade to a no-op rather than take
-                        // down the whole dispatch task's input handling,
-                        // mirroring `stage.rs`'s own pure-core precedent
-                        // (`unreachable_transition`'s `debug_assert!` +
-                        // graceful fallback, not a hard `unreachable!()`).
-                        debug_assert!(
-                            false,
-                            "SuppressPrimary reached Engine::update despite the \
-                             QuickSkip filter above"
-                        );
+                    // Ticket 04: the buffered primary `Down` is dropped for
+                    // good — genuinely a no-op here, since `begin_quick_skip`
+                    // swallowed it before it ever reached `individual` at
+                    // all (unlike `ReleasePrimary`, there is nothing live to
+                    // force-release).
+                    StageOp::SuppressPrimary => {}
+                }
+            }
+        }
+        Ok(edits)
+    }
+
+    /// The dispatch-side half of Quick-Skip's primary-suppression buffer
+    /// (`tartarus-dual-stage-keys` ticket 04) — `handle_event`'s divert calls
+    /// this on a fresh Quick-Skip primary `Down`, off the real `rx_events`
+    /// edge rather than waiting for `update`'s own coalescing `rx_depth`
+    /// tick, so the ~50ms window is armed at the exact moment the primary
+    /// physically crosses. `depth` is that same `Down` `PhysicalEvent`'s own
+    /// raw depth reading, ordinarily enough on its own to resolve whether the
+    /// deep band is already hot (ADR-0007's synchronous-resolution trick,
+    /// the same one `advance`'s mechanical-replay tables rely on for a
+    /// same-report double-crossing) — this is the only place this key's
+    /// outer Up->Down edge is ever *decided* (`update`'s own `quick_skip.
+    /// is_none()` bypass defers to it entirely). But `depth` can still be
+    /// *stale* by the time this runs: `rx_depth` is a coalescing `watch`
+    /// while `rx_events` is a non-lossy `mpsc`, so under load `update`'s own
+    /// shadow-band tracking can race ahead and observe a later, larger depth
+    /// sample first (code-review finding on this ticket) — handled below by
+    /// deferring to `rt.deep` whenever that's happened, rather than trusting
+    /// `depth` unconditionally.
+    pub(crate) async fn begin_quick_skip(
+        &mut self,
+        deps: EngineDeps<'_>,
+        input: Input,
+        depth: u8,
+    ) -> io::Result<Vec<Edit>> {
+        let EngineDeps {
+            config,
+            active_layer,
+            injector,
+            cursors,
+            toggle_lap_target,
+            ..
+        } = deps;
+        let profile = config
+            .active_profile()
+            .expect("load_or_seed validates active_profile names a real profile");
+        let deep_cfg = profile
+            .deep_stages
+            .get(&input)
+            .copied()
+            .expect("handle_event's divert only calls this for a configured Quick-Skip key");
+        let rt = self.runtime.entry(input).or_default();
+        // Structurally the key was at rest (`(Up, Up)`) the instant before
+        // this real primary `Down` — *unless* `update`'s own `rx_depth`-
+        // driven shadow tracking has already raced ahead of this `rx_events`
+        // message and observed a later, larger depth sample first (`rx_depth`
+        // is a coalescing `watch`, `rx_events` a non-lossy `mpsc` — the two
+        // can reorder under load, code-review finding on this ticket).
+        // `update`'s own `quick_skip.is_none()` bypass still writes the
+        // shadow bands unconditionally even while it declines to decide an
+        // op, so `rt.primary` already reading `Down` here is exactly that
+        // signal: trust its already-tracked `rt.deep` (strictly more recent
+        // than this event's own, now-stale `depth` field) rather than
+        // recomputing from scratch, which would otherwise roll a genuine
+        // deep-band crossing back to `Up` and wrongly Arm instead of
+        // resolving Skipped.
+        let deep_state = if rt.primary == KeyState::Down {
+            rt.deep
+        } else {
+            analog::observe(KeyState::Up, depth, deep_cfg.actuation).0
+        };
+        rt.primary = KeyState::Down;
+        rt.deep = deep_state;
+        let next = (Band::Down, to_band(deep_state));
+        let (ops, quick_skip) = advance((Band::Up, Band::Up), next, StagingMode::QuickSkip, None);
+        rt.quick_skip = quick_skip;
+        let mut edits = Vec::new();
+        for op in ops {
+            match op {
+                // The buffered Down is dropped for good — nothing to
+                // release, since it was never given to `individual`.
+                StageOp::SuppressPrimary => {}
+                StageOp::FireDeep => {
+                    let deep_binding = profile
+                        .deep_layer(active_layer)
+                        .get(&input)
+                        .cloned()
+                        .expect("handle_event's divert only calls this for a live deep stage");
+                    if let Some(edit) = fire(
+                        &mut self.slots,
+                        StageKey(input),
+                        &deep_binding,
+                        injector,
+                        config,
+                        cursors,
+                        toggle_lap_target,
+                    )
+                    .await?
+                    {
+                        edits.push(edit);
                     }
+                }
+                StageOp::Nothing
+                | StageOp::FirePrimary
+                | StageOp::RepressPrimary
+                | StageOp::ReleasePrimary
+                | StageOp::ReleaseDeep => debug_assert!(
+                    false,
+                    "quick_skip_advance's `None`-phase branch only ever emits an \
+                     empty Vec (Armed) or [SuppressPrimary, FireDeep] (already hot), \
+                     got {op:?}"
+                ),
+            }
+        }
+        Ok(edits)
+    }
+
+    /// Whether `input`'s Quick-Skip runtime state is currently `Late` — the
+    /// deadline already fired the primary retroactively, so this press now
+    /// runs as ordinary Handoff. `handle_event`'s divert queries this to
+    /// decide whether a real `Up`/`Repeat` should keep being swallowed (still
+    /// `Armed`/`Skipped`/`None`) or must instead reach the ordinary
+    /// individual-dispatch path below it, exactly like an ordinary Handoff
+    /// key's own real events would.
+    pub(crate) fn is_late(&self, input: Input) -> bool {
+        matches!(
+            self.runtime.get(&input).and_then(|rt| rt.quick_skip),
+            Some(QuickSkipPhase::Late)
+        )
+    }
+
+    /// The earliest still-armed Quick-Skip deadline across every tracked
+    /// key, or `None` if none is currently `Armed` — the `run` loop's fourth
+    /// `select!` arm (`wait_for_stage_deadline`, ticket 04) arms on this.
+    /// Unlike Chord's single global window, every Quick-Skip key arms its
+    /// own independent deadline, so this takes the minimum rather than
+    /// reading one shared value.
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        self.runtime
+            .values()
+            .filter_map(|rt| next_deadline(rt.quick_skip))
+            .min()
+    }
+
+    /// Fires every Quick-Skip key whose deadline has elapsed by `now`
+    /// (ticket 04) — the `wait_for_stage_deadline` `select!` arm's handler.
+    /// A spurious call before any deadline has actually elapsed (or after
+    /// `stop_all`/an early `Up` already cancelled it) touches nothing, the
+    /// same tolerance `chord::tick` extends. Collects the elapsed keys
+    /// first, then mutates `self.runtime` per key, to avoid borrowing it
+    /// both immutably (the scan) and mutably (the update) at once.
+    pub(crate) async fn tick(
+        &mut self,
+        deps: EngineDeps<'_>,
+        now: Instant,
+    ) -> io::Result<Vec<Edit>> {
+        let EngineDeps {
+            config,
+            active_layer,
+            individual,
+            injector,
+            cursors,
+            toggle_lap_target,
+        } = deps;
+        let profile = config
+            .active_profile()
+            .expect("load_or_seed validates active_profile names a real profile");
+        let elapsed: Vec<Input> = self
+            .runtime
+            .iter()
+            .filter_map(|(&input, rt)| match rt.quick_skip {
+                Some(QuickSkipPhase::Armed { deadline }) if now >= deadline => Some(input),
+                _ => None,
+            })
+            .collect();
+        let mut edits = Vec::new();
+        for input in elapsed {
+            let rt = self
+                .runtime
+                .get_mut(&input)
+                .expect("just collected this key from the same map");
+            let (ops, phase) = tick(rt.quick_skip, now);
+            rt.quick_skip = phase;
+            for op in ops {
+                match op {
+                    StageOp::RepressPrimary => {
+                        // A primary must exist for a deep stage to exist at
+                        // all (`ConfigError::DeepStageWithoutPrimary`); the
+                        // `else` is defensive, not a reachable production
+                        // path.
+                        let Some(primary_binding) =
+                            profile.layer(active_layer).get(&input).cloned()
+                        else {
+                            continue;
+                        };
+                        if let Some(edit) = fire(
+                            individual,
+                            input,
+                            &primary_binding,
+                            injector,
+                            config,
+                            cursors,
+                            toggle_lap_target,
+                        )
+                        .await?
+                        {
+                            edits.push(edit);
+                        }
+                    }
+                    other => debug_assert!(
+                        false,
+                        "the pure `tick` only ever emits [RepressPrimary] or an \
+                         empty Vec, got {other:?}"
+                    ),
                 }
             }
         }
