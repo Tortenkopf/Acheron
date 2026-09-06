@@ -119,6 +119,25 @@ CSS = """
 .depth-track-dim { opacity: 0.35; }
 .marker-actuation { background-color: #2ecc71; }
 .marker-release { background-color: #e6991a; }
+/* tartarus-dual-stage-keys ticket 07: the dual-stage "swap toggle" binding
+   panel (binding_editor.py::build_dual_stage_panel). The deep stage sits in
+   a second colour pair stacked strictly above the primary green/amber band
+   (blue actuation / purple release), and its own picker highlights its
+   current pick in that same blue so which stage's picker is on screen is
+   unambiguous — `background-image: none` clears the theme's
+   `.suggested-action` accent layer, which otherwise masks a plain colour
+   override regardless of provider priority. */
+.marker-deep-actuation { background-color: #3498db; }
+.marker-deep-release { background-color: #9b59b6; }
+.deep-picker .keycap.suggested-action,
+.deep-picker .padbtn.suggested-action {
+    background-image: none;
+    background-color: #3498db;
+    border-color: #3498db;
+    color: white;
+}
+.staging-mode-row button { font-size: smaller; }
+.icon-btn { min-width: 24px; min-height: 24px; padding: 0 2px; font-weight: bold; }
 /* Ticket 42: the real key/mouse-button picker (key_picker.py), ported from
    ticket 32's winning variant A prototype. */
 .warning { background-color: alpha(#e6991a, 0.18); border-radius: 6px; padding: 6px 8px; font-size: smaller; }

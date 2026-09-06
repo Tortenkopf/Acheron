@@ -11,8 +11,8 @@
 //! and synchronous. `Engine` owns the spawned tokio tasks and is NOT pure:
 //! the same shape as `executor::ActiveToggle`. This module imports nothing
 //! from `dispatch`, `edit`, `chord`, `trigger`, or `config::Config` —
-//! `dispatch` keeps `compile_action` and hands the engine pre-compiled
-//! `Vec<MacroStep>`.
+//! `dispatch` calls `trigger::compile_action` and hands the engine
+//! pre-compiled `Vec<MacroStep>`.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -166,8 +166,8 @@ struct ActiveAnalogRepeat {
 impl ActiveAnalogRepeat {
     /// Spawns the task: `steps` is compiled once by dispatch, from the
     /// Binding's Action as of the moment Depth first crossed the deadzone
-    /// (mirrors `perform_trigger`'s own once-per-fire `compile_action` call)
-    /// — not recompiled per tick, so a Stepper Action's cursor advances once
+    /// (mirrors `trigger::Slots::perform`'s own once-per-fire `compile_action`
+    /// call) — not recompiled per tick, so a Stepper Action's cursor advances once
     /// per "press session" rather than auto-cycling at the tick rate.
     /// `depth_rx` is the caller's own clone of the shared live-Depth watch
     /// channel (ticket 26), read fresh on every tick to drive the rate curve.
@@ -318,7 +318,7 @@ impl Engine {
     /// Run `reconcile` against the live task set, perform every `Stop`
     /// (cancelling the token then awaiting the task — the engine owns the
     /// map), and return the Inputs that need a fresh task. Dispatch compiles
-    /// each one's steps (`compile_action`, staying dispatch-side) and calls
+    /// each one's steps (`trigger::compile_action`, off this engine) and calls
     /// `spawn`. Replaces `update_analog_repeats`'s body.
     pub(crate) async fn update(
         &mut self,
@@ -341,7 +341,7 @@ impl Engine {
     }
 
     /// Compile-once-at-spawn (a Stepper cursor advances per press-session, not
-    /// per tick — mirrors `perform_trigger`). `steps` and `pulse_hold` arrive
+    /// per tick — mirrors `trigger::Slots::perform`). `steps` and `pulse_hold` arrive
     /// pre-resolved from dispatch. Sync, like today's
     /// `ActiveAnalogRepeat::spawn`. "Spawn only if absent" — dispatch only
     /// ever calls this for an Input `update` just reported as needing a task.

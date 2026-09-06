@@ -70,6 +70,10 @@ Acheron is two cooperating pieces:
 - **Analog grid keys** — on hardware that supports it, per-key actuation and
   release points with a live depth readout, and continuous **axis output**
   (a grid key drives a gamepad trigger or stick half by pressure).
+- **Dual-stage keys** — give one analog grid key a second Action at a deeper
+  press: a light press does one thing, pushing past a deeper point does
+  another, with a selectable hand-off between them (a camera-shutter
+  half-press / full-press).
 - **Mouse-button hold** — Hold-to-repeat on a mouse button is a real sustained
   press, so click-and-drag works.
 - **System tray icon** — active profile/layer at a glance, quick profile
@@ -157,8 +161,8 @@ membership take full effect (or unplug/replug the device).
 ### Building a release
 
 Both components self-label their version from git. A plain `main` checkout
-reports `1.1.0-dev+<short-hash>`; a checkout sitting exactly on the `v1.1.0`
-tag (or a tarball with no `.git`) reports the bare `1.1.0`. **Tag the release
+reports `1.2.0-dev+<short-hash>`; a checkout sitting exactly on the `v1.2.0`
+tag (or a tarball with no `.git`) reports the bare `1.2.0`. **Tag the release
 commit before building** the artifacts you hand to users. The canonical
 version numbers live in `daemon/Cargo.toml` and `gui/acheron_gui/__init__.py`
 (`_BASE_VERSION`); a release bumps both. `daemon/build.rs` honours an explicit
@@ -221,6 +225,37 @@ run `acheron-gui`.
 
 Editing is blocked with an on-screen reason whenever the Daemon isn't running
 or the device isn't connected, so a change never looks applied when it can't be.
+
+### Dual-stage keys
+
+An analog grid key normally fires one Action at one press depth. A **deep
+stage** gives it a second, independent Binding that fires only when you press
+*past* a deeper point — think a racing sim where a light press of one key is
+half-throttle and pushing it to the floor is full-throttle, or a camera
+shutter that focuses on a half-press and shoots on a full press.
+
+Open a grid key's editor and click **+ Add deep stage** (bind a primary Action
+first — **Apply** commits it without closing the editor, so you can add the
+deep stage in the same window). The depth bar grows two more markers (the deep
+stage's own actuation and release points, always stacked above the primary's),
+and a **Primary / Deep** toggle swaps which stage the Trigger / Action /
+picker below it edits. A **Staging mode** row chooses how the two hand off as
+the key travels through both bands:
+
+- **Handoff** — crossing into the deep band releases the primary and presses
+  the deep; coming back up releases the deep and re-presses the primary. One
+  stage held at a time.
+- **No-Return** — like Handoff going in, but the primary does not re-fire on
+  the way back up.
+- **Additive** — the deep press adds the deep stage on top; the primary stays
+  held. Both release together.
+- **Quick-Skip** — reaching the deep band within about 50 ms of the primary
+  point suppresses the primary's press entirely (for a fast full-press you
+  never wanted the light press for); otherwise it behaves as Handoff.
+
+Deep stages need analog capture — in digital-capture mode the controls grey
+out and only the primary fires. Removing the primary Binding removes the deep
+stage with it.
 
 ### Configuration file
 

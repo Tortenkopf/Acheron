@@ -36,6 +36,32 @@ def test_reference_count_spans_base_held_and_chord_layers_across_profiles():
     ) == 3
 
 
+def test_reference_count_spans_deep_stage_layers():
+    # tartarus-dual-stage-keys ticket 01: a deep-stage Binding is just
+    # another `Individual`-site Binding source (`config::profile_all_
+    # binding_sites`), so a Macro/Stepper reference sitting only in
+    # `deep_base`/`deep_held` must still count. No GUI mutation path exists
+    # yet for the deep-stage maps (ticket 05), so this pokes the stub's
+    # internal shape directly — the same shape a hand-edited
+    # `[profiles.Default.deep_base.*]` config.toml entry parses into.
+    stub = DaemonStub()
+    macro_id = stub.create_macro("Test macro", [])
+    stub._profiles["Default"]["deep_base"]["grid_r1c1"] = {
+        "trigger": "fire_once",
+        "type": "macro",
+        "macro_id": macro_id,
+    }
+    stub._profiles["Default"]["deep_held"]["grid_r1c2"] = {
+        "trigger": "fire_once",
+        "type": "macro",
+        "macro_id": macro_id,
+    }
+
+    assert reference_count(
+        _bindings(stub), binding_type="macro", id_field="macro_id", id_value=macro_id
+    ) == 2
+
+
 def test_reference_count_filters_on_both_type_and_id_field():
     # A Stepper Binding and a Macro Binding at different Inputs — each scan
     # sees only its own kind, keyed on its own id field.

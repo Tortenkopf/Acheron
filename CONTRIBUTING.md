@@ -182,7 +182,8 @@ and it can be verified before merge.
   both the individual (`Input`-keyed) and Chord (`ChordKey`-keyed) paths. Only
   the *performance* of a `TriggerDecision` (`compile_action`, `spawn_fire_once`
   / `ActiveToggle::spawn{,_held}`, the map insert) belongs in
-  `dispatch::perform_trigger`.
+  `trigger::Slots::perform`, the `async` method on the `(firings, toggles)`
+  handle pair.
 
 - **Changing axis conflict resolution** (the §5 rule — opposite-half
   suppression, greater-Depth-wins, the owner tie-break — or the
@@ -202,7 +203,7 @@ and it can be verified before merge.
   or adjust the logic there and add a row to the `analog_repeat::tests`
   tables, never in `dispatch`. Only the task shell
   (`analog_repeat::Engine`, `run_analog_repeat_loop`) and the
-  `compile_action` handoff belong outside the pure core.
+  `trigger::compile_action` handoff belong outside the pure core.
 
 - **Changing Stepper cursor behaviour** (the wrap-around, which item a step
   lands on, the default-to-first, or how an edited/deleted list reconciles a
@@ -213,8 +214,9 @@ and it can be verified before merge.
   `Effect::ReconcileStepperCursor(id)` on a `DeleteStepper` /
   `SetStepperItems`; the drop-vs-clamp rule is `reconcile`'s. The
   `StepperItem` → `Vec<MacroStep>` compilation is
-  `executor::compile_stepper_item`. Only spawning the compiled firing stays
-  in `dispatch` (`compile_action`).
+  `executor::compile_stepper_item`; `trigger::compile_action` picks the
+  cursor-advancing path and hands the steps to `trigger::Slots::perform` (or
+  `analog_repeat`) to spawn.
 
 - **Adding a new piece of dispatch runtime state** (a new per-Input handle
   map, another momentary mode flag, a live view of something the supervisor
@@ -238,9 +240,17 @@ and it can be verified before merge.
   mirrors the Daemon's device vocabularies and the pure part of
   `config::validate` in `gui/acheron_gui/rules.py` (ADR 0003's split-language
   stack — the model can't be shared across the D-Bus process seam, so it's
-  copied and *contract-tested*). After changing a gamepad/axis catalog
-  (`input::gamepad_button_codes`, `AxisTarget`), a `TriggerMode`/`Action`
-  rule in `config::validate`, or `config::slug_base`/`ChordKey`:
+  copied and *contract-tested*). The pure per-Binding half lives behind two
+  named functions — `config::binding::check_binding` (ProfileSwitch /
+  ControllerButton / Step trigger legality, the gamepad-code check, the
+  analog-repeat / Chord site-shape rules) and
+  `config::binding::check_axis_assignment` (Axis assignments are Grid-only) —
+  and `rules.valid_triggers` / `rules.valid_action_kinds` mirror exactly
+  those; `daemon/src/schema.rs` drives the two functions directly, one call
+  per fixture row. After changing a gamepad/axis catalog
+  (`input::gamepad_button_codes`, `AxisTarget`), a `check_binding` /
+  `check_axis_assignment` rule, another `TriggerMode`/`Action` rule in
+  `config::validate`, or `config::slug_base`/`ChordKey`:
 
   1. Regenerate the contract fixture:
      `ACHERON_BLESS=1 cargo test --manifest-path daemon/Cargo.toml schema`

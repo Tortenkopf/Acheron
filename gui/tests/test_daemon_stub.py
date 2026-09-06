@@ -27,6 +27,9 @@ def test_fresh_stub_matches_the_seed_configs_shape():
                 "chords_held": {},
                 "axis_base": {},
                 "axis_held": {},
+                "deep_base": {},
+                "deep_held": {},
+                "deep_stages": {},
             }
         },
         "force_digital": False,
@@ -39,7 +42,7 @@ def test_fresh_stub_matches_the_seed_configs_shape():
         "active_toggles": [],
         "device_connected": True,
         "capture_mode": "digital",
-        "daemon_version": "1.1.0",
+        "daemon_version": "1.2.0",
         # Ticket 101: present because the stub starts "connected".
         "firmware_version": "v1.2",
         "serial_number": "PM2443F36300141",
@@ -85,6 +88,49 @@ def test_clear_binding_on_an_unbound_input_raises_not_found():
         stub.clear_binding("grid_r1c1", "base")
 
 
+def test_clear_binding_removing_a_primary_with_a_live_deep_binding_cascades_it_away():
+    # `tartarus-dual-stage-keys` ticket 06's cascade-delete, mirrored: a
+    # `deep_base`/`deep_held` entry can never outlive the primary Binding it
+    # requires, so removing the primary drops the orphaned deep Binding too
+    # — but never `deep_stages` (the Actuation/mode config stays legal and
+    # inert with no matching entry).
+    stub = DaemonStub()
+    _with_primary_and_deep_stage(stub)
+    stub.set_deep_stage("grid_r1c1", "base", _keypress(key="KEY_B"))
+
+    stub.clear_binding("grid_r1c1", "base")
+
+    profile = stub.get_config()["profiles"]["Default"]
+    assert "grid_r1c1" not in profile["base"]
+    assert "grid_r1c1" not in profile["deep_base"]
+    assert "grid_r1c1" in profile["deep_stages"]
+
+
+def test_set_binding_overwriting_a_primary_keeps_its_live_deep_binding():
+    # An *overwrite* leaves a primary in place, so the deep stage stays
+    # valid and is kept — the GUI edits either stage and Saves both. Only
+    # `clear_binding` (a removal) cascades the orphaned deep Binding away.
+    stub = DaemonStub()
+    _with_primary_and_deep_stage(stub)
+    stub.set_deep_stage("grid_r1c1", "base", _keypress(key="KEY_B"))
+
+    stub.set_binding("grid_r1c1", "base", _keypress(key="KEY_C"))
+
+    profile = stub.get_config()["profiles"]["Default"]
+    assert profile["base"]["grid_r1c1"] == _keypress(key="KEY_C")
+    assert profile["deep_base"]["grid_r1c1"] == _keypress(key="KEY_B")
+    assert "grid_r1c1" in profile["deep_stages"]
+
+
+def test_set_binding_on_a_fresh_input_with_no_deep_binding_leaves_deep_state_untouched():
+    stub = DaemonStub()
+
+    stub.set_binding("grid_r1c1", "base", _keypress())
+
+    profile = stub.get_config()["profiles"]["Default"]
+    assert profile["deep_base"] == {}
+
+
 def test_set_mode_key_role_updates_the_active_profile():
     stub = DaemonStub()
 
@@ -122,6 +168,9 @@ def test_create_profile_adds_an_empty_profile():
         "chords_held": {},
         "axis_base": {},
         "axis_held": {},
+        "deep_base": {},
+        "deep_held": {},
+        "deep_stages": {},
     }
     assert stub.calls == [("create_profile", "Gaming")]
 
@@ -756,3 +805,244 @@ def test_set_status_leds_updates_the_active_profile_and_records_the_call():
         "blue": True,
     }
     assert stub.calls == [("set_status_leds", True, False, True)]
+
+
+# --- tartarus-dual-stage-keys ticket 05: deep-stage D-Bus surface -----------
+
+
+def _keypress(trigger: str = "fire_once", key: str = "KEY_A") -> dict:
+    return {"trigger": trigger, "type": "keypress", "key": key, "modifiers": []}
+
+
+def _with_primary_and_deep_stage(stub: DaemonStub, input_str: str = "grid_r1c1") -> None:
+    """Installs a primary Binding plus a valid `deep_stages` config for
+    `input_str` on the Base Layer — the minimal state `set_deep_stage`
+    needs to succeed, mirroring `edit.rs::tests::with_primary_and_deep_stage`."""
+    stub.set_binding(input_str, "base", _keypress(key="KEY_A"))
+    stub.set_deep_actuation(input_str, 220, 200)
+
+
+def test_set_deep_stage_inserts_into_deep_base_and_records_the_call():
+    stub = DaemonStub()
+    _with_primary_and_deep_stage(stub)
+    deep_binding = _keypress(key="KEY_B")
+
+    stub.set_deep_stage("grid_r1c1", "base", deep_binding)
+
+    assert stub.get_config()["profiles"]["Default"]["deep_base"]["grid_r1c1"] == deep_binding
+    assert stub.calls[-1] == ("set_deep_stage", "grid_r1c1", "base", deep_binding)
+
+
+def test_set_deep_stage_targets_the_held_layer_independently_of_base():
+    stub = DaemonStub()
+    stub.set_binding("grid_r1c1", "held", _keypress(key="KEY_A"))
+    stub.set_deep_actuation("grid_r1c1", 220, 200)
+
+    stub.set_deep_stage("grid_r1c1", "held", _keypress(key="KEY_B"))
+
+    profile = stub.get_config()["profiles"]["Default"]
+    assert "grid_r1c1" in profile["deep_held"]
+    assert "grid_r1c1" not in profile["deep_base"]
+
+
+def test_set_deep_stage_rejects_a_non_grid_input():
+    stub = DaemonStub()
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_deep_stage("mode_key", "base", _keypress())
+
+
+def test_set_deep_stage_reuses_validate_binding_action_for_an_unknown_macro_id():
+    stub = DaemonStub()
+    _with_primary_and_deep_stage(stub)
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_deep_stage(
+            "grid_r1c1",
+            "base",
+            {"trigger": "fire_once", "type": "macro", "macro_id": "no-such-macro"},
+        )
+
+
+def test_set_deep_stage_without_a_primary_binding_raises_invalid_binding():
+    # `ConfigError::DeepStageWithoutPrimary` — no primary Binding on this
+    # Layer for a deep stage to sit on top of.
+    stub = DaemonStub()
+    stub.set_deep_actuation("grid_r1c1", 220, 200)
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_deep_stage("grid_r1c1", "base", _keypress())
+
+
+def test_set_deep_stage_with_no_deep_stages_config_raises_invalid_binding():
+    # `ConfigError::DeepStageMissingConfig` — a primary Binding alone, with
+    # no deep Actuation point / Staging mode configured yet.
+    stub = DaemonStub()
+    stub.set_binding("grid_r1c1", "base", _keypress())
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_deep_stage("grid_r1c1", "base", _keypress())
+
+
+def test_set_deep_stage_rejects_analog_repeat_on_the_deep_binding():
+    stub = DaemonStub()
+    _with_primary_and_deep_stage(stub)
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_deep_stage("grid_r1c1", "base", _keypress(trigger="analog_repeat"))
+
+
+def test_set_deep_stage_rejects_when_the_primary_is_analog_repeat():
+    stub = DaemonStub()
+    stub.set_binding("grid_r1c1", "base", _keypress(trigger="analog_repeat"))
+    stub.set_deep_actuation("grid_r1c1", 220, 200)
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_deep_stage("grid_r1c1", "base", _keypress())
+
+
+def test_set_deep_stage_rejects_a_chord_member():
+    # `ConfigError::ChordMemberDeepStageConflict` — the two Depth
+    # interpretations tangle.
+    stub = DaemonStub()
+    stub.set_chord_binding(["grid_r1c1", "grid_r1c2"], "base", _keypress())
+    stub.set_binding("grid_r1c1", "base", _keypress())
+    stub.set_deep_actuation("grid_r1c1", 220, 200)
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_deep_stage("grid_r1c1", "base", _keypress())
+
+
+def test_clear_deep_stage_removes_it_and_an_unknown_one_raises_not_found():
+    stub = DaemonStub()
+    _with_primary_and_deep_stage(stub)
+    stub.set_deep_stage("grid_r1c1", "base", _keypress(key="KEY_B"))
+
+    stub.clear_deep_stage("grid_r1c1", "base")
+
+    assert "grid_r1c1" not in stub.get_config()["profiles"]["Default"]["deep_base"]
+    assert stub.calls[-1] == ("clear_deep_stage", "grid_r1c1", "base")
+
+    with pytest.raises(NotFoundError):
+        stub.clear_deep_stage("grid_r1c1", "base")
+
+
+def test_set_deep_actuation_creates_a_fresh_config_defaulting_to_handoff():
+    stub = DaemonStub()
+
+    stub.set_deep_actuation("grid_r1c1", 220, 200)
+
+    assert stub.get_config()["profiles"]["Default"]["deep_stages"]["grid_r1c1"] == {
+        "actuation": {"actuation": 220, "release": 200},
+        "mode": "handoff",
+    }
+    assert stub.calls[-1] == ("set_deep_actuation", "grid_r1c1", 220, 200)
+
+
+def test_set_deep_actuation_on_an_existing_entry_leaves_its_mode_untouched():
+    stub = DaemonStub()
+    stub.set_deep_actuation("grid_r1c1", 220, 200)
+    stub.set_staging_mode("grid_r1c1", "additive")
+
+    stub.set_deep_actuation("grid_r1c1", 230, 210)
+
+    cfg = stub.get_config()["profiles"]["Default"]["deep_stages"]["grid_r1c1"]
+    assert cfg == {"actuation": {"actuation": 230, "release": 210}, "mode": "additive"}
+
+
+def test_set_deep_actuation_rejects_release_equal_to_actuation():
+    stub = DaemonStub()
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_deep_actuation("grid_r1c1", 200, 200)
+
+
+def test_set_deep_actuation_rejects_a_non_grid_input():
+    stub = DaemonStub()
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_deep_actuation("mode_key", 220, 200)
+
+
+def test_set_deep_actuation_rejects_a_band_overlapping_the_primary_actuation():
+    # `ConfigError::DeepStageBandOverlapsPrimary` — the deep release must sit
+    # strictly above the resolved primary Actuation point (default 128).
+    stub = DaemonStub()
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_deep_actuation("grid_r1c1", 150, 128)
+
+
+def test_set_default_deep_actuation_records_the_seed_on_the_active_profile():
+    # tartarus-dual-stage-keys ticket 08: the remembered deep-band seed.
+    # Absent from a fresh Profile (matching a fresh Daemon's `None`).
+    stub = DaemonStub()
+    assert "default_deep_actuation" not in stub.get_config()["profiles"]["Default"]
+
+    stub.set_default_deep_actuation(240, 205)
+
+    assert stub.get_config()["profiles"]["Default"]["default_deep_actuation"] == {
+        "actuation": 240,
+        "release": 205,
+    }
+    assert stub.calls[-1] == ("set_default_deep_actuation", 240, 205)
+
+
+def test_set_default_deep_actuation_rejects_release_at_or_above_actuation():
+    stub = DaemonStub()
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_default_deep_actuation(200, 200)
+
+
+def test_set_staging_mode_creates_a_fresh_config_and_only_writes_mode():
+    # A low primary override keeps the fresh config's default
+    # `ActuationPoint` (128/112) from overlapping the primary band —
+    # `set_staging_mode` itself writes no `actuation` field, so that has to
+    # come from somewhere for the disjoint-band check to accept this,
+    # mirroring `edit.rs::tests::set_staging_mode_creates_a_fresh_deep_stage_config_and_only_writes_mode`.
+    stub = DaemonStub()
+    stub.set_actuation_point("grid_r1c1", 50, 40)
+
+    stub.set_staging_mode("grid_r1c1", "quick_skip")
+
+    assert stub.get_config()["profiles"]["Default"]["deep_stages"]["grid_r1c1"] == {
+        "actuation": {"actuation": 128, "release": 112},
+        "mode": "quick_skip",
+    }
+    assert stub.calls[-1] == ("set_staging_mode", "grid_r1c1", "quick_skip")
+
+
+def test_set_staging_mode_on_an_existing_entry_leaves_its_actuation_untouched():
+    stub = DaemonStub()
+    stub.set_deep_actuation("grid_r1c1", 220, 200)
+
+    stub.set_staging_mode("grid_r1c1", "no_return")
+
+    cfg = stub.get_config()["profiles"]["Default"]["deep_stages"]["grid_r1c1"]
+    assert cfg == {"actuation": {"actuation": 220, "release": 200}, "mode": "no_return"}
+
+
+def test_set_staging_mode_rejects_a_band_overlap_when_creating_a_fresh_entry():
+    # With the Profile's default primary Actuation point (128/112) left
+    # untouched, a fresh deep-stage config's own default (128/112) overlaps
+    # it — `set_staging_mode` alone can't paper over that.
+    stub = DaemonStub()
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_staging_mode("grid_r1c1", "additive")
+
+
+def test_set_staging_mode_rejects_a_non_grid_input():
+    stub = DaemonStub()
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_staging_mode("mode_key", "additive")
+
+
+def test_set_staging_mode_rejects_an_unknown_mode_string():
+    stub = DaemonStub()
+    stub.set_deep_actuation("grid_r1c1", 220, 200)
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_staging_mode("grid_r1c1", "quickskip")

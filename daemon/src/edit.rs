@@ -25,7 +25,8 @@ use std::path::Path;
 
 use crate::config::{
     self, Action, ActuationPoint, AxisTarget, Binding, ChordKey, Config, Layer, MacroId,
-    MacroStepDto, ModeKeyRole, Profile, StatusLeds, StepDirection, StepperId, StepperItem,
+    MacroStepDto, ModeKeyRole, Profile, StagingMode, StatusLeds, StepDirection, StepperId,
+    StepperItem,
 };
 use crate::input::Input;
 
@@ -103,6 +104,13 @@ pub enum Edit {
     /// point every Grid key uses unless it has its own override. Fails
     /// `InvalidRequest` if `release > actuation`.
     SetDefaultActuation { actuation: u8, release: u8 },
+    /// Sets the active Profile's `default_deep_actuation` (ticket 08) — the
+    /// deep Actuation/Release pair the GUI seeds a *new* deep stage from.
+    /// Relies on the trailing `config::validate` for the hysteresis check
+    /// (`ConfigError::ReleaseNotBelowActuation`, locus `"default deep"`). No
+    /// `Effect` — the runtime never reads this field, only `+ Add deep
+    /// stage` does.
+    SetDefaultDeepActuation { actuation: u8, release: u8 },
     /// Clears every per-key override on the active Profile in one
     /// `config.toml` rewrite — the GUI's "reset all keys to Profile default"
     /// affordance (ticket 17 §5), not 20 individual `ClearActuationPoint`
@@ -233,6 +241,42 @@ pub enum Edit {
         green: bool,
         blue: bool,
     },
+    /// Creates or edits the deep Binding on the active Profile's `layer`
+    /// for a dual-stage grid key (tartarus-dual-stage-keys ticket 05 —
+    /// CONTEXT.md: Actuation stage). Mirrors `SetBinding` one level deeper.
+    /// Relies entirely on the trailing `config::validate(&next)?` (no
+    /// inline check) for `DeepStageWithoutPrimary`/`DeepStageMissingConfig`
+    /// — sequencing across the primary Binding, the deep Binding, and the
+    /// `deep_stages` config is the caller's job, the same way
+    /// `SetAxisAssignment` leaves "was there already a Binding here" to
+    /// `validate`'s reachable states.
+    SetDeepStage {
+        input: Input,
+        layer: Layer,
+        binding: Binding,
+    },
+    /// Removes the deep Binding on `layer`. Fails `NotFound` if `input` has
+    /// no deep Binding there. Does **not** cascade-clear `deep_stages` or
+    /// force-release a live slot — ticket 06's runtime-teardown sweep covers
+    /// only a *primary* Binding's removal cascading the deep one away
+    /// (`SetBinding`/`ClearBinding` below); editing the deep Binding directly
+    /// isn't one of spec.md's five listed transitions, so this stays as-is.
+    ClearDeepStage { input: Input, layer: Layer },
+    /// Sets a grid key's deep Actuation/Release point pair on the active
+    /// Profile, `.entry(input).or_default()`-creating a fresh
+    /// `DeepStageConfig` (mode defaulting to `StagingMode::Handoff`) if none
+    /// exists yet. **No `Effect`** — unlike `SetActuationPoint`, nothing
+    /// needs a live snapshot pushed to it: `stage::Engine` lives in dispatch
+    /// and reads `Config` directly each tick.
+    SetDeepActuation {
+        input: Input,
+        actuation: u8,
+        release: u8,
+    },
+    /// Sets a grid key's Staging mode on the active Profile, the same
+    /// `.or_default()`-creation as `SetDeepActuation`. No `Effect`, same
+    /// reasoning.
+    SetStagingMode { input: Input, mode: StagingMode },
 }
 
 /// A post-commit effect the caller must run — described here by `plan`,
@@ -259,6 +303,18 @@ pub(crate) enum Effect {
     StopAllToggles,
     /// Force-stop every running Analog-repeat task.
     StopAllAnalogRepeats,
+    /// Force-release every live dual-stage deep slot and reset `stage::
+    /// Engine`'s per-key runtime state (`stage::Engine::stop_all()`) —
+    /// `SwitchProfile`'s own share of `tartarus-dual-stage-keys` ticket 06's
+    /// runtime teardown, alongside `StopAllToggles`/`StopAllAnalogRepeats`.
+    StopAllStages,
+    /// Force-release the given Input's live dual-stage deep slot immediately
+    /// (`stage::Engine::stop_stage`) — pushed by `SetBinding`/`ClearBinding`
+    /// when the edit cascades away an orphaned `deep_base`/`deep_held` entry
+    /// (ticket 06's "Cascade-delete": a live deep stage must not survive its
+    /// primary Binding's removal, and can't wait for a next Up that may
+    /// never come).
+    StopStage(Input),
     /// Center every live axis output and clear the axis engine's state.
     ResetAxisOutputs,
     /// Reconcile the given Stepper's Daemon-side runtime cursor against the
@@ -332,6 +388,14 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             active_profile_mut(&mut next)
                 .layer_mut(layer)
                 .insert(input, binding);
+            // No deep-stage cascade here: *overwriting* a primary Binding
+            // leaves a primary in place, so the deep stage stays valid and
+            // is deliberately kept (the GUI edits either stage and Saves
+            // both — a trigger tweak to the primary must not wipe the deep
+            // Binding). Only *removing* the primary orphans the deep stage —
+            // see `ClearBinding` below. A replacement primary that would
+            // make the deep stage illegal (`analog_repeat`, a Chord member)
+            // is already rejected by the trailing `config::validate(&next)`.
         }
         Edit::ClearBinding { input, layer } => {
             if active_profile_mut(&mut next)
@@ -341,6 +405,7 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             {
                 return Err(CommandError::NotFound);
             }
+            cascade_orphaned_deep_stage(&mut next, layer, input, &mut effects);
         }
         Edit::SetModeKeyRole { role } => {
             active_profile_mut(&mut next).mode_key_role = role;
@@ -402,9 +467,10 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             // what deletes `SwitchProfile`'s old bespoke reply-before-signal
             // reasoning (the hazard it dodged is now the default shape).
             //
-            // `StopAllToggles` clears only the per-Input `toggles` map, never
-            // `dispatch::ChordRuntime`'s `ChordKey`-keyed firings/toggles —
-            // an active Chord Toggle survives a Profile switch today. That is
+            // `StopAllToggles` drains only the individual `Slots<Input>`
+            // (`dispatch`'s `individual` field), never the `ChordKey`-keyed
+            // `chord_slots` — an active Chord Toggle survives a Profile switch
+            // today. That is
             // pre-existing behaviour, preserved unchanged by post-release
             // ticket 07's mechanical carve; whether a Chord Toggle *should*
             // outlive a Profile switch is an open question for the domain
@@ -413,6 +479,15 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             effects.push(Effect::RepublishActuation);
             effects.push(Effect::ResetAxisOutputs);
             effects.push(Effect::StopAllAnalogRepeats);
+            // Ticket 06: a live dual-stage deep press must not survive a
+            // Profile switch either — same reasoning as the Toggle/Analog-
+            // repeat stops just above. Safe to run after this firing's own
+            // `Edit::SwitchProfile` was already produced: `update_stages`/
+            // `begin_quick_skip` fully complete (and this `Edit` is returned)
+            // before `commit_input_edits` ever reaches `edit::apply`, so the
+            // triggering firing itself is never interrupted by its own
+            // consequence.
+            effects.push(Effect::StopAllStages);
             // The physical indicator follows the active Profile deterministically
             // (`tartarus-status-leds` ticket 03). Order is irrelevant — the LEDs
             // are independent of Toggles / axes / Analog-repeat.
@@ -438,6 +513,10 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
         Edit::SetDefaultActuation { actuation, release } => {
             active_profile_mut(&mut next).default_actuation = ActuationPoint { actuation, release };
             effects.push(Effect::RepublishActuation);
+        }
+        Edit::SetDefaultDeepActuation { actuation, release } => {
+            active_profile_mut(&mut next).default_deep_actuation =
+                Some(ActuationPoint { actuation, release });
         }
         Edit::ResetActuationPoints => {
             active_profile_mut(&mut next).actuation_overrides.clear();
@@ -620,6 +699,42 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             };
             effects.push(Effect::AssertStatusLeds);
         }
+        Edit::SetDeepStage {
+            input,
+            layer,
+            binding,
+        } => {
+            active_profile_mut(&mut next)
+                .deep_layer_mut(layer)
+                .insert(input, binding);
+        }
+        Edit::ClearDeepStage { input, layer } => {
+            if active_profile_mut(&mut next)
+                .deep_layer_mut(layer)
+                .remove(&input)
+                .is_none()
+            {
+                return Err(CommandError::NotFound);
+            }
+        }
+        Edit::SetDeepActuation {
+            input,
+            actuation,
+            release,
+        } => {
+            active_profile_mut(&mut next)
+                .deep_stages
+                .entry(input)
+                .or_default()
+                .actuation = ActuationPoint { actuation, release };
+        }
+        Edit::SetStagingMode { input, mode } => {
+            active_profile_mut(&mut next)
+                .deep_stages
+                .entry(input)
+                .or_default()
+                .mode = mode;
+        }
     }
 
     config::validate(&next)?;
@@ -640,6 +755,30 @@ pub(crate) async fn apply(
     config::persist(&next, path).await?;
     *config = next;
     Ok(outcome)
+}
+
+/// `tartarus-dual-stage-keys` ticket 06's "Cascade-delete": `ClearBinding`
+/// removing `input`'s primary Binding on `layer` orphans any deep Binding it
+/// carried there — a deep Binding can never exist without a matching primary
+/// (`ConfigError::DeepStageWithoutPrimary`), so the removal would otherwise
+/// be rejected outright by the trailing `config::validate`. Drops the deep
+/// Binding and pushes `Effect::StopStage(input)` so a live slot
+/// force-releases immediately rather than waiting for a next Up that may
+/// never come. `deep_stages` (the Actuation/mode config) is left untouched —
+/// legal and inert with no matching `deep_base`/`deep_held` entry.
+fn cascade_orphaned_deep_stage(
+    next: &mut Config,
+    layer: Layer,
+    input: Input,
+    effects: &mut Vec<Effect>,
+) {
+    if active_profile_mut(next)
+        .deep_layer_mut(layer)
+        .remove(&input)
+        .is_some()
+    {
+        effects.push(Effect::StopStage(input));
+    }
 }
 
 /// The `Default` Profile always exists — `load_or_seed` refuses to start a
@@ -908,6 +1047,44 @@ mod tests {
     }
 
     #[test]
+    fn set_binding_overwriting_a_primary_keeps_its_live_deep_binding() {
+        // A primary Binding stays in place across an *overwrite*, so its
+        // deep stage stays valid and is deliberately kept — the GUI edits
+        // either stage and Saves both, and a trigger tweak to the primary
+        // must not wipe the deep Binding. Only *removing* the primary
+        // (`ClearBinding`) orphans the deep stage.
+        let mut config = with_primary_and_deep_stage(Input::Grid(1, 1));
+        active(&mut config)
+            .deep_base
+            .insert(Input::Grid(1, 1), keypress());
+
+        let (next, outcome) = plan_ok(
+            &config,
+            Edit::SetBinding {
+                input: Input::Grid(1, 1),
+                layer: Layer::Base,
+                binding: Binding {
+                    trigger: TriggerMode::Toggle,
+                    action: Action::Keypress {
+                        modifiers: Modifiers::default(),
+                        key: KeyCode::KEY_B,
+                    },
+                },
+            },
+        );
+        assert!(
+            next.profiles[DEFAULT_PROFILE_NAME]
+                .deep_base
+                .contains_key(&Input::Grid(1, 1)),
+            "the deep Binding must survive an overwrite of its primary"
+        );
+        assert!(
+            outcome.effects.is_empty(),
+            "no teardown on a mere overwrite"
+        );
+    }
+
+    #[test]
     fn set_binding_with_a_step_action_steals_the_direction_off_its_old_input() {
         let mut config = seed();
         with_stepper(&mut config, "wep");
@@ -1028,6 +1205,29 @@ mod tests {
             ),
             CommandError::NotFound
         ));
+    }
+
+    #[test]
+    fn clear_binding_removing_a_primary_with_a_live_deep_binding_cascades_it_away() {
+        let mut config = with_primary_and_deep_stage(Input::Grid(1, 1));
+        active(&mut config)
+            .deep_base
+            .insert(Input::Grid(1, 1), keypress());
+
+        let (next, outcome) = plan_ok(
+            &config,
+            Edit::ClearBinding {
+                input: Input::Grid(1, 1),
+                layer: Layer::Base,
+            },
+        );
+        assert!(next.profiles[DEFAULT_PROFILE_NAME].base.is_empty());
+        assert!(
+            next.profiles[DEFAULT_PROFILE_NAME].deep_base.is_empty(),
+            "the orphaned deep Binding must be cascaded away"
+        );
+        assert!(!next.profiles[DEFAULT_PROFILE_NAME].deep_stages.is_empty());
+        assert_eq!(outcome.effects, vec![Effect::StopStage(Input::Grid(1, 1))]);
     }
 
     #[test]
@@ -1201,6 +1401,7 @@ mod tests {
                 Effect::RepublishActuation,
                 Effect::ResetAxisOutputs,
                 Effect::StopAllAnalogRepeats,
+                Effect::StopAllStages,
                 Effect::AssertStatusLeds,
                 Effect::AnnounceProfileChange("Gaming".to_string()),
             ]
@@ -1248,6 +1449,28 @@ mod tests {
             let (_, outcome) = plan_ok(&seed(), edit);
             assert_eq!(outcome.effects, vec![Effect::RepublishActuation]);
         }
+    }
+
+    #[test]
+    fn set_default_deep_actuation_records_it_with_no_effect() {
+        // Ticket 08: a GUI-authoring seed — persisted, but the runtime never
+        // reads it, so no `Effect` (unlike `SetDefaultActuation`'s
+        // `RepublishActuation`).
+        let (next, outcome) = plan_ok(
+            &seed(),
+            Edit::SetDefaultDeepActuation {
+                actuation: 240,
+                release: 205,
+            },
+        );
+        assert_eq!(
+            next.profiles[DEFAULT_PROFILE_NAME].default_deep_actuation,
+            Some(ActuationPoint {
+                actuation: 240,
+                release: 205,
+            })
+        );
+        assert!(outcome.effects.is_empty());
     }
 
     #[test]
@@ -1473,6 +1696,169 @@ mod tests {
         ));
     }
 
+    // --- deep-stage Edit variants (tartarus-dual-stage-keys ticket 05) --------
+
+    fn with_primary_and_deep_stage(input: Input) -> Config {
+        let mut config = seed();
+        active(&mut config).base.insert(input, keypress());
+        active(&mut config).deep_stages.insert(
+            input,
+            crate::config::DeepStageConfig {
+                actuation: ActuationPoint {
+                    actuation: 220,
+                    release: 200,
+                },
+                mode: StagingMode::Handoff,
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn set_deep_stage_inserts_into_the_active_profiles_deep_layer_and_relies_on_validate() {
+        let config = with_primary_and_deep_stage(Input::Grid(1, 1));
+        let (next, outcome) = plan_ok(
+            &config,
+            Edit::SetDeepStage {
+                input: Input::Grid(1, 1),
+                layer: Layer::Base,
+                binding: keypress(),
+            },
+        );
+        assert_eq!(
+            next.profiles[DEFAULT_PROFILE_NAME].deep_base[&Input::Grid(1, 1)],
+            keypress()
+        );
+        assert!(outcome.effects.is_empty());
+
+        // No inline "needs a primary" check in `plan` itself — `validate`
+        // alone rejects this (`DeepStageWithoutPrimary`/`DeepStageMissingConfig`).
+        assert!(matches!(
+            plan_err(
+                &seed(),
+                Edit::SetDeepStage {
+                    input: Input::Grid(1, 1),
+                    layer: Layer::Base,
+                    binding: keypress(),
+                }
+            ),
+            CommandError::InvalidRequest(_)
+        ));
+    }
+
+    #[test]
+    fn clear_deep_stage_removes_it_and_rejects_an_absent_one() {
+        let mut config = with_primary_and_deep_stage(Input::Grid(1, 1));
+        active(&mut config)
+            .deep_base
+            .insert(Input::Grid(1, 1), keypress());
+
+        let (next, _) = plan_ok(
+            &config,
+            Edit::ClearDeepStage {
+                input: Input::Grid(1, 1),
+                layer: Layer::Base,
+            },
+        );
+        assert!(next.profiles[DEFAULT_PROFILE_NAME].deep_base.is_empty());
+
+        assert!(matches!(
+            plan_err(
+                &seed(),
+                Edit::ClearDeepStage {
+                    input: Input::Grid(1, 1),
+                    layer: Layer::Base,
+                }
+            ),
+            CommandError::NotFound
+        ));
+    }
+
+    #[test]
+    fn set_deep_actuation_creates_a_fresh_deep_stage_config_defaulting_to_handoff() {
+        let (next, outcome) = plan_ok(
+            &seed(),
+            Edit::SetDeepActuation {
+                input: Input::Grid(1, 1),
+                actuation: 220,
+                release: 200,
+            },
+        );
+        assert_eq!(
+            next.profiles[DEFAULT_PROFILE_NAME].deep_stages[&Input::Grid(1, 1)],
+            crate::config::DeepStageConfig {
+                actuation: ActuationPoint {
+                    actuation: 220,
+                    release: 200,
+                },
+                mode: StagingMode::Handoff,
+            }
+        );
+        assert!(outcome.effects.is_empty());
+    }
+
+    #[test]
+    fn set_deep_actuation_on_an_existing_entry_leaves_its_mode_untouched() {
+        let mut config = seed();
+        active(&mut config).deep_stages.insert(
+            Input::Grid(1, 1),
+            crate::config::DeepStageConfig {
+                actuation: ActuationPoint {
+                    actuation: 220,
+                    release: 200,
+                },
+                mode: StagingMode::Additive,
+            },
+        );
+
+        let (next, _) = plan_ok(
+            &config,
+            Edit::SetDeepActuation {
+                input: Input::Grid(1, 1),
+                actuation: 230,
+                release: 210,
+            },
+        );
+        let cfg = next.profiles[DEFAULT_PROFILE_NAME].deep_stages[&Input::Grid(1, 1)];
+        assert_eq!(
+            cfg.actuation,
+            ActuationPoint {
+                actuation: 230,
+                release: 210,
+            }
+        );
+        assert_eq!(cfg.mode, StagingMode::Additive);
+    }
+
+    #[test]
+    fn set_staging_mode_creates_a_fresh_deep_stage_config_and_only_writes_mode() {
+        // A low primary override keeps the fresh `DeepStageConfig`'s
+        // default `ActuationPoint` (128/112) from overlapping the primary
+        // band — `SetStagingMode` itself writes no `actuation` field, so
+        // that has to come from somewhere for `validate` to accept this.
+        let mut config = seed();
+        active(&mut config).actuation_overrides.insert(
+            Input::Grid(1, 1),
+            ActuationPoint {
+                actuation: 50,
+                release: 40,
+            },
+        );
+
+        let (next, outcome) = plan_ok(
+            &config,
+            Edit::SetStagingMode {
+                input: Input::Grid(1, 1),
+                mode: StagingMode::QuickSkip,
+            },
+        );
+        assert_eq!(
+            next.profiles[DEFAULT_PROFILE_NAME].deep_stages[&Input::Grid(1, 1)].mode,
+            StagingMode::QuickSkip
+        );
+        assert!(outcome.effects.is_empty());
+    }
+
     // --- preconditions and invariants, one row each ---------------------------
 
     struct Case {
@@ -1631,6 +2017,15 @@ mod tests {
                 matches: |e| is_invalid(e, "default"),
             },
             Case {
+                name: "SetDefaultDeepActuation: release >= actuation (invariant)",
+                setup: |_| {},
+                edit: || Edit::SetDefaultDeepActuation {
+                    actuation: 200,
+                    release: 200,
+                },
+                matches: |e| is_invalid(e, "default deep"),
+            },
+            Case {
                 name: "CreateMacro: blank name (precondition)",
                 setup: |_| {},
                 edit: || Edit::CreateMacro {
@@ -1774,6 +2169,22 @@ mod tests {
                     target: AxisTarget::LeftTrigger,
                 },
                 matches: |e| is_invalid(e, "only Grid Inputs"),
+            },
+            Case {
+                name: "SetDeepStage: no primary Binding on the layer (invariant)",
+                setup: |_| {},
+                edit: || Edit::SetDeepStage {
+                    input: Input::Grid(1, 1),
+                    layer: Layer::Base,
+                    binding: Binding {
+                        trigger: TriggerMode::HoldToRepeat,
+                        action: Action::Keypress {
+                            modifiers: Modifiers::default(),
+                            key: KeyCode::KEY_A,
+                        },
+                    },
+                },
+                matches: |e| is_invalid(e, "no primary Binding"),
             },
         ];
 

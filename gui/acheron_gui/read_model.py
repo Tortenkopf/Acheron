@@ -16,9 +16,12 @@ from __future__ import annotations
 
 def _profile_all_bindings(profile: dict):
     """Mirror of `config::profile_all_bindings` — every Binding across both
-    per-Input Layers *and* both Chord Layers (ticket 40). The Daemon's
-    reference-count guards scan all four, so a client-side mirror must too."""
-    for layer_key in ("base", "held", "chords_base", "chords_held"):
+    per-Input Layers, both Chord Layers (ticket 40), and both deep-stage
+    Layers (tartarus-dual-stage-keys ticket 01 — `deep_base`/`deep_held` are
+    just another `Individual`-site Binding source, per
+    `profile_all_binding_sites`). The Daemon's reference-count guards scan
+    all six, so a client-side mirror must too."""
+    for layer_key in ("base", "held", "chords_base", "chords_held", "deep_base", "deep_held"):
         yield from profile[layer_key].values()
 
 

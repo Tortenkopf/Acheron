@@ -1191,3 +1191,865 @@ def test_chord_dialog_does_not_offer_axis_as_an_action_kind():
     )
     action_dd = _dropdown_labeled(dialog, "Action")
     assert "Axis" not in [action_dd.get_model().get_string(i) for i in range(action_dd.get_model().get_n_items())]
+
+
+# --- Dual-stage grid keys (tartarus-dual-stage-keys ticket 07) ---
+
+
+def _dual_stage_editor(stub, *, layer="base", capture_mode="analog", key="KEY_A"):
+    """A `build_binding_editor` for a Grid key that already carries a primary
+    Binding — the state that swaps the plain editor for the dual-stage swap
+    panel. Clears `stub.calls` so a test only sees what the panel itself
+    sends."""
+    stub.set_binding(
+        "grid_r1c1", layer, {"trigger": "hold_to_repeat", "type": "keypress", "key": key, "modifiers": []}
+    )
+    stub.calls.clear()
+    return build_binding_editor(
+        stub, stub.get_config(), "Default", layer, "grid_r1c1", lambda: None, capture_mode=capture_mode
+    )
+
+
+def _toggles_startswith(root, prefix):
+    return find_all(
+        root, lambda w: isinstance(w, Gtk.ToggleButton) and (w.get_label() or "").startswith(prefix)
+    )
+
+
+def _picker_panels(root):
+    return find_all(root, lambda w: "picker-panel" in w.get_css_classes())
+
+
+def _staging_rows(root):
+    return find_all(root, lambda w: isinstance(w, Gtk.Box) and "staging-mode-row" in w.get_css_classes())
+
+
+def _markers(root, *css):
+    wanted = set(css) if css else {
+        "marker-actuation", "marker-release", "marker-deep-actuation", "marker-deep-release"
+    }
+    return find_all(root, lambda w: bool(wanted & set(w.get_css_classes())))
+
+
+def _add_deep_stage(editor):
+    button_labeled(editor, "+ Add deep stage").emit("clicked")
+
+
+def test_unbound_grid_key_shows_the_unified_panel_with_a_synthetic_primary_stage():
+    # Ticket 09: an unbound grid key opens the same swap-toggle panel a bound
+    # one does — a synthetic primary stage (Keypress on the Input's default
+    # Trigger mode), the `Primary — …` toggle showing the passthrough-default
+    # label, `+ Add deep stage` and `Clear Binding` both disabled, and no
+    # "Bind a primary Action first" line anywhere.
+    stub = DaemonStub()
+
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    assert find_all(editor, lambda w: isinstance(w, Gtk.Label) and "Bind a primary Action first" in (w.get_label() or "")) == []
+
+    primary_toggles = _toggles_startswith(editor, "Primary")
+    assert len(primary_toggles) == 1
+    # The passthrough-default label for grid_r1c1 ("1"), not the synthetic KEY_A.
+    assert primary_toggles[0].get_label() == "Primary — 1"
+    assert _toggles_startswith(editor, "Deep") == []
+
+    add_btn = find_one(editor, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "+ Add deep stage")
+    assert not add_btn.get_sensitive()
+    assert add_btn.get_tooltip_text() == "Save or Apply a primary Action first"
+    assert not button_labeled(editor, "Clear Binding").get_sensitive()
+
+    # One picker mounted (the synthetic primary's), not also a plain editor.
+    assert len(_picker_panels(editor)) == 1
+    assert len(_markers(editor)) == 2
+
+    # The synthetic primary stage is a Keypress on the Input's default
+    # Trigger mode (Hold-to-repeat for a grid key).
+    assert _dropdown_labeled(editor, "Action").get_model().get_string(
+        _dropdown_labeled(editor, "Action").get_selected()
+    ) == "Keypress"
+    trigger_dd = _dropdown_labeled(editor, "Trigger mode")
+    assert TRIGGER_OPTIONS[trigger_dd.get_selected()][0] == "hold_to_repeat"
+
+
+def test_unbound_grid_key_add_deep_stage_is_inert_while_disabled():
+    # The disabled `+ Add deep stage` must not reach the Daemon even if its
+    # "clicked" is emitted directly (a deep stage structurally requires a
+    # primary Binding).
+    stub = DaemonStub()
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    button_labeled(editor, "+ Add deep stage").emit("clicked")
+
+    assert stub.calls == []
+    assert _toggles_startswith(editor, "Deep") == []
+
+
+def test_unbound_grid_key_save_with_no_edits_still_creates_the_placeholder_binding():
+    # The synthetic primary is committed unconditionally on Save (matching
+    # the old plain editor's "Save always calls set_binding"): opening an
+    # unbound key and hitting Save binds it to the placeholder — which seeds
+    # from the Input's own passthrough default (grid_r1c1 → KEY_1), not a
+    # fixed KEY_A.
+    stub = DaemonStub()
+    changed = []
+
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
+    popover = editor_content(btn)
+
+    button_labeled(popover, "Save").emit("clicked")
+
+    assert stub.calls == [
+        (
+            "set_binding",
+            "grid_r1c1",
+            "base",
+            {"trigger": "hold_to_repeat", "type": "keypress", "key": "KEY_1", "modifiers": []},
+        )
+    ]
+    assert changed == [1]
+
+
+def test_unbound_editor_seeds_the_key_picker_from_the_inputs_own_default():
+    # Ticket 11 follow-up: opening the editor on an as-yet-unbound Input
+    # highlights the key that Input already passes through, not a fixed "A".
+    stub = DaemonStub()
+
+    grid = editor_content(
+        make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c2", lambda: None)
+    )
+    grid_summary = find_one(grid, lambda w: "key-picker-summary" in w.get_css_classes())
+    assert grid_summary.get_label() == "Selected: 2"  # grid_r1c2 passes through KEY_2
+
+    # Non-grid plain editor takes the same default (Mode key → Left Alt).
+    mode = build_binding_editor(stub, stub.get_config(), "Default", "base", "mode_key", lambda: None)
+    mode_summary = find_one(mode, lambda w: "key-picker-summary" in w.get_css_classes())
+    assert mode_summary.get_label() == "Selected: Left Alt"
+
+
+def test_a_bound_grid_key_gets_the_swap_panel_with_a_single_editor_slot_and_no_deep_stage():
+    stub = DaemonStub()
+
+    editor = _dual_stage_editor(stub)
+
+    assert find_one(editor, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "+ Add deep stage")
+    assert len(_toggles_startswith(editor, "Primary")) == 1
+    assert _toggles_startswith(editor, "Deep") == []
+    assert _staging_rows(editor) == []
+    # "never two pickers on screen at once" — only the primary's fields are
+    # mounted, not also a plain top-level editor.
+    assert len(_picker_panels(editor)) == 1
+    assert len(_markers(editor)) == 2
+
+
+def test_adding_a_deep_stage_wires_the_daemon_and_reveals_the_deep_row_and_staging_row():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+
+    _add_deep_stage(editor)
+
+    assert [c[0] for c in stub.calls] == ["set_deep_actuation", "set_deep_stage"]
+    assert len(_toggles_startswith(editor, "Deep")) == 1
+    assert len(_staging_rows(editor)) == 1
+    assert find_all(editor, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "+ Add deep stage") == []
+    assert len(find_all(editor, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "✕")) == 1
+    # the shared bar gains the two deep markers, still one editor slot.
+    assert len(_markers(editor, "marker-deep-actuation", "marker-deep-release")) == 2
+    assert len(_markers(editor)) == 4
+    assert len(_picker_panels(editor)) == 1
+
+
+def test_removing_the_deep_stage_calls_clear_deep_stage_and_restores_the_add_button():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)
+    stub.calls.clear()
+
+    button_labeled(editor, "✕").emit("clicked")
+
+    assert stub.calls == [("clear_deep_stage", "grid_r1c1", "base")]
+    assert find_one(editor, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "+ Add deep stage")
+    assert _toggles_startswith(editor, "Deep") == []
+    assert _staging_rows(editor) == []
+    assert len(_markers(editor)) == 2
+
+
+def test_only_one_stage_picker_is_ever_mounted_across_the_swap_toggle():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    assert len(_picker_panels(editor)) == 1
+
+    _add_deep_stage(editor)  # lands on the Deep stage
+    assert len(_picker_panels(editor)) == 1
+
+    _toggles_startswith(editor, "Primary")[0].set_active(True)
+    assert len(_picker_panels(editor)) == 1
+
+    _toggles_startswith(editor, "Deep")[0].set_active(True)
+    assert len(_picker_panels(editor)) == 1
+
+
+def test_the_deep_stages_picker_carries_the_deep_picker_class_only_while_selected():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    assert find_all(editor, lambda w: "deep-picker" in w.get_css_classes()) == []
+
+    _add_deep_stage(editor)
+    assert len(find_all(editor, lambda w: "deep-picker" in w.get_css_classes())) == 1
+
+    _toggles_startswith(editor, "Primary")[0].set_active(True)
+    assert find_all(editor, lambda w: "deep-picker" in w.get_css_classes()) == []
+
+
+def test_picking_a_staging_mode_calls_set_staging_mode():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)
+    stub.calls.clear()
+
+    find_one(editor, lambda w: isinstance(w, Gtk.ToggleButton) and w.get_label() == "Additive").set_active(True)
+
+    assert ("set_staging_mode", "grid_r1c1", "additive") in stub.calls
+
+
+def test_saving_the_deep_stage_sends_set_deep_stage_with_the_edited_binding():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)  # lands on the Deep stage
+    stub.calls.clear()
+
+    _pick_key(editor, "Key", "F1")
+    button_labeled(editor, "Save").emit("clicked")
+
+    assert stub.calls[-1] == (
+        "set_deep_stage",
+        "grid_r1c1",
+        "base",
+        {"trigger": "hold_to_repeat", "type": "keypress", "key": "KEY_F1", "modifiers": []},
+    )
+
+
+def test_clearing_the_primary_cascades_the_deep_stage_away():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)
+    _toggles_startswith(editor, "Primary")[0].set_active(True)
+
+    button_labeled(editor, "Clear Binding").emit("clicked")
+
+    assert ("clear_binding", "grid_r1c1", "base") in stub.calls
+    profile = stub.get_config()["profiles"]["Default"]
+    assert profile["base"] == {}
+    assert profile["deep_base"] == {}
+    # ticket 06's cascade also drops the deep display: a fresh editor lands
+    # back on the synthetic-primary state — no deep toggle, `+ Add deep
+    # stage` disabled again.
+    fresh = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+    assert _toggles_startswith(fresh, "Deep") == []
+    assert not find_one(
+        fresh, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "+ Add deep stage"
+    ).get_sensitive()
+
+
+def test_digital_mode_greys_the_bar_and_the_staging_row():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub, capture_mode="digital")
+
+    assert find_all(editor, lambda w: "depth-track-dim" in w.get_css_classes())
+    bar_note = find_one(
+        editor, lambda w: "digital-note-overlay" in w.get_css_classes() and "No depth" in w.get_label()
+    )
+    assert bar_note.get_visible()
+
+    _add_deep_stage(editor)
+
+    assert find_one(
+        editor, lambda w: "digital-note-overlay" in w.get_css_classes() and "Requires analog" in w.get_label()
+    )
+    for mode_btn in find_all(editor, lambda w: isinstance(w, Gtk.ToggleButton) and w.get_label() == "Handoff"):
+        assert not mode_btn.get_sensitive()
+
+
+def test_adding_a_deep_stage_to_a_chord_member_surfaces_the_daemon_rejection():
+    stub = DaemonStub()
+    stub.set_chord_binding(
+        ["grid_r1c1", "grid_r1c2"], "base",
+        {"trigger": "fire_once", "type": "keypress", "key": "KEY_A", "modifiers": []},
+    )
+    editor = _dual_stage_editor(stub)
+
+    _add_deep_stage(editor)
+
+    err = find_one(editor, lambda w: "error" in w.get_css_classes() and w.get_visible())
+    assert "Chord member" in err.get_label()
+    assert stub.get_config()["profiles"]["Default"]["deep_base"] == {}
+
+
+def test_adding_a_deep_stage_to_an_analog_repeat_primary_surfaces_the_daemon_rejection():
+    stub = DaemonStub()
+    stub.set_binding(
+        "grid_r1c1", "base",
+        {"trigger": "analog_repeat", "type": "keypress", "key": "KEY_A", "modifiers": []},
+    )
+    stub.calls.clear()
+    editor = build_binding_editor(
+        stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None, capture_mode="analog"
+    )
+
+    _add_deep_stage(editor)
+
+    err = find_one(editor, lambda w: "error" in w.get_css_classes() and w.get_visible())
+    assert "analog_repeat" in err.get_label()
+
+
+def test_building_the_dual_stage_panel_does_not_start_a_depth_stream_at_construction_time():
+    stub = DaemonStub()
+
+    _dual_stage_editor(stub)
+
+    assert stub._depth_target is None
+
+
+def test_swap_panel_keeps_the_primary_actuation_profile_default_controls():
+    stub = DaemonStub()
+    stub.set_actuation_point("grid_r1c1", 200, 180)
+    editor = _dual_stage_editor(stub)
+
+    button_labeled(editor, "Reset to Profile default").emit("clicked")
+    assert ("clear_actuation_point", "grid_r1c1") in stub.calls
+
+    button_labeled(editor, "Set as Profile default").emit("clicked")
+    assert any(c[0] == "set_default_actuation" for c in stub.calls)
+
+
+def test_reset_to_profile_default_also_returns_the_deep_band():
+    stub = DaemonStub()
+    stub.set_default_deep_actuation(210, 190)  # the Profile's remembered deep band
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)
+
+    # drag the deep band away from the remembered default
+    track = find_one(editor, lambda w: isinstance(w, DepthTrack))
+    d_act_i = next(i for i, m in enumerate(track.markers) if "marker-deep-actuation" in m["css"])
+    d_rel_i = next(i for i, m in enumerate(track.markers) if "marker-deep-release" in m["css"])
+    track.markers[d_act_i]["value"] = 250
+    track.on_drag_end(d_act_i, 250)
+    track.markers[d_rel_i]["value"] = 230
+    track.on_drag_end(d_rel_i, 230)
+    stub.calls.clear()
+
+    button_labeled(editor, "Reset to Profile default").emit("clicked")
+
+    # primary override cleared *and* the deep band returned to the remembered
+    # default (recomputed disjoint from the reset primary).
+    assert ("clear_actuation_point", "grid_r1c1") in stub.calls
+    assert ("set_deep_actuation", "grid_r1c1", 210, 190) in stub.calls
+    assert stub.get_config()["profiles"]["Default"]["deep_stages"]["grid_r1c1"]["actuation"] == {
+        "actuation": 210,
+        "release": 190,
+    }
+    # the rebuilt bar shows the reset band, not the dragged one
+    fresh_track = find_one(editor, lambda w: isinstance(w, DepthTrack))
+    by_kind = {
+        ("d_act" if "marker-deep-actuation" in m["css"] else "d_rel"): m["value"]
+        for m in fresh_track.markers
+        if "deep" in m["css"]
+    }
+    assert by_kind == {"d_act": 210, "d_rel": 190}
+
+
+def test_reset_to_profile_default_with_no_deep_stage_touches_only_the_primary():
+    stub = DaemonStub()
+    stub.set_actuation_point("grid_r1c1", 200, 180)
+    editor = _dual_stage_editor(stub)
+    stub.calls.clear()
+
+    button_labeled(editor, "Reset to Profile default").emit("clicked")
+
+    assert [c for c in stub.calls if c[0] == "set_deep_actuation"] == []
+    assert ("clear_actuation_point", "grid_r1c1") in stub.calls
+
+
+def test_swap_panel_persists_a_deep_marker_drag_across_a_stage_toggle():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)
+    stub.calls.clear()
+
+    track = find_one(editor, lambda w: isinstance(w, DepthTrack))
+    d_act_index = next(i for i, m in enumerate(track.markers) if "marker-deep-actuation" in m["css"])
+    track.markers[d_act_index]["value"] = 240
+    track.on_drag_end(d_act_index, 240)
+    assert any(c[0] == "set_deep_actuation" for c in stub.calls)
+
+    # toggling to Primary and back rebuilds the bar from the snapshot — the
+    # dragged value must survive rather than snapping back.
+    _toggles_startswith(editor, "Primary")[0].set_active(True)
+    _toggles_startswith(editor, "Deep")[0].set_active(True)
+    track = find_one(editor, lambda w: isinstance(w, DepthTrack))
+    d_act = next(m["value"] for m in track.markers if "marker-deep-actuation" in m["css"])
+    assert d_act == 240
+
+
+def test_deep_stage_action_menu_offers_the_full_binding_menu_minus_axis():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)  # lands on the Deep stage
+
+    action_dd = _dropdown_labeled(editor, "Action")
+    labels = [action_dd.get_model().get_string(i) for i in range(action_dd.get_model().get_n_items())]
+    assert "Keypress" in labels
+    assert "Macro" in labels
+    assert "Stepper" in labels
+    assert "Switch Profile" in labels
+    assert "Axis" not in labels
+
+
+def test_dragging_the_primary_actuation_marker_is_clamped_below_the_deep_band():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)
+
+    track = find_one(editor, lambda w: isinstance(w, DepthTrack))
+    p_act_i = next(i for i, m in enumerate(track.markers) if "marker-actuation" in m["css"])
+    d_rel_i = next(i for i, m in enumerate(track.markers) if "marker-deep-release" in m["css"])
+    track.on_marker_moved(p_act_i, 255)
+
+    assert track.markers[p_act_i]["value"] == track.markers[d_rel_i]["value"] - 1
+
+
+def test_a_pre_dual_stage_daemon_config_falls_back_to_the_plain_editor():
+    # Version skew: a Daemon built before the dual-stage feature has no
+    # deep_base/deep_held/deep_stages keys in GetConfig(). The editor must
+    # fall back to the plain layout rather than KeyError on the panel.
+    stub = DaemonStub()
+    stub.set_binding(
+        "grid_r1c1", "base", {"trigger": "hold_to_repeat", "type": "keypress", "key": "KEY_A", "modifiers": []}
+    )
+    config = stub.get_config()
+    for key in ("deep_base", "deep_held", "deep_stages"):
+        config["profiles"]["Default"].pop(key, None)
+
+    editor = build_binding_editor(stub, config, "Default", "base", "grid_r1c1", lambda: None)
+
+    assert _toggles_startswith(editor, "Primary") == []
+    assert find_all(editor, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "+ Add deep stage") == []
+    # the plain Trigger/Action editor + actuation section are still there
+    assert _dropdown_labeled(editor, "Trigger mode")
+    assert find_one(editor, lambda w: "sub-heading" in w.get_css_classes() and w.get_label() == "Actuation & release")
+
+
+def test_save_commits_both_stages_regardless_of_which_one_is_on_screen():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)  # primary = KEY_A
+    _add_deep_stage(editor)  # lands on the Deep stage (default KEY_A)
+
+    _pick_key(editor, "Key", "F1")  # edit the deep binding
+    _toggles_startswith(editor, "Primary")[0].set_active(True)
+    _pick_key(editor, "Key", "F2")  # edit the primary binding
+    stub.calls.clear()
+
+    button_labeled(editor, "Save").emit("clicked")
+
+    kinds = {c[0] for c in stub.calls}
+    assert "set_binding" in kinds and "set_deep_stage" in kinds
+    profile = stub.get_config()["profiles"]["Default"]
+    assert profile["base"]["grid_r1c1"]["key"] == "KEY_F2"
+    assert profile["deep_base"]["grid_r1c1"]["key"] == "KEY_F1"
+
+
+def test_editing_only_the_primary_keeps_the_deep_stage_and_pushes_only_set_binding():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)
+    _toggles_startswith(editor, "Primary")[0].set_active(True)
+    _pick_key(editor, "Key", "F2")
+    stub.calls.clear()
+
+    button_labeled(editor, "Save").emit("clicked")
+
+    assert [c[0] for c in stub.calls] == ["set_binding"]
+    profile = stub.get_config()["profiles"]["Default"]
+    assert profile["base"]["grid_r1c1"]["key"] == "KEY_F2"
+    assert "grid_r1c1" in profile["deep_base"]
+
+
+def test_save_with_no_edits_pushes_nothing():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)
+    _toggles_startswith(editor, "Primary")[0].set_active(True)
+    _toggles_startswith(editor, "Deep")[0].set_active(True)
+    stub.calls.clear()
+
+    button_labeled(editor, "Save").emit("clicked")
+
+    assert stub.calls == []
+
+
+def test_deep_actuation_marker_drag_persists_across_a_full_editor_rebuild():
+    # Regression: a deep-marker drag must survive the editor being torn down
+    # and rebuilt from a fresh GetConfig (an app rebuild), exactly the way a
+    # primary-marker drag does.
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)
+    stub.calls.clear()
+
+    track = find_one(editor, lambda w: isinstance(w, DepthTrack))
+    d_act_i = next(i for i, m in enumerate(track.markers) if "marker-deep-actuation" in m["css"])
+    d_rel_i = next(i for i, m in enumerate(track.markers) if "marker-deep-release" in m["css"])
+    track.markers[d_act_i]["value"] = 240
+    track.on_drag_end(d_act_i, 240)
+    track.markers[d_rel_i]["value"] = 205
+    track.on_drag_end(d_rel_i, 205)
+
+    assert ("set_deep_actuation", "grid_r1c1", 240, 205) in stub.calls
+    assert stub.get_config()["profiles"]["Default"]["deep_stages"]["grid_r1c1"]["actuation"] == {
+        "actuation": 240,
+        "release": 205,
+    }
+
+    # A brand-new editor built from the daemon's current config (what an app
+    # rebuild does) shows the dragged deep band, not the seeded default.
+    fresh = build_binding_editor(
+        stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None, capture_mode="analog"
+    )
+    fresh_track = find_one(fresh, lambda w: isinstance(w, DepthTrack))
+    by_kind = {
+        ("d_act" if "marker-deep-actuation" in m["css"] else "d_rel"): m["value"]
+        for m in fresh_track.markers
+        if "deep" in m["css"]
+    }
+    assert by_kind == {"d_act": 240, "d_rel": 205}
+
+
+def test_set_as_profile_default_records_the_current_deep_band():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)
+
+    # move the deep band, then "Set as Profile default"
+    track = find_one(editor, lambda w: isinstance(w, DepthTrack))
+    d_act_i = next(i for i, m in enumerate(track.markers) if "marker-deep-actuation" in m["css"])
+    d_rel_i = next(i for i, m in enumerate(track.markers) if "marker-deep-release" in m["css"])
+    track.markers[d_act_i]["value"] = 244
+    track.on_drag_end(d_act_i, 244)
+    track.markers[d_rel_i]["value"] = 208
+    track.on_drag_end(d_rel_i, 208)
+    stub.calls.clear()
+
+    button_labeled(editor, "Set as Profile default").emit("clicked")
+
+    kinds = [c[0] for c in stub.calls]
+    assert "set_default_actuation" in kinds
+    assert ("set_default_deep_actuation", 244, 208) in stub.calls
+    assert stub.get_config()["profiles"]["Default"]["default_deep_actuation"] == {
+        "actuation": 244,
+        "release": 208,
+    }
+
+
+def test_add_deep_stage_seeds_from_the_profile_default_deep_band():
+    stub = DaemonStub()
+    stub.set_default_deep_actuation(244, 208)
+    editor = _dual_stage_editor(stub)
+
+    _add_deep_stage(editor)
+
+    # the seeded band is the remembered one, not the +20/+35 offset off the
+    # primary default (128 -> 148 / 183).
+    assert ("set_deep_actuation", "grid_r1c1", 244, 208) in stub.calls
+    track = find_one(editor, lambda w: isinstance(w, DepthTrack))
+    by_kind = {
+        ("d_act" if "marker-deep-actuation" in m["css"] else "d_rel"): m["value"]
+        for m in track.markers
+        if "deep" in m["css"]
+    }
+    assert by_kind == {"d_act": 244, "d_rel": 208}
+
+
+def test_add_deep_stage_clamps_a_remembered_band_that_would_overlap_this_keys_primary():
+    stub = DaemonStub()
+    # a per-key primary override sitting above the remembered deep release
+    stub.set_actuation_point("grid_r1c1", 220, 200)
+    stub.set_default_deep_actuation(210, 190)  # release 190 < this key's primary actuation 220
+    editor = _dual_stage_editor(stub, key="KEY_A")
+
+    _add_deep_stage(editor)
+
+    # the seed is clamped so release > 220 (disjoint from this key's primary).
+    call = next(c for c in stub.calls if c[0] == "set_deep_actuation")
+    _, _, d_act, d_rel = call
+    assert d_rel > 220 and d_act > d_rel
+
+
+def test_add_deep_stage_uses_the_offset_when_no_profile_default_is_set():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)  # primary default 128/112, no remembered band
+
+    _add_deep_stage(editor)
+
+    assert ("set_deep_actuation", "grid_r1c1", 183, 148) in stub.calls
+
+
+# --- "Apply": commit the binding without closing the editor
+#     (tartarus-dual-stage-keys ticket 10) ---
+
+
+def _grid_editor_button(stub, *, layer="base", capture_mode="analog"):
+    """A `make_input_button` for grid_r1c1 (so the real window + close-request
+    handler are in play) plus a `changed` list counting `on_change()` calls.
+    Clears `stub.calls` first so a test only sees what it drives."""
+    stub.calls.clear()
+    changed = []
+    btn = make_input_button(
+        stub, stub.get_config(), "Default", layer, "grid_r1c1",
+        lambda: changed.append(1), capture_mode=capture_mode,
+    )
+    return btn, changed
+
+
+def _dismiss(btn):
+    # `Gtk.Window.close()` only emits `close-request` for a realized window,
+    # which a headless test never has — emit it directly, standing in for the
+    # WM close button / Escape / Save's own `window.close()`.
+    btn.binding_editor_window.emit("close-request")
+
+
+def test_apply_button_is_plain_while_save_keeps_the_accent():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+
+    apply_btn = button_labeled(editor, "Apply")
+    assert "suggested-action" not in apply_btn.get_css_classes()
+    assert "suggested-action" in button_labeled(editor, "Save").get_css_classes()
+
+
+# --- consistent right-aligned button rows across the three editors
+#     (tartarus-dual-stage-keys ticket 11) ---
+
+
+def _button_row(root, *, save_label="Save"):
+    """The action-button row — the Gtk.Box holding the editor's Save/Apply/
+    Clear (or Cancel/Save Chord) buttons as direct children."""
+    return button_labeled(root, save_label).get_parent()
+
+
+def _row_button_labels(row):
+    labels = []
+    child = row.get_first_child()
+    while child is not None:
+        if isinstance(child, Gtk.Button):
+            labels.append(child.get_label())
+        child = child.get_next_sibling()
+    return labels
+
+
+def _has_ancestor_of_type(widget, typ):
+    parent = widget.get_parent()
+    while parent is not None:
+        if isinstance(parent, typ):
+            return True
+        parent = parent.get_parent()
+    return False
+
+
+def test_grid_editor_button_row_is_clear_apply_save_right_aligned():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+
+    row = _button_row(editor)
+    assert _row_button_labels(row) == ["Clear Binding", "Apply", "Save"]
+    assert row.get_halign() == Gtk.Align.END
+    # Outside the panel's scroll container — visible however tall the panel grows.
+    assert not _has_ancestor_of_type(row, Gtk.ScrolledWindow)
+    assert find_all(editor, lambda w: isinstance(w, Gtk.ScrolledWindow)) != []
+
+
+def test_non_grid_editor_button_row_is_clear_save_right_aligned():
+    stub = DaemonStub()
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "mode_key", lambda: None)
+
+    row = _button_row(editor)
+    assert _row_button_labels(row) == ["Clear Binding", "Save"]
+    assert row.get_halign() == Gtk.Align.END
+
+
+def test_chord_dialog_button_row_is_cancel_save_chord_right_aligned():
+    stub = DaemonStub()
+    dialog = build_chord_binding_dialog(
+        stub, stub.get_config(), "Default", "base", ["grid_r1c1", "grid_r1c2"], None, lambda: None, None
+    )
+
+    row = _button_row(dialog, save_label="Save Chord")
+    assert _row_button_labels(row) == ["Cancel", "Save Chord"]
+    assert row.get_halign() == Gtk.Align.END
+
+
+def test_non_grid_and_chord_editors_have_no_apply_button():
+    stub = DaemonStub()
+
+    non_grid = build_binding_editor(stub, stub.get_config(), "Default", "base", "mode_key", lambda: None)
+    assert find_all(non_grid, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Apply") == []
+
+    chord = build_chord_binding_dialog(
+        stub, stub.get_config(), "Default", "base", ["grid_r1c1", "grid_r1c2"], None, lambda: None, None
+    )
+    assert find_all(chord, lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Apply") == []
+
+
+def test_apply_on_an_unbound_key_creates_the_binding_and_keeps_the_window_open():
+    stub = DaemonStub()
+    btn, changed = _grid_editor_button(stub)
+    editor = editor_content(btn)
+
+    _pick_key(editor, "Key", "F1")
+    button_labeled(editor, "Apply").emit("clicked")
+
+    assert stub.calls == [
+        (
+            "set_binding",
+            "grid_r1c1",
+            "base",
+            {"trigger": "hold_to_repeat", "type": "keypress", "key": "KEY_F1", "modifiers": []},
+        )
+    ]
+    # No full-app rebuild yet — the window stays open.
+    assert changed == []
+
+    # The panel rebuilt in place into the bound layout.
+    editor = editor_content(btn)
+    assert button_labeled(editor, "+ Add deep stage").get_sensitive()
+    assert button_labeled(editor, "Clear Binding").get_sensitive()
+    primary_toggle = _toggles_startswith(editor, "Primary")[0]
+    assert "F1" in primary_toggle.get_label()
+    assert primary_toggle.get_label() != "Primary — 1"
+
+
+def test_apply_then_add_deep_stage_works_in_one_window_session():
+    stub = DaemonStub()
+    btn, changed = _grid_editor_button(stub)
+
+    button_labeled(editor_content(btn), "Apply").emit("clicked")  # binds the grid_r1c1 default (KEY_1) placeholder
+    button_labeled(editor_content(btn), "+ Add deep stage").emit("clicked")
+
+    assert [c[0] for c in stub.calls] == ["set_binding", "set_deep_actuation", "set_deep_stage"]
+    assert len(_toggles_startswith(editor_content(btn), "Deep")) == 1
+    # Still no full-app rebuild while the window is open.
+    assert changed == []
+
+
+def test_close_after_apply_drives_exactly_one_on_change():
+    stub = DaemonStub()
+    btn, changed = _grid_editor_button(stub)
+
+    button_labeled(editor_content(btn), "Apply").emit("clicked")
+    button_labeled(editor_content(btn), "Apply").emit("clicked")  # redundant no-op push
+    assert changed == []
+
+    _dismiss(btn)
+    assert changed == [1]
+
+    _dismiss(btn)  # a second dismissal must not re-fire
+    assert changed == [1]
+
+
+def test_open_and_close_with_no_commit_drives_no_on_change():
+    stub = DaemonStub()
+    btn, changed = _grid_editor_button(stub)
+
+    _dismiss(btn)
+
+    assert changed == []
+    assert stub.calls == []
+
+
+def test_save_after_apply_still_commits_and_closes_once():
+    stub = DaemonStub()
+    btn, changed = _grid_editor_button(stub)
+
+    _pick_key(editor_content(btn), "Key", "F1")
+    button_labeled(editor_content(btn), "Apply").emit("clicked")
+    assert changed == []
+
+    # A second edit, then Save: it commits the delta and drives the one rebuild.
+    _pick_key(editor_content(btn), "Key", "F2")
+    button_labeled(editor_content(btn), "Save").emit("clicked")
+
+    assert stub.calls[-1] == (
+        "set_binding",
+        "grid_r1c1",
+        "base",
+        {"trigger": "hold_to_repeat", "type": "keypress", "key": "KEY_F2", "modifiers": []},
+    )
+    assert changed == [1]
+    _dismiss(btn)  # nothing left to flush
+    assert changed == [1]
+
+
+def test_apply_is_insensitive_under_the_same_conditions_as_save():
+    stub = DaemonStub()  # empty Macro library
+    editor = _dual_stage_editor(stub)
+
+    action_dd = _dropdown_labeled(editor, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("macro"))
+
+    assert not button_labeled(editor, "Save").get_sensitive()
+    assert not button_labeled(editor, "Apply").get_sensitive()
+
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("keypress"))
+    assert button_labeled(editor, "Save").get_sensitive()
+    assert button_labeled(editor, "Apply").get_sensitive()
+
+
+def test_apply_that_pushes_nothing_does_not_arm_the_deferred_rebuild():
+    stub = DaemonStub()
+    stub.set_binding(
+        "grid_r1c1", "base",
+        {"trigger": "hold_to_repeat", "type": "keypress", "key": "KEY_A", "modifiers": []},
+    )
+    btn, changed = _grid_editor_button(stub)
+
+    button_labeled(editor_content(btn), "Apply").emit("clicked")  # nothing edited
+
+    assert stub.calls == []
+    _dismiss(btn)
+    assert changed == []
+
+
+def test_apply_with_an_axis_primary_falls_back_to_close_and_reopen():
+    # An Axis assignment has no representation in the swap panel — Apply
+    # commits it (like Save) and then closes rather than stranding the editor
+    # on the synthetic-primary layout with Clear disabled.
+    stub = DaemonStub()
+    btn, changed = _grid_editor_button(stub)
+    editor = editor_content(btn)
+
+    action_dd = _dropdown_labeled(editor, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("axis"))
+    _click_axis_target(editor_content(btn), "Left Trigger")
+
+    button_labeled(editor_content(btn), "Apply").emit("clicked")
+
+    assert any(c[0] == "set_axis_assignment" for c in stub.calls)
+    assert changed == [1]  # the close-and-reopen fallback drove the rebuild
+
+
+def test_add_deep_stage_then_dismiss_drives_exactly_one_on_change():
+    # A structural edit that commits real Daemon state also arms the deferred
+    # rebuild, so closing the window afterwards refreshes the other cached
+    # editors even though Save/Apply/Clear were never clicked.
+    stub = DaemonStub()
+    stub.set_binding(
+        "grid_r1c1", "base",
+        {"trigger": "hold_to_repeat", "type": "keypress", "key": "KEY_A", "modifiers": []},
+    )
+    btn, changed = _grid_editor_button(stub)
+
+    button_labeled(editor_content(btn), "+ Add deep stage").emit("clicked")
+    assert changed == []  # still open, no full rebuild yet
+
+    _dismiss(btn)
+    assert changed == [1]
+    _dismiss(btn)
+    assert changed == [1]

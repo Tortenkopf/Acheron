@@ -47,9 +47,10 @@ struct ChordWindow {
 
 /// The Chord-detection state machine's own state — pure bookkeeping only.
 /// Reset fresh on every dispatch task start, same as the old `ChordState`.
-/// The `ChordKey`-keyed firing/toggle *handles* are NOT here — they stay in
-/// `dispatch::ChordRuntime` and their liveness is passed into every `feed`
-/// call as a `trigger::Slot` snapshot.
+/// The `ChordKey`-keyed firing/toggle *handles* are NOT here — they live in
+/// `DispatchState`'s `chord_slots: trigger::Slots<ChordKey>` and their liveness
+/// is passed into every `feed` call as a `trigger::Slot` snapshot
+/// (`Slots::snapshot`).
 #[derive(Default)]
 pub(crate) struct ChordMachine {
     window: Option<ChordWindow>,
@@ -72,7 +73,7 @@ pub(crate) struct ChordMachine {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ChordEffect {
     /// Run this Chord's own Trigger-mode dispatch (`trigger::decide` +
-    /// `dispatch::perform_trigger`, ex-`fire_chord`), keyed by member set.
+    /// `trigger::Slots::perform`, ex-`fire_chord`), keyed by member set.
     FireChord {
         key: ChordKey,
         binding: Binding,
@@ -113,7 +114,7 @@ pub(crate) enum ChordOutcome {
 /// window bookkeeping. `chords` is `profile.chords(active_layer)` — the
 /// machine needs no other `Config` view (macro / stepper / individual-Binding
 /// lookup is the executor's job). `live` is the per-`ChordKey` liveness
-/// snapshot `dispatch` derives from its `ChordRuntime`.
+/// snapshot `dispatch` takes from `chord_slots` (`trigger::Slots::snapshot`).
 pub(crate) fn feed(
     machine: &mut ChordMachine,
     chords: &HashMap<ChordKey, Binding>,
@@ -313,8 +314,8 @@ fn close_window_if_drained(machine: &mut ChordMachine) {
 }
 
 /// Whether a `trigger::Slot` is a live (or lingering-but-finished)
-/// Fire-once / Hold-to-repeat firing — bare presence in dispatch's
-/// `ChordRuntime::firings` map, the old `chord_in_flight.contains_key`
+/// Fire-once / Hold-to-repeat firing — bare presence in the `chord_slots`
+/// firings map (`trigger::Slots`), the old `chord_in_flight.contains_key`
 /// check. Only a firing (not a Toggle) re-fires a Hold-to-repeat leader's
 /// `Repeat` or releases on a completed member's `Up`.
 fn slot_is_firing(slot: &Slot) -> bool {

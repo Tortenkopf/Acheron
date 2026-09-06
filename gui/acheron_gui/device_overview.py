@@ -482,9 +482,39 @@ def make_input_button(
     window = Gtk.Window(modal=True, title=f"{profile} / {layer} / {input_label(inp)}")
     window.set_hide_on_close(True)
 
+    # tartarus-dual-stage-keys ticket 10: the full app rebuild moved off the
+    # per-Save path onto the window's close-request handler, fired once per
+    # editing session and only when a Save or Apply actually committed
+    # something (`committed`). The grid-key panel's **Apply** commits and
+    # rebuilds itself in place *without* closing; `on_commit` arms this flag
+    # so the eventual dismissal — Save's own `window.close()`, the WM close
+    # button, or Escape — still drives exactly one `on_change()`. A pure
+    # open/close (nothing committed) leaves the cached hide-on-close window
+    # untouched and skips the rebuild, keeping "reopen is instant".
+    committed = {"yes": False}
+
+    def mark_committed():
+        committed["yes"] = True
+
+    def rebuild_if_committed():
+        if committed["yes"]:
+            committed["yes"] = False
+            on_change()
+
     def on_saved():
+        committed["yes"] = True
         window.close()
-        on_change()
+        # `Gtk.Window.close()` only emits `close-request` for a realized
+        # window, so drive the deferred rebuild directly here too; when the
+        # signal *does* also fire (a mapped window), `rebuild_if_committed`
+        # is a no-op the second time (the flag is already cleared).
+        rebuild_if_committed()
+
+    def on_close_request(_w):
+        rebuild_if_committed()
+        return False  # let hide-on-close proceed
+
+    window.connect("close-request", on_close_request)
 
     # No scrolling wrapper here — this window has no other container
     # imposing a height on it, so it always sizes to `editor`'s own natural
@@ -495,7 +525,9 @@ def make_input_button(
     # heading, error, the Trigger/Action fields including the inline key/
     # mouse-button picker's full expanded shape — without scrolling, per
     # the user's own "always reachable" ask for those specifically.
-    editor = build_binding_editor(client, config, profile, layer, inp, on_saved, capture_mode)
+    editor = build_binding_editor(
+        client, config, profile, layer, inp, on_saved, capture_mode, on_commit=mark_committed
+    )
     window.set_child(editor)
 
     def on_click(_b):

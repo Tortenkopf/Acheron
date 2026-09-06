@@ -10,15 +10,13 @@
 //! an `Injector` handle used only by `SetOutputSuppressed` (ticket 24), which
 //! is deliberately Config-free and so bypasses dispatch entirely.
 
+mod connection_scoped_task;
 pub mod wire;
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures_util::StreamExt;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
 use zbus::interface;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::OwnedValue;
@@ -28,6 +26,7 @@ use crate::config::{MacroId, StepperId};
 use crate::edit::{CommandError, CreatedId, Edit};
 use crate::injector::Injector;
 use crate::input::Input;
+use connection_scoped_task::ConnectionScopedTask;
 
 /// `com.acheron.Daemon.Error.*` — a small named set (issue 08's grilling
 /// answer), not one generic error or one per validation rule, so a client
@@ -71,32 +70,6 @@ fn injector_gone<T>(_: T) -> DaemonError {
 
 type DaemonResult<T> = Result<T, DaemonError>;
 
-/// Tracks which connection, if any, currently holds output suppression
-/// (ticket 24). `epoch` is bumped on every `SetOutputSuppressed` call,
-/// whatever its value — the disconnect-watcher task spawned for a `true`
-/// call captures the epoch it was born with and only auto-clears
-/// suppression if that epoch is still current, so a stale watcher from a
-/// since-superseded call can never clobber a newer one (last-write-wins,
-/// disconnect-clear tied to whichever connection most recently set it).
-struct SuppressionState {
-    epoch: u64,
-    watcher: Option<JoinHandle<()>>,
-}
-
-/// Ticket 26: which Grid Input, if any, the GUI's Actuation & release editor
-/// currently wants live depth for — a single current target rather than a
-/// set of subscribers, mirroring `SuppressionState`'s last-write-wins shape
-/// rather than `active_toggles`-style tracking, since exactly one editor
-/// popover is ever meaningfully open at a time in practice. `epoch` guards
-/// the same race `SetOutputSuppressed` already documents: a `StartDepthStream`
-/// racing a `StopDepthStream`/a newer `StartDepthStream` must never let the
-/// loser's pump task clobber the winner's already-stored state.
-struct DepthStreamState {
-    epoch: u64,
-    input: Option<Input>,
-    watcher: Option<JoinHandle<()>>,
-}
-
 /// `DepthChanged`'s rate limit (ticket 19's prototype modeled ~30Hz; ticket
 /// 13 measured the real device pushing changes roughly every 1ms while
 /// moving, so this is what actually keeps the signal off the wire's firehose
@@ -106,9 +79,15 @@ const DEPTH_STREAM_INTERVAL: Duration = Duration::from_millis(33);
 pub struct Daemon {
     commands: mpsc::Sender<Command>,
     injector: Injector,
-    suppression: Arc<Mutex<SuppressionState>>,
+    /// The connection-scoped auto-clear task behind `SetOutputSuppressed`
+    /// (ticket 24) — superseded on every call, torn down (clearing
+    /// suppression) if the setting connection drops.
+    suppression: ConnectionScopedTask,
     depth_rx: watch::Receiver<HashMap<Input, u8>>,
-    depth_stream: Arc<Mutex<DepthStreamState>>,
+    /// The connection-scoped pump behind `StartDepthStream` / `StopDepthStream`
+    /// (ticket 26) — superseded on every retarget, torn down if the streaming
+    /// connection drops.
+    depth_stream: ConnectionScopedTask,
 }
 
 impl Daemon {
@@ -120,16 +99,9 @@ impl Daemon {
         Daemon {
             commands,
             injector,
-            suppression: Arc::new(Mutex::new(SuppressionState {
-                epoch: 0,
-                watcher: None,
-            })),
+            suppression: ConnectionScopedTask::new(),
             depth_rx,
-            depth_stream: Arc::new(Mutex::new(DepthStreamState {
-                epoch: 0,
-                input: None,
-                watcher: None,
-            })),
+            depth_stream: ConnectionScopedTask::new(),
         }
     }
 
@@ -177,7 +149,11 @@ impl Daemon {
 /// Ticket 26's depth-pump task: one spawned per `StartDepthStream` call,
 /// aborted (not gracefully stopped) the moment it's superseded — by a
 /// `StopDepthStream`, a fresh `StartDepthStream`, or the owning connection
-/// disconnecting (`watch_disconnect`, shared with `SetOutputSuppressed`).
+/// disconnecting. The abort and the disconnect watch are
+/// `ConnectionScopedTask`'s job now (`start_depth_stream` hands this loop to
+/// `ArmToken::finish` as its `pump`); this function is just the sampling loop
+/// and never returns on its own.
+///
 /// Samples `depth_rx` at `DEPTH_STREAM_INTERVAL` rather than reacting to
 /// every `watch` change: the analog capture source overwrites it on every
 /// incoming report (sub-millisecond while a key is moving, per ticket 13),
@@ -187,86 +163,31 @@ impl Daemon {
 /// than emitting a stale/absent value.
 async fn run_depth_stream(
     connection: zbus::Connection,
-    sender: Option<String>,
     depth_rx: watch::Receiver<HashMap<Input, u8>>,
     input: Input,
-    state: Arc<Mutex<DepthStreamState>>,
-    epoch: u64,
 ) {
     let Ok(emitter) = SignalEmitter::new(&connection, "/com/acheron/Daemon") else {
         return;
     };
     // `interval_at`, not `interval`: the latter's first tick resolves
-    // immediately rather than after one `DEPTH_STREAM_INTERVAL`, which would
-    // let a since-superseded `StartDepthStream` race one signal out before
-    // its abort takes effect (observed in
+    // immediately rather than after one `DEPTH_STREAM_INTERVAL`. A
+    // since-superseded arming still has a ~33ms window between `tokio::spawn`
+    // and `finish`'s abort, and `interval`'s immediate first tick would
+    // reliably emit one stray `DepthChanged` into it (observed in
     // `start_depth_stream_over_real_dbus_retargeting_replaces_the_previous_stream`).
     let mut interval = tokio::time::interval_at(
         tokio::time::Instant::now() + DEPTH_STREAM_INTERVAL,
         DEPTH_STREAM_INTERVAL,
     );
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let disconnect = watch_disconnect(connection.clone(), sender);
-    tokio::pin!(disconnect);
 
     loop {
-        tokio::select! {
-            _ = &mut disconnect => break,
-            _ = interval.tick() => {
-                let depth = depth_rx.borrow().get(&input).copied();
-                if let Some(depth) = depth {
-                    let _ = Daemon::depth_changed(&emitter, &input.to_string(), depth).await;
-                }
-            }
+        interval.tick().await;
+        let depth = depth_rx.borrow().get(&input).copied();
+        if let Some(depth) = depth {
+            let _ = Daemon::depth_changed(&emitter, &input.to_string(), depth).await;
         }
     }
-
-    // Mirrors `set_output_suppressed`'s disconnect-clear: only clear the
-    // shared state if this task's own epoch is still current — a since-
-    // superseded task's late cleanup must never clobber a newer call's
-    // already-stored watcher/input.
-    let mut state = state.lock().unwrap();
-    if state.epoch == epoch {
-        state.input = None;
-        state.watcher = None;
-    }
-}
-
-/// Waits for whichever connection sent a `SetOutputSuppressed(true)` call to
-/// disconnect. On a real message bus (`connection.is_bus()`), that's a
-/// specific client among potentially several sharing the Daemon's one
-/// session-bus connection, so it's tracked by unique name via
-/// `org.freedesktop.DBus`'s `NameOwnerChanged` (the standard idiom for
-/// "notice when my caller goes away" on a shared bus — zbus's own
-/// `Connection::close_when_bus_name_disappears`-style tests use the same
-/// `(0, name), (2, "")` match-arg filter). Over a private peer-to-peer
-/// connection (the test harness's `TestServer`, and any future non-bus
-/// transport), there is no bus daemon and no unique name to watch, but the
-/// `zbus::Connection` itself *is* the one peer, so its own close detection
-/// is exact.
-async fn watch_disconnect(connection: zbus::Connection, sender: Option<String>) {
-    if connection.is_bus()
-        && let Some(sender) = sender
-        && let Ok(dbus) = zbus::fdo::DBusProxy::new(&connection).await
-        && let Ok(mut stream) = dbus
-            .receive_name_owner_changed_with_args(&[(0, sender.as_str()), (2, "")])
-            .await
-    {
-        // Subscribed *before* checking current ownership, never the other
-        // way around, so a disconnect racing this setup can never be
-        // missed: if the name is already gone by the time we check, either
-        // it vanished before the subscription above took effect (caught by
-        // this check) or after (already queued in `stream`, caught by
-        // `stream.next()` below either way).
-        if let Ok(name) = zbus::names::BusName::try_from(sender.as_str())
-            && let Ok(false) = dbus.name_has_owner(name).await
-        {
-            return;
-        }
-        stream.next().await;
-        return;
-    }
-    connection.closed().await;
 }
 
 #[interface(name = "com.acheron.Daemon")]
@@ -325,59 +246,37 @@ impl Daemon {
     ) -> Result<(), DaemonError> {
         let sender = header.sender().map(ToString::to_string);
 
-        // zbus spawns a fresh task per incoming method call (every method
-        // here takes `&self`, never `&mut self`), so two `SetOutputSuppressed`
-        // calls can genuinely run concurrently — the epoch bump and the old
-        // watcher's take/abort must happen in one atomic critical section,
-        // and `epoch` must be *this* call's own bumped value, not whatever
-        // `state.epoch` happens to read moments later after an `.await` —
-        // or a racing call's bump could get misattributed and this call's
-        // final store below could clobber a newer call's already-stored
-        // watcher.
-        let epoch = {
-            let mut state = self.suppression.lock().unwrap();
-            state.epoch += 1;
-            if let Some(handle) = state.watcher.take() {
-                handle.abort();
-            }
-            state.epoch
-        };
-
-        self.injector
-            .set_suppressed(suppressed)
-            .await
-            .map_err(injector_gone)?;
-
+        // The epoch bump + old-watcher abort, the racing-calls atomicity, and
+        // the "capture the epoch before the injector `.await`, re-check after"
+        // store guard all live in `ConnectionScopedTask` now — see its module
+        // doc comment.
         if suppressed {
-            let connection = connection.clone();
-            let injector = self.injector.clone();
-            let suppression = self.suppression.clone();
-            let handle = tokio::spawn(async move {
-                watch_disconnect(connection, sender).await;
-                let should_clear = {
-                    let mut state = suppression.lock().unwrap();
-                    if state.epoch == epoch {
-                        state.watcher = None;
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if should_clear {
-                    let _ = injector.set_suppressed(false).await;
-                }
-            });
+            let token = self.suppression.supersede();
+            self.injector
+                .set_suppressed(true)
+                .await
+                .map_err(injector_gone)?;
 
-            // Only claim the watcher slot if no concurrent call has
-            // superseded this one since `epoch` was captured above —
-            // otherwise abort immediately rather than overwrite whatever
-            // that newer call already stored.
-            let mut state = self.suppression.lock().unwrap();
-            if state.epoch == epoch {
-                state.watcher = Some(handle);
-            } else {
-                handle.abort();
-            }
+            let injector = self.injector.clone();
+            token.finish(
+                connection.clone(),
+                sender,
+                std::future::pending(),
+                move || async move {
+                    let _ = injector.set_suppressed(false).await;
+                },
+            );
+        } else {
+            // `disarm` first, mirroring the old supersede-block-then-injector
+            // ordering exactly (the two are order-independent — the aborted
+            // watcher only ever drives suppression toward `false` — but doing
+            // it first keeps a concurrent `set_output_suppressed(true)` from
+            // racing its freshly-stored watcher against this abort).
+            self.suppression.disarm();
+            self.injector
+                .set_suppressed(false)
+                .await
+                .map_err(injector_gone)?;
         }
 
         Ok(())
@@ -733,6 +632,18 @@ impl Daemon {
             .await
     }
 
+    /// Records the active Profile's remembered deep-band seed (ticket 08) —
+    /// what `+ Add deep stage` starts a new deep stage from. Errors
+    /// `InvalidBinding` if `release > actuation`.
+    async fn set_default_deep_actuation(
+        &self,
+        actuation: u8,
+        release: u8,
+    ) -> Result<(), DaemonError> {
+        self.apply(Edit::SetDefaultDeepActuation { actuation, release })
+            .await
+    }
+
     /// Clears every per-key override on the active Profile in one call/one
     /// `config.toml` rewrite — the GUI's "reset all keys to Profile
     /// default" affordance (ticket 17 §5). Never fails on validation
@@ -771,6 +682,77 @@ impl Daemon {
         .await
     }
 
+    /// Creates or edits the deep Binding on `layer` for a dual-stage grid
+    /// key (tartarus-dual-stage-keys ticket 05 — CONTEXT.md: Actuation
+    /// stage) — atomic/immediately-applied/immediately-persisted, mirroring
+    /// `set_binding` exactly but one stage deeper. Errors `InvalidBinding`
+    /// if the Action/Trigger combination or the resulting `Config` fails
+    /// `config::validate` (including `DeepStageWithoutPrimary`/
+    /// `DeepStageMissingConfig` — sequencing across the primary Binding,
+    /// the deep Binding, and the deep Actuation/Staging-mode config is the
+    /// caller's job).
+    async fn set_deep_stage(
+        &self,
+        input: String,
+        layer: String,
+        binding: HashMap<String, OwnedValue>,
+    ) -> Result<(), DaemonError> {
+        let input = Self::parse_input(&input)?;
+        let layer = wire::layer_from_str(&layer).map_err(DaemonError::InvalidBinding)?;
+        let binding = wire::binding_from_dict(&binding).map_err(DaemonError::InvalidBinding)?;
+
+        self.apply(Edit::SetDeepStage {
+            input,
+            layer,
+            binding,
+        })
+        .await
+    }
+
+    /// Removes the deep Binding on `layer`. Errors `NotFound` if `input`
+    /// has no deep Binding there. Does not cascade-clear the deep
+    /// Actuation/Staging-mode config or force-release a live slot.
+    async fn clear_deep_stage(&self, input: String, layer: String) -> Result<(), DaemonError> {
+        let input = Self::parse_input(&input)?;
+        let layer = wire::layer_from_str(&layer).map_err(DaemonError::InvalidBinding)?;
+
+        self.apply(Edit::ClearDeepStage { input, layer }).await
+    }
+
+    /// Sets a grid key's deep Actuation/Release point pair on the active
+    /// Profile, creating a fresh deep-stage config (Staging mode defaulting
+    /// to Handoff) if none exists yet. Errors `InvalidBinding` if the
+    /// resulting `Config` fails `config::validate` (a non-Grid `input`, the
+    /// pair's own hysteresis, or the disjoint-band constraint against the
+    /// resolved primary Actuation point).
+    async fn set_deep_actuation(
+        &self,
+        input: String,
+        actuation: u8,
+        release: u8,
+    ) -> Result<(), DaemonError> {
+        let input = Self::parse_input(&input)?;
+
+        self.apply(Edit::SetDeepActuation {
+            input,
+            actuation,
+            release,
+        })
+        .await
+    }
+
+    /// Sets a grid key's Staging mode on the active Profile, creating a
+    /// fresh deep-stage config (Actuation/Release defaulting to
+    /// `ActuationPoint::default()`) if none exists yet. Errors
+    /// `InvalidBinding` if `mode` doesn't parse or the resulting `Config`
+    /// fails `config::validate`.
+    async fn set_staging_mode(&self, input: String, mode: String) -> Result<(), DaemonError> {
+        let input = Self::parse_input(&input)?;
+        let mode = wire::staging_mode_from_str(&mode).map_err(DaemonError::InvalidBinding)?;
+
+        self.apply(Edit::SetStagingMode { input, mode }).await
+    }
+
     /// Starts (or retargets) live depth streaming for `input` — the GUI's
     /// Actuation & release editor's `DepthChanged` feed (ticket 19/26).
     /// Connection-scoped and last-write-wins, mirroring
@@ -796,51 +778,28 @@ impl Daemon {
         }
         let sender = header.sender().map(ToString::to_string);
 
-        let epoch = {
-            let mut state = self.depth_stream.lock().unwrap();
-            state.epoch += 1;
-            if let Some(handle) = state.watcher.take() {
-                handle.abort();
-            }
-            state.input = Some(input);
-            state.epoch
-        };
-
-        let connection = connection.clone();
-        let depth_rx = self.depth_rx.clone();
-        let depth_stream = self.depth_stream.clone();
-        let handle = tokio::spawn(run_depth_stream(
-            connection,
+        // Supersede + spawn + store-if-current all live in
+        // `ConnectionScopedTask`; the sampling loop is `finish`'s `pump` (it
+        // never returns), so the race reduces to `pump` vs `watch_disconnect`,
+        // and there is nothing extra to clear on teardown.
+        let token = self.depth_stream.supersede();
+        token.finish(
+            connection.clone(),
             sender,
-            depth_rx,
-            input,
-            depth_stream,
-            epoch,
-        ));
-
-        let mut state = self.depth_stream.lock().unwrap();
-        if state.epoch == epoch {
-            state.watcher = Some(handle);
-        } else {
-            handle.abort();
-        }
+            run_depth_stream(connection.clone(), self.depth_rx.clone(), input),
+            || async {},
+        );
         Ok(())
     }
 
     /// Stops live depth streaming. `input` is validated for symmetry with
     /// `StartDepthStream` but otherwise unused: exactly one stream target
-    /// exists at a time (see `DepthStreamState`), so this always stops
-    /// whichever one is current, regardless of which connection started it —
-    /// the same "level-set, not a per-caller toggle" shape
-    /// `SetOutputSuppressed` already uses.
+    /// exists at a time, so this always stops whichever one is current,
+    /// regardless of which connection started it — the same "level-set, not a
+    /// per-caller toggle" shape `SetOutputSuppressed` already uses.
     async fn stop_depth_stream(&self, input: String) -> Result<(), DaemonError> {
         Self::parse_input(&input)?;
-        let mut state = self.depth_stream.lock().unwrap();
-        state.epoch += 1;
-        if let Some(handle) = state.watcher.take() {
-            handle.abort();
-        }
-        state.input = None;
+        self.depth_stream.disarm();
         Ok(())
     }
 
@@ -920,6 +879,7 @@ mod tests {
     use crate::config::{Config, DEFAULT_PROFILE_NAME, Profile};
     use crate::injector::testing::RecordingSink;
     use crate::injector::{self};
+    use futures_util::StreamExt;
     use zbus::Connection;
     use zbus::proxy;
 
@@ -984,6 +944,16 @@ mod tests {
         fn reset_actuation_points(&self) -> zbus::Result<()>;
         fn set_force_digital(&self, force: bool) -> zbus::Result<()>;
         fn set_status_leds(&self, orange: bool, green: bool, blue: bool) -> zbus::Result<()>;
+        fn set_deep_stage(
+            &self,
+            input: &str,
+            layer: &str,
+            binding: HashMap<String, OwnedValue>,
+        ) -> zbus::Result<()>;
+        fn clear_deep_stage(&self, input: &str, layer: &str) -> zbus::Result<()>;
+        fn set_deep_actuation(&self, input: &str, actuation: u8, release: u8) -> zbus::Result<()>;
+        fn set_default_deep_actuation(&self, actuation: u8, release: u8) -> zbus::Result<()>;
+        fn set_staging_mode(&self, input: &str, mode: &str) -> zbus::Result<()>;
         fn start_depth_stream(&self, input: &str) -> zbus::Result<()>;
         fn stop_depth_stream(&self, input: &str) -> zbus::Result<()>;
 
@@ -2781,6 +2751,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_default_deep_actuation_over_real_dbus_persists_and_surfaces_via_get_config() {
+        let server = TestServer::start().await;
+
+        server
+            .proxy
+            .set_default_deep_actuation(240, 205)
+            .await
+            .expect("SetDefaultDeepActuation over D-Bus must succeed");
+
+        let config = server.proxy.get_config().await.unwrap();
+        let profiles: wire::Dict = config.get("profiles").unwrap().clone().try_into().unwrap();
+        let default_profile: wire::Dict = profiles
+            .get(DEFAULT_PROFILE_NAME)
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let deep: wire::Dict = default_profile
+            .get("default_deep_actuation")
+            .expect("default_deep_actuation must be present once set")
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(u8::try_from(deep.get("actuation").unwrap()).unwrap(), 240);
+        assert_eq!(u8::try_from(deep.get("release").unwrap()).unwrap(), 205);
+
+        let on_disk = std::fs::read_to_string(&server.config_path).unwrap();
+        server.shut_down().await;
+        assert!(on_disk.contains("default_deep_actuation"));
+
+        // A rejected pair leaves nothing behind.
+        let server = TestServer::start().await;
+        let err = server
+            .proxy
+            .set_default_deep_actuation(200, 200)
+            .await
+            .expect_err("release >= actuation must be rejected");
+        assert!(
+            matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "com.acheron.Daemon.Error.InvalidBinding")
+        );
+        server.shut_down().await;
+    }
+
+    #[tokio::test]
     async fn set_default_actuation_over_real_dbus_with_release_above_actuation_is_rejected() {
         let server = TestServer::start().await;
 
@@ -2892,6 +2906,132 @@ mod tests {
 
         assert!(on_disk.contains("[profiles.Default.status_leds]"));
         assert!(on_disk.contains("orange = true"));
+    }
+
+    /// tartarus-dual-stage-keys ticket 05's core requirement: `SetDeepStage`/
+    /// `SetDeepActuation`/`SetStagingMode`/`ClearDeepStage` each persist to
+    /// `config.toml` and are visible via `GetConfig`, mirroring
+    /// `set_status_leds_over_real_dbus_persists_the_triple_and_surfaces_it_via_get_config`.
+    #[tokio::test]
+    async fn deep_stage_edits_over_real_dbus_persist_and_surface_via_get_config() {
+        let server = TestServer::start().await;
+
+        // A deep stage needs a primary Binding on the same Input/Layer
+        // first (`config::validate`'s `DeepStageWithoutPrimary`).
+        let mut primary = wire::action_to_dict(&crate::config::Action::Keypress {
+            modifiers: crate::config::Modifiers::default(),
+            key: evdev::KeyCode::KEY_A,
+        });
+        primary.insert(
+            "trigger".to_string(),
+            OwnedValue::try_from(zbus::zvariant::Value::new("hold_to_repeat".to_string())).unwrap(),
+        );
+        server
+            .proxy
+            .set_binding("grid_r1c1", "base", primary)
+            .await
+            .expect("SetBinding over D-Bus must succeed");
+
+        server
+            .proxy
+            .set_deep_actuation("grid_r1c1", 220, 200)
+            .await
+            .expect("SetDeepActuation over D-Bus must succeed");
+        server
+            .proxy
+            .set_staging_mode("grid_r1c1", "additive")
+            .await
+            .expect("SetStagingMode over D-Bus must succeed");
+
+        let mut deep = wire::action_to_dict(&crate::config::Action::Keypress {
+            modifiers: crate::config::Modifiers::default(),
+            key: evdev::KeyCode::KEY_B,
+        });
+        deep.insert(
+            "trigger".to_string(),
+            OwnedValue::try_from(zbus::zvariant::Value::new("fire_once".to_string())).unwrap(),
+        );
+        server
+            .proxy
+            .set_deep_stage("grid_r1c1", "base", deep)
+            .await
+            .expect("SetDeepStage over D-Bus must succeed");
+
+        let get_default_profile = |config: &HashMap<String, OwnedValue>| -> wire::Dict {
+            let profiles: wire::Dict = config.get("profiles").unwrap().clone().try_into().unwrap();
+            profiles
+                .get(DEFAULT_PROFILE_NAME)
+                .unwrap()
+                .clone()
+                .try_into()
+                .unwrap()
+        };
+
+        let config = server.proxy.get_config().await.unwrap();
+        let default_profile = get_default_profile(&config);
+        let deep_base: wire::Dict = default_profile
+            .get("deep_base")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert!(deep_base.contains_key("grid_r1c1"));
+        let deep_stages: wire::Dict = default_profile
+            .get("deep_stages")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let deep_stage: wire::Dict = deep_stages
+            .get("grid_r1c1")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let deep_actuation: wire::Dict = deep_stage
+            .get("actuation")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let actuation: u8 = deep_actuation
+            .get("actuation")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let release: u8 = deep_actuation
+            .get("release")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!((actuation, release), (220, 200));
+        let mode: String = deep_stage.get("mode").unwrap().clone().try_into().unwrap();
+        assert_eq!(mode, "additive");
+
+        let on_disk_before = std::fs::read_to_string(&server.config_path).unwrap();
+        assert!(on_disk_before.contains("[profiles.Default.deep_base.grid_r1c1]"));
+        assert!(on_disk_before.contains("[profiles.Default.deep_stages.grid_r1c1]"));
+        assert!(on_disk_before.contains("mode = \"additive\""));
+
+        server
+            .proxy
+            .clear_deep_stage("grid_r1c1", "base")
+            .await
+            .expect("ClearDeepStage over D-Bus must succeed");
+
+        let config = server.proxy.get_config().await.unwrap();
+        let default_profile = get_default_profile(&config);
+        let deep_base: wire::Dict = default_profile
+            .get("deep_base")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert!(!deep_base.contains_key("grid_r1c1"));
+
+        server.shut_down().await;
     }
 
     #[tokio::test]
