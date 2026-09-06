@@ -301,4 +301,4 @@ persistence. No new daemon message.
 - The effort's remaining open tickets after this: **08** (test-only, frontier) and **09**
   (config restriction, frontier). Once both resolve, the map's destination is reached:
   audit ratified, surfaces fixed (06), ADR + term written (04), and both specs
-  (`spec.md`, `spec-kernel-shaped-repeat.md`) gated.
+  (`spec-user-facing-output-safety-guidance.md`, `spec-kernel-shaped-repeat.md`) gated.

@@ -41,7 +41,7 @@ Source of truth: [`spec-kernel-shaped-repeat.md`](../../humane-output-rate/spec-
 - [x] README: check the Hold-to-repeat / Toggle feature descriptions for any
       "sends repeated keypresses" wording that the `value=2` change makes inaccurate;
       tighten if so. (The user-facing *tips* are a separate spec —
-      `.scratch/humane-output-rate/spec.md`, ticket 05 there — not this ticket.)
+      `.scratch/humane-output-rate/spec-user-facing-output-safety-guidance.md`, ticket 05 there — not this ticket.)
 
 ## Comments
 

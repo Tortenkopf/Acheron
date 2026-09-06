@@ -11,7 +11,7 @@ restatement. Feature bullets earlier in the README point here.
 
 **Blocked by:** None — can start immediately.
 
-Source: `.scratch/humane-output-rate/spec-user-facing output-safety guidance.md` §5.
+Source: `.scratch/humane-output-rate/spec-user-facing-output-safety-guidance.md` §5.
 
 - [x] New top-level `## Output safety` section added **between `## Usage` and
       `## Troubleshooting`**, with the four parts from spec §5: the intro paragraph +

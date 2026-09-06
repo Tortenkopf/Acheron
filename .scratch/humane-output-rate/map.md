@@ -10,7 +10,8 @@ for a **physically held key or button** — the kernel's configured autorepeat d
 for keys, and exactly one Down/Up (no repeat) for a held mouse/gamepad button. Any surface
 that fails the bar is **fixed within this map** (execution is in scope, not handed off).
 
-The finding then feeds two gated specs: a **`spec.md`** for the user-facing output-safety
+The finding then feeds two gated specs: a **`spec-user-facing-output-safety-guidance.md`**
+for the user-facing output-safety
 guidance (macro-editor disclaimer + best-practice tips covering anti-cheat plausibility and
 not locking down / impeding one's own system, plus the Analog-repeat selection toast) to
 land in the editor and the README; and a **`spec-kernel-shaped-repeat.md`** (ticket 01's
@@ -23,7 +24,8 @@ stays only as this effort's working name) so future repeat-based features inheri
 invariant.
 
 Done when: the audit verdict is ratified, every flagged surface is fixed, the ADR + term
-are written, and both specs (`spec.md` and `spec-kernel-shaped-repeat.md`) are gated —
+are written, and both specs (`spec-user-facing-output-safety-guidance.md` and
+`spec-kernel-shaped-repeat.md`) are gated —
 ready for fresh implementation efforts.
 
 ## Notes
@@ -38,7 +40,7 @@ ready for fresh implementation efforts.
   fix tickets graduate from ticket 01's audit and are resolved on this map, not a handoff
   (so far: ticket 06, the pace-loop clamp). **Two** things are handed off as specs for
   fresh implementation efforts: the user-facing guidance UI + README (ticket 05's
-  `spec.md`) and the `value=2` kernel-shaped repeat (ticket 07's
+  `spec-user-facing-output-safety-guidance.md`) and the `value=2` kernel-shaped repeat (ticket 07's
   `spec-kernel-shaped-repeat.md` — carved out at ticket 01's ratification because it is a
   cross-cutting behaviour change, not a localised fix).
 - **The bar** (settled while charting): the Linux **kernel autorepeat rate** as read live
@@ -118,7 +120,8 @@ ready for fresh implementation efforts.
   bursts. Ticket 07's `value=2` rebuild of surface 2 must preserve `advance_fired`'s
   re-base.
 - [Spec the user-facing output-safety guidance](issues/05-spec-macro-editor-safety-guidance.md)
-  — gated [`spec.md`](spec.md). **Text + placement only** — no config check, no blocking
+  — gated [`spec-user-facing-output-safety-guidance.md`](spec-user-facing-output-safety-guidance.md).
+  **Text + placement only** — no config check, no blocking
   widget. Two **GUI hints** (not a toast — new CONTEXT.md `### Interface` terms **Toast
   label** vs **GUI hint**): the standing macro-editor disclaimer (`⚠️` line, Macro tab
   only) and the Analog-repeat notice (`⚠️` line below the Trigger-mode dropdown while
@@ -128,7 +131,8 @@ ready for fresh implementation efforts.
   runaway recovery, friendly no-warranty restatement, no "safe" numbers — risk depends on
   the game). Anti-cheat research **relocated this session** to
   `docs/anti-cheat-input-heuristics.md`; CONTEXT.md terms **written this session**.
-  Implementation (widgets + README edit) is a fresh effort.
+  Implementation (widgets + README edit) is a fresh effort — now broken into four tickets
+  at [`output-safety-guidance/`](../output-safety-guidance/issues/) (2026-09-07).
 - [Record the humane-output-rate principle — ADR + CONTEXT.md term](issues/04-record-humane-output-rate-principle.md)
   — written. **ADR-0008** (`docs/adr/0008-physical-plausibility-ceiling-for-synthetic-output.md`):
   the ceiling (live kernel autorepeat rate; held `BTN_*` one Down/Up), the ticket-01 audit
@@ -146,7 +150,8 @@ ready for fresh implementation efforts.
 - **Implement the user-facing output-safety guidance** — the two GUI hints (`⚠️`
   macro-editor disclaimer + Analog-repeat notice), the "About macro safety" `Gtk.Expander`,
   the README `## Output safety` section, and the feature-bullet pointers. Ticket 05's
-  [`spec.md`](spec.md) is now **gated and ready**. A fresh implementation effort, not
+  [`spec-user-facing-output-safety-guidance.md`](spec-user-facing-output-safety-guidance.md)
+  is now **gated and ready**. A fresh implementation effort, not
   resolved here.
 - ~~**Implement the kernel-shaped `value=2` repeat**~~ — **done.** Ticket 07's
   [`spec-kernel-shaped-repeat.md`](spec-kernel-shaped-repeat.md) was implemented in

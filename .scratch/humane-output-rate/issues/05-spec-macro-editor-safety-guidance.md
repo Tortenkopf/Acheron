@@ -19,7 +19,7 @@ Parent: [Humane output rate](../map.md)
 
 ## Question
 
-Produce a gated `.scratch/humane-output-rate/spec.md` for the **user-facing output-safety
+Produce a gated `.scratch/humane-output-rate/spec-user-facing-output-safety-guidance.md` for the **user-facing output-safety
 guidance** — the macro-editor disclaimer + best-practice tips **and** the Analog-repeat
 selection toast — ready to hand to a fresh implementation effort. It must cover:
 
@@ -78,7 +78,7 @@ README edit, any warning widget) is a fresh effort, per the map's Notes.
 ## Answer
 
 Grilled + ratified with Charon in a `/grilling` + `/domain-modeling` session
-(2026-09-06). Deliverable: gated [`spec.md`](../spec.md).
+(2026-09-06). Deliverable: gated [`spec-user-facing-output-safety-guidance.md`](../spec-user-facing-output-safety-guidance.md).
 
 ### Decisions
 
@@ -93,7 +93,7 @@ Grilled + ratified with Charon in a `/grilling` + `/domain-modeling` session
 
 2. **Disclaimer** — one always-visible line at the top of the Macro editor (Macro tab
    only; not the Stepper tab, not `binding_editor.py`), leading with a `⚠️` emoji (a
-   deliberate exception to the no-emoji norm). Exact copy in `spec.md` §2:
+   deliberate exception to the no-emoji norm). Exact copy in `spec-user-facing-output-safety-guidance.md` §2:
    *"⚠️ uinput input is always identifiable as synthetic; Acheron keeps its own Trigger
    modes within physically-plausible rates, but a Macro does exactly what you write. Use
    macros with caution!"*
@@ -101,14 +101,14 @@ Grilled + ratified with Charon in a `/grilling` + `/domain-modeling` session
 3. **Tips** — a single `Gtk.Expander` ("About macro safety", collapsed by default) in
    the Macro editor, two themes (plausible-to-a-game / don't-lock-up-your-system) plus a
    recovery list (focus the window, tray pause, `systemctl --user stop`) and a link to
-   the README. No separate help dialog. Compact copy in `spec.md` §3.
+   the README. No separate help dialog. Compact copy in `spec-user-facing-output-safety-guidance.md` §3.
 
 4. **README `## Output safety`** — a new top-level section between Usage and
    Troubleshooting (not a Usage subsection, not Troubleshooting), covering the ceiling
    principle for users, the two tip themes at length, recovery, a friendly restatement
    of the no-warranty term ("any trouble you get yourself into … is entirely your own
    responsibility"), and a link to the research doc. Quotes **no** threshold numbers —
-   makes explicit that risk depends on the game. Full prose in `spec.md` §5.
+   makes explicit that risk depends on the game. Full prose in `spec-user-facing-output-safety-guidance.md` §5.
 
 5. **Research doc relocated this session** —
    `.scratch/humane-output-rate/research/anticheat-input-timing-heuristics.md` →
@@ -123,7 +123,7 @@ Grilled + ratified with Charon in a `/grilling` + `/domain-modeling` session
 
 ### Handoff
 
-`spec.md` is gated. Implementation — the two hint widgets, the expander, the README
+`spec-user-facing-output-safety-guidance.md` is gated. Implementation — the two hint widgets, the expander, the README
 section, and the feature-bullet pointers — is a fresh effort, per the map's Notes. The
 research-doc move and the CONTEXT.md terms are already done; the implementation effort
 only links to `docs/anti-cheat-input-heuristics.md` from the new README section.
