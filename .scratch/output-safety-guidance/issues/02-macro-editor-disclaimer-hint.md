@@ -1,5 +1,7 @@
 # 02 — Macro-editor standing disclaimer hint
 
+Status: done — 2026-09-07
+
 **What to build:** When the user opens the Macro editor, a single always-visible advisory
 line sits at the top of the editor column: `uinput` output is always identifiable as
 synthetic, Acheron paces its own Trigger modes, but a Macro does exactly what you write.

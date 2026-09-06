@@ -1,5 +1,12 @@
 <!-- wayfinder:map -->
 
+Status: archived — destination reached 2026-09-07; all nine tickets resolved. Both gated
+specs handed off and implemented: `spec-kernel-shaped-repeat.md` →
+[`kernel-shaped-repeat-impl/`](../kernel-shaped-repeat-impl/issues/) (2026-09-06),
+`spec-user-facing-output-safety-guidance.md` →
+[`output-safety-guidance/`](../output-safety-guidance/issues/) (2026-09-07). ADR-0008 +
+the "Physical-plausibility ceiling" `CONTEXT.md` term are written and un-gated.
+
 # Humane output rate
 
 ## Destination
@@ -145,14 +152,25 @@ ready for fresh implementation efforts.
   as this effort's working name (map heading, path, `Parent:` links) and sits on the term's
   `_Avoid_` line. Effort/map not renamed.
 
+- [Disallow the Analog-repeat + Macro Binding](issues/09-disallow-analog-repeat-macro-binding.md)
+  — execution ticket, done on `dev`. New `ConfigError::AnalogRepeatMacro(input)` in
+  `config::binding::check_binding` (site-shape step, `Individual(Grid)` arm) → enforced at
+  both `SetBinding` and `load_or_seed` from the one pure rule; reachable only where
+  analog-repeat is otherwise legal (non-grid still `InvalidAnalogRepeatInput`, Chord still
+  `InvalidChordAnalogRepeat`). `schema.rs` fixture re-blessed (20 `{macro, grid_*,
+  analog_repeat}` rows → `false`); `rules.valid_triggers` + `binding_editor` drop the
+  option for a Macro Action; CONTEXT.md **Trigger mode** entry gains a third "except…"
+  clause (no ADR). **This was the last open ticket — the map's destination is reached and
+  it can be archived.**
+
 ## Not yet specified
 
-- **Implement the user-facing output-safety guidance** — the two GUI hints (`⚠️`
-  macro-editor disclaimer + Analog-repeat notice), the "About macro safety" `Gtk.Expander`,
-  the README `## Output safety` section, and the feature-bullet pointers. Ticket 05's
+- ~~**Implement the user-facing output-safety guidance**~~ — **done.** Ticket 05's
   [`spec-user-facing-output-safety-guidance.md`](spec-user-facing-output-safety-guidance.md)
-  is now **gated and ready**. A fresh implementation effort, not
-  resolved here.
+  was implemented in [`.scratch/output-safety-guidance/`](../output-safety-guidance/issues/)
+  (2026-09-07, all 4 tickets done): the two GUI hints (`⚠️` macro-editor disclaimer +
+  Analog-repeat notice), the "About macro safety" `Gtk.Expander`, the README
+  `## Output safety` section, and the feature-bullet pointers.
 - ~~**Implement the kernel-shaped `value=2` repeat**~~ — **done.** Ticket 07's
   [`spec-kernel-shaped-repeat.md`](spec-kernel-shaped-repeat.md) was implemented in
   [`.scratch/kernel-shaped-repeat-impl/`](../kernel-shaped-repeat-impl/issues/)
