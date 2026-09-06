@@ -123,6 +123,29 @@ _CONTROLLER_MACRO_HINT = (
 
 _UNASSIGNED_LABEL = "— Unassigned —"
 
+# Output-safety spec §2 (effort `.scratch/output-safety-guidance/`, ticket
+# 02): the standing disclaimer at the top of the Macro editor's column. A
+# **GUI hint** (CONTEXT.md → Interface) — always present on the Macro tab,
+# never on the Stepper tab, dim, non-blocking, no dismiss; its condition is
+# simply "the Macro editor is shown". Leads with the ⚠️ emoji, a deliberate
+# exception to the GUI's no-emoji norm (matched by the Analog-repeat hint).
+# Rendered as one wrapped line — the sentences are the content, not a layout.
+_MACRO_DISCLAIMER = (
+    "⚠️ uinput input is always identifiable as synthetic; Acheron keeps its "
+    "own Trigger modes within physically-plausible rates, but a Macro does exactly what "
+    "you write. Use macros with caution!"
+)
+
+
+def _macro_disclaimer_label() -> Gtk.Label:
+    """The §2 disclaimer line, in the same dim wrapped-label style as
+    `_CONTROLLER_MACRO_HINT`. Built here for both editors: the Macro tab
+    shows it; the Stepper tab carries an inert opacity-0 copy so column 3's
+    body lands at the same y on both tabs (ticket 91's identical-measurements
+    rule — its rendered height depends on column width and theme, so a
+    matching widget is more robust than a hardcoded reserve)."""
+    return Gtk.Label(label=_MACRO_DISCLAIMER, xalign=0, wrap=True, css_classes=["dim"])
+
 # Ticket 91: the Macro and Stepper editors are built to identical
 # measurements so nothing visibly shifts when the user flips between the two
 # library tabs. `build_editor_columns` is structured the same way regardless
@@ -826,6 +849,7 @@ class LibraryKind:
     binding_type: str  # "macro" / "step" — the used-by scan predicate
     id_field: str  # "macro_id" / "stepper_id" — the used-by scan field
     toast_key: str | None  # "stepper_toast" / None — the one-shot col-3 notice
+    shows_disclaimer: bool  # spec §2 (output-safety ticket 02) — Macro editor only
 
     # client calls — `client` passed explicitly so `grep client.create_macro`
     # still finds the call site
@@ -849,6 +873,7 @@ MACRO = LibraryKind(
     binding_type="macro",
     id_field="macro_id",
     toast_key=None,
+    shows_disclaimer=True,
     create=lambda client, name: client.create_macro(name, []),
     rename=lambda client, mid, new: client.rename_macro(mid, new),
     delete=lambda client, mid: client.delete_macro(mid),
@@ -865,6 +890,7 @@ STEPPER = LibraryKind(
     binding_type="step",
     id_field="stepper_id",
     toast_key="stepper_toast",
+    shows_disclaimer=False,
     create=lambda client, name: client.create_stepper(name, []),
     rename=lambda client, sid, new: client.rename_stepper(sid, new),
     delete=lambda client, sid: client.delete_stepper(sid),
@@ -904,6 +930,18 @@ def build_editor_columns(
     current_list = entry[kind.items_key]
 
     col3 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_EDITOR_COL_SPACING)
+
+    # Spec §2 (output-safety ticket 02): the standing disclaimer sits at the
+    # very top of the Macro editor's column, above the §3 expander slot and
+    # the "Changes save automatically." hint. The Stepper tab gets the same
+    # widget at opacity 0 and hidden from the a11y tree — an inert reserve
+    # keeping column 3 in lockstep so nothing shifts on a tab flip (ticket
+    # 91), without a screen reader announcing the caution off the Stepper tab.
+    disclaimer = _macro_disclaimer_label()
+    if not kind.shows_disclaimer:
+        disclaimer.set_opacity(0)
+        disclaimer.update_state([Gtk.AccessibleState.HIDDEN], [True])
+    col3.append(disclaimer)
 
     if kind.toast_key is not None:
         toast = ui_state.pop(kind.toast_key, None)

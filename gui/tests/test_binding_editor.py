@@ -561,6 +561,19 @@ def test_trigger_mode_warning_wiring_survives_repeated_action_kind_switching():
     assert not _has_warning(editor)
 
 
+def test_macro_binding_editor_does_not_carry_the_macro_editor_disclaimer():
+    # Output-safety spec §2 / ticket 02: the standing "use macros with
+    # caution" line belongs where a Macro is *written* (the library editor),
+    # not where it is *assigned* — it must not leak into binding_editor.py.
+    stub = DaemonStub()
+    stub.create_macro("Screenshot Combo", [{"type": "key_down", "key": "KEY_A"}])
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    _dropdown_labeled(editor, "Action").set_selected([k for k, _ in ACTION_TYPES].index("macro"))
+
+    assert find_all(editor, lambda w: isinstance(w, Gtk.Label) and w.get_label().startswith("⚠️")) == []
+
+
 def test_selecting_macro_with_an_empty_library_shows_no_macros_yet_and_disables_save():
     # Ticket 52's real assignment flow: with no library entries to pick
     # from (and no "+ New Macro" submitted yet), Save must stay disabled

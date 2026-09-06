@@ -854,3 +854,76 @@ def test_editor_columns_mount_with_col3_at_its_natural_width_on_both_tabs():
         assert col2.get_hexpand() is True
         assert col3.get_hexpand() is False
     assert "wheel_scroll_up" not in stub.get_config()["profiles"]["Default"]["base"]
+
+
+# --- Macro-editor standing disclaimer (spec §2 / output-safety ticket 02) ---
+
+# The exact copy from `spec-user-facing output-safety guidance.md` §2 —
+# rendered as one wrapped line, leading with the ⚠️ emoji (a deliberate
+# exception to the GUI's no-emoji norm).
+_MACRO_DISCLAIMER_COPY = (
+    "⚠️ uinput input is always identifiable as synthetic; Acheron keeps its "
+    "own Trigger modes within physically-plausible rates, but a Macro does exactly what "
+    "you write. Use macros with caution!"
+)
+
+
+def _disclaimer_labels(root):
+    return find_all(
+        root, lambda w: isinstance(w, Gtk.Label) and w.get_label() == _MACRO_DISCLAIMER_COPY
+    )
+
+
+def test_macro_editor_shows_the_standing_disclaimer_as_a_dim_wrapped_line():
+    stub = DaemonStub()
+    stub.create_macro("M", [])
+
+    root = _build(stub, {})  # macros tab
+
+    label = find_one(
+        root, lambda w: isinstance(w, Gtk.Label) and w.get_label() == _MACRO_DISCLAIMER_COPY
+    )
+    assert label.get_xalign() == 0
+    assert label.get_wrap() is True
+    assert "dim" in label.get_css_classes()
+    assert label.get_opacity() == 1.0
+    assert "\n" not in label.get_label()  # one wrapped line, no hard breaks
+
+
+def test_disclaimer_sits_above_the_changes_save_automatically_hint():
+    stub = DaemonStub()
+    stub.create_macro("M", [])
+
+    root = _build(stub, {})
+    ordered = list(walk(root))
+    disclaimer = _disclaimer_labels(root)[0]
+    save_hint = find_one(
+        root,
+        lambda w: isinstance(w, Gtk.Label) and w.get_label() == "Changes save automatically.",
+    )
+    assert ordered.index(disclaimer) < ordered.index(save_hint)
+
+
+def test_stepper_editor_never_displays_the_disclaimer():
+    stub = DaemonStub()
+    stub.create_stepper("S", [])
+
+    root = _build_steppers(stub)
+
+    # Any copy of the line on the Stepper tab is the inert tab-flip reserve
+    # (opacity 0), never a visible advisory.
+    assert all(label.get_opacity() == 0 for label in _disclaimer_labels(root))
+
+
+def test_stepper_editor_keeps_an_inert_disclaimer_reserve_for_tab_flip_lockstep():
+    # Ticket 91: the two editors are built to identical measurements so
+    # nothing shifts when flipping tabs — the Macro-only disclaimer needs a
+    # matching inert reserve on the Stepper side.
+    stub = DaemonStub()
+    stub.create_stepper("S", [])
+
+    root = _build_steppers(stub)
+
+    reserves = _disclaimer_labels(root)
+    assert len(reserves) == 1
+    assert reserves[0].get_opacity() == 0  # inert: occupies height, shows nothing
