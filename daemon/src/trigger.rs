@@ -39,7 +39,7 @@ use evdev::KeyCode;
 
 use crate::capture::EventState;
 use crate::config::{
-    Action, Binding, Config, MacroDef, MacroId, StepperDef, StepperId, TriggerMode,
+    Action, Binding, Config, MacroDef, MacroId, Modifiers, StepperDef, StepperId, TriggerMode,
 };
 use crate::executor::{self, ActiveToggle, FiringHandle, MacroStep};
 use crate::injector::Injector;
@@ -103,6 +103,60 @@ fn sustained_hold_key(action: &Action) -> Option<KeyCode> {
         Action::ControllerButton { button } => Some(*button),
         Action::Keypress { key, .. } if is_mouse_button(*key) => Some(*key),
         _ => None,
+    }
+}
+
+/// How a Binding's held target behaves downstream when held or repeated
+/// (spec-kernel-shaped-repeat.md §2.1) — the classification `decide` needs to
+/// tell a "held single key" (which must present as genuine kernel autorepeat)
+/// apart from a mouse/gamepad button (which the kernel never autorepeats) and
+/// from a multi-step target. Replaces the bare `Option<KeyCode>` that
+/// `sustained_hold_key` returns today.
+///
+/// - `SustainedNoRepeat(code)` — today's `sustained_hold_key` set: an
+///   `Action::ControllerButton`, or an `Action::Keypress` on a mouse-button
+///   code. On `Repeat` these resolve to `D::Nothing`.
+/// - `AutorepeatKey(mods, code)` — a single keyboard key: an `Action::Keypress`
+///   (with or without modifiers) on a non-mouse code, or an `Action::Macro`
+///   whose compiled steps satisfy `executor::single_held_key`.
+#[allow(dead_code)] // ticket 03 wires `decide` to `hold_repeat_kind`; unused until then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HoldKind {
+    SustainedNoRepeat(KeyCode),
+    AutorepeatKey(Modifiers, KeyCode),
+}
+
+/// A single held key's `HoldKind`, keyboard vs. mouse-button split — the
+/// kernel autorepeats keyboard keys but never `BTN_*`, so a mouse-button code
+/// is `SustainedNoRepeat` even though it arrived through the same
+/// `[KeyDown(k), KeyUp(k)]` shape. Shared by `hold_repeat_kind`'s `Keypress`
+/// and `Macro` arms so a single-key Macro classifies *exactly* like the
+/// equivalent Keypress (`Action::Keypress.key` and a macro step accept the
+/// same unvalidated `KeyCode`, `BTN_*` included).
+fn key_hold_kind(modifiers: Modifiers, key: KeyCode) -> HoldKind {
+    if is_mouse_button(key) {
+        HoldKind::SustainedNoRepeat(key)
+    } else {
+        HoldKind::AutorepeatKey(modifiers, key)
+    }
+}
+
+/// Classifies a Binding's held target into a `HoldKind` (spec §2.1) — the
+/// successor to `sustained_hold_key`. For `Action::Keypress` /
+/// `Action::ControllerButton` it reads `mods` + `key` straight off the action;
+/// for `Action::Macro` it resolves the `MacroDef`, compiles the steps
+/// (`executor::compile`), and runs `executor::single_held_key`. Multi-step
+/// Macro, Stepper, Profile switch → `None` (multi-step, or handled earlier).
+#[allow(dead_code)] // ticket 03 removes this — `decide` does not call it yet.
+fn hold_repeat_kind(action: &Action, macros: &HashMap<MacroId, MacroDef>) -> Option<HoldKind> {
+    match action {
+        Action::ControllerButton { button } => Some(HoldKind::SustainedNoRepeat(*button)),
+        Action::Keypress { modifiers, key } => Some(key_hold_kind(*modifiers, *key)),
+        Action::Macro { .. } => {
+            let steps = executor::compile(action, macros);
+            executor::single_held_key(&steps).map(|(mods, key)| key_hold_kind(mods, key))
+        }
+        Action::Step { .. } | Action::ProfileSwitch { .. } => None,
     }
 }
 
@@ -534,6 +588,137 @@ mod tests {
             decide(&htr, EventState::Down, Some(Slot::Toggle)),
             TriggerDecision::SpawnFireOnce
         );
+    }
+
+    fn macro_action(id: &str) -> Action {
+        Action::Macro {
+            macro_id: MacroId::from(id),
+        }
+    }
+
+    fn macros_with(
+        id: &str,
+        steps: Vec<crate::config::MacroStepDto>,
+    ) -> HashMap<MacroId, MacroDef> {
+        let mut macros = HashMap::new();
+        macros.insert(
+            MacroId::from(id),
+            MacroDef {
+                name: id.to_string(),
+                steps,
+            },
+        );
+        macros
+    }
+
+    #[test]
+    fn hold_repeat_kind_classifies_keypress_controller_and_step() {
+        let no_macros: HashMap<MacroId, MacroDef> = HashMap::new();
+
+        // keyboard Keypress, plain + modified → AutorepeatKey off the action.
+        assert_eq!(
+            hold_repeat_kind(&keyboard(KBD), &no_macros),
+            Some(HoldKind::AutorepeatKey(Modifiers::default(), KBD))
+        );
+        let mods = Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            hold_repeat_kind(
+                &Action::Keypress {
+                    modifiers: mods,
+                    key: KBD,
+                },
+                &no_macros
+            ),
+            Some(HoldKind::AutorepeatKey(mods, KBD))
+        );
+
+        // mouse-button Keypress and ControllerButton → SustainedNoRepeat.
+        assert_eq!(
+            hold_repeat_kind(&keyboard(MOUSE), &no_macros),
+            Some(HoldKind::SustainedNoRepeat(MOUSE))
+        );
+        assert_eq!(
+            hold_repeat_kind(&Action::ControllerButton { button: PAD }, &no_macros),
+            Some(HoldKind::SustainedNoRepeat(PAD))
+        );
+
+        // Step → None (multi-step: each Repeat targets a different item).
+        assert_eq!(
+            hold_repeat_kind(
+                &Action::Step {
+                    stepper: StepperId::from("s"),
+                    direction: crate::config::StepDirection::Forward,
+                },
+                &no_macros
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn hold_repeat_kind_single_key_macro_matches_the_equivalent_keypress() {
+        use crate::config::MacroStepDto;
+        let macros = macros_with(
+            "hold-x",
+            vec![
+                MacroStepDto::KeyDown(KeyCode::KEY_X),
+                MacroStepDto::KeyUp(KeyCode::KEY_X),
+            ],
+        );
+
+        let via_macro = hold_repeat_kind(&macro_action("hold-x"), &macros);
+        assert_eq!(
+            via_macro,
+            hold_repeat_kind(&keyboard(KeyCode::KEY_X), &macros),
+            "a single-key Macro classifies exactly like the equivalent Keypress"
+        );
+        assert_eq!(
+            via_macro,
+            Some(HoldKind::AutorepeatKey(
+                Modifiers::default(),
+                KeyCode::KEY_X
+            ))
+        );
+    }
+
+    #[test]
+    fn hold_repeat_kind_single_mouse_button_macro_matches_the_equivalent_keypress() {
+        // A macro step accepts any `KeyCode`, `BTN_*` included — a single
+        // mouse-button macro must classify as `SustainedNoRepeat`, exactly
+        // like the equivalent mouse-button Keypress, not as an autorepeat key
+        // (the kernel never autorepeats `BTN_*`).
+        use crate::config::MacroStepDto;
+        let macros = macros_with(
+            "hold-click",
+            vec![MacroStepDto::KeyDown(MOUSE), MacroStepDto::KeyUp(MOUSE)],
+        );
+
+        let via_macro = hold_repeat_kind(&macro_action("hold-click"), &macros);
+        assert_eq!(
+            via_macro,
+            hold_repeat_kind(&keyboard(MOUSE), &macros),
+            "a single mouse-button Macro classifies like the equivalent Keypress"
+        );
+        assert_eq!(via_macro, Some(HoldKind::SustainedNoRepeat(MOUSE)));
+    }
+
+    #[test]
+    fn hold_repeat_kind_multi_step_macro_is_none() {
+        use crate::config::MacroStepDto;
+        let macros = macros_with(
+            "combo",
+            vec![
+                MacroStepDto::KeyDown(KeyCode::KEY_A),
+                MacroStepDto::KeyUp(KeyCode::KEY_A),
+                MacroStepDto::KeyDown(KeyCode::KEY_B),
+                MacroStepDto::KeyUp(KeyCode::KEY_B),
+            ],
+        );
+        assert_eq!(hold_repeat_kind(&macro_action("combo"), &macros), None);
     }
 }
 

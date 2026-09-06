@@ -89,6 +89,96 @@ pub(crate) fn keypress_steps(modifiers: Modifiers, key: KeyCode) -> Vec<MacroSte
     steps
 }
 
+/// `Some((mods, key))` iff `steps` is a single held keyboard key — the exact
+/// shape a physically held key produces, so the decision layer can route it
+/// through the kernel-autorepeat (`value=2`) path instead of a `[Down, Up]`
+/// loop (spec-kernel-shaped-repeat.md §6). Pure over `&[MacroStep]` and
+/// unit-tested standalone; ticket 03 wires `trigger::hold_repeat_kind` to it.
+///
+/// **Qualifies:**
+/// - `[KeyDown(k), KeyUp(k)]` — a plain unmodified key;
+/// - `[KeyDown(m0)…KeyDown(mN), KeyDown(k), KeyUp(k), KeyUp(mN)…KeyUp(m0)]` —
+///   a modifier-wrapped single key, `m*` being modifier codes in
+///   `keypress_steps`' fixed ctrl/shift/alt/super order (released in reverse);
+/// - either of the above followed by at most one trailing `MacroStep::Delay`
+///   (ignored — ticket 03's "turbo macro written with a trailing pause").
+///
+/// **Disqualifies (`None`):** more than one distinct non-modifier key; any
+/// `Delay` *between* the key steps; two or more trailing `Delay`s; an
+/// out-of-order modifier chord; any other shape.
+pub(crate) fn single_held_key(steps: &[MacroStep]) -> Option<(Modifiers, KeyCode)> {
+    // Strip at most one trailing Delay (ticket 03's turbo macro written with a
+    // trailing pause). Two or more trailing Delays are an authored cadence.
+    let core = match steps.split_last() {
+        Some((MacroStep::Delay(_), rest)) => {
+            if matches!(rest.last(), Some(MacroStep::Delay(_))) {
+                return None;
+            }
+            rest
+        }
+        _ => steps,
+    };
+
+    // A Delay between the key edges is an authored cadence — a real macro.
+    if core.iter().any(|s| matches!(s, MacroStep::Delay(_))) {
+        return None;
+    }
+    if core.len() < 2 || core.len() % 2 != 0 {
+        return None;
+    }
+    let (downs, ups) = core.split_at(core.len() / 2);
+
+    let down_codes: Vec<KeyCode> = downs
+        .iter()
+        .map(|s| match s {
+            MacroStep::KeyDown(k) => Some(*k),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let up_codes: Vec<KeyCode> = ups
+        .iter()
+        .map(|s| match s {
+            MacroStep::KeyUp(k) => Some(*k),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+
+    // A physically held key releases its modifiers in reverse order.
+    if !up_codes.iter().rev().eq(down_codes.iter()) {
+        return None;
+    }
+
+    let (key, mods_prefix) = down_codes.split_last()?;
+
+    // The modifier prefix must be codes in `keypress_steps`' fixed
+    // ctrl/shift/alt/super order — an out-of-order (or duplicated) chord is a
+    // real macro, not a held key.
+    const ORDER: [KeyCode; 4] = [
+        KeyCode::KEY_LEFTCTRL,
+        KeyCode::KEY_LEFTSHIFT,
+        KeyCode::KEY_LEFTALT,
+        KeyCode::KEY_LEFTMETA,
+    ];
+    let mut next = 0;
+    let mut modifiers = Modifiers::default();
+    for code in mods_prefix {
+        let pos = ORDER.iter().position(|c| c == code)?;
+        if pos < next {
+            return None;
+        }
+        next = pos + 1;
+        match *code {
+            KeyCode::KEY_LEFTCTRL => modifiers.ctrl = true,
+            KeyCode::KEY_LEFTSHIFT => modifiers.shift = true,
+            KeyCode::KEY_LEFTALT => modifiers.alt = true,
+            KeyCode::KEY_LEFTMETA => modifiers.super_key = true,
+            _ => unreachable!("guarded by the ORDER lookup above"),
+        }
+    }
+
+    Some((modifiers, *key))
+}
+
 /// The down/dwell/up triple a single atomic controller-button press
 /// compiles to (ticket 75/76's `CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD`
 /// dwell between the edges, so a same-poll-frame game doesn't swallow the
@@ -635,6 +725,198 @@ mod tests {
                 MacroStep::Delay(CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD),
                 MacroStep::KeyUp(KeyCode::BTN_SOUTH),
             ]
+        );
+    }
+
+    const CTRL: KeyCode = KeyCode::KEY_LEFTCTRL;
+    const SHIFT: KeyCode = KeyCode::KEY_LEFTSHIFT;
+    const ALT: KeyCode = KeyCode::KEY_LEFTALT;
+    const SUPER: KeyCode = KeyCode::KEY_LEFTMETA;
+
+    #[test]
+    fn single_held_key_accepts_a_plain_unmodified_key() {
+        let steps = vec![
+            MacroStep::KeyDown(KeyCode::KEY_X),
+            MacroStep::KeyUp(KeyCode::KEY_X),
+        ];
+        assert_eq!(
+            single_held_key(&steps),
+            Some((Modifiers::default(), KeyCode::KEY_X))
+        );
+    }
+
+    #[test]
+    fn single_held_key_accepts_a_modifier_wrapped_key() {
+        let steps = vec![
+            MacroStep::KeyDown(CTRL),
+            MacroStep::KeyDown(KeyCode::KEY_X),
+            MacroStep::KeyUp(KeyCode::KEY_X),
+            MacroStep::KeyUp(CTRL),
+        ];
+        assert_eq!(
+            single_held_key(&steps),
+            Some((
+                Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+                KeyCode::KEY_X
+            ))
+        );
+    }
+
+    #[test]
+    fn single_held_key_matches_keypress_steps_for_every_modifier_combination() {
+        // The predicate is the inverse of `keypress_steps` — anything that
+        // helper builds must round-trip back to its own `(mods, key)`.
+        for mods in [
+            Modifiers::default(),
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+            Modifiers {
+                shift: true,
+                alt: true,
+                ..Modifiers::default()
+            },
+            Modifiers {
+                ctrl: true,
+                shift: true,
+                alt: true,
+                super_key: true,
+            },
+        ] {
+            let steps = keypress_steps(mods, KeyCode::KEY_J);
+            assert_eq!(
+                single_held_key(&steps),
+                Some((mods, KeyCode::KEY_J)),
+                "keypress_steps({mods:?}) must round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn single_held_key_ignores_one_trailing_delay() {
+        let steps = vec![
+            MacroStep::KeyDown(SHIFT),
+            MacroStep::KeyDown(KeyCode::KEY_X),
+            MacroStep::KeyUp(KeyCode::KEY_X),
+            MacroStep::KeyUp(SHIFT),
+            MacroStep::Delay(Duration::from_millis(30)),
+        ];
+        assert_eq!(
+            single_held_key(&steps),
+            Some((
+                Modifiers {
+                    shift: true,
+                    ..Modifiers::default()
+                },
+                KeyCode::KEY_X
+            ))
+        );
+    }
+
+    #[test]
+    fn single_held_key_rejects_a_delay_between_the_key_steps() {
+        let steps = vec![
+            MacroStep::KeyDown(KeyCode::KEY_X),
+            MacroStep::Delay(Duration::from_millis(30)),
+            MacroStep::KeyUp(KeyCode::KEY_X),
+        ];
+        assert_eq!(single_held_key(&steps), None);
+    }
+
+    #[test]
+    fn single_held_key_rejects_two_trailing_delays() {
+        let steps = vec![
+            MacroStep::KeyDown(KeyCode::KEY_X),
+            MacroStep::KeyUp(KeyCode::KEY_X),
+            MacroStep::Delay(Duration::from_millis(30)),
+            MacroStep::Delay(Duration::from_millis(30)),
+        ];
+        assert_eq!(single_held_key(&steps), None);
+    }
+
+    #[test]
+    fn single_held_key_rejects_modifiers_out_of_keypress_order() {
+        // shift-down before ctrl-down — `keypress_steps` always emits ctrl first.
+        let steps = vec![
+            MacroStep::KeyDown(SHIFT),
+            MacroStep::KeyDown(CTRL),
+            MacroStep::KeyDown(KeyCode::KEY_X),
+            MacroStep::KeyUp(KeyCode::KEY_X),
+            MacroStep::KeyUp(CTRL),
+            MacroStep::KeyUp(SHIFT),
+        ];
+        assert_eq!(single_held_key(&steps), None);
+    }
+
+    #[test]
+    fn single_held_key_accepts_modifiers_in_keypress_order() {
+        let steps = vec![
+            MacroStep::KeyDown(CTRL),
+            MacroStep::KeyDown(ALT),
+            MacroStep::KeyDown(SUPER),
+            MacroStep::KeyDown(KeyCode::KEY_X),
+            MacroStep::KeyUp(KeyCode::KEY_X),
+            MacroStep::KeyUp(SUPER),
+            MacroStep::KeyUp(ALT),
+            MacroStep::KeyUp(CTRL),
+        ];
+        assert_eq!(
+            single_held_key(&steps),
+            Some((
+                Modifiers {
+                    ctrl: true,
+                    alt: true,
+                    super_key: true,
+                    ..Modifiers::default()
+                },
+                KeyCode::KEY_X
+            ))
+        );
+    }
+
+    #[test]
+    fn single_held_key_rejects_more_than_one_non_modifier_key() {
+        let steps = vec![
+            MacroStep::KeyDown(KeyCode::KEY_X),
+            MacroStep::KeyDown(KeyCode::KEY_Y),
+            MacroStep::KeyUp(KeyCode::KEY_Y),
+            MacroStep::KeyUp(KeyCode::KEY_X),
+        ];
+        assert_eq!(single_held_key(&steps), None);
+    }
+
+    #[test]
+    fn single_held_key_rejects_modifiers_not_released_in_reverse() {
+        let steps = vec![
+            MacroStep::KeyDown(CTRL),
+            MacroStep::KeyDown(SHIFT),
+            MacroStep::KeyDown(KeyCode::KEY_X),
+            MacroStep::KeyUp(KeyCode::KEY_X),
+            MacroStep::KeyUp(CTRL),
+            MacroStep::KeyUp(SHIFT),
+        ];
+        assert_eq!(single_held_key(&steps), None);
+    }
+
+    #[test]
+    fn single_held_key_rejects_unbalanced_and_empty_shapes() {
+        assert_eq!(single_held_key(&[]), None);
+        assert_eq!(single_held_key(&[MacroStep::KeyDown(KeyCode::KEY_X)]), None);
+        assert_eq!(
+            single_held_key(&[
+                MacroStep::KeyDown(KeyCode::KEY_X),
+                MacroStep::KeyDown(KeyCode::KEY_X),
+            ]),
+            None,
+            "two KeyDowns is not a balanced hold"
+        );
+        assert_eq!(
+            single_held_key(&[MacroStep::Delay(Duration::from_millis(5))]),
+            None
         );
     }
 
