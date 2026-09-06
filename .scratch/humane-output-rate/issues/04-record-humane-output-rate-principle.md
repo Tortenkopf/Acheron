@@ -3,6 +3,23 @@
 Type: grilling
 Status: open
 Blocked by: 01, 07
+<!-- 07 resolved 2026-09-06 (spec-kernel-shaped-repeat.md). For this ADR:
+     - The heuristics-report rationale is spec §8 — lift it verbatim as ADR-0008's rationale
+       block (origin visible + accepted; the change makes held/repeated output
+       timing-indistinguishable from a physical hold — value, envelope, dwell; the
+       Analog-repeat ramp is hand-driven; plausibility of rate, not disguise).
+     - **ADR-0002 does NOT cover uinput-origin detectability** — it is "direct evdev/uinput
+       vs OpenRazer" only. No ADR records the premise. This ADR (0008) is the first. Fix the
+       "(ADR-0002)" citation in the glossary draft below → "(ADR-0008)".
+     - value=2 decision to record: inject it ourselves (evdev 0.13.2 can't enable EV_REP on
+       a VirtualDevice); converts Digital/Analog-synth Hold-to-repeat, Chord (single-key),
+       Analog-repeat hold-solid, and Toggle → single key; NOT Stepper, NOT button Toggles,
+       NOT multi-step Macro loops. -->
+<!-- Analog-repeat cannot wrap a Macro (ticket 03 decision 4 / ticket 09) — note it in the
+     ADR and the glossary term. Cite ticket 08's mechanism (run_toggle_loop target_lap + the
+     FiringUnfinished overlap guard), not a new constant, for trigger-driven Macro repetition.
+     Both blockers (01, 07) are resolved as of 2026-09-06 — this ticket is on the frontier. -->
+
 <!-- 03 (self-DoS macro guardrail) resolved 2026-09-06 — see issues/03. Key points for the ADR:
      trigger-driven Macro *repetition* is floored to max(kernel period, MIN_TOGGLE_LAP) by
      EXISTING mechanism (run_toggle_loop's target_lap + the FiringUnfinished overlap guard),

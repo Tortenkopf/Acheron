@@ -43,6 +43,10 @@ ready for fresh implementation efforts.
   delay / 33 ms period. Steady-state repeat *rate* only — a physical key's ~250 ms
   initial-repeat delay is judged per surface, not required everywhere (Analog-repeat
   deliberately simulates tapping, not holding). Held buttons: one Down/Up, no repeat.
+- **ADR-0002 does *not* cover uinput-origin detectability** (found while resolving ticket
+  07): it is about "direct evdev/uinput instead of OpenRazer" only. No ADR in the repo
+  records the "uinput origin is always detectable" premise. Ticket 04 writes it as a new
+  ADR (0008); the glossary term and any rationale cite 0008, not 0002.
 - **Prior art in-tree**: ticket 26 (`MIN_TOGGLE_LAP` 20 ms floor, added after a zero-delay
   toggled Keypress hard-froze a machine), ticket 68 (`resolve_toggle_lap_target` live
   kernel read), ticket 20 (Analog-repeat 2–20 Hz curve), ticket 18 §4 (`RepeatSchedule`
@@ -78,6 +82,19 @@ ready for fresh implementation efforts.
   `[KeyDown,KeyUp]` pairs, never `value=2` (uinput device has no `EV_REP`) — rate-compliant
   but the clearest synthetic tell → **ticket 07** speccs a `value=2` rebuild. Macro paths
   (surfaces 9 & 10) → ticket 03. Pathologically fast kernel `kbdrate` ruled out of scope.
+- [Spec the kernel-shaped repeat behaviour (`value=2`)](issues/07-spec-kernel-shaped-repeat.md)
+  — gated [`spec-kernel-shaped-repeat.md`](spec-kernel-shaped-repeat.md). Fork: **inject
+  `value=2` ourselves** (evdev 0.13.2 can't enable `EV_REP` on a `VirtualDevice`;
+  `translate` already emits `value=2` for passthrough). New `D::RepeatKey` + `hold_repeat_kind`
+  extending `sustained_hold_key`. **Converts**: Digital + Analog-synth Hold-to-repeat, Chord
+  (single-key), Analog-repeat hold-solid, Toggle → keyboard Keypress / single-key Macro —
+  all emit `value=1` then `value=2` at the live kernel `REP_DELAY`→`REP_PERIOD` (no delay
+  for hold-solid). **Untouched**: Stepper Hold-to-repeat, Toggle → button (7/8), Toggle /
+  Hold-to-repeat → multi-step Macro (9/10 — `run_toggle_loop` + `target_lap` survive here
+  only). Ticket 06's `advance_fired` clamp carries untouched (decides *when*, not *what*);
+  Toggle + hold-solid emitters adopt it. Single-key predicate (`[KeyDown(k),KeyUp(k)]`,
+  modifier-wrapped, one trailing `Delay`) detected in `Slots::perform`. → **ticket 08**
+  rewired `Blocked by: 01, 07`; **ticket 04** ADR cites 0008 not 0002.
 - [Clamp missed deadlines in both repeat pace loops](issues/06-clamp-repeat-pace-loop-deadlines.md)
   — surfaces 2 & 5 fixed inline on `dev`. Two pure, table-tested helpers:
   `RepeatSchedule::advance_fired` re-bases the Grid Hold-to-repeat `fired` count from real
@@ -93,8 +110,9 @@ ready for fresh implementation efforts.
 - **Implement the user-facing output-safety guidance** — the GtkExpander / hint widgets,
   the Analog-repeat toast, the README section. Blocked on ticket 05's `spec.md`. A fresh
   implementation effort, not resolved here.
-- **Implement the kernel-shaped `value=2` repeat** — blocked on ticket 07's
-  `spec-kernel-shaped-repeat.md`. A fresh implementation effort, not resolved here.
+- **Implement the kernel-shaped `value=2` repeat** — ticket 07's
+  [`spec-kernel-shaped-repeat.md`](spec-kernel-shaped-repeat.md) is now **gated and ready**.
+  A fresh implementation effort, not resolved here.
 
 ## Out of scope
 
