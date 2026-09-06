@@ -100,6 +100,14 @@ ready for fresh implementation efforts.
   Toggle + hold-solid emitters adopt it. Single-key predicate (`[KeyDown(k),KeyUp(k)]`,
   modifier-wrapped, one trailing `Delay`) detected in `Slots::perform`. → **ticket 08**
   rewired `Blocked by: 01, 07`; **ticket 04** ADR cites 0008 not 0002.
+  **Implemented and shipped 2026-09-06** in
+  [`.scratch/kernel-shaped-repeat-impl/`](../kernel-shaped-repeat-impl/issues/) (7
+  tickets, all done). Its ticket 07 un-gated ADR-0008, restructured the `CONTEXT.md`
+  "Toggle" entry for the three now-distinct hold behaviours (the "Physical-plausibility
+  ceiling" term already read present-tense and was left as-is), and resolved
+  **ticket 08** below (the Toggle→Macro regression split landed with that effort's
+  ticket 05). Effort decision along the way: a single-key **deep-stage** Hold-to-repeat
+  converts too.
 - [Clamp missed deadlines in both repeat pace loops](issues/06-clamp-repeat-pace-loop-deadlines.md)
   — surfaces 2 & 5 fixed inline on `dev`. Two pure, table-tested helpers:
   `RepeatSchedule::advance_fired` re-bases the Grid Hold-to-repeat `fired` count from real
@@ -140,9 +148,11 @@ ready for fresh implementation efforts.
   the README `## Output safety` section, and the feature-bullet pointers. Ticket 05's
   [`spec.md`](spec.md) is now **gated and ready**. A fresh implementation effort, not
   resolved here.
-- **Implement the kernel-shaped `value=2` repeat** — ticket 07's
-  [`spec-kernel-shaped-repeat.md`](spec-kernel-shaped-repeat.md) is now **gated and ready**.
-  A fresh implementation effort, not resolved here.
+- ~~**Implement the kernel-shaped `value=2` repeat**~~ — **done.** Ticket 07's
+  [`spec-kernel-shaped-repeat.md`](spec-kernel-shaped-repeat.md) was implemented in
+  [`.scratch/kernel-shaped-repeat-impl/`](../kernel-shaped-repeat-impl/issues/)
+  (2026-09-06, all 7 tickets done). ADR-0008 un-gated, `CONTEXT.md` "Toggle" entry
+  restructured, [ticket 08](issues/08-lock-macro-repetition-floor-tests.md) resolved.
 
 ## Out of scope
 

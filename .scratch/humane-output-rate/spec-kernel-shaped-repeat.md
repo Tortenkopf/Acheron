@@ -1,6 +1,11 @@
 # Spec: kernel-shaped repeat output (`value=2`)
 
-Status: gated — ready for a fresh implementation effort
+Status: **implemented** 2026-09-06 in
+[`.scratch/kernel-shaped-repeat-impl/`](../kernel-shaped-repeat-impl/issues/) (7 tickets,
+all done). ADR-0008 un-gated; `CONTEXT.md` "Toggle" entry restructured (the
+"Physical-plausibility ceiling" term already read present-tense). As-built notes inline
+where behaviour was pinned down during implementation (see the "As implemented" blocks
+in §3.2 and §7).
 Source: [Humane output rate](map.md) ticket [07](issues/07-spec-kernel-shaped-repeat.md)
 (grilled + ratified with Charon, 2026-09-06)
 
@@ -123,7 +128,18 @@ autorepeats. This is exactly what the kernel does for a physically held `Ctrl+X`
 A Toggle whose held target is a single key — plain `Keypress` **or** a single-key `Macro`
 (identical compiled steps ⇒ identical behaviour) — no longer loops `[Down,Up]` through
 `run_toggle_loop`. It starts a sustained autorepeat hold and stops it on the second press
-(and on `stop_all` — Layer/Profile switch, Analog→Digital flip).
+(and on the Toggle-teardown paths below).
+
+> **As implemented** (`kernel-shaped-repeat-impl` ticket 05): an *individual* Toggle —
+> autorepeat or looping — deliberately **survives a Layer switch and an Analog→Digital
+> capture flip** (`handle_layer_switch` / `handle_capture_mode_change` only
+> `drain_firings`; see [`tartarus-keybinder/spec.md`](../tartarus-keybinder/spec.md)
+> § "Toggle behavior across Layer/Profile switches"). It is stopped only by the **second
+> press**, a **Profile switch** (`Effect::StopAllToggles`), or the **GUI-focus
+> `Command::StopAllToggles`** — `Slots::stop_all` (firings + toggles) is only ever
+> invoked on the deep stage's `Slots<StageKey>`, never on the individual `Slots<Input>`.
+> Tests: `single_key_autorepeat_toggle_survives_a_layer_switch`,
+> `stop_all_toggles_releases_a_running_single_key_autorepeat_toggle`.
 
 `run_toggle_loop` + `target_lap` (`MIN_TOGGLE_LAP` / `combine_toggle_lap_target`) survive
 **only** for `D::StartToggleLoop` — the multi-step Macro loop (surface 9, the declared Macro
@@ -352,7 +368,8 @@ Every teardown path already emits the terminating `value=0`:
 |---|---|---|
 | physical `Up` (individual / chord member) | `decide` → `D::ForceReleaseStuck` → `Slots::force_release` → `FiringHandle::force_release_stuck` drains `held` (`executor.rs:229-241`) | ✓ (key + any modifiers) |
 | chord dissolves (any member released) | `ChordEffect::ReleaseChordFiring` → `Slots::force_release` | ✓ |
-| Layer / Profile switch, Analog→Digital flip | `Slots::stop_all` (`trigger.rs:388-393`) | ✓ |
+| Layer switch, Profile switch, Analog→Digital flip — **Hold-to-repeat firing** | `Slots::drain_firings` (force-release + remove every firing; `handle_layer_switch` / `handle_capture_mode_change` / `SwitchProfile`'s `Effect::ReleaseAllHolds`) | ✓ (key + any modifiers) |
+| **Profile switch** or **GUI-focus `Command::StopAllToggles`** — **autorepeat Toggle** | `Slots::stop_all_toggles` → each `ActiveToggle` `cancel` → `force_release(held)` | ✓ |
 | Toggle second press / stop | `run_toggle_autorepeat` `cancel` → `force_release(held)` | ✓ |
 | Analog-repeat cancel, or Depth leaves hold-solid | `run_analog_repeat_loop` → `release_solid` / `executor::force_release` | ✓ |
 | dropped device connection | capture layer synthesises `EventState::Up` (`analog.rs:860-870`) | ✓ |

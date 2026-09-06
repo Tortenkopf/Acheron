@@ -31,21 +31,21 @@ so a scheduler or injector stall longer than one period produced a bunched catch
 burst on resume — fixed inline (ticket 06) by re-basing `fired` from real elapsed time,
 matching the kernel's `input_repeat_key`, which re-arms from *now* and never bursts.
 
-**Kernel-shaped repeat (`value=2`).** Every Hold-to-repeat path today emits
-`[KeyDown, KeyUp]` pairs with ~0 ms dwell — rate-compliant, but the clearest synthetic
-tell in the research, with an implied hold time no physical key produces. The decision
-(ticket 07, specced in `.scratch/humane-output-rate/spec-kernel-shaped-repeat.md`,
-**gated and pending a fresh implementation effort**) is that a held single key instead
-emits one `value=1` then `value=2` autorepeat events at the live `REP_DELAY`→`REP_PERIOD`
+**Kernel-shaped repeat (`value=2`).** Before this change every Hold-to-repeat path
+emitted `[KeyDown, KeyUp]` pairs with ~0 ms dwell — rate-compliant, but the clearest
+synthetic tell in the research, with an implied hold time no physical key produces. The
+rebuild (ticket 07, specced in `.scratch/humane-output-rate/spec-kernel-shaped-repeat.md`,
+carried out in `.scratch/kernel-shaped-repeat-impl/`) makes a held single key instead
+emit one `value=1` then `value=2` autorepeat events at the live `REP_DELAY`→`REP_PERIOD`
 envelope, then `value=0`. We inject `value=2` ourselves rather than advertise `EV_REP`
 on the virtual device — `evdev` 0.13.2 cannot enable kernel softrepeat on a
 `VirtualDevice`, and `injector::translate` already emits `value=2` for passthrough. This
-converts Digital and analog-synth Hold-to-repeat, single-key Chord, Analog-repeat
-hold-solid, and Toggle / Hold-to-repeat of a single key or single-key Macro. It does
-**not** touch Stepper Hold-to-repeat (each repeat targets a different item), button
-Toggles (`BTN_*` does not autorepeat), or multi-step Macro loops. After it lands,
-Acheron's held and repeated keyboard output is timing-indistinguishable from a physical
-hold, and its one dynamic mode — the Analog-repeat depth ramp — is continuously
+converts Digital and analog-synth Hold-to-repeat, single-key Chord, single-key deep-stage
+Hold-to-repeat, Analog-repeat hold-solid, and Toggle / Hold-to-repeat of a single key or
+single-key Macro. It does **not** touch Stepper Hold-to-repeat (each repeat targets a
+different item), button Toggles (`BTN_*` does not autorepeat), or multi-step Macro loops.
+Acheron's held and repeated keyboard output is now timing-indistinguishable from a
+physical hold, and its one dynamic mode — the Analog-repeat depth ramp — is continuously
 hand-driven.
 
 **The Macro exception.** A Macro is the sole deliberate exception: its author may
