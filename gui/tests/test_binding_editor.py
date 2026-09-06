@@ -4,7 +4,13 @@
 import pytest
 from gi.repository import Gtk
 
-from acheron_gui.binding_editor import DepthTrack, action_summary, build_binding_editor, build_chord_binding_dialog
+from acheron_gui.binding_editor import (
+    _ANALOG_REPEAT_HINT,
+    DepthTrack,
+    action_summary,
+    build_binding_editor,
+    build_chord_binding_dialog,
+)
 from acheron_gui.daemon_client import InvalidBindingError
 from acheron_gui.daemon_stub import DaemonStub
 from acheron_gui.device_overview import make_input_button
@@ -1059,6 +1065,136 @@ def test_saving_an_analog_repeat_binding_on_a_grid_input_calls_set_binding():
             {"trigger": "analog_repeat", "type": "keypress", "key": "KEY_F1", "modifiers": []},
         )
     ]
+
+
+# --- Analog-repeat selection hint (output-safety spec §4 / ticket 04) ---
+
+
+def _analog_hint_labels(root):
+    return find_all(root, lambda w: isinstance(w, Gtk.Label) and w.get_label() == _ANALOG_REPEAT_HINT)
+
+
+def _select_trigger(root, key):
+    _dropdown_labeled(root, "Trigger mode").set_selected([k for k, _ in TRIGGER_OPTIONS].index(key))
+
+
+def test_analog_repeat_hint_copy_leads_with_the_warning_glyph_and_matches_the_spec():
+    # Spec §4: exactly the three sentences, one wrapped line, leading with ⚠️.
+    assert _ANALOG_REPEAT_HINT.startswith("⚠️ ")
+    assert "\n" not in _ANALOG_REPEAT_HINT
+    assert "far faster than a hand could" in _ANALOG_REPEAT_HINT
+    assert "single-player or otherwise known-safe games" in _ANALOG_REPEAT_HINT
+    assert "never in competitive multiplayer" in _ANALOG_REPEAT_HINT
+    assert "flagged as automation" in _ANALOG_REPEAT_HINT
+
+
+def test_analog_repeat_selection_reveals_the_hint_and_changing_away_removes_it():
+    stub = DaemonStub()
+    editor = build_binding_editor(
+        stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None, capture_mode="analog"
+    )
+
+    assert _analog_hint_labels(editor) == []
+
+    _select_trigger(editor, "analog_repeat")
+    hints = _analog_hint_labels(editor)
+    assert len(hints) == 1
+    assert "dim" in hints[0].get_css_classes()
+    assert hints[0].get_wrap()
+
+    _select_trigger(editor, "hold_to_repeat")
+    assert _analog_hint_labels(editor) == []
+
+
+def test_analog_repeat_hint_sits_directly_below_the_trigger_mode_row():
+    stub = DaemonStub()
+    editor = build_binding_editor(
+        stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None, capture_mode="analog"
+    )
+    _select_trigger(editor, "analog_repeat")
+
+    trigger_row = find_one(
+        editor, lambda w: isinstance(w, Gtk.Box) and _row_label_text(w) == "Trigger mode"
+    )
+    assert trigger_row.get_next_sibling() is _analog_hint_labels(editor)[0]
+
+
+def test_analog_repeat_hint_shows_for_an_existing_analog_repeat_binding_on_open():
+    stub = DaemonStub()
+    stub.set_binding(
+        "grid_r1c1", "base",
+        {"trigger": "analog_repeat", "type": "keypress", "key": "KEY_A", "modifiers": []},
+    )
+    editor = build_binding_editor(
+        stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None, capture_mode="analog"
+    )
+
+    assert len(_analog_hint_labels(editor)) == 1
+
+
+def test_analog_repeat_hint_never_appears_for_a_non_grid_input():
+    stub = DaemonStub()
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "mode_key", lambda: None)
+    popover = editor_content(btn)
+
+    trigger_dd = _dropdown_labeled(popover, "Trigger mode")
+    labels = [trigger_dd.get_model().get_string(i) for i in range(trigger_dd.get_model().get_n_items())]
+    assert "Analog-repeat" not in labels
+    assert _analog_hint_labels(popover) == []
+
+
+def test_analog_repeat_hint_tracks_the_selection_across_action_kind_changes():
+    stub = DaemonStub()
+    editor = build_binding_editor(
+        stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None, capture_mode="analog"
+    )
+    _select_trigger(editor, "analog_repeat")
+    assert len(_analog_hint_labels(editor)) == 1
+
+    action_dd = _dropdown_labeled(editor, "Action")
+    # Macro keeps the same Trigger-mode matrix — analog_repeat stays selected.
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("macro"))
+    assert len(_analog_hint_labels(editor)) == 1
+
+    # Profile Switch is locked to Fire-once — the hint must clear.
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("profile_switch"))
+    assert _analog_hint_labels(editor) == []
+
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("keypress"))
+    assert _analog_hint_labels(editor) == []
+
+
+def test_analog_repeat_hint_does_not_accumulate_across_repeated_action_kind_switching():
+    # The show/hide reaction rides a single persistent trigger_dd listener,
+    # not one reconnected per render_action_editor() rebuild — cycling kinds
+    # must not pile up stale handlers that leave duplicate hint labels.
+    stub = DaemonStub()
+    editor = build_binding_editor(
+        stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None, capture_mode="analog"
+    )
+    action_dd = _dropdown_labeled(editor, "Action")
+    for _ in range(4):
+        action_dd.set_selected([k for k, _ in ACTION_TYPES].index("macro"))
+        action_dd.set_selected([k for k, _ in ACTION_TYPES].index("keypress"))
+
+    _select_trigger(editor, "analog_repeat")
+    assert len(_analog_hint_labels(editor)) == 1
+
+    _select_trigger(editor, "toggle")
+    assert _analog_hint_labels(editor) == []
+
+
+def test_analog_repeat_hint_works_in_the_deep_stage_editor():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)  # lands on the Deep stage
+
+    assert _analog_hint_labels(editor) == []
+    _select_trigger(editor, "analog_repeat")
+    assert len(_analog_hint_labels(editor)) == 1
+
+    _select_trigger(editor, "hold_to_repeat")
+    assert _analog_hint_labels(editor) == []
 
 
 def test_selecting_axis_disables_the_trigger_dropdown():

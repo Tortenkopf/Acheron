@@ -41,6 +41,27 @@ from .controller_picker import build_inline_controller_picker
 from .key_picker import LABEL_BY_CODE, build_inline_key_picker
 
 
+# Output-safety spec §4 (effort `.scratch/output-safety-guidance/`, ticket
+# 04): a **GUI hint** (CONTEXT.md → Interface) shown directly below the
+# Trigger-mode dropdown whenever the selected Trigger mode is
+# `analog_repeat`, in every editor that offers the selector (the individual
+# binding editor and the deep-stage editor — both flow through
+# `build_action_and_trigger_fields`). It tracks the live selection rather
+# than firing once, so it is genuinely added to / removed from the tree as
+# the selection crosses `analog_repeat` — no `ui_state` seen-flag, no
+# dismiss control. Leads with the ⚠️ emoji, a deliberate exception to the
+# GUI's no-emoji norm (matched by the Macro-editor disclaimer, spec §2).
+# Rendered as one wrapped line — the sentences are the content, not a
+# layout. Written to stay correct after kernel-shaped-repeat ticket 07's
+# `value=2` rebuild: it is about the real *rate* the ramp can reach, not the
+# event *shape*.
+_ANALOG_REPEAT_HINT = (
+    "⚠️ Analog-repeat can drive a key far faster than a hand could as it nears full "
+    "travel. Use it only in single-player or otherwise known-safe games — never in "
+    "competitive multiplayer, where it may be flagged as automation."
+)
+
+
 def action_summary(
     binding: dict | None, inp: str, macros: dict, steppers: dict | None = None, axis_target: str | None = None
 ) -> str:
@@ -519,7 +540,32 @@ def build_action_and_trigger_fields(
     trigger_keys = [k for k, _ in trigger_options]
     trigger_dd = Gtk.DropDown(model=Gtk.StringList.new([lbl for _, lbl in trigger_options]))
     trigger_dd.set_selected(trigger_keys.index(starting["trigger"]))
-    fields.append(labeled_row("Trigger mode", trigger_dd))
+    trigger_row = labeled_row("Trigger mode", trigger_dd)
+    fields.append(trigger_row)
+
+    # Output-safety spec §4 / ticket 04: the Analog-repeat GUI hint. Added
+    # directly below the Trigger-mode row while `analog_repeat` is the live
+    # selection and removed the moment it changes away — a persistent hint
+    # that tracks the selection, not a one-shot toast. `sync_analog_hint`
+    # runs from a single `trigger_dd` listener wired once here (so it never
+    # accumulates one stale handler per `render_action_editor()` rebuild, and
+    # reacts for every Action kind that shows the selector — unlike the
+    # keypress-only `_trigger_handler` slot below) and again at the end of
+    # `render_action_editor()`, which is where an Action-kind change can pull
+    # `analog_repeat` out of the model entirely (Profile Switch, Axis).
+    analog_hint = Gtk.Label(label=_ANALOG_REPEAT_HINT, xalign=0, wrap=True, css_classes=["dim"])
+
+    def sync_analog_hint() -> None:
+        idx = trigger_dd.get_selected()
+        selected = trigger_keys[idx] if 0 <= idx < len(trigger_keys) else None
+        want = selected == "analog_repeat"
+        present = analog_hint.get_parent() is not None
+        if want and not present:
+            fields.insert_child_after(analog_hint, trigger_row)
+        elif present and not want:
+            fields.remove(analog_hint)
+
+    trigger_dd.connect("notify::selected", lambda *_: sync_analog_hint())
 
     known_action_kinds = [k for k, _ in available_action_types]
     # `Action::Step` (ticket 03/54) has no editor built here yet (ticket
@@ -820,6 +866,12 @@ def build_action_and_trigger_fields(
             editor_slot.append(new_macro_btn)
 
             save_btn.set_sensitive(draft["macro"].get("macro_id") is not None)
+
+        # An Action-kind change can rebuild the Trigger-mode model and pull
+        # `analog_repeat` out of it (Profile Switch, Axis) or shift the
+        # selected index — re-sync the hint against the settled model here,
+        # after `trigger_keys` is up to date, not only from the live listener.
+        sync_analog_hint()
 
     action_dd.connect("notify::selected", lambda *_: render_action_editor())
     render_action_editor()
