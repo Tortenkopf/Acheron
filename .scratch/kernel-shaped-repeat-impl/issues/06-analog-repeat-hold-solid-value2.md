@@ -18,38 +18,46 @@ sibling).
 
 **Blocked by:** 01 — Injector `repeat_key` primitive.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `capture::analog::RepeatSchedule` gains a no-`delay_ms` missed-deadline clamp
-      (§5.4): either `advance_fired_steady(elapsed, fired) -> u32`
-      = `max(fired + 1, elapsed / period_ms + 1)`, or generalise `advance_fired` with
-      a `delay: Duration` argument. Pick one; unit-test it the way `advance_fired` is
-      table-tested (on-schedule → `+1`; a multi-period stall → jump to the
-      elapsed-time count, next due a full `period_ms` later, no burst; never
-      regresses).
-- [ ] `run_analog_repeat_loop` gains a `schedule: RepeatSchedule` parameter, read at
-      spawn in `dispatch::update_analog_repeats` from the same source
-      (`read_repeat_schedule`), and `solid_since: Option<Instant>` / `solid_fired: u32`
-      loop state. Thread `schedule` through `ActiveAnalogRepeat::spawn` /
-      `Engine::spawn` alongside `pulse_hold`.
-- [ ] The `TickPlan::HoldSolid` arm (per §5.3): on first entry press the `KeyDown`
-      steps (`value=1`), set `holding_solid`, `solid_since = Some(now)`,
-      `solid_fired = 0`. Thereafter `select!` on `cancel` / `depth_rx.changed()` /
-      a `sleep` to the next `value=2` due at `solid_since + N * period_ms` (no
-      `delay_ms`); on the sleep firing, `solid_fired = advance_fired_steady(...)`,
-      then `injector.repeat_key(solid_key)`.
-- [ ] `solid_key` is the single non-modifier `KeyDown` code in `steps` (Analog-repeat
-      is grid-key-only; its Action compiles to a keypress or single button).
-- [ ] Leaving hold-solid (`release_solid_first` true, or cancel): the existing
-      `release_solid` / `executor::force_release` fires the `KeyUp` steps (`value=0`)
-      and `solid_since` / `solid_fired` reset to `None` / `0`.
-- [ ] The tap band (`TickPlan::Tap`, Depth < 235) is untouched —
+- [x] `capture::analog::RepeatSchedule` gains `without_warmup()` — the same live
+      envelope with `delay_ms` collapsed to a single `period_ms`, so the Nth repeat is
+      due a plain `N * period_ms` in and the first `value=2` lands at `period_ms`, not
+      `delay_ms`. `due_offset` / `repeat_due` / `advance_fired` then apply unchanged —
+      the missed-deadline clamp (§5.4) included — so it needs no `advance_fired_steady`
+      sibling (the ticket's other listed option; this is the DRYer of the two).
+      Unit-tested the way `advance_fired` is: first repeat at `period_ms`; the whole
+      `due_offset`/`repeat_due` boundary contract on the collapsed schedule; a
+      multi-period stall → one repeat, next due within a period, no burst; never
+      regresses.
+- [x] `run_analog_repeat_loop` gains a `schedule: RepeatSchedule` parameter (threaded
+      through `ActiveAnalogRepeat::spawn` / `Engine::spawn` alongside `pulse_hold`) and
+      a `Solid { Off | On { since, fired } }` loop-state enum — one value, not a
+      hand-synced `bool` + `Option<Instant>` + `u32`. The schedule is the
+      daemon-startup-resolved value ticket 05 already threads to `DispatchState`
+      (`toggle_autorepeat_schedule`, now read by both self-driven `value=2` emitters);
+      an inline blocking read at spawn would break the `tokio::time::pause()` harness,
+      exactly as ticket 05/68 found.
+- [x] The `TickPlan::HoldSolid` arm (per §5.3): on first entry press the `KeyDown`
+      steps (`value=1`), `solid = Solid::On { since: now, fired: 0 }`. Thereafter
+      `select!` on `cancel` / `depth_rx.changed()` /
+      `sleep_until(since + schedule.due_offset(fired))`; on the sleep firing, bump
+      `fired` via `schedule.advance_fired(elapsed, fired)` then
+      `injector.repeat_key(solid_key)`.
+- [x] `solid_key` is the single non-modifier `KeyDown` code in `steps`
+      (`solid_key_in`, unit-tested for plain / modified keypress + controller button +
+      the none case). `None` ⇒ the arm just parks (pre-spec behaviour).
+- [x] Leaving hold-solid (`release_solid_first` true, or cancel): `leave_solid`
+      (one helper, both the Idle and Tap arms) fires the `KeyUp` steps via
+      `release_solid` (`value=0`) and resets `solid` to `Solid::Off`; `force_release`
+      on task exit covers the cancel path.
+- [x] The tap band (`TickPlan::Tap`, Depth < 235) is untouched —
       `fire_analog_repeat_pulse` still emits balanced `[KeyDown … pulse_hold … KeyUp]`
-      pulses paced by `tap_pace_wait` (ticket 06). A `start_paused` test asserts the
-      tap→hold-solid→tap transition: pulsed pairs below 235, a `value=1`+`value=2`
-      stream at/above 235 with the first `value=2` at `period_ms` (not `delay_ms`),
-      pulsed pairs again on dropping back below, with a clean `value=0` at each
-      hold-solid exit and no key left down.
-- [ ] Analog-repeat + Macro stays rejected at the config layer (ticket 09) — nothing
-      to do here; note it.
-- [ ] `cargo fmt --check`, `cargo clippy --all-targets`, full daemon suite green.
+      pulses paced by `tap_pace_wait`. `analog_repeat_tap_to_hold_solid_to_tap_transition`
+      asserts the full ramp; `analog_repeat_holds_solid_above_the_hold_threshold`
+      rewritten for the `value=1`+`value=2` stream (first `value=2` at `period_ms`,
+      clean `value=0` on exit, key not left down).
+- [x] Analog-repeat + Macro stays rejected at the config layer (ticket 09) —
+      unchanged (`config::tests::refuses_to_start_when_a_chord_binding_is_analog_repeat`
+      / `..._on_a_non_grid_input` still green); nothing added here.
+- [x] `cargo fmt --check`, `cargo clippy --all-targets`, full daemon suite green (516).

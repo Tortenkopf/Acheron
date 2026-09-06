@@ -22,6 +22,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::capture::analog::RepeatSchedule;
 use crate::config::Action;
 use crate::executor::{self, MacroStep};
 use crate::injector::Injector;
@@ -69,7 +70,9 @@ const ANALOG_REPEAT_HOLD_SOLID: u8 = 235;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TickPlan {
     /// Depth ≥ HOLD_SOLID: press every Down step solid if not already
-    /// holding, then wait on `depth_rx.changed()` / cancel.
+    /// holding (`value=1`), then drive a self-contained `value=2` autorepeat
+    /// stream at the kernel period until `depth_rx.changed()` / cancel
+    /// (spec-kernel-shaped-repeat.md §5.3).
     HoldSolid,
     /// Depth < DEADZONE: `update` is about to stop this task (or a stale
     /// wakeup is racing it) — wait, don't fire a spurious minimum-rate pulse.
@@ -189,6 +192,7 @@ impl ActiveAnalogRepeat {
         input: Input,
         steps: Vec<MacroStep>,
         pulse_hold: Duration,
+        schedule: RepeatSchedule,
         depth_rx: watch::Receiver<HashMap<Input, u8>>,
     ) -> Self {
         let cancel = CancellationToken::new();
@@ -197,6 +201,7 @@ impl ActiveAnalogRepeat {
             input,
             steps,
             pulse_hold,
+            schedule,
             depth_rx,
             cancel.clone(),
         ));
@@ -246,44 +251,127 @@ async fn release_solid(injector: &Injector, steps: &[MacroStep], held: &mut Hash
     }
 }
 
+/// The single non-modifier `KeyDown` code in a compiled Analog-repeat Action —
+/// the one key the hold-solid phase autorepeats with `value=2`
+/// (spec-kernel-shaped-repeat.md §5.3). Analog-repeat is grid-key-only and its
+/// Action compiles to a keypress (`[mods…, KeyDown(k), KeyUp(k), …mods]`) or a
+/// single button (`[KeyDown(b), Delay, KeyUp(b)]`), so the first non-modifier
+/// `KeyDown` is that key. `None` for a shape with no such step (e.g. a
+/// Profile-switch Action) — the hold-solid arm then just parks the held key.
+fn solid_key_in(steps: &[MacroStep]) -> Option<KeyCode> {
+    const MODIFIERS: [KeyCode; 4] = [
+        KeyCode::KEY_LEFTCTRL,
+        KeyCode::KEY_LEFTSHIFT,
+        KeyCode::KEY_LEFTALT,
+        KeyCode::KEY_LEFTMETA,
+    ];
+    steps.iter().find_map(|step| match step {
+        MacroStep::KeyDown(key) if !MODIFIERS.contains(key) => Some(*key),
+        _ => None,
+    })
+}
+
+/// Whether the loop is holding the key solid, and — when it is — the state
+/// its self-driven `value=2` emitter needs (§5.3): when this hold-solid phase
+/// began and how many repeats it has emitted so far. One value rather than a
+/// hand-synced `bool` + `Option<Instant>` + `u32`.
+#[derive(Debug, Clone, Copy)]
+enum Solid {
+    Off,
+    On { since: Instant, fired: u32 },
+}
+
+/// Releases whatever `steps` left held and clears the hold-solid state — the
+/// "if you were holding solid, let go first" step that runs before the
+/// deadzone / tapping branches. A no-op when not holding solid.
+async fn leave_solid(
+    injector: &Injector,
+    steps: &[MacroStep],
+    held: &mut HashSet<KeyCode>,
+    solid: &mut Solid,
+) {
+    if matches!(solid, Solid::On { .. }) {
+        release_solid(injector, steps, held).await;
+        *solid = Solid::Off;
+    }
+}
+
 /// The task body `ActiveAnalogRepeat::spawn` runs — a thin shell driving
 /// `tick_plan`. Exits (force-releasing whatever it's still holding) only on
 /// external cancellation — `Engine::update` is the sole owner of *when* that
 /// happens, driven by Depth crossing back down through the deadzone.
+///
+/// `schedule` is the live kernel-autorepeat envelope resolved once at Daemon
+/// startup and threaded down as a plain value (same discipline as the Toggle
+/// path, ticket 05). The hold-solid phase runs it through `without_warmup` —
+/// it drives its own `value=2` stream with no `delay_ms` gap before the first
+/// repeat (§5.3) — while `due_offset` / `repeat_due` / `advance_fired` apply
+/// unchanged, the missed-deadline clamp (§5.4) included.
 async fn run_analog_repeat_loop(
     injector: Injector,
     input: Input,
     steps: Vec<MacroStep>,
     pulse_hold: Duration,
+    schedule: RepeatSchedule,
     mut depth_rx: watch::Receiver<HashMap<Input, u8>>,
     cancel: CancellationToken,
 ) {
+    let schedule = schedule.without_warmup();
+    let solid_key = solid_key_in(&steps);
     let mut held: HashSet<KeyCode> = HashSet::new();
-    let mut holding_solid = false;
+    let mut solid = Solid::Off;
 
     loop {
         let depth = *depth_rx.borrow().get(&input).unwrap_or(&0);
-        match tick_plan(depth, holding_solid) {
+        match tick_plan(depth, matches!(solid, Solid::On { .. })) {
             TickPlan::HoldSolid => {
-                if !holding_solid {
-                    for step in &steps {
-                        if let MacroStep::KeyDown(_) = step {
-                            let _ = executor::execute_step(&injector, &mut held, *step).await;
+                let (since, fired) = match solid {
+                    Solid::On { since, fired } => (since, fired),
+                    Solid::Off => {
+                        for step in &steps {
+                            if let MacroStep::KeyDown(_) = step {
+                                let _ = executor::execute_step(&injector, &mut held, *step).await;
+                            }
                         }
+                        let since = Instant::now();
+                        solid = Solid::On { since, fired: 0 };
+                        (since, 0)
                     }
-                    holding_solid = true;
-                }
+                };
+                // With no single key to autorepeat (an Action that compiled
+                // to no non-modifier `KeyDown`), just hold it down and park
+                // until Depth moves or the task is cancelled — the pre-spec
+                // behaviour.
+                let Some(solid_key) = solid_key else {
+                    tokio::select! {
+                        () = cancel.cancelled() => break,
+                        _ = depth_rx.changed() => {}
+                    }
+                    continue;
+                };
+                // Nth repeat due `N * period_ms` after this hold-solid phase
+                // began (no initial REP_DELAY — `without_warmup`).
+                let due = since + schedule.due_offset(fired);
                 tokio::select! {
                     () = cancel.cancelled() => break,
                     _ = depth_rx.changed() => {}
+                    () = tokio::time::sleep_until(due) => {
+                        let elapsed = since.elapsed();
+                        if schedule.repeat_due(elapsed, fired) {
+                            solid = Solid::On {
+                                since,
+                                fired: schedule.advance_fired(elapsed, fired),
+                            };
+                            let _ = injector.repeat_key(solid_key).await;
+                        }
+                    }
                 }
             }
             TickPlan::Idle {
                 release_solid_first,
             } => {
                 if release_solid_first {
-                    release_solid(&injector, &steps, &mut held).await;
-                    holding_solid = false;
+                    leave_solid(&injector, &steps, &mut held, &mut solid).await;
                 }
                 tokio::select! {
                     () = cancel.cancelled() => break,
@@ -295,8 +383,7 @@ async fn run_analog_repeat_loop(
                 release_solid_first,
             } => {
                 if release_solid_first {
-                    release_solid(&injector, &steps, &mut held).await;
-                    holding_solid = false;
+                    leave_solid(&injector, &steps, &mut held, &mut solid).await;
                 }
                 let tick_start = Instant::now();
                 let cancelled = tokio::select! {
@@ -362,10 +449,11 @@ impl Engine {
         input: Input,
         steps: Vec<MacroStep>,
         pulse_hold: Duration,
+        schedule: RepeatSchedule,
         depth_rx: watch::Receiver<HashMap<Input, u8>>,
     ) {
         self.tasks.entry(input).or_insert_with(|| {
-            ActiveAnalogRepeat::spawn(injector, input, steps, pulse_hold, depth_rx)
+            ActiveAnalogRepeat::spawn(injector, input, steps, pulse_hold, schedule, depth_rx)
         });
     }
 
@@ -534,5 +622,39 @@ mod tests {
             key: KeyCode::KEY_A,
         };
         assert_eq!(pulse_hold_for(&kbd), ANALOG_REPEAT_PULSE_HOLD);
+    }
+
+    // ── solid_key_in ─────────────────────────────────────────────────────
+
+    #[test]
+    fn solid_key_in_picks_the_bare_key_of_a_plain_keypress() {
+        let steps = executor::keypress_steps(Modifiers::default(), KeyCode::KEY_F1);
+        assert_eq!(solid_key_in(&steps), Some(KeyCode::KEY_F1));
+    }
+
+    #[test]
+    fn solid_key_in_skips_the_modifiers_of_a_modified_keypress() {
+        let mods = Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Modifiers::default()
+        };
+        let steps = executor::keypress_steps(mods, KeyCode::KEY_X);
+        assert_eq!(solid_key_in(&steps), Some(KeyCode::KEY_X));
+    }
+
+    #[test]
+    fn solid_key_in_picks_the_button_of_a_controller_button_press() {
+        let steps = executor::controller_button_steps(KeyCode::BTN_SOUTH);
+        assert_eq!(solid_key_in(&steps), Some(KeyCode::BTN_SOUTH));
+    }
+
+    #[test]
+    fn solid_key_in_is_none_when_no_non_modifier_key_is_pressed() {
+        assert_eq!(solid_key_in(&[]), None);
+        assert_eq!(
+            solid_key_in(&[MacroStep::KeyDown(KeyCode::KEY_LEFTCTRL)]),
+            None
+        );
     }
 }

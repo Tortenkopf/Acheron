@@ -89,10 +89,14 @@ struct DispatchState {
     actuation_tx: watch::Sender<HashMap<Input, ActuationPoint>>,
     capture_control_tx: mpsc::Sender<bool>,
     toggle_lap_target: Duration,
-    /// The kernel autorepeat envelope a single-key Toggle holds at
-    /// (`spec-kernel-shaped-repeat.md` §5.2, ticket 05) — resolved once at
-    /// Daemon startup (`main.rs`) and threaded to every `spawn_autorepeat`
-    /// call site as a plain value, exactly like `toggle_lap_target`.
+    /// The live kernel autorepeat envelope every self-driven `value=2` emitter
+    /// paces from (`spec-kernel-shaped-repeat.md` §5.2 single-key Toggle,
+    /// ticket 05; §5.3 Analog-repeat hold-solid, ticket 06) — resolved once at
+    /// Daemon startup (`main.rs`) and threaded to every spawn site as a plain
+    /// value, exactly like `toggle_lap_target`. Both emitters read the same
+    /// envelope; Analog-repeat's hold-solid phase runs it through
+    /// `RepeatSchedule::without_warmup` (no `delay_ms` gap before the first
+    /// `value=2` — §5.3), the Toggle path keeps the full envelope.
     toggle_autorepeat_schedule: RepeatSchedule,
     /// The `led` task's `watch::Sender` (`tartarus-status-leds` ticket 02 /
     /// ADR-0006), handed in from `main.rs`. `push_status_leds` sends the
@@ -599,6 +603,13 @@ impl DispatchState {
                 input,
                 steps,
                 analog_repeat::pulse_hold_for(&binding.action),
+                // The same startup-resolved kernel envelope the Toggle path
+                // holds at — hold-solid's `value=2` stream paces from it
+                // (spec-kernel-shaped-repeat.md §5.3), minus the `delay_ms`
+                // warm-up (`RepeatSchedule::without_warmup`, applied in the
+                // loop). Not re-read here: an inline blocking read would break
+                // the `tokio::time::pause()` test harness (ticket 68).
+                self.toggle_autorepeat_schedule,
                 depth_rx.clone(),
             );
         }
@@ -851,11 +862,12 @@ pub async fn run(
     // press — the kernel autorepeat rate it reflects never changes while
     // the Daemon is running.
     toggle_lap_target: Duration,
-    // Ticket 05 / spec-kernel-shaped-repeat.md §5.2: the kernel autorepeat
-    // envelope a single-key Toggle holds at, resolved once at Daemon startup
-    // (`main.rs`) beside `toggle_lap_target` and threaded down the same way —
-    // an inline per-press blocking read would break the `tokio::time::pause()`
-    // test harness (ticket 68's finding).
+    // Ticket 05 / 06 / spec-kernel-shaped-repeat.md §5.2, §5.3: the live kernel
+    // autorepeat envelope every self-driven `value=2` emitter paces from — a
+    // single-key Toggle hold and Analog-repeat's hold-solid phase — resolved
+    // once at Daemon startup (`main.rs`) beside `toggle_lap_target` and
+    // threaded down the same way; an inline per-press blocking read would
+    // break the `tokio::time::pause()` test harness (ticket 68's finding).
     toggle_autorepeat_schedule: RepeatSchedule,
     // Ticket 71: the same live-Depth watch channel the Analog grid task
     // already publishes into on every incoming report (`capture::analog`,
@@ -2647,17 +2659,42 @@ mod tests {
 
         depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), u8::MAX)]));
         tokio::task::yield_now().await;
-        // Well past several ordinary ticks' worth of time — still holding
-        // solid the whole way through, not tapping.
-        tokio::time::advance(Duration::from_millis(500)).await;
-        tokio::task::yield_now().await;
 
-        let batches = sink.batches();
-        assert_eq!(batches.len(), 1, "expected exactly one KeyDown, no taps");
-        let evdev::EventSummary::Key(_, code, value) = batches[0][0].destructure() else {
-            panic!("expected a key event");
-        };
-        assert_eq!((code, value), (evdev::KeyCode::KEY_F1, 1));
+        // Crossing 235: a single value=1, nothing else yet — no [Down, Up]
+        // taps, and no immediate value=2 (spec-kernel-shaped-repeat.md §5.3).
+        assert_eq!(sink.batches().len(), 1, "one value=1 on crossing 235");
+        assert_eq!(
+            key_and_value(sink.batches()[0][0]),
+            (evdev::KeyCode::KEY_F1, 1)
+        );
+
+        // Just before the kernel period: still no autorepeat.
+        tokio::time::advance(Duration::from_millis(32)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            sink.batches().len(),
+            1,
+            "no value=2 before the first period_ms elapses"
+        );
+
+        // The first value=2 lands at period_ms (33) — not delay_ms (250):
+        // this is the top of a hand-driven tapping ramp, not a fresh press.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(sink.batches().len(), 2, "first value=2 at period_ms");
+        assert_eq!(
+            key_and_value(sink.batches()[1][0]),
+            (evdev::KeyCode::KEY_F1, 2)
+        );
+
+        // Steady value=2 every period_ms thereafter.
+        tokio::time::advance(Duration::from_millis(33)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(sink.batches().len(), 3, "second value=2 one period later");
+        assert_eq!(
+            key_and_value(sink.batches()[2][0]),
+            (evdev::KeyCode::KEY_F1, 2)
+        );
 
         // Falling back below the deadzone force-releases the held key.
         depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), 0u8)]));
@@ -2670,11 +2707,164 @@ mod tests {
         inj_handle.await.unwrap().unwrap();
 
         let batches = sink.batches();
-        assert_eq!(batches.len(), 2);
-        let evdev::EventSummary::Key(_, code, value) = batches[1][0].destructure() else {
-            panic!("expected a key event");
+        assert_eq!(
+            key_and_value(*batches.last().unwrap().last().unwrap()),
+            (evdev::KeyCode::KEY_F1, 0),
+            "a clean value=0 when Depth leaves hold-solid"
+        );
+        // Every value=1 for the key is balanced by a value=0 — nothing left down.
+        let net_downs = batches
+            .iter()
+            .flatten()
+            .filter(|e| key_and_value(**e).0 == evdev::KeyCode::KEY_F1)
+            .filter_map(|e| match key_and_value(*e).1 {
+                1 => Some(1i32),
+                0 => Some(-1),
+                _ => None,
+            })
+            .sum::<i32>();
+        assert_eq!(net_downs, 0, "the key is not left logically down");
+    }
+
+    /// Ticket 06 / spec-kernel-shaped-repeat.md §5.3: the full
+    /// tap → hold-solid → tap transition. Below 235: balanced [Down, Up]
+    /// pulse pairs (ticket 20's deliberately-human shape, untouched). At/above
+    /// 235: a value=1 + steady value=2 stream, first value=2 at period_ms.
+    /// Dropping back below: a clean value=0, then pulsed pairs resume — and
+    /// the key is never left down at any exit.
+    #[tokio::test(start_paused = true)]
+    async fn analog_repeat_tap_to_hold_solid_to_tap_transition() {
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::AnalogRepeat,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: evdev::KeyCode::KEY_F1,
+                },
+            },
+        );
+
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
+        let (tx, rx) = mpsc::channel(8);
+        let (_conn_tx, conn_rx) = mpsc::channel(8);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (depth_tx, depth_rx) = watch::channel(HashMap::new());
+        let dispatch_handle = tokio::spawn(run(
+            rx,
+            conn_rx,
+            cmd_rx,
+            inj.clone(),
+            config_with_bindings(bindings),
+            unused_config_path(),
+            None,
+            actuation_channel(),
+            capture_mode_channel(),
+            capture_control_channel(),
+            executor::MIN_TOGGLE_LAP,
+            RepeatSchedule::new(250, 33),
+            depth_rx,
+            device_info_channel(),
+            led_channel(),
+        ));
+
+        // Advance ~`ms` of paused time in 5ms steps so the clock drives each
+        // pulse edge / period sleep / injector round-trip in turn (the
+        // one-big-`advance` shortcut skips intermediate wakeups). The tap
+        // band's own `tap_pace_wait` sleep doesn't watch Depth, so a
+        // band-crossing isn't noticed until the in-flight pulse's pace sleep
+        // ends (~111ms worst case) — settle windows straddling a crossing are
+        // sized well past that.
+        async fn settle(ms: u64) {
+            for _ in 0..ms / 5 {
+                tokio::time::advance(Duration::from_millis(5)).await;
+                tokio::task::yield_now().await;
+            }
+        }
+        let values = |batches: &[Vec<evdev::InputEvent>]| -> Vec<i32> {
+            batches.iter().map(|b| key_and_value(b[0]).1).collect()
         };
-        assert_eq!((code, value), (evdev::KeyCode::KEY_F1, 0));
+
+        // ── tap band (depth 100 ≈ 9 Hz, ~111ms period) ──────────────────
+        depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), 100u8)]));
+        settle(300).await;
+
+        let tap = values(&sink.batches());
+        assert!(
+            tap.len() >= 2 && tap.len().is_multiple_of(2),
+            "balanced [Down, Up] pulse pairs below 235, got {tap:?}"
+        );
+        assert!(
+            tap.iter().all(|v| matches!(v, 0 | 1)),
+            "the tap band never emits value=2: {tap:?}"
+        );
+
+        // ── hold-solid (depth 250) ─────────────────────────────────────
+        depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), 250u8)]));
+        settle(300).await;
+
+        let solid = values(&sink.batches());
+        // The hold-solid press is the last value=1 in the log; everything
+        // after it is a bare value=2 stream — no [Down, Up] pulse pairs.
+        let press_at = solid.iter().rposition(|&v| v == 1).expect("a value=1");
+        assert!(
+            solid[press_at + 1..].iter().all(|&v| v == 2),
+            "hold-solid emits only value=2 after the press: {:?}",
+            &solid[press_at..]
+        );
+        let v2_in_solid = solid[press_at + 1..].len();
+        assert!(
+            v2_in_solid >= 5,
+            "a steady value=2 stream over 300ms at a 33ms period, got {v2_in_solid}"
+        );
+        let v2_total = solid.iter().filter(|&&v| v == 2).count();
+
+        // ── back to the tap band (depth 100) ───────────────────────────
+        depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), 100u8)]));
+        settle(300).await;
+
+        let after = values(&sink.batches());
+        // A clean value=0 closes the hold-solid stream…
+        assert_eq!(
+            after[solid.len()],
+            0,
+            "a clean value=0 on leaving hold-solid: {:?}",
+            &after[solid.len().saturating_sub(1)..]
+        );
+        // …and no further value=2 is emitted once Depth is back below 235.
+        assert_eq!(
+            after.iter().filter(|&&v| v == 2).count(),
+            v2_total,
+            "no value=2 in the tap band"
+        );
+        assert!(
+            after.len() > solid.len() + 1,
+            "pulsed pairs resume below 235"
+        );
+
+        depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), 0u8)]));
+        settle(40).await;
+        drop(tx);
+        drop(depth_tx);
+        dispatch_handle.await.unwrap().unwrap();
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+
+        // Nothing left logically down at the end of the whole ramp.
+        let net_downs = sink
+            .batches()
+            .iter()
+            .flatten()
+            .filter(|e| key_and_value(**e).0 == evdev::KeyCode::KEY_F1)
+            .filter_map(|e| match key_and_value(*e).1 {
+                1 => Some(1i32),
+                0 => Some(-1),
+                _ => None,
+            })
+            .sum::<i32>();
+        assert_eq!(net_downs, 0, "no key left down after tap→solid→tap");
     }
 
     #[tokio::test(start_paused = true)]
