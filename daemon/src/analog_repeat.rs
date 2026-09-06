@@ -99,6 +99,19 @@ pub(crate) fn tick_plan(depth: u8, holding_solid: bool) -> TickPlan {
     }
 }
 
+/// How long the tapping-band loop sleeps after a pulse to pace the next fire
+/// to the curve `period`, measured from the tick's start — `pulse_elapsed` is
+/// how long the fire itself took. Normally `period - pulse_elapsed`. On an
+/// overrun (`pulse_elapsed >= period` — the pulse's injector round-trips
+/// blocked under back-pressure, or the runtime stalled) it re-arms for a
+/// full `period` from now rather than letting the loop re-enter immediately,
+/// so a run of overrunning ticks can't free-run above the 20 Hz curve
+/// ceiling. Mirrors the kernel's `input_repeat_key`, which re-arms its timer
+/// from the current instant and never emits a catch-up burst (ticket 06).
+fn tap_pace_wait(period: Duration, pulse_elapsed: Duration) -> Duration {
+    period.checked_sub(pulse_elapsed).unwrap_or(period)
+}
+
 /// The `1 / lerp(MIN_HZ, MAX_HZ, depth/255)` rate math (ticket 20's Answer:
 /// not renormalized to the key's own Actuation/Release band) — a private
 /// helper feeding `tick_plan`'s `Tap.period`.
@@ -293,12 +306,10 @@ async fn run_analog_repeat_loop(
                 if cancelled {
                     break;
                 }
-                let elapsed = tick_start.elapsed();
-                if elapsed < period {
-                    tokio::select! {
-                        () = cancel.cancelled() => break,
-                        () = tokio::time::sleep(period - elapsed) => {}
-                    }
+                let wait = tap_pace_wait(period, tick_start.elapsed());
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    () = tokio::time::sleep(wait) => {}
                 }
             }
         }
@@ -432,6 +443,32 @@ mod tests {
         assert!((hz(12) - 2.847).abs() < 0.05, "depth 12: {}", hz(12));
         assert!((hz(100) - 9.06).abs() < 0.05, "depth 100: {}", hz(100));
         assert!((hz(235) - 18.6).abs() < 0.1, "depth 235: {}", hz(235));
+    }
+
+    // ── tap_pace_wait ─────────────────────────────────────────────────────
+
+    #[test]
+    fn tap_pace_wait_sleeps_the_remainder_of_the_period_when_the_pulse_fits() {
+        let period = Duration::from_millis(50);
+        assert_eq!(
+            tap_pace_wait(period, Duration::from_millis(15)),
+            Duration::from_millis(35)
+        );
+        // Right on the pace: no sleep, the next fire is already due.
+        assert_eq!(tap_pace_wait(period, period), Duration::ZERO);
+    }
+
+    #[test]
+    fn tap_pace_wait_re_arms_a_full_period_on_an_overrun_rather_than_bursting() {
+        let period = Duration::from_millis(50);
+        // The pulse blocked past the period under back-pressure / a stall.
+        // Don't re-fire immediately (that's the catch-up burst ticket 06
+        // guards against) — wait a full period from now.
+        assert_eq!(
+            tap_pace_wait(period, Duration::from_millis(300)),
+            period,
+            "a 300ms overrun on a 50ms period must still yield a full period"
+        );
     }
 
     // ── reconcile table ───────────────────────────────────────────────────

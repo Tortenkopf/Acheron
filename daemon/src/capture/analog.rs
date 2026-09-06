@@ -269,6 +269,26 @@ impl RepeatSchedule {
         let due_at_ms = u128::from(self.delay_ms) + u128::from(fired) * u128::from(self.period_ms);
         held_for.as_millis() >= due_at_ms
     }
+
+    /// The `fired` count to advance to after emitting one Repeat at
+    /// `held_for` — normally `fired + 1`, but when the loop stalled long
+    /// enough that several repeats' due times slipped past (a full
+    /// `event_rx` back-pressuring `blocking_send`, or a scheduler hiccup),
+    /// it jumps straight to the count real elapsed time calls for, so the
+    /// caller emits exactly one Repeat now and the next falls due a full
+    /// `period_ms` later — not a sub-millisecond catch-up burst of the
+    /// missed ones. Mirrors the kernel's `input_repeat_key`, which re-arms
+    /// its timer from the current instant and never bursts (ticket 06).
+    pub fn advance_fired(&self, held_for: Duration, fired: u32) -> u32 {
+        let held_ms = held_for.as_millis();
+        let delay_ms = u128::from(self.delay_ms);
+        let elapsed_repeats = held_ms
+            .checked_sub(delay_ms)
+            .map(|since_delay| since_delay / u128::from(self.period_ms) + 1)
+            .unwrap_or(0);
+        let caught_up = u32::try_from(elapsed_repeats).unwrap_or(u32::MAX);
+        caught_up.max(fired + 1)
+    }
 }
 
 /// Runtime (non-pure) bookkeeping for one Grid key's currently-held Down —
@@ -808,10 +828,13 @@ fn relay_grid_blocking(
         // read a fresh report, so a device report cadence sparser than
         // `REPORT_POLL_TIMEOUT` still can't starve Hold-to-repeat.
         for (i, hold) in holds.iter_mut().enumerate() {
-            if let Some(state) = hold
-                && schedule.repeat_due(state.started.elapsed(), state.fired)
-            {
-                state.fired += 1;
+            let Some(state) = hold else { continue };
+            let held_for = state.started.elapsed();
+            if schedule.repeat_due(held_for, state.fired) {
+                // Advance past any repeats whose due time slipped by while
+                // the loop was stalled, rather than `+= 1` and firing a
+                // bunched catch-up burst on the next ticks (ticket 06).
+                state.fired = schedule.advance_fired(held_for, state.fired);
                 if tx
                     .blocking_send(PhysicalEvent {
                         input: grid_input_for_byte(i),
@@ -1177,6 +1200,44 @@ mod tests {
         assert!(schedule.repeat_due(Duration::from_millis(11), 0));
         assert!(!schedule.repeat_due(Duration::from_millis(10), 1));
         assert!(schedule.repeat_due(Duration::from_millis(11), 1));
+    }
+
+    #[test]
+    fn advance_fired_steps_by_one_when_on_schedule() {
+        let schedule = RepeatSchedule::new(250, 33);
+        // First repeat, due right at the delay: 0 -> 1.
+        assert_eq!(schedule.advance_fired(Duration::from_millis(250), 0), 1);
+        // Second, exactly one period later: 1 -> 2.
+        assert_eq!(schedule.advance_fired(Duration::from_millis(283), 1), 2);
+        // A tick that fires a hair past due still only steps by one.
+        assert_eq!(schedule.advance_fired(Duration::from_millis(300), 1), 2);
+    }
+
+    #[test]
+    fn advance_fired_skips_missed_repeats_after_a_stall_and_the_next_is_a_full_period_out() {
+        let schedule = RepeatSchedule::new(250, 33);
+        // Held 5s but only the initial repeat emitted (fired == 1): the loop
+        // stalled through ~143 due times. `repeat_due` is true...
+        assert!(schedule.repeat_due(Duration::from_millis(5_000), 1));
+        // ...and advancing jumps straight to the count real elapsed time
+        // calls for — (5000 - 250) / 33 + 1 == 144 — so exactly one Repeat
+        // is emitted now, not a burst of the 143 missed ones.
+        let fired = schedule.advance_fired(Duration::from_millis(5_000), 1);
+        assert_eq!(fired, (5_000 - 250) / 33 + 1);
+        // The next repeat is due one full period later, not immediately.
+        assert!(!schedule.repeat_due(Duration::from_millis(5_000), fired));
+        assert!(!schedule.repeat_due(Duration::from_millis(5_001), fired));
+        let next_due = 250 + u64::from(fired) * 33;
+        assert!(!schedule.repeat_due(Duration::from_millis(next_due - 1), fired));
+        assert!(schedule.repeat_due(Duration::from_millis(next_due), fired));
+    }
+
+    #[test]
+    fn advance_fired_never_regresses_the_count() {
+        let schedule = RepeatSchedule::new(250, 33);
+        // A spurious call before the first repeat is even due still moves
+        // forward rather than backward.
+        assert_eq!(schedule.advance_fired(Duration::from_millis(0), 4), 5);
     }
 
     // -- byte -> Input mapping (ticket 16: byte n == keycap n) -------------
