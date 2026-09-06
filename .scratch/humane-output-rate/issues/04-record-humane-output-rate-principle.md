@@ -1,7 +1,7 @@
 # Record the humane-output-rate principle — ADR + CONTEXT.md term
 
 Type: grilling
-Status: open
+Status: resolved
 Blocked by: 01, 07
 <!-- 07 resolved 2026-09-06 (spec-kernel-shaped-repeat.md). For this ADR:
      - The heuristics-report rationale is spec §8 — lift it verbatim as ADR-0008's rationale
@@ -69,3 +69,64 @@ re-deriving it:
 
 Invoke `/domain-modeling`. Cross-check against ADR-0001/0002 for tone and against any
 `_Avoid_` collisions.
+
+## Answer
+
+Grilled with Charon (`/domain-modeling`, 2026-09-06). Both artifacts written.
+
+### 1. ADR — `docs/adr/0008-physical-plausibility-ceiling-for-synthetic-output.md`
+
+Title: *"Synthetic output holds to a physical-plausibility ceiling; held keys present as
+genuine kernel autorepeat."* Prose, seven short paragraphs matching the 0006/0007 house
+density. Records, in order:
+
+- **The rationale** — some games/anti-cheat flag inhuman rate + regularity (cites the
+  `research/` file, not a fresh derivation); the `uinput` origin is already visible and
+  that is **accepted, not fought**; plausibility of *rate*, not disguise of *origin*; no
+  jitter / anti-regularity injection. This ADR is the **first** place the
+  "uinput-origin-always-detectable" premise is recorded — the closing paragraph states
+  ADR-0002 is neither its basis nor refined by it (0002 is transport only).
+- **The ceiling** — live kernel autorepeat delay/period (`analog::read_kernel_auto_repeat`,
+  fallback 250/33); one Down/Up for a held `BTN_*`; steady-state rate is the invariant,
+  initial-repeat delay judged per surface. Enforced by existing constants
+  (`MIN_TOGGLE_LAP`, `combine_toggle_lap_target`, `RepeatSchedule` seeding,
+  `run_toggle_held` / `spawn_held`, `CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD`), not a
+  central gate.
+- **The audit (ticket 01)** — 12 surfaces, 8 OK, 2 flagged → the missed-deadline clamp
+  (ticket 06) on both repeat pace loops, re-basing from real elapsed time like
+  `input_repeat_key`.
+- **`value=2` (ticket 07)** — recorded as a **firm decision, marked gated / pending a
+  fresh implementation effort** (Charon's call): inject `value=2` ourselves (evdev 0.13.2
+  can't enable `EV_REP` on a `VirtualDevice`; `translate` already emits it); converts
+  Digital + analog-synth Hold-to-repeat, single-key Chord, Analog-repeat hold-solid,
+  Toggle / Hold-to-repeat of a single key or single-key Macro; **not** Stepper, button
+  Toggles, or multi-step Macro loops. Rationale block is spec §8 in substance.
+- **The Macro exception** — once-fired burst + within-run cadence unrestricted;
+  trigger-driven Macro *repetition* floored to `max(kernel period, MIN_TOGGLE_LAP)` by
+  **existing** mechanism (`run_toggle_loop` `target_lap` + `FiringUnfinished` overlap
+  guard), no new floor, ticket 08 locks it; Analog-repeat cannot wrap a Macro (ticket
+  09).
+- **Not guarded** — a pathologically fast kernel `kbdrate` (ticket 01, Q4).
+
+### 2. Glossary term — `CONTEXT.md`, Runtime section, after *Output suppression*
+
+**Term renamed** (Charon's call): **"Physical-plausibility ceiling"**, not "Humane output
+rate". "Humane output rate" survives only as this effort's working name — the map heading,
+the `.scratch/humane-output-rate/` path, and every ticket's `Parent:` link keep it; it is
+listed under the term's `_Avoid_` line as "the working name of the effort that established
+this, not a domain term". Effort/map **not** renamed (identity churn across ~10 files not
+worth it).
+
+Full-detail entry (house style): the rate ceiling + held-button rule, the `value=2`
+autorepeat presentation, the Macro exception in full, "not a disguise — `uinput` origin
+always detectable (ADR-0008); plausibility of *rate*". Citation fixed to **ADR-0008**, not
+the wrong `(ADR-0002)` in the ticket's draft.
+
+### 3. Map + README touched
+
+- Map: the two lines equating the effort name with the term (Destination para, Notes
+  Domain bullet) reworded to name "Physical-plausibility ceiling" as the codified term and
+  demote "Humane output rate" to the working name.
+- `.scratch/README.md`: the `("Humane output rate")` parenthetical on the term → the new
+  name.
+- Decisions-so-far: context pointer appended.

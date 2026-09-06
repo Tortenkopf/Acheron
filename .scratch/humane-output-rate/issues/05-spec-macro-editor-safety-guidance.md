@@ -1,9 +1,10 @@
 # Spec the user-facing output-safety guidance
 
 Type: grilling
-Status: open
+Status: resolved
 Blocked by: 01, 06, 07
-<!-- 02 (anti-cheat research) resolved 2026-09-06 — see research/anticheat-input-timing-heuristics.md -->
+<!-- 02 (anti-cheat research) resolved 2026-09-06 — see docs/anti-cheat-input-heuristics.md
+     (relocated from research/anticheat-input-timing-heuristics.md when 05 resolved) -->
 <!-- Broadened by ticket 01 (2026-09-06): also holds the Analog-repeat selection toast, and
      waits on the fix (06) + the value=2 spec (07) so the tips describe post-change reality.
      Sequencing per Charon: audit → required changes → then the disclaimer/tip text. -->
@@ -73,3 +74,56 @@ README edit, any warning widget) is a fresh effort, per the map's Notes.
 > inline fix (06, the pace-loop clamp) and one behaviour-change spec (07, `value=2`). The
 > user's sequencing is audit → required changes → *then* the disclaimer/tip text, so the
 > tips can describe what the built-in modes actually do post-change.
+
+## Answer
+
+Grilled + ratified with Charon in a `/grilling` + `/domain-modeling` session
+(2026-09-06). Deliverable: gated [`spec.md`](../spec.md).
+
+### Decisions
+
+1. **Two GUI hints, not a toast.** Both the standing macro-editor disclaimer and the
+   Analog-repeat notice are **GUI hints** — persistent `["dim"]` labels in the
+   `_CONTROLLER_MACRO_HINT` style, shown while their condition holds. This supersedes
+   ticket 01 Q3's "one-time toast": the "single-player only" warning is worth repeating
+   every time Analog-repeat is the live Trigger-mode choice, and a persistent hint needs
+   no seen-flag or dismiss control. **New CONTEXT.md `### Interface` terms** —
+   **Toast label** (the one-shot ticket-60/68 pattern) vs **GUI hint** (persistent,
+   condition-bound) — written this session to fix the vocabulary.
+
+2. **Disclaimer** — one always-visible line at the top of the Macro editor (Macro tab
+   only; not the Stepper tab, not `binding_editor.py`), leading with a `⚠️` emoji (a
+   deliberate exception to the no-emoji norm). Exact copy in `spec.md` §2:
+   *"⚠️ uinput input is always identifiable as synthetic; Acheron keeps its own Trigger
+   modes within physically-plausible rates, but a Macro does exactly what you write. Use
+   macros with caution!"*
+
+3. **Tips** — a single `Gtk.Expander` ("About macro safety", collapsed by default) in
+   the Macro editor, two themes (plausible-to-a-game / don't-lock-up-your-system) plus a
+   recovery list (focus the window, tray pause, `systemctl --user stop`) and a link to
+   the README. No separate help dialog. Compact copy in `spec.md` §3.
+
+4. **README `## Output safety`** — a new top-level section between Usage and
+   Troubleshooting (not a Usage subsection, not Troubleshooting), covering the ceiling
+   principle for users, the two tip themes at length, recovery, a friendly restatement
+   of the no-warranty term ("any trouble you get yourself into … is entirely your own
+   responsibility"), and a link to the research doc. Quotes **no** threshold numbers —
+   makes explicit that risk depends on the game. Full prose in `spec.md` §5.
+
+5. **Research doc relocated this session** —
+   `.scratch/humane-output-rate/research/anticheat-input-timing-heuristics.md` →
+   `docs/anti-cheat-input-heuristics.md` (`git mv` on `dev`). A non-process path, so it
+   reaches `main` and un-breaks ADR-0008's citation (which linked into `.scratch/`). Top
+   matter reframed for a reader audience; body unchanged. ADR-0008, `map.md`, ticket 02
+   links updated.
+
+6. **Text and placement only** — no `config::validate` change, no `ConfigError`, no
+   blocking Save widget, no new daemon message. Ticket 03 already ruled the within-run
+   burst text-only; ticket 09 already makes Analog-repeat + Macro unsaveable.
+
+### Handoff
+
+`spec.md` is gated. Implementation — the two hint widgets, the expander, the README
+section, and the feature-bullet pointers — is a fresh effort, per the map's Notes. The
+research-doc move and the CONTEXT.md terms are already done; the implementation effort
+only links to `docs/anti-cheat-input-heuristics.md` from the new README section.

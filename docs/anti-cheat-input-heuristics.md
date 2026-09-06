@@ -1,7 +1,12 @@
 # Anti-cheat input-timing & rate heuristics
 
-Research for [Humane output rate](../map.md), ticket
-[02](../issues/02-anticheat-input-detection-research.md).
+Background for Acheron's [Output safety](../README.md#output-safety) guidance: what
+publicly-documented signals let games and anti-cheat systems tell synthetic keyboard
+and mouse input from a human, and where the line between "plausible" and "flagged"
+actually sits. This is the grounding for the advice in the README and the macro
+editor — it is not an evasion guide, and it quotes no "safe" threshold, because
+there isn't one. It also underpins [ADR-0008](adr/0008-physical-plausibility-ceiling-for-synthetic-output.md),
+which records the ceiling Acheron holds its own (non-macro) output to.
 
 **Scope.** What publicly-documented signals let games / anti-cheat / bot-detection
 systems tell synthetic keyboard & mouse input from a human, **restricted to timing

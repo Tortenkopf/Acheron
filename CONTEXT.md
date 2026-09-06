@@ -135,3 +135,17 @@ _Avoid_: driver mode (the research/prototype write-ups' working name for Analog)
 **Output suppression**:
 A connected client's request that the Daemon withhold all synthetic output while the request is active, without stopping anything internally — Trigger-mode firing, Macro looping, and a Toggle's running state continue unaffected, and only the write to the physical device is withheld. Distinct from a Toggle *stopping*: a suppressed Toggle is still active and resumes emitting the instant suppression clears. The GUI additionally stops every Toggle outright on its own window gaining focus (`StopAllToggles`, a separate call the GUI makes alongside suppression, not a side effect of suppression itself) — see spec.md's "Toggle behavior across Layer/Profile switches" and "Daemon output suppression" sections.
 _Avoid_: pause, mute, disable (all imply something is stopped, not just withheld)
+
+**Physical-plausibility ceiling**:
+The ceiling on how fast the Daemon emits synthetic key/button events: no holding or repeating Action produces events faster than the Linux input stack does for a physically held key — the machine's configured kernel autorepeat delay/period (`analog::read_kernel_auto_repeat`, fallback 250 ms / 33 ms) — and a held mouse or gamepad button emits exactly one Down/Up with no repeat. A held or repeated single key presents as genuine kernel autorepeat (`value=1` then `value=2` on the real delay→period envelope), not a stream of Down/Up pairs. A Macro is the sole deliberate exception: its author sequences Keypresses at any cadence, and only *trigger-driven Macro repetition* is floored (to `max(kernel period, MIN_TOGGLE_LAP)`); a Macro fired once and the keystroke cadence within one run are unrestricted, and Analog-repeat cannot wrap a Macro. Not a disguise — the `uinput` origin is always detectable (ADR-0008); the goal is plausibility of *rate*. The Daemon's compliance with this ceiling was audited surface by surface in `.scratch/humane-output-rate/`.
+_Avoid_: humane output rate (the working name of the effort that established this — `.scratch/humane-output-rate/`, not a domain term), humanization, anti-cheat evasion, input sanitisation, jitter
+
+### Interface
+
+**Toast label**:
+A transient one-shot notice in the GUI — a short highlighted line shown once, immediately after the action that triggered it, and cleared on the next redraw of that view. Reports what just happened (a Stepper list moved off its former Input pair; an axis target already claimed). Never blocks, has no dismiss control, does not reappear.
+_Avoid_: notification (reserve for OS-level), banner, alert, snackbar
+
+**GUI hint**:
+A persistent advisory line in the GUI, shown for as long as its condition holds and removed once it no longer applies — dim, inline, non-blocking, no dismiss control. Attaches a caveat to a choice the user currently has in effect (a Macro step targeting a controller button; Analog-repeat selected as a Trigger mode; the standing macro-editor caution, whose condition is simply "the Macro editor is open"). Distinct from a Toast label, which fires once and vanishes regardless of state.
+_Avoid_: tooltip (hover-only — a distinct thing), inline warning, disclaimer (the macro-editor line is one instance, not the general term)

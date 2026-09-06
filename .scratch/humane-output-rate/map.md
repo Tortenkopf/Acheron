@@ -18,7 +18,9 @@ ratification, Q5) for making every Hold-to-repeat path emit genuine `value=2` ke
 autorepeat — with the real delay→period envelope — instead of `[KeyDown,KeyUp]` pairs, so a
 heuristics report reads Acheron's virtual device as playing by the rules and hand-driven,
 not automated. The principle is recorded as an **ADR + a `CONTEXT.md` glossary term**
-("Humane output rate") so future repeat-based features inherit the invariant.
+("Physical-plausibility ceiling" — the term chosen at ticket 04; "Humane output rate"
+stays only as this effort's working name) so future repeat-based features inherit the
+invariant.
 
 Done when: the audit verdict is ratified, every flagged surface is fixed, the ADR + term
 are written, and both specs (`spec.md` and `spec-kernel-shaped-repeat.md`) are gated —
@@ -28,7 +30,8 @@ ready for fresh implementation efforts.
 
 - **Domain**: `CONTEXT.md` at repo root; `docs/adr/` (0001–0007). Use the glossary's
   vocabulary — Trigger mode, Hold-to-repeat, Analog-repeat, Toggle, Capture mode, Depth,
-  Macro, Chord, Stepper. This effort proposes one new term ("Humane output rate", ticket 04).
+  Macro, Chord, Stepper. This effort adds one new term — **"Physical-plausibility ceiling"**
+  (ticket 04, now in `CONTEXT.md` + ADR-0008).
 - **Skills**: `/grilling` + `/domain-modeling` on every grilling ticket; `/research` for
   ticket 02.
 - **Execution is in scope.** This map carries its own fixes (user decision, 2026-09-06):
@@ -59,7 +62,9 @@ ready for fresh implementation efforts.
 <!-- one line per closed ticket: gist + link; zoom the ticket for detail -->
 
 - [Anti-cheat input-detection heuristics for the macro tips](issues/02-anticheat-input-detection-research.md)
-  — grounding written to [`research/anticheat-input-timing-heuristics.md`](research/anticheat-input-timing-heuristics.md).
+  — grounding written to `research/anticheat-input-timing-heuristics.md`, **relocated at
+  ticket 05 to [`docs/anti-cheat-input-heuristics.md`](../../docs/anti-cheat-input-heuristics.md)**
+  (non-process path → reaches `main`, cited by ADR-0008 + the README).
   Confirms the bar: Linux held-key autorepeat is software (`input.c`, `input_enable_softrepeat(dev, 250, 33)`
   — 250 ms delay then ~33 ms/~30 Hz), `BTN_*` never autorepeats. **Regularity, not raw rate,
   is the universal tell** (osu! circleguard ~5 ms SD = bot; CS2 "0 ms overlap/neutral" = macro;
@@ -104,12 +109,37 @@ ready for fresh implementation efforts.
   injector back-pressure. Kernel-parity: `input_repeat_key` re-arms from *now*, never
   bursts. Ticket 07's `value=2` rebuild of surface 2 must preserve `advance_fired`'s
   re-base.
+- [Spec the user-facing output-safety guidance](issues/05-spec-macro-editor-safety-guidance.md)
+  — gated [`spec.md`](spec.md). **Text + placement only** — no config check, no blocking
+  widget. Two **GUI hints** (not a toast — new CONTEXT.md `### Interface` terms **Toast
+  label** vs **GUI hint**): the standing macro-editor disclaimer (`⚠️` line, Macro tab
+  only) and the Analog-repeat notice (`⚠️` line below the Trigger-mode dropdown while
+  `analog_repeat` is selected — supersedes ticket 01 Q3's "one-time toast"). One
+  collapsed **`Gtk.Expander`** "About macro safety" holds the compact tips; the long form
+  is a new **`## Output safety`** README section (ceiling for users, two tip themes,
+  runaway recovery, friendly no-warranty restatement, no "safe" numbers — risk depends on
+  the game). Anti-cheat research **relocated this session** to
+  `docs/anti-cheat-input-heuristics.md`; CONTEXT.md terms **written this session**.
+  Implementation (widgets + README edit) is a fresh effort.
+- [Record the humane-output-rate principle — ADR + CONTEXT.md term](issues/04-record-humane-output-rate-principle.md)
+  — written. **ADR-0008** (`docs/adr/0008-physical-plausibility-ceiling-for-synthetic-output.md`):
+  the ceiling (live kernel autorepeat rate; held `BTN_*` one Down/Up), the ticket-01 audit
+  + ticket-06 clamp, the `value=2` decision (firm, marked gated pending a fresh effort), the
+  Macro exception (once-fired + within-run free; trigger-repetition floored by existing
+  mechanism; no Analog-repeat+Macro), and the "not guarded: pathological `kbdrate`" note.
+  ADR-0008 is the first record of "uinput origin is always detectable, and accepted" —
+  **not** ADR-0002. **Glossary term named "Physical-plausibility ceiling"** (Charon's call,
+  not "Humane output rate") in `CONTEXT.md` Runtime section; "Humane output rate" stays only
+  as this effort's working name (map heading, path, `Parent:` links) and sits on the term's
+  `_Avoid_` line. Effort/map not renamed.
 
 ## Not yet specified
 
-- **Implement the user-facing output-safety guidance** — the GtkExpander / hint widgets,
-  the Analog-repeat toast, the README section. Blocked on ticket 05's `spec.md`. A fresh
-  implementation effort, not resolved here.
+- **Implement the user-facing output-safety guidance** — the two GUI hints (`⚠️`
+  macro-editor disclaimer + Analog-repeat notice), the "About macro safety" `Gtk.Expander`,
+  the README `## Output safety` section, and the feature-bullet pointers. Ticket 05's
+  [`spec.md`](spec.md) is now **gated and ready**. A fresh implementation effort, not
+  resolved here.
 - **Implement the kernel-shaped `value=2` repeat** — ticket 07's
   [`spec-kernel-shaped-repeat.md`](spec-kernel-shaped-repeat.md) is now **gated and ready**.
   A fresh implementation effort, not resolved here.

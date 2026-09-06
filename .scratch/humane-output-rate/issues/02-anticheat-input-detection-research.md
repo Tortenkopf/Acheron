@@ -33,9 +33,13 @@ Acheron should evade detection (it can't; uinput origin is always visible).
 
 ## Answer
 
-Findings written to
-[`research/anticheat-input-timing-heuristics.md`](../research/anticheat-input-timing-heuristics.md)
-(570 lines, every claim tagged `[PRIMARY]` / `[OSS]` / `[SECONDARY]`). The throwaway
+Findings written to `research/anticheat-input-timing-heuristics.md`
+(570 lines, every claim tagged `[PRIMARY]` / `[OSS]` / `[SECONDARY]`).
+**Relocated 2026-09-06 (ticket 05)** to
+[`docs/anti-cheat-input-heuristics.md`](../../../docs/anti-cheat-input-heuristics.md) —
+a non-process path, so it reaches `main`, is citable from ADR-0008, and is linked from
+the README's new Output safety section. Top matter lightly reframed for a reader
+audience; body unchanged. The throwaway
 worktree branch was removed after the file was copied into the `dev` checkout; `.scratch/`
 is gitignored so the tracker is local-only anyway.
 
