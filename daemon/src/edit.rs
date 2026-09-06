@@ -308,6 +308,15 @@ pub(crate) enum Effect {
     /// `SwitchProfile`'s own share of `tartarus-dual-stage-keys` ticket 06's
     /// runtime teardown, alongside `StopAllToggles`/`StopAllAnalogRepeats`.
     StopAllStages,
+    /// Force-release and drop every live individual firing
+    /// (`trigger::Slots::drain_firings`), leaving individual Toggles running —
+    /// `SwitchProfile`'s share of `spec-kernel-shaped-repeat.md` §7: a
+    /// single-key Hold-to-repeat holds a bare unbalanced `KeyDown` for the
+    /// life of the press (ticket 04), and the new Profile's binding for that
+    /// key may not release it (unbound / Toggle-bound ⇒ `decide`'s `Up` arm
+    /// is inert). Alongside `StopAllStages`, which does the same for the deep
+    /// slots.
+    ReleaseAllHolds,
     /// Force-release the given Input's live dual-stage deep slot immediately
     /// (`stage::Engine::stop_stage`) — pushed by `SetBinding`/`ClearBinding`
     /// when the edit cascades away an orphaned `deep_base`/`deep_held` entry
@@ -476,6 +485,13 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             // outlive a Profile switch is an open question for the domain
             // owner, not something to settle here.
             effects.push(Effect::StopAllToggles);
+            // `spec-kernel-shaped-repeat.md` §7: a single-key Hold-to-repeat
+            // holds a bare unbalanced `KeyDown` for the life of the press
+            // (ticket 04); the incoming Profile's binding for that key may
+            // never release it, so drain every live individual firing here —
+            // same reasoning as `StopAllToggles` / `StopAllStages`. Individual
+            // Toggles deliberately survive the switch (see above).
+            effects.push(Effect::ReleaseAllHolds);
             effects.push(Effect::RepublishActuation);
             effects.push(Effect::ResetAxisOutputs);
             effects.push(Effect::StopAllAnalogRepeats);
@@ -1398,6 +1414,7 @@ mod tests {
             outcome.effects,
             vec![
                 Effect::StopAllToggles,
+                Effect::ReleaseAllHolds,
                 Effect::RepublishActuation,
                 Effect::ResetAxisOutputs,
                 Effect::StopAllAnalogRepeats,

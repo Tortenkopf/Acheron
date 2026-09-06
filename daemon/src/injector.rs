@@ -737,6 +737,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_queued_repeat_key_never_lands_after_the_force_release_that_follows_it() {
+        // Spec-kernel-shaped-repeat.md §7's required ordering lock: a `value=2`
+        // still queued on the one channel when the key's `Up` arrives must be
+        // delivered *before* the terminating `value=0`, never after it — so the
+        // key is never left logically down. Send order through the single mpsc
+        // channel is the guarantee; this test pins it.
+        let sink = testing::RecordingSink::new();
+        let (injector, handle) = spawn(sink.clone(), sink.clone());
+
+        // The dispatch task performs `RepeatKey` then, on `Up`,
+        // `ForceReleaseStuck` — two sends onto the same channel, in that order.
+        injector.repeat_key(KeyCode::KEY_A).await.unwrap();
+        injector.force_release_key(KeyCode::KEY_A).await.unwrap();
+        drop(injector);
+        handle.await.unwrap().unwrap();
+
+        let events: Vec<_> = sink
+            .batches()
+            .into_iter()
+            .flatten()
+            .map(key_and_value)
+            .collect();
+        assert_eq!(events, vec![(KeyCode::KEY_A, 2), (KeyCode::KEY_A, 0)]);
+        assert_eq!(
+            events.last(),
+            Some(&(KeyCode::KEY_A, 0)),
+            "the final event for the key is value=0 — never left logically down"
+        );
+    }
+
     #[test]
     fn build_gamepad_device_declares_all_11_axis_codes() {
         let codes = all_axis_abs_codes();

@@ -75,6 +75,23 @@ fn modifier_codes(modifiers: Modifiers) -> Vec<KeyCode> {
 /// unrelated tuning knobs. Not final-tuned against a real game yet.
 pub(crate) const CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD: Duration = Duration::from_millis(35);
 
+/// The down-only prefix of a modified single-key press (spec-kernel-shaped-repeat.md
+/// §3.1): each modifier then the key, all `KeyDown`, no matching `KeyUp` — a
+/// deliberately *unbalanced* hold that mirrors a physically held `Ctrl+X`. Only
+/// the base key goes on to autorepeat (`value=2`, via `Injector::repeat_key`);
+/// the modifiers just sit held `value=1`. Every code that actually reached
+/// `uinput` lands in the firing's `held` set, so `FiringHandle::force_release_stuck`
+/// on the bound Input's physical `Up` balances the whole chord with `value=0`.
+/// The `keypress_steps` prefix up to and including the key press.
+pub(crate) fn held_key_down_steps(modifiers: Modifiers, key: KeyCode) -> Vec<MacroStep> {
+    let mut steps: Vec<MacroStep> = modifier_codes(modifiers)
+        .into_iter()
+        .map(MacroStep::KeyDown)
+        .collect();
+    steps.push(MacroStep::KeyDown(key));
+    steps
+}
+
 /// `pub(crate)` (rather than private) so `compile_stepper_item` can reuse
 /// the same canned mods-down/key/mods-up sequence for a Stepper item's
 /// modifier combination (ticket 63) — the two callers share the exact
