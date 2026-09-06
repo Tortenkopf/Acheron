@@ -393,7 +393,7 @@ async fn fire<K: Eq + Hash + Clone>(
         }));
     }
     let slot = slots.slot(&key);
-    let decision = trigger::decide(binding, EventState::Down, slot);
+    let decision = trigger::decide(binding, &config.macros, EventState::Down, slot);
     let deps = PerformDeps::new(injector, config, cursors, toggle_lap_target);
     slots.perform(decision, key, binding, deps).await?;
     Ok(None)
@@ -854,7 +854,7 @@ impl Engine {
         let deep_binding = deep_binding.clone();
         let key = StageKey(input);
         let slot = self.slots.slot(&key);
-        let decision = trigger::decide(&deep_binding, EventState::Repeat, slot);
+        let decision = trigger::decide(&deep_binding, &config.macros, EventState::Repeat, slot);
         let perform_deps = PerformDeps::new(injector, config, cursors, toggle_lap_target);
         self.slots
             .perform(decision, key, &deep_binding, perform_deps)

@@ -355,7 +355,7 @@ impl DispatchState {
                     return Ok(Vec::new());
                 }
                 let slot = self.individual.slot(&event.input);
-                let decision = trigger::decide(&binding, event.state, slot);
+                let decision = trigger::decide(&binding, &config.macros, event.state, slot);
                 let deps = trigger::PerformDeps::new(
                     &self.injector,
                     config,
@@ -397,7 +397,7 @@ impl DispatchState {
                     // ever emits `Down` / `Repeat`, so those `decide` arms are
                     // unreachable here.
                     let slot = self.chord_slots.slot(&key);
-                    let decision = trigger::decide(&binding, state, slot);
+                    let decision = trigger::decide(&binding, &config.macros, state, slot);
                     let deps = trigger::PerformDeps::new(
                         &self.injector,
                         config,
@@ -506,7 +506,7 @@ impl DispatchState {
                 // Analog-repeat-triggered is a narrow combination this
                 // fast-follow doesn't specially engineer for.
                 let slot = self.individual.slot(&input);
-                let decision = trigger::decide(&binding, EventState::Down, slot);
+                let decision = trigger::decide(&binding, &config.macros, EventState::Down, slot);
                 let deps = trigger::PerformDeps::new(
                     &self.injector,
                     config,

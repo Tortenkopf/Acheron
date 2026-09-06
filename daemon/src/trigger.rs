@@ -92,20 +92,6 @@ pub(crate) enum TriggerDecision {
     ForceReleaseStuck,
 }
 
-/// The `KeyCode` behind the two Action shapes that get *sustained-hold*
-/// treatment — a real mouse button (`Action::Keypress` on a `BTN_*` code) or a
-/// gamepad button (`Action::ControllerButton`) — instead of the ordinary
-/// pulse / repeat-tap: a bare unbalanced `KeyDown` under Hold-to-repeat
-/// (tickets 75/76, 79/80) and `spawn_held`'s single hold under Toggle
-/// (tickets 78, 82/83). `None` for a keyboard Keypress, a Macro, or a Step.
-fn sustained_hold_key(action: &Action) -> Option<KeyCode> {
-    match action {
-        Action::ControllerButton { button } => Some(*button),
-        Action::Keypress { key, .. } if is_mouse_button(*key) => Some(*key),
-        _ => None,
-    }
-}
-
 /// How a Binding's held target behaves downstream when held or repeated
 /// (spec-kernel-shaped-repeat.md §2.1) — the classification `decide` needs to
 /// tell a "held single key" (which must present as genuine kernel autorepeat)
@@ -118,8 +104,10 @@ fn sustained_hold_key(action: &Action) -> Option<KeyCode> {
 ///   code. On `Repeat` these resolve to `D::Nothing`.
 /// - `AutorepeatKey(mods, code)` — a single keyboard key: an `Action::Keypress`
 ///   (with or without modifiers) on a non-mouse code, or an `Action::Macro`
-///   whose compiled steps satisfy `executor::single_held_key`.
-#[allow(dead_code)] // ticket 03 wires `decide` to `hold_repeat_kind`; unused until then.
+///   whose compiled steps satisfy `executor::single_held_key`. Ticket 03 routes
+///   this onto exactly the decisions the old `sustained_hold_key`'s `None`
+///   produced (the ordinary keyboard arms); ticket 04 splits it onto the
+///   `value=2` autorepeat path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HoldKind {
     SustainedNoRepeat(KeyCode),
@@ -147,7 +135,6 @@ fn key_hold_kind(modifiers: Modifiers, key: KeyCode) -> HoldKind {
 /// for `Action::Macro` it resolves the `MacroDef`, compiles the steps
 /// (`executor::compile`), and runs `executor::single_held_key`. Multi-step
 /// Macro, Stepper, Profile switch → `None` (multi-step, or handled earlier).
-#[allow(dead_code)] // ticket 03 removes this — `decide` does not call it yet.
 fn hold_repeat_kind(action: &Action, macros: &HashMap<MacroId, MacroDef>) -> Option<HoldKind> {
     match action {
         Action::ControllerButton { button } => Some(HoldKind::SustainedNoRepeat(*button)),
@@ -160,7 +147,9 @@ fn hold_repeat_kind(action: &Action, macros: &HashMap<MacroId, MacroDef>) -> Opt
     }
 }
 
-/// The pure decision core. `binding` carries `.trigger` and `.action`; `slot`
+/// The pure decision core. `binding` carries `.trigger` and `.action`; `macros`
+/// resolves an `Action::Macro`'s compiled shape for `hold_repeat_kind` (every
+/// call site already holds it — `config.macros` / `deps.config.macros`); `slot`
 /// is the liveness of this key's existing firing/toggle (`None` == absent).
 /// No I/O, no async. `ProfileSwitch` never reaches here — it is intercepted
 /// upstream (`dispatch_individual_down` / `handle_event`'s `Repeat | Up` arm),
@@ -172,7 +161,12 @@ fn hold_repeat_kind(action: &Action, macros: &HashMap<MacroId, MacroDef>) -> Opt
 /// path never reaches the `AnalogRepeat` or `Up` arms at all
 /// (`config::validate` rejects an `AnalogRepeat` Chord, and `chord::feed` only
 /// ever emits `Down` / `Repeat`).
-pub(crate) fn decide(binding: &Binding, state: EventState, slot: Option<Slot>) -> TriggerDecision {
+pub(crate) fn decide(
+    binding: &Binding,
+    macros: &HashMap<MacroId, MacroDef>,
+    state: EventState,
+    slot: Option<Slot>,
+) -> TriggerDecision {
     use EventState::{Down, Repeat, Up};
     use TriggerDecision as D;
     use TriggerMode::{AnalogRepeat, FireOnce, HoldToRepeat, Toggle};
@@ -188,7 +182,24 @@ pub(crate) fn decide(binding: &Binding, state: EventState, slot: Option<Slot>) -
             proceed
         }
     };
-    let hold_key = sustained_hold_key(&binding.action);
+    // `sustained_hold_key`'s successor: only the mouse-button / gamepad
+    // `SustainedNoRepeat` shape takes the bare-hold carve-out arms. A single
+    // keyboard key (`AutorepeatKey`) and a multi-step target (`None`) both ride
+    // the ordinary keyboard arms below — exactly the decisions
+    // `sustained_hold_key`'s `None` produced. Ticket 04 splits `AutorepeatKey`
+    // onto the `value=2` autorepeat path.
+    //
+    // Only the `HoldToRepeat` and `Toggle` arms consult `hold_key`, so the
+    // classification — an `executor::compile` of an `Action::Macro` among it —
+    // is skipped entirely for `FireOnce` / `AnalogRepeat`, which the old eager
+    // `sustained_hold_key` call also computed but never read.
+    let hold_key = match binding.trigger {
+        HoldToRepeat | Toggle => match hold_repeat_kind(&binding.action, macros) {
+            Some(HoldKind::SustainedNoRepeat(code)) => Some(code),
+            Some(HoldKind::AutorepeatKey(..)) | None => None,
+        },
+        FireOnce | AnalogRepeat => None,
+    };
 
     match (binding.trigger, state) {
         // Tickets 75/76 & 79/80: a mouse / gamepad button under Hold-to-repeat
@@ -502,6 +513,18 @@ mod tests {
         use TriggerDecision as D;
         use TriggerMode::{AnalogRepeat, FireOnce, HoldToRepeat, Toggle};
 
+        // Most rows here are a Keypress / ControllerButton shape, so
+        // `hold_repeat_kind` never reads the macro map. The single-key Macro
+        // row below does — it shares this map, holding a `[KeyDown, KeyUp]`
+        // macro that must classify exactly like the equivalent Keypress.
+        use crate::config::MacroStepDto;
+        let macros = macros_with(
+            "hold-a",
+            vec![MacroStepDto::KeyDown(KBD), MacroStepDto::KeyUp(KBD)],
+        );
+        let decide =
+            |b: &Binding, s: EventState, slot: Option<Slot>| super::decide(b, &macros, s, slot);
+
         // Every slot state the overlap guard distinguishes.
         let slots = [
             None,
@@ -564,11 +587,35 @@ mod tests {
             let ar_cb = binding(AnalogRepeat, Action::ControllerButton { button: PAD });
             assert_eq!(decide(&ar_cb, Down, slot), guarded(D::SpawnFireOnce));
             assert_eq!(decide(&ar_cb, Repeat, slot), guarded(D::SpawnFireOnce));
+
+            // ── Single-key Macro == the equivalent Keypress (ticket 03) ────
+            //    `hold-a` compiles to `[KeyDown(A), KeyUp(A)]` — the same
+            //    shape `keyboard(KBD)` produces. Every (mode, state) decision
+            //    must match, arm for arm: this locks the "no behaviour change
+            //    yet" contract that ticket 04 then deliberately breaks by
+            //    routing `AutorepeatKey` onto the `value=2` path.
+            let mac = binding(HoldToRepeat, macro_action("hold-a"));
+            for state in [Down, Repeat, Up] {
+                assert_eq!(
+                    decide(&mac, state, slot),
+                    decide(&binding(HoldToRepeat, keyboard(KBD)), state, slot),
+                    "single-key Macro must decide like the equivalent Keypress ({state:?})"
+                );
+            }
+            let mac_tg = binding(Toggle, macro_action("hold-a"));
+            assert_eq!(
+                decide(&mac_tg, Down, slot),
+                decide(&binding(Toggle, keyboard(KBD)), Down, slot),
+            );
+            assert_eq!(decide(&mac_tg, Down, slot), D::StartToggleLoop);
         }
     }
 
     #[test]
     fn overlap_guard_only_blocks_on_an_unfinished_firing() {
+        let no_macros: HashMap<MacroId, MacroDef> = HashMap::new();
+        let decide =
+            |b: &Binding, s: EventState, slot: Option<Slot>| super::decide(b, &no_macros, s, slot);
         let htr = binding(TriggerMode::HoldToRepeat, keyboard(KBD));
         assert_eq!(
             decide(&htr, EventState::Down, Some(Slot::FiringUnfinished)),
@@ -587,6 +634,46 @@ mod tests {
         assert_eq!(
             decide(&htr, EventState::Down, Some(Slot::Toggle)),
             TriggerDecision::SpawnFireOnce
+        );
+    }
+
+    /// The one place ticket 03's wiring is *not* verbatim-unchanged: a Macro
+    /// that compiles to a single mouse-button press used to classify as
+    /// `sustained_hold_key`'s `None` (Macro ⇒ never sustained) and loop /
+    /// pulse; ticket 02's `hold_repeat_kind` deliberately made a single-key
+    /// Macro classify like the equivalent Keypress, so it is now
+    /// `SustainedNoRepeat(BTN_LEFT)` and takes the latched-hold arms — exactly
+    /// what `keyboard(MOUSE)` already does. A `Keypress` on `BTN_LEFT` can
+    /// never itself be a Macro, so no keyboard-key path regresses. Locked here
+    /// so ticket 04+ don't silently move it again.
+    #[test]
+    fn single_mouse_button_macro_takes_the_sustained_hold_arms_like_the_equivalent_keypress() {
+        use crate::config::MacroStepDto;
+        use EventState::{Down, Repeat};
+        let macros = macros_with(
+            "hold-click",
+            vec![MacroStepDto::KeyDown(MOUSE), MacroStepDto::KeyUp(MOUSE)],
+        );
+        let decide =
+            |b: &Binding, s: EventState, slot: Option<Slot>| super::decide(b, &macros, s, slot);
+
+        let mac_htr = binding(TriggerMode::HoldToRepeat, macro_action("hold-click"));
+        let kbd_htr = binding(TriggerMode::HoldToRepeat, keyboard(MOUSE));
+        assert_eq!(
+            decide(&mac_htr, Down, None),
+            decide(&kbd_htr, Down, None),
+            "== the equivalent mouse-button Keypress"
+        );
+        assert_eq!(
+            decide(&mac_htr, Down, None),
+            TriggerDecision::HoldKeyDown(MOUSE)
+        );
+        assert_eq!(decide(&mac_htr, Repeat, None), TriggerDecision::Nothing);
+
+        let mac_tg = binding(TriggerMode::Toggle, macro_action("hold-click"));
+        assert_eq!(
+            decide(&mac_tg, Down, None),
+            TriggerDecision::StartToggleHeld(MOUSE),
         );
     }
 
