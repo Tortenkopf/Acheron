@@ -144,6 +144,8 @@ def valid_triggers(action_kind: str, input_str: str | None) -> frozenset[str]:
     - `profile_switch` → `{fire_once}` (`InvalidProfileSwitchTrigger`);
     - `controller_button` excludes `fire_once` (`InvalidControllerButtonTrigger`);
     - `step` excludes `toggle` (`InvalidStepTrigger`);
+    - `macro` excludes `analog_repeat` (`AnalogRepeatMacro`, ticket 09 —
+      Analog-repeat collapses a multi-step Macro to one simultaneous pulse);
     - `analog_repeat` only on a Grid Input (`InvalidAnalogRepeatInput` /
       `InvalidChordAnalogRepeat`).
 
@@ -161,6 +163,8 @@ def valid_triggers(action_kind: str, input_str: str | None) -> frozenset[str]:
         triggers -= {"fire_once"}
     if action_kind == "step":
         triggers -= {"toggle"}
+    if action_kind == "macro":
+        triggers -= {"analog_repeat"}
     if input_str is None or not is_grid_input(input_str):
         triggers -= {"analog_repeat"}
     return frozenset(triggers)

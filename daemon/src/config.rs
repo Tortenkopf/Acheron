@@ -980,6 +980,17 @@ pub enum ConfigError {
     /// discrete member-set completion, not a single grid key's continuous
     /// Depth, mirroring `InvalidChordProfileSwitch`'s exact precedent.
     InvalidChordAnalogRepeat,
+    /// A grid-key Binding whose trigger is `AnalogRepeat` and whose `Action`
+    /// is `Action::Macro` (humane-output-rate ticket 09) —
+    /// `analog_repeat::fire_analog_repeat_pulse` collapses a multi-step Macro
+    /// to a single simultaneous pulse, ignoring every embedded
+    /// `MacroStep::Delay`, so the combination has no coherent meaning. Ticket
+    /// 03 chose an outright ban over inventing semantics for it. The string is
+    /// the offending Input's `Display` form, like `AnalogRepeatOnDualStageKey`.
+    /// (A non-grid Input trips `InvalidAnalogRepeatInput` first; a Chord
+    /// Binding trips `InvalidChordAnalogRepeat` first — this variant is
+    /// reachable only where `analog_repeat` is otherwise legal.)
+    AnalogRepeatMacro(String),
     /// A `default_actuation` or `actuation_overrides` entry whose `release`
     /// point is not strictly below its `actuation` point (ticket 04) —
     /// `release >= actuation` defeats hysteresis entirely: a key held at a
@@ -1122,6 +1133,12 @@ impl fmt::Display for ConfigError {
             ConfigError::InvalidChordAnalogRepeat => {
                 write!(f, "a Chord Binding's trigger cannot be analog_repeat")
             }
+            ConfigError::AnalogRepeatMacro(input) => write!(
+                f,
+                "an analog_repeat trigger on the Macro Binding for {input:?} is not allowed — \
+                 Analog-repeat collapses a multi-step Macro to a single simultaneous pulse \
+                 (its Delay steps ignored); change the trigger mode"
+            ),
             ConfigError::ReleaseNotBelowActuation(locus) => write!(
                 f,
                 "the actuation point for {locus} has its release point at or above its actuation point (defeats hysteresis)"
@@ -2869,6 +2886,38 @@ action = { type = "keypress", key = "KEY_A" }
         let err =
             load_or_seed(&path).expect_err("an Analog-repeat Chord Binding must refuse to start");
         assert!(matches!(err, ConfigError::InvalidChordAnalogRepeat));
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn refuses_to_start_when_an_analog_repeat_grid_binding_wraps_a_macro() {
+        // humane-output-rate ticket 09: Analog-repeat collapses a multi-step
+        // Macro to one simultaneous pulse, so the combo is banned outright —
+        // no silent coercion, the Daemon refuses to start.
+        let (_dir, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"schema_version = 1
+active_profile = "Default"
+
+[macros.spin]
+name = "Spin"
+steps = [
+  { key_down = "KEY_A" }, { delay_ms = 40 }, { key_up = "KEY_A" },
+]
+
+[profiles.Default.base.grid_r1c1]
+trigger = "analog_repeat"
+action = { type = "macro", macro_id = "spin" }
+"#;
+        fs::write(&path, original).unwrap();
+
+        let err = load_or_seed(&path)
+            .expect_err("an Analog-repeat Binding wrapping a Macro must refuse to start");
+        assert!(
+            matches!(&err, ConfigError::AnalogRepeatMacro(input) if input == "grid_r1c1"),
+            "got {err:?}"
+        );
 
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }

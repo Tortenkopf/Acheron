@@ -1154,8 +1154,14 @@ def test_analog_repeat_hint_tracks_the_selection_across_action_kind_changes():
     assert len(_analog_hint_labels(editor)) == 1
 
     action_dd = _dropdown_labeled(editor, "Action")
-    # Macro keeps the same Trigger-mode matrix — analog_repeat stays selected.
+    # Ticket 09: Macro drops analog_repeat from its Trigger-mode matrix — the
+    # selection falls back to hold_to_repeat and the hint must clear.
     action_dd.set_selected([k for k, _ in ACTION_TYPES].index("macro"))
+    assert _analog_hint_labels(editor) == []
+
+    # Back to keypress, reselect analog_repeat so the next switch has a hint to clear.
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("keypress"))
+    _select_trigger(editor, "analog_repeat")
     assert len(_analog_hint_labels(editor)) == 1
 
     # Profile Switch is locked to Fire-once — the hint must clear.

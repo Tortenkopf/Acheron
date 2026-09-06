@@ -631,21 +631,22 @@ def build_action_and_trigger_fields(
         # other kind must not stay disabled from a previous render.
         save_btn.set_sensitive(True)
 
-        # Ticket 78: Fire-once is locked out for Controller Button (Hold-to-
-        # repeat's sustained-hold behavior already covers a quick tap; no
-        # real gamepad button press works like Fire-once's decoupled pulse).
-        # Unlike Profile Switch / Axis (locked to a single option, handled by
-        # disabling the dropdown below) and Step (two of three options, left
-        # unlocked — the Daemon's own rejection surfaces on Save), Controller
-        # Button drops one entry from an otherwise-normal list, so the model
-        # is rebuilt here from the `rules` matrix rather than a hardcoded
-        # `"fire_once"` literal. It depends on `kind`, which the user can flip
-        # live via `action_dd`, so it can't be computed once like
+        # Two Action kinds drop one entry from an otherwise-normal trigger
+        # list: Controller Button loses Fire-once (ticket 78 — Hold-to-repeat's
+        # sustained hold already covers a quick tap; no real gamepad button
+        # works like Fire-once's decoupled pulse), and Macro loses Analog-repeat
+        # (ticket 09 — Analog-repeat collapses a multi-step Macro to one
+        # simultaneous pulse). Unlike Profile Switch / Axis (locked to a single
+        # option, handled by disabling the dropdown below) and Step (two of
+        # three options, left unlocked — the Daemon's own rejection surfaces on
+        # Save), these two rebuild the model here from the `rules` matrix rather
+        # than a hardcoded literal. It depends on `kind`, which the user can
+        # flip live via `action_dd`, so it can't be computed once like
         # `base_trigger_options`. (`Gtk.DropDown` has no per-item sensitivity
         # — ticket 39's precedent.)
         new_trigger_options = (
             [(k, lbl) for k, lbl in base_trigger_options if k in rules.valid_triggers(kind, inp)]
-            if kind == "controller_button"
+            if kind in ("controller_button", "macro")
             else base_trigger_options
         )
         new_trigger_keys = [k for k, _ in new_trigger_options]
@@ -660,8 +661,9 @@ def build_action_and_trigger_fields(
             trigger_dd.set_selected(
                 trigger_keys.index(previous_key)
                 if previous_key in trigger_keys
-                # Fire-once just got excluded (kind became controller_button)
-                # — Hold-to-repeat is the closest real-gamepad equivalent.
+                # The live trigger just got excluded (Fire-once when the kind
+                # became controller_button; Analog-repeat when it became macro)
+                # — Hold-to-repeat is the closest surviving equivalent.
                 else trigger_keys.index("hold_to_repeat")
             )
 
