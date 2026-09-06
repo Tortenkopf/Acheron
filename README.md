@@ -5,7 +5,7 @@ Copyright © 2026 Justin Milatz
 
 # Acheron
 
-**An open keybinding tool for the Razer Tartarus Pro.**
+**An open keybinding tool for the Razer Tartarus Pro on Linux.**
 
 ---
 
@@ -16,8 +16,10 @@ Copyright © 2026 Justin Milatz
 
 ---
 
-Acheron remaps the Tartarus Pro's keys and builds macros, layers, and profiles
-for it on Linux and enables the use of the Tartarus Pro's analog keys.
+Acheron builds macros, layers, and profiles for the Razer Tartarus Pro on Linux,
+and remaps its keys. It offers full operational feature parity with Razer Synapse
+plus extra features: it enables the use of the Tartarus Pro's analog keys and
+allows a second "deep stage" per key.
 It talks to the device directly through the Linux kernel (`evdev` in, `uinput` out).
 
 ---
