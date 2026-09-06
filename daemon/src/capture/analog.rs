@@ -270,6 +270,19 @@ impl RepeatSchedule {
         held_for.as_millis() >= due_at_ms
     }
 
+    /// The offset from the start of a hold at which repeat number `fired`
+    /// falls due — `delay_ms + fired * period_ms`, the same due time
+    /// `repeat_due` checks against. A self-driven autorepeat emitter (the
+    /// Toggle sustained-hold loop, spec-kernel-shaped-repeat.md §5.2) sleeps
+    /// until `started + due_offset(fired)` before consulting `repeat_due` /
+    /// `advance_fired`; `capture::analog`'s own grid loop doesn't need it
+    /// because it is already woken by the incoming report stream.
+    pub fn due_offset(&self, fired: u32) -> Duration {
+        Duration::from_millis(
+            u64::from(self.delay_ms) + u64::from(fired) * u64::from(self.period_ms),
+        )
+    }
+
     /// The `fired` count to advance to after emitting one Repeat at
     /// `held_for` — normally `fired + 1`, but when the loop stalled long
     /// enough that several repeats' due times slipped past (a full
@@ -398,6 +411,22 @@ fn read_repeat_schedule() -> RepeatSchedule {
         Some(evdev::AutoRepeat { delay, period }) => RepeatSchedule::new(delay, period),
         None => RepeatSchedule::new(DEFAULT_REPEAT_DELAY_MS, DEFAULT_REPEAT_PERIOD_MS),
     }
+}
+
+/// Resolves the live kernel-autorepeat envelope once at Daemon startup for
+/// the Toggle sustained-autorepeat path (spec-kernel-shaped-repeat.md §5.2):
+/// a `spawn_blocking` wrapper around `read_repeat_schedule` so the device
+/// open/ioctl never runs on an async task's own thread — the exact
+/// discipline `executor::resolve_toggle_lap_target` follows for `target_lap`.
+/// An inline per-Toggle-press blocking read breaks the `tokio::time::pause()`
+/// test harness (ticket 68's finding), so the resolved value is threaded
+/// down as a plain `RepeatSchedule` instead. A `spawn_blocking` panic (never
+/// observed, only theoretically possible) falls back to the kernel-default
+/// pair, same as a failed device read.
+pub async fn resolve_toggle_autorepeat_schedule() -> RepeatSchedule {
+    tokio::task::spawn_blocking(read_repeat_schedule)
+        .await
+        .unwrap_or_else(|_| RepeatSchedule::new(DEFAULT_REPEAT_DELAY_MS, DEFAULT_REPEAT_PERIOD_MS))
 }
 
 /// (Re)discover the Interface-2 control node and open it read+write on a
@@ -1238,6 +1267,22 @@ mod tests {
         // A spurious call before the first repeat is even due still moves
         // forward rather than backward.
         assert_eq!(schedule.advance_fired(Duration::from_millis(0), 4), 5);
+    }
+
+    #[test]
+    fn due_offset_is_the_full_delay_then_one_period_per_fired_repeat() {
+        let schedule = RepeatSchedule::new(250, 33);
+        // The first repeat (fired == 0) falls due a full delay after the
+        // press — a Toggle-held key looks exactly like a physically held one.
+        assert_eq!(schedule.due_offset(0), Duration::from_millis(250));
+        assert_eq!(schedule.due_offset(1), Duration::from_millis(283));
+        assert_eq!(schedule.due_offset(5), Duration::from_millis(250 + 5 * 33));
+        // `due_offset(fired)` is exactly the boundary `repeat_due` checks.
+        for fired in 0..10 {
+            let at = schedule.due_offset(fired);
+            assert!(schedule.repeat_due(at, fired));
+            assert!(!schedule.repeat_due(at - Duration::from_millis(1), fired));
+        }
     }
 
     // -- byte -> Input mapping (ticket 16: byte n == keycap n) -------------

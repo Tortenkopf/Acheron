@@ -140,6 +140,12 @@ async fn main() -> io::Result<()> {
     // kernel autorepeat rate this reflects never changes while the Daemon
     // is running, so there is no reason to re-read it on every Toggle press.
     let toggle_lap_target = acheron_daemon::executor::resolve_toggle_lap_target().await;
+    // Ticket 05 / spec-kernel-shaped-repeat.md §5.2: the kernel autorepeat
+    // envelope a single-key Toggle holds at, read once here off the same
+    // If01 node `toggle_lap_target` sources from — an inline per-press read
+    // would break the `tokio::time::pause()` test harness (ticket 68).
+    let toggle_autorepeat_schedule =
+        acheron_daemon::capture::analog::resolve_toggle_autorepeat_schedule().await;
     let dispatch_handle = tokio::spawn(dispatch::run(
         event_rx,
         connection_rx,
@@ -152,6 +158,7 @@ async fn main() -> io::Result<()> {
         capture_mode_rx,
         capture_control_tx,
         toggle_lap_target,
+        toggle_autorepeat_schedule,
         depth_rx,
         device_info_rx,
         led_tx,

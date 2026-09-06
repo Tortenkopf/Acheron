@@ -22,7 +22,7 @@ use evdev::KeyCode;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::capture::analog;
+use crate::capture::analog::{self, RepeatSchedule};
 use crate::config::{Action, MacroDef, MacroId, MacroStepDto, Modifiers, StepperItem};
 use crate::injector::{Injector, InjectorClosed};
 
@@ -419,6 +419,36 @@ impl ActiveToggle {
         ActiveToggle { cancel, handle }
     }
 
+    /// Ticket 05 / spec-kernel-shaped-repeat.md §3.2, §5.2: a Toggle whose
+    /// held target is a single keyboard key (`AutorepeatKey`) — plain
+    /// `Keypress` or single-key `Macro` — holds a genuine Linux autorepeat
+    /// rather than looping `[Down, Up]` through `run_toggle_loop`. `value=1`
+    /// on the first press (each modifier, then the base key, all tracked in a
+    /// loop-private `held`), then one `value=2` per `schedule` tick at the
+    /// full `REP_DELAY`→`REP_PERIOD` envelope — a Toggle-held key *is* a held
+    /// key — and `value=0` for the key and every modifier on `stop()` /
+    /// `StopAllToggles` / Layer-Profile switch. `schedule` is resolved once at
+    /// Daemon startup (`capture::analog::resolve_toggle_autorepeat_schedule`)
+    /// and threaded down as a plain value, same as `spawn`'s `target_lap`.
+    /// Same `{cancel, handle}` shape as `spawn` / `spawn_held`, so `stop()`
+    /// and every caller work unchanged.
+    pub fn spawn_autorepeat(
+        injector: Injector,
+        modifiers: Modifiers,
+        key: KeyCode,
+        schedule: RepeatSchedule,
+    ) -> Self {
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(run_toggle_autorepeat(
+            injector,
+            modifiers,
+            key,
+            schedule,
+            cancel.clone(),
+        ));
+        ActiveToggle { cancel, handle }
+    }
+
     /// Stops the Toggle and waits for its force-release to complete, so a
     /// caller that awaits this knows every held key is already released
     /// before doing anything else (e.g. resuming normal evaluation of the
@@ -429,6 +459,13 @@ impl ActiveToggle {
     }
 }
 
+/// Ticket 05: `run_toggle_loop` + `target_lap` + `MIN_TOGGLE_LAP` +
+/// `combine_toggle_lap_target` + `resolve_toggle_lap_target` now survive
+/// **only** for the multi-step Macro Toggle (`D::StartToggleLoop`, surface 9)
+/// — the sole remaining looping Toggle. A Toggle whose held target is a
+/// single keyboard key routes through `spawn_autorepeat` /
+/// `run_toggle_autorepeat` instead (spec-kernel-shaped-repeat.md §3.2).
+///
 /// Hard safety floor beneath the live-cadence target `resolve_toggle_lap_
 /// target` resolves (ticket 68) — no longer the pacing target itself. Found
 /// live (ticket 26, 2026-08-15): a Toggle wrapping a plain `Action::Keypress`
@@ -443,7 +480,8 @@ pub(crate) const MIN_TOGGLE_LAP: Duration = Duration::from_millis(20);
 
 /// Combines the live kernel-repeat period with `MIN_TOGGLE_LAP`'s hard
 /// floor — pure and unit-tested on its own, independent of the device read
-/// that produces `kernel_period` in production (ticket 68).
+/// that produces `kernel_period` in production (ticket 68). Ticket 05: only
+/// the multi-step Macro Toggle (`run_toggle_loop`) is paced this way now.
 fn combine_toggle_lap_target(kernel_period: Duration) -> Duration {
     kernel_period.max(MIN_TOGGLE_LAP)
 }
@@ -459,6 +497,10 @@ fn combine_toggle_lap_target(kernel_period: Duration) -> Duration {
 /// directly, which is also this module's own pre-ticket-68 pacing constant —
 /// so a sandboxed/hardware-less run resolves to exactly the old hardcoded
 /// behavior.
+///
+/// Ticket 05: paces only the surviving multi-step Macro Toggle
+/// (`D::StartToggleLoop`); a single-key Toggle holds a kernel autorepeat via
+/// `capture::analog::resolve_toggle_autorepeat_schedule` instead.
 pub async fn resolve_toggle_lap_target() -> Duration {
     let kernel_period = tokio::task::spawn_blocking(|| {
         analog::read_kernel_auto_repeat()
@@ -471,6 +513,9 @@ pub async fn resolve_toggle_lap_target() -> Duration {
     combine_toggle_lap_target(kernel_period)
 }
 
+/// The looping Toggle body — ticket 05 leaves this reached **only** by
+/// `D::StartToggleLoop`, i.e. a Toggle wrapping a *multi-step* Macro
+/// (surface 9). Every single-key Toggle now runs `run_toggle_autorepeat`.
 async fn run_toggle_loop(
     injector: Injector,
     steps: Vec<MacroStep>,
@@ -530,6 +575,55 @@ async fn run_toggle_held(injector: Injector, key: KeyCode, cancel: CancellationT
         return;
     }
     cancel.cancelled().await;
+    force_release(&injector, held).await;
+}
+
+/// Ticket 05's sustained-autorepeat Toggle body (spec-kernel-shaped-repeat.md
+/// §5.2): press each modifier then the base key (`value=1`, tracked in a
+/// loop-private `held`), then emit one `injector.repeat_key(key)` (`value=2`)
+/// per `schedule` tick — the Nth repeat due at `started + delay_ms +
+/// N*period_ms`, the **full** kernel envelope, because a Toggle-held key is a
+/// held key. `RepeatSchedule::advance_fired` carries the missed-deadline
+/// clamp for free: after a stall the loop emits exactly one `value=2` on
+/// resume and re-bases, never a catch-up burst (mirrors the kernel's
+/// `input_repeat_key`). On `cancel` — second press, `StopAllToggles`,
+/// Layer/Profile switch, Analog→Digital flip — `force_release` drains `held`,
+/// so the base key and every modifier go `value=0` together. The `value=2`
+/// stream itself is stateless and needs no teardown (§7).
+async fn run_toggle_autorepeat(
+    injector: Injector,
+    modifiers: Modifiers,
+    key: KeyCode,
+    schedule: RepeatSchedule,
+    cancel: CancellationToken,
+) {
+    let mut held: HashSet<KeyCode> = HashSet::new();
+    for step in held_key_down_steps(modifiers, key) {
+        if execute_step(&injector, &mut held, step).await.is_err() {
+            // The injector task has died — the whole Daemon is going down,
+            // so there's no one left to force-release to.
+            return;
+        }
+    }
+
+    let started = tokio::time::Instant::now();
+    let mut fired = 0u32;
+    loop {
+        let due = started + schedule.due_offset(fired);
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = tokio::time::sleep_until(due) => {}
+        }
+        let held_for = started.elapsed();
+        if !schedule.repeat_due(held_for, fired) {
+            continue;
+        }
+        fired = schedule.advance_fired(held_for, fired);
+        if injector.repeat_key(key).await.is_err() {
+            break;
+        }
+    }
+
     force_release(&injector, held).await;
 }
 
@@ -1070,6 +1164,163 @@ mod tests {
         let batches = sink.batches();
         assert_eq!(batches.len(), 2, "exactly one KeyDown, one KeyUp");
         assert_eq!(key_and_value(batches[1][0]), (KeyCode::BTN_LEFT, 0));
+    }
+
+    /// Ticket 05 / spec-kernel-shaped-repeat.md §5.2: a single-key Toggle
+    /// holds a genuine kernel autorepeat — `value=1` on press, the first
+    /// `value=2` a full `delay_ms` later, then `value=2` every `period_ms`,
+    /// `value=0` on `stop()`.
+    #[tokio::test(start_paused = true)]
+    async fn toggle_autorepeat_holds_the_full_kernel_envelope_then_releases() {
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
+        let schedule = RepeatSchedule::new(250, 33);
+
+        tokio::task::yield_now().await;
+        let toggle = ActiveToggle::spawn_autorepeat(
+            inj.clone(),
+            Modifiers::default(),
+            KeyCode::KEY_A,
+            schedule,
+        );
+        tokio::task::yield_now().await;
+
+        // The press: exactly one value=1, nothing else yet.
+        assert_eq!(sink.batches().len(), 1, "one value=1 on the first press");
+        assert_eq!(key_and_value(sink.batches()[0][0]), (KeyCode::KEY_A, 1));
+
+        // Just before the full delay: still no autorepeat.
+        tokio::time::advance(Duration::from_millis(249)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            sink.batches().len(),
+            1,
+            "no value=2 before the full REP_DELAY elapses"
+        );
+
+        // Crossing the delay: the first value=2.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(sink.batches().len(), 2, "first value=2 at the full delay");
+        assert_eq!(key_and_value(sink.batches()[1][0]), (KeyCode::KEY_A, 2));
+
+        // One period later: the second value=2.
+        tokio::time::advance(Duration::from_millis(33)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(sink.batches().len(), 3, "second value=2 one period later");
+        assert_eq!(key_and_value(sink.batches()[2][0]), (KeyCode::KEY_A, 2));
+
+        toggle.stop().await;
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+
+        let batches = sink.batches();
+        assert_eq!(
+            key_and_value(*batches.last().unwrap().last().unwrap()),
+            (KeyCode::KEY_A, 0),
+            "stop() releases the held key with value=0"
+        );
+    }
+
+    /// Ticket 05 / §5.4: a stall past several due times emits exactly one
+    /// `value=2` on resume and re-bases — no catch-up burst (reuses
+    /// `RepeatSchedule::advance_fired`, same as surface 2).
+    #[tokio::test(start_paused = true)]
+    async fn toggle_autorepeat_does_not_burst_after_a_long_stall() {
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
+        let schedule = RepeatSchedule::new(250, 33);
+
+        tokio::task::yield_now().await;
+        let toggle = ActiveToggle::spawn_autorepeat(
+            inj.clone(),
+            Modifiers::default(),
+            KeyCode::KEY_A,
+            schedule,
+        );
+        tokio::task::yield_now().await;
+
+        // Jump 5s in one go — ~144 repeats' worth of due times slipped past.
+        tokio::time::advance(Duration::from_millis(5_000)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let after_stall = sink.batches().len();
+        assert_eq!(
+            after_stall, 2,
+            "one value=1 + exactly one value=2 on resume, not a burst of the missed repeats"
+        );
+        assert_eq!(key_and_value(sink.batches()[1][0]), (KeyCode::KEY_A, 2));
+
+        // Thereafter it re-bases to a steady one-per-period cadence — one
+        // more value=2 per period elapsed, never a catch-up burst.
+        tokio::time::advance(Duration::from_millis(33)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            sink.batches().len(),
+            3,
+            "one value=2 per period after re-basing"
+        );
+        tokio::time::advance(Duration::from_millis(33)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(sink.batches().len(), 4);
+
+        toggle.stop().await;
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+    }
+
+    /// Ticket 05 / §3.1: the modifier-wrapped variant holds the modifier
+    /// `value=1` alongside the base key, autorepeats only the base key, and
+    /// releases the modifier with the key on `stop()`.
+    #[tokio::test(start_paused = true)]
+    async fn toggle_autorepeat_holds_the_modifier_and_repeats_only_the_base_key() {
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
+        let schedule = RepeatSchedule::new(250, 33);
+        let mods = Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        };
+
+        tokio::task::yield_now().await;
+        let toggle = ActiveToggle::spawn_autorepeat(inj.clone(), mods, KeyCode::KEY_X, schedule);
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            sink.batches()
+                .iter()
+                .map(|b| key_and_value(b[0]))
+                .collect::<Vec<_>>(),
+            vec![(KeyCode::KEY_LEFTCTRL, 1), (KeyCode::KEY_X, 1)],
+            "modifier held value=1, then the base key value=1"
+        );
+
+        // Two autorepeat ticks — only the base key, never the modifier.
+        tokio::time::advance(Duration::from_millis(250)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(33)).await;
+        tokio::task::yield_now().await;
+        let repeats: Vec<_> = sink.batches()[2..]
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect();
+        assert_eq!(repeats, vec![(KeyCode::KEY_X, 2), (KeyCode::KEY_X, 2)]);
+
+        toggle.stop().await;
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+
+        let released: std::collections::HashSet<_> = sink
+            .batches()
+            .iter()
+            .filter(|b| key_and_value(b[0]).1 == 0)
+            .map(|b| key_and_value(b[0]).0)
+            .collect();
+        assert!(
+            released.contains(&KeyCode::KEY_X) && released.contains(&KeyCode::KEY_LEFTCTRL),
+            "both the base key and its modifier are released on stop: {released:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -47,7 +47,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::capture::EventState;
-use crate::capture::analog::{self, KeyState};
+use crate::capture::analog::{self, KeyState, RepeatSchedule};
 use crate::config::{Action, Binding, Config, Layer, StagingMode, TriggerMode};
 use crate::edit::Edit;
 use crate::injector::Injector;
@@ -382,10 +382,7 @@ async fn fire<K: Eq + Hash + Clone>(
     slots: &mut Slots<K>,
     key: K,
     binding: &Binding,
-    injector: &Injector,
-    config: &Config,
-    cursors: &mut stepper::Cursors,
-    toggle_lap_target: Duration,
+    deps: PerformDeps<'_>,
 ) -> io::Result<Option<Edit>> {
     if let Action::ProfileSwitch { target } = &binding.action {
         return Ok(Some(Edit::SwitchProfile {
@@ -393,8 +390,7 @@ async fn fire<K: Eq + Hash + Clone>(
         }));
     }
     let slot = slots.slot(&key);
-    let decision = trigger::decide(binding, &config.macros, EventState::Down, slot);
-    let deps = PerformDeps::new(injector, config, cursors, toggle_lap_target);
+    let decision = trigger::decide(binding, deps.macros, EventState::Down, slot);
     slots.perform(decision, key, binding, deps).await?;
     Ok(None)
 }
@@ -434,6 +430,7 @@ pub(crate) struct EngineDeps<'a> {
     pub injector: &'a Injector,
     pub cursors: &'a mut stepper::Cursors,
     pub toggle_lap_target: Duration,
+    pub toggle_autorepeat_schedule: RepeatSchedule,
 }
 
 impl Engine {
@@ -516,6 +513,7 @@ impl Engine {
             injector,
             cursors,
             toggle_lap_target,
+            toggle_autorepeat_schedule,
         } = deps;
         let profile = config
             .active_profile()
@@ -617,10 +615,13 @@ impl Engine {
                             individual,
                             input,
                             &primary_binding,
-                            injector,
-                            config,
-                            cursors,
-                            toggle_lap_target,
+                            PerformDeps::new(
+                                injector,
+                                config,
+                                cursors,
+                                toggle_lap_target,
+                                toggle_autorepeat_schedule,
+                            ),
                         )
                         .await?
                         {
@@ -636,10 +637,13 @@ impl Engine {
                             &mut self.slots,
                             StageKey(input),
                             &deep_binding,
-                            injector,
-                            config,
-                            cursors,
-                            toggle_lap_target,
+                            PerformDeps::new(
+                                injector,
+                                config,
+                                cursors,
+                                toggle_lap_target,
+                                toggle_autorepeat_schedule,
+                            ),
                         )
                         .await?
                         {
@@ -706,6 +710,7 @@ impl Engine {
             injector,
             cursors,
             toggle_lap_target,
+            toggle_autorepeat_schedule,
             ..
         } = deps;
         let profile = config
@@ -757,10 +762,13 @@ impl Engine {
                         &mut self.slots,
                         StageKey(input),
                         &deep_binding,
-                        injector,
-                        config,
-                        cursors,
-                        toggle_lap_target,
+                        PerformDeps::new(
+                            injector,
+                            config,
+                            cursors,
+                            toggle_lap_target,
+                            toggle_autorepeat_schedule,
+                        ),
                     )
                     .await?
                     {
@@ -833,6 +841,7 @@ impl Engine {
             injector,
             cursors,
             toggle_lap_target,
+            toggle_autorepeat_schedule,
             individual: _,
         } = deps;
         if !self
@@ -855,7 +864,13 @@ impl Engine {
         let key = StageKey(input);
         let slot = self.slots.slot(&key);
         let decision = trigger::decide(&deep_binding, &config.macros, EventState::Repeat, slot);
-        let perform_deps = PerformDeps::new(injector, config, cursors, toggle_lap_target);
+        let perform_deps = PerformDeps::new(
+            injector,
+            config,
+            cursors,
+            toggle_lap_target,
+            toggle_autorepeat_schedule,
+        );
         self.slots
             .perform(decision, key, &deep_binding, perform_deps)
             .await
@@ -893,6 +908,7 @@ impl Engine {
             injector,
             cursors,
             toggle_lap_target,
+            toggle_autorepeat_schedule,
         } = deps;
         let profile = config
             .active_profile()
@@ -929,10 +945,13 @@ impl Engine {
                             individual,
                             input,
                             &primary_binding,
-                            injector,
-                            config,
-                            cursors,
-                            toggle_lap_target,
+                            PerformDeps::new(
+                                injector,
+                                config,
+                                cursors,
+                                toggle_lap_target,
+                                toggle_autorepeat_schedule,
+                            ),
                         )
                         .await?
                         {

@@ -38,6 +38,7 @@ use std::time::Duration;
 use evdev::KeyCode;
 
 use crate::capture::EventState;
+use crate::capture::analog::RepeatSchedule;
 use crate::config::{
     Action, Binding, Config, MacroDef, MacroId, Modifiers, StepperDef, StepperId, TriggerMode,
 };
@@ -94,11 +95,20 @@ pub(crate) enum TriggerDecision {
     /// (§7 — the one `value=1` from the `Down` is balanced by every existing
     /// teardown path; the `value=2` stream needs none of its own).
     RepeatKey(KeyCode),
-    /// Compile `binding.action` and start a looping Toggle.
+    /// Compile `binding.action` and start a looping Toggle — the multi-step
+    /// Macro Toggle only (surface 9). A single-key Toggle takes
+    /// `StartToggleAutorepeat` instead (ticket 05).
     StartToggleLoop,
     /// Start a single-held Toggle — mouse-button / `ControllerButton` Toggle
     /// (tickets 78, 82/83).
     StartToggleHeld(KeyCode),
+    /// Start a sustained-autorepeat Toggle — a single keyboard key's Toggle
+    /// `Down` (`spec-kernel-shaped-repeat.md` §3.2, ticket 05). Holds a
+    /// genuine Linux autorepeat (`value=1`, then `value=2` at the full
+    /// `REP_DELAY`→`REP_PERIOD` envelope) rather than looping `[Down, Up]`
+    /// through `run_toggle_loop`; the modifiers are held `value=1` alongside
+    /// and released with the base key on the second press / any stop.
+    StartToggleAutorepeat(Modifiers, KeyCode),
     /// Force-release whatever this key's firing left stuck — Fire-once /
     /// Hold-to-repeat / Analog-repeat `Up` on the individual path.
     ForceReleaseStuck,
@@ -256,12 +266,14 @@ pub(crate) fn decide(
         (FireOnce, Down) | (AnalogRepeat, Down | Repeat) => guarded(D::SpawnFireOnce),
 
         // Toggle starts only on `Down`: a mouse / gamepad button latches as a
-        // single held `KeyDown` (tickets 78, 82/83), everything else loops.
-        // (Ticket 05 splits `AutorepeatKey` onto a sustained-autorepeat hold;
-        // for now a single keyboard key still loops, unchanged.)
+        // single held `KeyDown` (tickets 78, 82/83); a single keyboard key
+        // holds a genuine kernel autorepeat (ticket 05, spec §3.2); a
+        // multi-step Macro loops `[Down, Up]` through `run_toggle_loop`
+        // (surface 9 — the sole remaining `StartToggleLoop` user).
         (Toggle, Down) => match hold_kind {
             Some(HoldKind::SustainedNoRepeat(code)) => D::StartToggleHeld(code),
-            Some(HoldKind::AutorepeatKey(..)) | None => D::StartToggleLoop,
+            Some(HoldKind::AutorepeatKey(mods, code)) => D::StartToggleAutorepeat(mods, code),
+            None => D::StartToggleLoop,
         },
 
         // Ticket 33's stuck-key fix — force-release whatever this key's most
@@ -312,17 +324,24 @@ pub(crate) struct PerformDeps<'a> {
     pub steppers: &'a HashMap<StepperId, StepperDef>,
     pub cursors: &'a mut stepper::Cursors,
     pub toggle_lap_target: Duration,
+    /// The kernel autorepeat envelope a single-key `StartToggleAutorepeat`
+    /// hold runs at (`spec-kernel-shaped-repeat.md` §5.2, ticket 05) —
+    /// resolved once at Daemon startup
+    /// (`capture::analog::resolve_toggle_autorepeat_schedule`) and threaded
+    /// down as a plain value, exactly like `toggle_lap_target`.
+    pub toggle_autorepeat_schedule: RepeatSchedule,
 }
 
 impl<'a> PerformDeps<'a> {
     /// The call-site constructor — takes `&Config` (read-only) and the two
     /// disjoint `DispatchState` borrows, so each retargeted site is one line
-    /// instead of the six-field literal.
+    /// instead of the field literal.
     pub(crate) fn new(
         injector: &'a Injector,
         config: &'a Config,
         cursors: &'a mut stepper::Cursors,
         toggle_lap_target: Duration,
+        toggle_autorepeat_schedule: RepeatSchedule,
     ) -> Self {
         PerformDeps {
             injector,
@@ -330,6 +349,7 @@ impl<'a> PerformDeps<'a> {
             steppers: &config.steppers,
             cursors,
             toggle_lap_target,
+            toggle_autorepeat_schedule,
         }
     }
 }
@@ -433,6 +453,24 @@ impl<K: Eq + Hash + Clone> Slots<K> {
             D::StartToggleHeld(code) => {
                 self.toggles
                     .insert(key, ActiveToggle::spawn_held(deps.injector.clone(), code));
+            }
+            D::StartToggleAutorepeat(modifiers, code) => {
+                // A single keyboard key's Toggle holds a genuine kernel
+                // autorepeat (spec-kernel-shaped-repeat.md §3.2, ticket 05) —
+                // `value=1` now, `value=2` at the full envelope, `value=0` for
+                // the key and its modifiers on the second press / any stop.
+                // The `run_toggle_autorepeat` task owns its own `held` set;
+                // `stop_toggle` / `stop_all_toggles` drive its teardown, so
+                // every existing caller works unchanged.
+                self.toggles.insert(
+                    key,
+                    ActiveToggle::spawn_autorepeat(
+                        deps.injector.clone(),
+                        modifiers,
+                        code,
+                        deps.toggle_autorepeat_schedule,
+                    ),
+                );
             }
             D::ForceReleaseStuck => {
                 self.force_release(&key, deps.injector).await;
@@ -702,9 +740,13 @@ mod tests {
             assert_eq!(decide(&mb_htr, Repeat, slot), D::Nothing);
             assert_eq!(decide(&mb_htr, Up, slot), D::ForceReleaseStuck);
 
-            // ── Toggle (keyboard): looping, Down only ──────────────────────
+            // ── Toggle (keyboard): a single key holds a genuine kernel
+            //    autorepeat (ticket 05), Down only ──────────────────────────
             let tg = binding(Toggle, keyboard(KBD));
-            assert_eq!(decide(&tg, Down, slot), D::StartToggleLoop);
+            assert_eq!(
+                decide(&tg, Down, slot),
+                D::StartToggleAutorepeat(Modifiers::default(), KBD)
+            );
             assert_eq!(decide(&tg, Repeat, slot), D::Nothing);
             assert_eq!(decide(&tg, Up, slot), D::Nothing);
 
@@ -740,7 +782,10 @@ mod tests {
                 decide(&mac_tg, Down, slot),
                 decide(&binding(Toggle, keyboard(KBD)), Down, slot),
             );
-            assert_eq!(decide(&mac_tg, Down, slot), D::StartToggleLoop);
+            assert_eq!(
+                decide(&mac_tg, Down, slot),
+                D::StartToggleAutorepeat(Modifiers::default(), KBD)
+            );
         }
     }
 
@@ -987,6 +1032,7 @@ mod slots {
                 steppers: &self.steppers,
                 cursors: &mut self.cursors,
                 toggle_lap_target: executor::MIN_TOGGLE_LAP,
+                toggle_autorepeat_schedule: RepeatSchedule::new(250, 33),
             }
         }
 
@@ -1176,6 +1222,21 @@ mod slots {
             slots.slot(&50),
             Some(Slot::Toggle),
             "StartToggleHeld → the toggles map"
+        );
+
+        slots
+            .perform(
+                TriggerDecision::StartToggleAutorepeat(Modifiers::default(), KeyCode::KEY_A),
+                60,
+                &binding,
+                fx.deps(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            slots.slot(&60),
+            Some(Slot::Toggle),
+            "StartToggleAutorepeat → the toggles map"
         );
 
         slots.stop_all_toggles().await;

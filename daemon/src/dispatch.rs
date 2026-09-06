@@ -34,7 +34,7 @@ use zbus::object_server::SignalEmitter;
 
 use crate::analog_repeat;
 use crate::axis;
-use crate::capture::analog::DeviceInfo;
+use crate::capture::analog::{DeviceInfo, RepeatSchedule};
 use crate::capture::{CaptureMode, EventState, PhysicalEvent};
 use crate::chord;
 use crate::command::{Command, State};
@@ -89,6 +89,11 @@ struct DispatchState {
     actuation_tx: watch::Sender<HashMap<Input, ActuationPoint>>,
     capture_control_tx: mpsc::Sender<bool>,
     toggle_lap_target: Duration,
+    /// The kernel autorepeat envelope a single-key Toggle holds at
+    /// (`spec-kernel-shaped-repeat.md` §5.2, ticket 05) — resolved once at
+    /// Daemon startup (`main.rs`) and threaded to every `spawn_autorepeat`
+    /// call site as a plain value, exactly like `toggle_lap_target`.
+    toggle_autorepeat_schedule: RepeatSchedule,
     /// The `led` task's `watch::Sender` (`tartarus-status-leds` ticket 02 /
     /// ADR-0006), handed in from `main.rs`. `push_status_leds` sends the
     /// active Profile's triple on it on device (re)connect and — from
@@ -108,6 +113,7 @@ impl DispatchState {
         actuation_tx: watch::Sender<HashMap<Input, ActuationPoint>>,
         capture_control_tx: mpsc::Sender<bool>,
         toggle_lap_target: Duration,
+        toggle_autorepeat_schedule: RepeatSchedule,
         led_tx: watch::Sender<Option<StatusLeds>>,
     ) -> Self {
         DispatchState {
@@ -127,6 +133,7 @@ impl DispatchState {
             actuation_tx,
             capture_control_tx,
             toggle_lap_target,
+            toggle_autorepeat_schedule,
             led_tx,
         }
     }
@@ -263,6 +270,7 @@ impl DispatchState {
                         injector: &self.injector,
                         cursors: &mut self.stepper,
                         toggle_lap_target: self.toggle_lap_target,
+                        toggle_autorepeat_schedule: self.toggle_autorepeat_schedule,
                     };
                     return self.stage.begin_quick_skip(deps, event.input, depth).await;
                 }
@@ -278,6 +286,7 @@ impl DispatchState {
                         injector: &self.injector,
                         cursors: &mut self.stepper,
                         toggle_lap_target: self.toggle_lap_target,
+                        toggle_autorepeat_schedule: self.toggle_autorepeat_schedule,
                     };
                     self.stage.deep_repeat(deps, event.input).await?;
                     return Ok(Vec::new());
@@ -304,6 +313,7 @@ impl DispatchState {
                 injector: &self.injector,
                 cursors: &mut self.stepper,
                 toggle_lap_target: self.toggle_lap_target,
+                toggle_autorepeat_schedule: self.toggle_autorepeat_schedule,
             };
             self.stage.deep_repeat(deps, event.input).await?;
             // Then, if the stage machine has handed this key's primary off to
@@ -362,6 +372,7 @@ impl DispatchState {
                     config,
                     &mut self.stepper,
                     self.toggle_lap_target,
+                    self.toggle_autorepeat_schedule,
                 );
                 self.individual
                     .perform(decision, event.input, &binding, deps)
@@ -404,6 +415,7 @@ impl DispatchState {
                         config,
                         &mut self.stepper,
                         self.toggle_lap_target,
+                        self.toggle_autorepeat_schedule,
                     );
                     self.chord_slots
                         .perform(decision, key, &binding, deps)
@@ -513,6 +525,7 @@ impl DispatchState {
                     config,
                     &mut self.stepper,
                     self.toggle_lap_target,
+                    self.toggle_autorepeat_schedule,
                 );
                 self.individual
                     .perform(decision, input, &binding, deps)
@@ -612,6 +625,7 @@ impl DispatchState {
             injector: &self.injector,
             cursors: &mut self.stepper,
             toggle_lap_target: self.toggle_lap_target,
+            toggle_autorepeat_schedule: self.toggle_autorepeat_schedule,
         };
         self.stage.update(deps, snapshot).await
     }
@@ -634,6 +648,7 @@ impl DispatchState {
             injector: &self.injector,
             cursors: &mut self.stepper,
             toggle_lap_target: self.toggle_lap_target,
+            toggle_autorepeat_schedule: self.toggle_autorepeat_schedule,
         };
         self.stage.tick(deps, now).await
     }
@@ -812,7 +827,7 @@ impl DispatchState {
 /// silently. The command channel closing is not fatal: it only means the
 /// D-Bus server side has gone away, and this task's other job (capture ->
 /// injector passthrough/remapping) still has work to do.
-// The 13 startup parameters: the `rx_*` receivers (plus `config` /
+// The startup parameters: the `rx_*` receivers (plus `config` /
 // `config_path`) stay `run` locals — pure `select!`-loop plumbing no handler
 // touches — and the rest are threaded once into `DispatchState` below.
 // Clippy's arg-count lint fires only here now (ticket 09): the struct literal
@@ -836,6 +851,12 @@ pub async fn run(
     // press — the kernel autorepeat rate it reflects never changes while
     // the Daemon is running.
     toggle_lap_target: Duration,
+    // Ticket 05 / spec-kernel-shaped-repeat.md §5.2: the kernel autorepeat
+    // envelope a single-key Toggle holds at, resolved once at Daemon startup
+    // (`main.rs`) beside `toggle_lap_target` and threaded down the same way —
+    // an inline per-press blocking read would break the `tokio::time::pause()`
+    // test harness (ticket 68's finding).
+    toggle_autorepeat_schedule: RepeatSchedule,
     // Ticket 71: the same live-Depth watch channel the Analog grid task
     // already publishes into on every incoming report (`capture::analog`,
     // ticket 26) — reused here as the continuous half of Axis-assignment
@@ -878,6 +899,7 @@ pub async fn run(
         actuation_tx,
         capture_control_tx,
         toggle_lap_target,
+        toggle_autorepeat_schedule,
         led_tx,
     );
     // Pure `select!`-loop plumbing — the `rx_*` receivers stay `run` locals
@@ -1373,6 +1395,7 @@ mod tests {
                 actuation_channel(),
                 capture_control_channel(),
                 executor::MIN_TOGGLE_LAP,
+                RepeatSchedule::new(250, 33),
                 led_channel(),
             );
             Seam {
@@ -2055,12 +2078,14 @@ mod tests {
         assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::BTN_SOUTH, 0));
     }
 
+    /// Spec §4 surface 6 / §3.2 (ticket 05): a Toggle whose held target is a
+    /// single keyboard key no longer loops `[Down, Up]` through
+    /// `run_toggle_loop` at `target_lap` — it holds a genuine Linux
+    /// autorepeat. `value=1` on the first press, the first `value=2` a full
+    /// `REP_DELAY` later, `value=2` every `REP_PERIOD` after that, and
+    /// `value=0` on the second press of the same key.
     #[tokio::test(start_paused = true)]
-    async fn toggle_keyboard_key_still_loops_at_dispatch_level() {
-        // Regression coverage (ticket 82/83): the mouse-button-only
-        // carve-out must not bleed onto keyboard-key output — `is_mouse_
-        // button` rejects an ordinary keyboard `KeyCode`, so the ordinary
-        // looping Toggle arm still applies.
+    async fn toggle_keyboard_key_holds_a_genuine_autorepeat_and_the_same_key_stops_it() {
         let mut bindings = HashMap::new();
         bindings.insert(
             Input::Grid(1, 1),
@@ -2075,18 +2100,256 @@ mod tests {
         let mut seam = Seam::with_bindings(bindings);
 
         seam.press(Input::Grid(1, 1)).await;
+        assert_eq!(
+            seam.sink.batches().len(),
+            1,
+            "one value=1 on the first press, nothing else yet"
+        );
+        assert_eq!(
+            key_and_value(seam.sink.batches()[0][0]),
+            (evdev::KeyCode::KEY_A, 1)
+        );
+
+        // The Seam's default schedule is `RepeatSchedule::new(250, 33)` — the
+        // full kernel envelope, exactly as a physically held key.
+        tokio::time::advance(Duration::from_millis(249)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            seam.sink.batches().len(),
+            1,
+            "no autorepeat before the full REP_DELAY elapses"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(33)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            seam.sink
+                .batches()
+                .iter()
+                .map(|b| key_and_value(b[0]))
+                .collect::<Vec<_>>(),
+            vec![
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 2),
+                (evdev::KeyCode::KEY_A, 2),
+            ],
+            "value=1 then value=2 at the kernel envelope — never a [Down, Up] loop"
+        );
+
+        // Same physical key, still toggled on: stops it with value=0.
+        seam.press(Input::Grid(1, 1)).await;
+        let batches = seam.finish().await;
+
+        let stream: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            stream,
+            vec![
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 2),
+                (evdev::KeyCode::KEY_A, 2),
+                (evdev::KeyCode::KEY_A, 0),
+            ],
+            "value=1, autorepeats, then a single value=0 — never a [Down, Up] pair stream"
+        );
+    }
+
+    /// Spec §4 surface 6b (ticket 05): a Toggle wrapping a *single-key* Macro
+    /// (identical compiled steps) produces the identical `value=1` … `value=2`
+    /// envelope as the equivalent Keypress — not a `target_lap`-paced
+    /// `[Down, Up]` loop.
+    #[tokio::test(start_paused = true)]
+    async fn toggle_single_key_macro_holds_the_same_autorepeat_as_the_equivalent_keypress() {
+        let (action, macros) = macro_action(
+            "hold-a",
+            vec![
+                MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
+                MacroStepDto::KeyUp(evdev::KeyCode::KEY_A),
+            ],
+        );
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::Toggle,
+                action,
+            },
+        );
+        let mut seam = Seam::new(config_with_bindings_and_macros(bindings, macros));
+
+        seam.press(Input::Grid(1, 1)).await;
+        tokio::time::advance(Duration::from_millis(250)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(33)).await;
+        tokio::task::yield_now().await;
+        seam.press(Input::Grid(1, 1)).await;
+        let batches = seam.finish().await;
+
+        assert_eq!(
+            batches
+                .iter()
+                .map(|b| key_and_value(b[0]))
+                .collect::<Vec<_>>(),
+            vec![
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 2),
+                (evdev::KeyCode::KEY_A, 2),
+                (evdev::KeyCode::KEY_A, 0),
+            ],
+        );
+    }
+
+    /// Spec §4 surface 9 (ticket 05): a Toggle wrapping a *multi-step* Macro
+    /// is the sole remaining `run_toggle_loop` user — it still loops the
+    /// whole macro, paced at `target_lap`, unchanged.
+    #[tokio::test(start_paused = true)]
+    async fn toggle_multi_step_macro_still_loops_at_target_lap() {
+        let (action, macros) = macro_action(
+            "combo",
+            vec![
+                MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
+                MacroStepDto::KeyUp(evdev::KeyCode::KEY_A),
+                MacroStepDto::KeyDown(evdev::KeyCode::KEY_B),
+                MacroStepDto::KeyUp(evdev::KeyCode::KEY_B),
+            ],
+        );
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::Toggle,
+                action,
+            },
+        );
+        let mut seam = Seam::new(config_with_bindings_and_macros(bindings, macros));
+
+        seam.press(Input::Grid(1, 1)).await;
         for _ in 0..7 {
             tokio::time::advance(executor::MIN_TOGGLE_LAP).await;
             tokio::task::yield_now().await;
         }
-
         seam.press(Input::Grid(1, 1)).await;
-
         let batches = seam.finish().await;
 
+        // Several full A-down/A-up/B-down/B-up laps ran — never a value=2.
         assert!(
-            batches.len() > 2,
-            "a keyboard-key Toggle must still loop (mash), unlike the mouse-button held variant: got {batches:?}"
+            batches.len() > 4,
+            "a multi-step Macro Toggle must still loop: got {} batches",
+            batches.len()
+        );
+        assert!(
+            batches.iter().all(|b| key_and_value(b[0]).1 != 2),
+            "a multi-step Macro Toggle loops [Down, Up] pairs — no kernel autorepeat"
+        );
+    }
+
+    /// Spec §3.2 / §7 (ticket 05): `StopAllToggles` (the GUI-focus stop, and
+    /// the Profile-switch effect) releases a running single-key autorepeat
+    /// Toggle with `value=0` — the loop-private `held` set is drained on
+    /// cancel exactly like the `[Down, Up]` loop variant.
+    #[tokio::test(start_paused = true)]
+    async fn stop_all_toggles_releases_a_running_single_key_autorepeat_toggle() {
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::Toggle,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: evdev::KeyCode::KEY_A,
+                },
+            },
+        );
+        let mut seam = Seam::with_bindings(bindings);
+
+        seam.press(Input::Grid(1, 1)).await;
+        tokio::time::advance(Duration::from_millis(300)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            seam.sink.batches().len() >= 2,
+            "the Toggle is autorepeating before the stop"
+        );
+
+        let (reply, rx) = oneshot::channel();
+        seam.state
+            .handle_command(
+                &mut seam.config,
+                &unused_config_path(),
+                Command::StopAllToggles { reply },
+            )
+            .await;
+        rx.await.unwrap();
+
+        let batches = seam.finish().await;
+        assert_eq!(
+            key_and_value(*batches.last().unwrap().last().unwrap()),
+            (evdev::KeyCode::KEY_A, 0),
+            "StopAllToggles force-releases the held key with value=0"
+        );
+    }
+
+    /// Spec.md's "Toggle behavior across Layer/Profile switches": an
+    /// *individual* Toggle deliberately survives a Layer switch —
+    /// `handle_layer_switch` leaves `individual` toggles running (it only
+    /// `drain_firings`). Ticket 05 does not change that: a running single-key
+    /// autorepeat Toggle keeps emitting `value=2` across the switch. (The
+    /// spec-kernel-shaped-repeat.md §7 "Layer / Profile switch" teardown row
+    /// is the Profile-switch `Effect::StopAllToggles` path, covered above.)
+    #[tokio::test(start_paused = true)]
+    async fn single_key_autorepeat_toggle_survives_a_layer_switch() {
+        let mut base = HashMap::new();
+        base.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::Toggle,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: evdev::KeyCode::KEY_A,
+                },
+            },
+        );
+        let mut seam = Seam::new(config_with_profile(Profile {
+            base,
+            ..Default::default()
+        }));
+
+        seam.press(Input::Grid(1, 1)).await;
+        tokio::time::advance(Duration::from_millis(300)).await;
+        tokio::task::yield_now().await;
+        let before = seam.sink.batches().len();
+
+        seam.feed(PhysicalEvent {
+            input: Input::ModeKey,
+            state: EventState::Down,
+            depth: None,
+        })
+        .await;
+        assert_eq!(seam.get_state().await.layer, "held");
+        assert_eq!(
+            seam.get_state().await.active_toggles,
+            vec![Input::Grid(1, 1)],
+            "the individual Toggle survives the Layer switch"
+        );
+
+        tokio::time::advance(Duration::from_millis(99)).await;
+        tokio::task::yield_now().await;
+        let after: Vec<_> = seam.sink.batches()[before..]
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect();
+        assert!(
+            !after.is_empty()
+                && after
+                    .iter()
+                    .all(|(c, v)| *c == evdev::KeyCode::KEY_A && *v == 2),
+            "it keeps autorepeating across the switch: {after:?}"
+        );
+
+        let batches = seam.finish().await;
+        assert_eq!(
+            key_and_value(*batches.last().unwrap().last().unwrap()),
+            (evdev::KeyCode::KEY_A, 0),
+            "teardown still balances the held key"
         );
     }
 
@@ -2131,6 +2394,7 @@ mod tests {
             capture_mode_channel(),
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
+            RepeatSchedule::new(250, 33),
             depth_channel(),
             device_info_channel(),
             led_channel(),
@@ -2189,6 +2453,7 @@ mod tests {
             capture_mode_channel(),
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
+            RepeatSchedule::new(250, 33),
             depth_rx,
             device_info_channel(),
             led_channel(),
@@ -2294,6 +2559,7 @@ mod tests {
             capture_mode_channel(),
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
+            RepeatSchedule::new(250, 33),
             depth_rx,
             device_info_channel(),
             led_channel(),
@@ -2373,6 +2639,7 @@ mod tests {
             capture_mode_channel(),
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
+            RepeatSchedule::new(250, 33),
             depth_rx,
             device_info_channel(),
             led_channel(),
@@ -2446,6 +2713,7 @@ mod tests {
             capture_mode_channel(),
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
+            RepeatSchedule::new(250, 33),
             depth_channel(),
             device_info_channel(),
             led_channel(),
@@ -2664,6 +2932,7 @@ mod tests {
                 capture_mode_channel(),
                 capture_control_channel(),
                 executor::MIN_TOGGLE_LAP,
+                RepeatSchedule::new(250, 33),
                 depth_rx,
                 device_info_rx,
                 led_tx,
@@ -5683,6 +5952,7 @@ mod tests {
             capture_mode_rx,
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
+            RepeatSchedule::new(250, 33),
             depth_rx,
             device_info_channel(),
             led_channel(),
@@ -5902,6 +6172,7 @@ mod tests {
             capture_mode_rx,
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
+            RepeatSchedule::new(250, 33),
             depth_rx,
             device_info_channel(),
             led_channel(),
