@@ -177,8 +177,11 @@ release, which is not wanted).
 machine-sequenced, so it should not carry the dwell at all — needs the "is this a
 dual-stage key?" predicate that `post-release-development` **ticket 17**
 (`fold-stage-routing-behind-engine-feed`) centralises in `stage::Engine::feed`.
-Folded into ticket 17's scope; see that ticket's Addendum. Until then this residual
-stands as described above (benign — kernel-deduplicated).
+**Resolved** in ticket 17 (see its Addendum): the primary path now builds
+`PerformDeps::new_machine_sequenced`, so a dual-stage primary carries no dwell and
+this redundant `value=0` is gone. The residual above still stands for the cases
+ticket 12 always covered (a genuine user one-shot released inside its own dwell,
+including a single-key Chord) — those keep the dwell by design.
 
 ### Docs
 

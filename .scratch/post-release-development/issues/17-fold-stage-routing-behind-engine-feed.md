@@ -327,42 +327,59 @@ schema, pure `stage.rs`, `stage::Engine` in dispatch, Quick-Skip buffer, the
 D-Bus surface, teardown, the binding editor) are all resolved; this refolds
 their dispatch-side seam.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `stage::StageOutcome { Handled(Vec<Edit>), NotMine }` added, mirroring
-      `chord::ChordOutcome`.
-- [ ] `stage::Engine::feed(deps, event) -> io::Result<StageOutcome>` — the
-      routing matrix above, bodies of `begin_quick_skip` / `deep_repeat`
-      moved in verbatim, `is_late` / `primary_handed_off` / `quick_skip_key`
-      as `match` conditions. `begin_quick_skip`'s `rx_events`-vs-`rx_depth`
-      race handling preserved line-for-line.
-- [ ] `begin_quick_skip`, `is_late`, `primary_handed_off`, `deep_repeat`
-      removed from the `pub(crate)` surface (inlined or made private helpers).
-      `Engine` interface: 10 → 7.
-- [ ] `handle_event` (`dispatch.rs`): the `246–289` and `291–321` blocks
-      replaced by one `EngineDeps` build + `match self.stage.feed(...).await?`,
-      sited right after `chord::feed`'s `NotMine` arm, before `binding` is
-      bound. `quick_skip_key` deleted.
-- [ ] No `select!` arm changes; no `wait_for_stage_deadline` /
+- [x] `stage::StageOutcome { Handled(Vec<Edit>), NotMine { machine_sequenced } }`
+      added, mirroring `chord::ChordOutcome` (the one-field `NotMine` is the
+      Addendum's option (a) — the constructor choice for the following
+      `perform`).
+- [x] `stage::Engine::feed(deps, event) -> io::Result<StageOutcome>` — the
+      routing matrix above. `begin_quick_skip` / `deep_repeat` kept as
+      **private helpers** (sanctioned alternative to inlining) so their bodies
+      — including `begin_quick_skip`'s `rx_events`-vs-`rx_depth` race handling
+      — are preserved byte-for-byte against HEAD, not relocated; `is_late` /
+      `primary_handed_off` are private `&self` getters used as `feed`'s `match`
+      conditions; the `quick_skip_key` predicate is `feed`'s early-out.
+- [x] `begin_quick_skip`, `is_late`, `primary_handed_off`, `deep_repeat`
+      dropped from the `pub(crate)` surface (now private helpers). `Engine`
+      interface: 10 → 7 (`feed`, `update`, `next_deadline`, `tick`,
+      `stop_all`, `stop_stage`, `stop_all_toggles`).
+- [x] `handle_event` (`dispatch.rs`): the two blocks replaced by one
+      `EngineDeps` build + `match self.stage.feed(...).await?`, sited right
+      after `chord::feed`'s `NotMine` arm, before `binding` is bound.
+      `quick_skip_key` deleted; the stale `StagingMode` import removed.
+- [x] No `select!` arm changes; no `wait_for_stage_deadline` /
       `wait_for_chord_deadline` change; `update_stages` / `tick_stages`
       unchanged.
-- [ ] ADR-0007 — dated **Refined:** paragraph (call shape narrowed;
-      dispatch-owns-Depth-interpretation decision unchanged).
-- [ ] New `stage::Engine::feed` routing-matrix unit tests in `stage.rs`
-      (every table row; the `Armed → Skipped → Late` sequence). All ~40
-      `dual_stage_*` pipeline tests kept unchanged and green.
-- [ ] `.scratch/README.md` `post-release-development` line extended with
+- [x] ADR-0007 — dated **Refined:** paragraph (call shape narrowed;
+      dispatch-owns-Depth-interpretation decision unchanged; Addendum
+      cross-referenced).
+- [x] New `stage::Engine::feed` routing-matrix unit tests in `stage.rs` (10
+      tests — every table row; the `Armed`/`Skipped`/`Late` phases via
+      `feed` + `tick`). All 28 `dual_stage_*` pipeline tests kept unchanged
+      and green.
+- [x] `.scratch/README.md` `post-release-development` line extended with
       ticket 17.
-- [ ] `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, full
-      daemon suite green; GUI suite unaffected (no wire/stub change) but run
-      to confirm.
-- [ ] `/code-review` (Standards + Spec) — no behaviour-change findings *other
-      than* the Addendum's sanctioned dual-stage-primary dwell change; moved
-      bodies verified verbatim against HEAD.
-- [ ] **Addendum:** dual-stage primary uses `PerformDeps::new_machine_sequenced`
-      (see below) — the redundant trailing `value=0` from `humane-output-rate`
-      ticket 12's sub-dwell force-release path is gone. A `dual_stage_*` test
-      pins it.
+- [x] `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, full
+      daemon suite green (539 tests); GUI suite unaffected — `gui/.venv/bin/
+      pytest gui/tests` 504 passed.
+- [x] `/code-review` — three findings, all assessed non-actionable within
+      this ticket: two (a redundant trailing `value=0` and a swallowed
+      sub-40ms re-press for an *ordinary* Fire-once key released mid-dwell)
+      are pre-existing `humane-output-rate` ticket 12 behaviour, unchanged
+      here — ticket 12 documents the first as accepted; the third is the
+      Addendum's own sanctioned decision (a dual-stage primary tapped without
+      crossing deep forgoes the ~40ms dwell — "the light half of an
+      escalating pair", judged negligible in the grilling). Moved bodies
+      verified verbatim against HEAD.
+- [x] **Addendum:** dual-stage primary's ordinary `perform` uses
+      `PerformDeps::new_machine_sequenced` (threaded through
+      `dispatch_individual_down` + the `Repeat`/`Up` tail via
+      `StageOutcome::NotMine { machine_sequenced }`; the Chord `FireIndividual`
+      path stays `new`). `settle_past_dwell()` reverted to `settle()` in both
+      Handoff/No-Return walk tests and the helper removed. Two new
+      `dual_stage_*` tests pin it (`..._carries_no_fire_once_dwell`,
+      `..._tapped_without_crossing_deep_fires_dwell_free`).
 
 ## Addendum (2026-09-07): fold the Fire-once-dwell × dual-stage-primary interaction
 
@@ -471,3 +488,19 @@ review candidate 3 (a depth-engine teardown contract) tractable
 — once `stage` presents one event entry point instead of ten methods, fitting
 it behind a shared contract is far cheaper. Not yet implemented — handed to a
 fresh session.
+
+**2026-09-07** — Implemented. `stage::Engine::feed` + `StageOutcome` land in
+`stage.rs`; `handle_event` collapses the `quick_skip_key` divert and the general
+deep-repeat/swallow into one `feed` call sited right after `chord::feed`.
+`begin_quick_skip` / `is_late` / `primary_handed_off` / `deep_repeat` are now
+private helpers (bodies untouched — verified against HEAD), interface 10 → 7.
+The Addendum's dwell change is threaded through `NotMine { machine_sequenced }`:
+`dispatch_individual_down` gained a `machine_sequenced: bool` (Chord path passes
+`false`), and the `Repeat`/`Up` tail picks its `PerformDeps` constructor the
+same way. `settle_past_dwell()` reverted to `settle()` in both walk tests, helper
+deleted. Coverage: 10 new `feed` routing-matrix unit tests in `stage.rs`, 2 new
+`dual_stage_*` pipeline tests for the dwell carve-out; all 28 pre-existing
+`dual_stage_*` tests green unchanged. `cargo fmt --check` / `clippy -D warnings`
+clean; daemon suite 539 green; GUI suite 504 green. ADR-0007 gains a dated
+**Refined:** paragraph, ADR-0008 a dual-stage-primary carve-out clause. Remaining:
+`/code-review`.

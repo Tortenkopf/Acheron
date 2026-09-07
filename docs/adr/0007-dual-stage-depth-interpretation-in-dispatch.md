@@ -55,3 +55,20 @@ the primary), the same shape the Chord executor already has.
 This refines the spirit of the existing "dispatch owns Depth interpretation" pattern (Axis,
 Analog-repeat established it); it does not supersede or refine ADR-0002 (evdev/uinput vs
 OpenRazer), which is about the capture/injection transport, not where Depth is interpreted.
+
+**Refined 2026-09-07** (`.scratch/post-release-development/` ticket 17): the per-Quick-Skip-key
+divert described above — "for Quick-Skip keys only, `handle_event` diverts the primary edge to
+the engine" — is now a single unconditional `stage::Engine::feed(deps, event) -> StageOutcome`
+call for *every* physical edge on a grid key, sited right after `chord::feed` and mirroring its
+shape (`Handled(Vec<Edit>)` / `NotMine`). `feed` owns the "is this a dual-stage key on the
+active Layer?" predicate (`handle_event` no longer recomputes a `Config`-derived
+`quick_skip_key`), and folds in what were two hand-rolled `handle_event` blocks plus the
+`begin_quick_skip` / `is_late` / `primary_handed_off` / `deep_repeat` reach-through — those four
+leave `stage::Engine`'s `pub(crate)` surface (10 → 7 methods: `feed`, `update`, `next_deadline`,
+`tick`, `stop_all`, `stop_stage`, `stop_all_toggles`). The load-bearing decision — staged-Depth
+interpretation lives in dispatch's `stage` module, not the capture source — is **unchanged**;
+only the internal call shape narrows. Folding the routing behind `feed` also moved the
+Fire-once-dwell decision for a dual-stage key's primary press onto the machine-sequenced side
+(`PerformDeps::new_machine_sequenced`), closing `.scratch/humane-output-rate/` ticket 12's noted
+residual (a redundant trailing `value=0` when a deep crossing landed inside the primary's 40 ms
+dwell) — see ADR-0008.

@@ -389,6 +389,29 @@ impl<'a> PerformDeps<'a> {
         )
     }
 
+    /// `new` / `new_machine_sequenced` chosen by predicate — the dispatch
+    /// *input* path's constructor, where whether a press is machine-sequenced
+    /// is only known at runtime (`stage::Engine::feed`'s `StageOutcome::NotMine
+    /// { machine_sequenced }`, ticket 17 Addendum). A dual-stage key's primary
+    /// press is machine-sequenced (dwell off); an ordinary key press is not.
+    pub(crate) fn for_input_press(
+        injector: &'a Injector,
+        config: &'a Config,
+        cursors: &'a mut stepper::Cursors,
+        toggle_lap_target: Duration,
+        toggle_autorepeat_schedule: RepeatSchedule,
+        machine_sequenced: bool,
+    ) -> Self {
+        PerformDeps::build(
+            injector,
+            config,
+            cursors,
+            toggle_lap_target,
+            toggle_autorepeat_schedule,
+            !machine_sequenced,
+        )
+    }
+
     fn build(
         injector: &'a Injector,
         config: &'a Config,

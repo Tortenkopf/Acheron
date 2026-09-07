@@ -499,7 +499,7 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             // Profile switch either — same reasoning as the Toggle/Analog-
             // repeat stops just above. Safe to run after this firing's own
             // `Edit::SwitchProfile` was already produced: `update_stages`/
-            // `begin_quick_skip` fully complete (and this `Edit` is returned)
+            // `stage::Engine::feed` fully complete (and this `Edit` is returned)
             // before `commit_input_edits` ever reaches `edit::apply`, so the
             // triggering firing itself is never interrupted by its own
             // consequence.

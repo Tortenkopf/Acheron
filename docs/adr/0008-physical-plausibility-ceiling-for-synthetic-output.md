@@ -28,7 +28,26 @@ Stepper-step / Chord equivalents — carries a fixed 40 ms dwell between Down an
 (`FIRE_ONCE_KEY_DWELL`), rather than the near-zero-dwell pair the research names the
 clearest synthetic tell. This is a rate-plausibility consistency follow-up
 (`.scratch/humane-output-rate/` ticket 12), not a detection defense: a Macro fired once
-still keeps its author's cadence, and Analog-repeat's tap pulses are unchanged.
+still keeps its author's cadence, and Analog-repeat's tap pulses are unchanged. A
+dual-stage key's **primary stage** is excluded — its press is machine-sequenced input,
+its timing already subject to depth interpretation, so it is dwelled nowhere
+`stage::Engine` drives a firing (`.scratch/post-release-development/` ticket 17: the
+primary path now builds `PerformDeps::new_machine_sequenced`, matching every other
+`stage::Engine`-driven edge — deep-stage fire, `RepressPrimary`, retroactive re-press,
+deep repeat, all already dwell-free before ticket 17).
+
+This carve-out is narrow. The dwell splice only ever engaged for a Fire-once binding
+whose compiled action is a *single held key* (`executor::single_held_key` — plain /
+modifier Keypress, single-key Macro, single-key Stepper `Key` step), so the exclusion
+touches only a primary binding that is **both** Fire-once **and** a single-key press,
+and only on its initial `Down`. A Toggle, Hold-to-repeat, multi-step-Macro, mouse- or
+gamepad-button primary never carried the dwell and is unaffected. Within that case the
+change is visible only when the key is tapped **without** crossing into the deep band —
+if it crosses, `ReleasePrimary` tears the key down regardless, which is the ~0 ms-dwell
+residual ticket 12 could not clean up and the reason this exclusion exists. The loss —
+one such primary, tapped shallow, forgoes the ~40 ms dwell on that one press — is
+negligible: dual-stage keys are niche and the primary is the light half of an
+escalating pair.
 
 **The audit.** `.scratch/humane-output-rate/` ticket 01 traced all twelve
 holding/repeating surfaces to their constants and ratified a verdict table. Eight

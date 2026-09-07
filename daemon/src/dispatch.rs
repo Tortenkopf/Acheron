@@ -39,8 +39,7 @@ use crate::capture::{CaptureMode, EventState, PhysicalEvent};
 use crate::chord;
 use crate::command::{Command, State};
 use crate::config::{
-    self, Action, ActuationPoint, ChordKey, Config, Layer, ModeKeyRole, StagingMode, StatusLeds,
-    TriggerMode,
+    self, Action, ActuationPoint, ChordKey, Config, Layer, ModeKeyRole, StatusLeds, TriggerMode,
 };
 use crate::dbus::Daemon;
 use crate::edit;
@@ -237,101 +236,35 @@ impl DispatchState {
             chord::ChordOutcome::NotMine => {}
         }
 
+        // The Staging-mode state machine (`tartarus-dual-stage-keys`,
+        // `post-release-development` ticket 17) runs unconditionally here,
+        // mirroring `chord::feed` just above — it owns the "is this a
+        // dual-stage key on the active Layer?" predicate and interprets this
+        // physical edge against the key's Quick-Skip / deep-repeat machine,
+        // folding what used to be two hand-rolled blocks (the `quick_skip_key`
+        // divert and the general deep-repeat swallow) plus the
+        // `begin_quick_skip` / `is_late` / `primary_handed_off` / `deep_repeat`
+        // reach-through into one call. `Handled` ⇒ the edge is consumed;
+        // `NotMine { machine_sequenced }` ⇒ run the ordinary Binding path,
+        // and — when `feed` tracks this key — build the following `perform`
+        // with `PerformDeps::new_machine_sequenced` so a dual-stage primary's
+        // press carries no Fire-once dwell (ticket 17 Addendum).
+        let deps = stage::EngineDeps {
+            config,
+            active_layer: self.active_layer,
+            individual: &mut self.individual,
+            injector: &self.injector,
+            cursors: &mut self.stepper,
+            toggle_lap_target: self.toggle_lap_target,
+            toggle_autorepeat_schedule: self.toggle_autorepeat_schedule,
+        };
+        let machine_sequenced = match self.stage.feed(deps, event).await? {
+            stage::StageOutcome::Handled(edits) => return Ok(edits),
+            stage::StageOutcome::NotMine { machine_sequenced } => machine_sequenced,
+        };
+
         let bindings = profile.layer(self.active_layer);
         let binding = bindings.get(&event.input).cloned();
-
-        // `tartarus-dual-stage-keys` ticket 04: Quick-Skip's dispatch-side
-        // primary-suppression buffer diverts here, gated on `event.depth.
-        // is_some()` exactly like the AnalogRepeat swallow just below — a
-        // Digital-mode primary press never diverts (the deep stage is inert
-        // for free in Digital mode), and Handoff/No-Return keys are
-        // entirely unaffected (this only ever matches a `QuickSkip`-mode
-        // Input carrying a live deep Binding on this Layer). `Down` always
-        // diverts — `stage::Engine::begin_quick_skip` arms the ~50ms window
-        // (or resolves synchronously to Skipped if the deep band is already
-        // hot on this same report) instead of firing the primary
-        // immediately. `Up`/`Repeat` divert too, unless this press already
-        // resolved to `Late` (the deadline already fired the primary
-        // retroactively): from `Late` on the key runs as ordinary Handoff, so
-        // its real events must reach the ordinary path below to actually
-        // release/repeat it.
-        let quick_skip_key = event.depth.is_some()
-            && profile
-                .deep_stages
-                .get(&event.input)
-                .is_some_and(|deep_cfg| deep_cfg.mode == StagingMode::QuickSkip)
-            && profile
-                .deep_layer(self.active_layer)
-                .contains_key(&event.input);
-        if quick_skip_key {
-            match event.state {
-                EventState::Down => {
-                    let depth = event.depth.expect("checked by `quick_skip_key` above");
-                    let deps = stage::EngineDeps {
-                        config,
-                        active_layer: self.active_layer,
-                        individual: &mut self.individual,
-                        injector: &self.injector,
-                        cursors: &mut self.stepper,
-                        toggle_lap_target: self.toggle_lap_target,
-                        toggle_autorepeat_schedule: self.toggle_autorepeat_schedule,
-                    };
-                    return self.stage.begin_quick_skip(deps, event.input, depth).await;
-                }
-                EventState::Repeat if !self.stage.is_late(event.input) => {
-                    // Quick-Skip's `Skipped` phase runs as Handoff for the
-                    // rest of the press — the deep stage's own Hold-to-repeat
-                    // still needs driving off this pulse (a no-op during
-                    // `Armed`, before the deep band is reached).
-                    let deps = stage::EngineDeps {
-                        config,
-                        active_layer: self.active_layer,
-                        individual: &mut self.individual,
-                        injector: &self.injector,
-                        cursors: &mut self.stepper,
-                        toggle_lap_target: self.toggle_lap_target,
-                        toggle_autorepeat_schedule: self.toggle_autorepeat_schedule,
-                    };
-                    self.stage.deep_repeat(deps, event.input).await?;
-                    return Ok(Vec::new());
-                }
-                EventState::Up if !self.stage.is_late(event.input) => {
-                    return Ok(Vec::new());
-                }
-                EventState::Up | EventState::Repeat => {}
-            }
-        }
-
-        // `tartarus-dual-stage-keys`: a synthesized primary `Repeat` pulse
-        // also drives a Hold-to-repeat *deep* stage's own repeat cadence
-        // while the deep band is engaged — the deep band has no independent
-        // `Repeat` source (see `stage::Engine::deep_repeat`). Runs for every
-        // Staging mode; a no-op unless the deep band is currently Down and
-        // the deep Binding is Hold-to-repeat. Gated on `depth.is_some()`
-        // like the diverts above (Digital mode has no deep stage).
-        if event.state == EventState::Repeat && event.depth.is_some() {
-            let deps = stage::EngineDeps {
-                config,
-                active_layer: self.active_layer,
-                individual: &mut self.individual,
-                injector: &self.injector,
-                cursors: &mut self.stepper,
-                toggle_lap_target: self.toggle_lap_target,
-                toggle_autorepeat_schedule: self.toggle_autorepeat_schedule,
-            };
-            self.stage.deep_repeat(deps, event.input).await?;
-            // Then, if the stage machine has handed this key's primary off to
-            // the deep stage (Handoff/No-Return crossed into the deep band),
-            // swallow the pulse for the primary itself — the primary band is
-            // still physically Down, so `capture::analog` keeps synthesizing
-            // these, but a Hold-to-repeat primary must stay silent under the
-            // deep stage rather than machine-gun. `stage::Engine` clears the
-            // flag on `RepressPrimary` (Handoff back out) and when the primary
-            // band itself goes Up, so repeats resume exactly when they should.
-            if self.stage.primary_handed_off(event.input) {
-                return Ok(Vec::new());
-            }
-        }
 
         // Real firing for an Analog-repeat Binding while Depth is available comes
         // entirely from `update_analog_repeats`'s own depth-driven background task
@@ -351,8 +284,11 @@ impl DispatchState {
                 // The bound → `trigger::decide` + `Slots::perform` /
                 // `ProfileSwitch` → `Edit` / unbound → passthrough tail, shared
                 // verbatim with the Chord machine's `FireIndividual` executor so
-                // the retroactive-fire logic exists once.
-                self.dispatch_individual_down(config, event.input).await
+                // the retroactive-fire logic exists once. `machine_sequenced`
+                // (a dual-stage key's primary press, per `stage::Engine::feed`)
+                // drops the Fire-once dwell — ticket 17 Addendum.
+                self.dispatch_individual_down(config, event.input, machine_sequenced)
+                    .await
             }
             EventState::Repeat | EventState::Up => {
                 let Some(binding) = binding else {
@@ -369,12 +305,18 @@ impl DispatchState {
                 }
                 let slot = self.individual.slot(&event.input);
                 let decision = trigger::decide(&binding, &config.macros, event.state, slot);
-                let deps = trigger::PerformDeps::new(
+                // A dual-stage key's primary Repeat/Up is machine-sequenced
+                // input too (`stage::Engine::feed` → `NotMine { machine_
+                // sequenced: true }`); the Fire-once dwell never applies to a
+                // Repeat/Up decision, but the constructor choice stays
+                // consistent with the `Down` arm above.
+                let deps = trigger::PerformDeps::for_input_press(
                     &self.injector,
                     config,
                     &mut self.stepper,
                     self.toggle_lap_target,
                     self.toggle_autorepeat_schedule,
+                    machine_sequenced,
                 );
                 self.individual
                     .perform(decision, event.input, &binding, deps)
@@ -432,7 +374,11 @@ impl DispatchState {
                     self.chord_slots.stop_toggle(&key).await;
                 }
                 chord::ChordEffect::FireIndividual { input } => {
-                    edits.extend(self.dispatch_individual_down(config, input).await?);
+                    // A Chord member can never be a dual-stage key
+                    // (`ChordMemberDeepStageConflict`), so this retroactive
+                    // Down is a genuine user one-shot — it keeps the Fire-once
+                    // dwell (`machine_sequenced: false`), ticket 17 Addendum.
+                    edits.extend(self.dispatch_individual_down(config, input, false).await?);
                 }
                 chord::ChordEffect::ForceReleaseIndividual { input } => {
                     self.individual.force_release(&input, &self.injector).await;
@@ -495,10 +441,19 @@ impl DispatchState {
     /// synthetic Down, which is wrong. Returns any `Edit::SwitchProfile` the
     /// member's own Binding produces — a Chord member's individual Binding can
     /// be any Action, unlike a Chord's own, which can never be `ProfileSwitch`.
+    ///
+    /// `machine_sequenced` selects the `PerformDeps` constructor (ticket 17
+    /// Addendum): the ordinary input path passes it through from
+    /// `stage::Engine::feed` (`true` for a dual-stage key's primary press, so
+    /// it carries no Fire-once dwell); the Chord `FireIndividual` executor
+    /// always passes `false` — a Chord member can never be a dual-stage key
+    /// (`ChordMemberDeepStageConflict`), so that retroactive Down is a genuine
+    /// user one-shot.
     async fn dispatch_individual_down(
         &mut self,
         config: &Config,
         input: Input,
+        machine_sequenced: bool,
     ) -> io::Result<Vec<edit::Edit>> {
         let profile = config
             .active_profile()
@@ -522,12 +477,13 @@ impl DispatchState {
                 // fast-follow doesn't specially engineer for.
                 let slot = self.individual.slot(&input);
                 let decision = trigger::decide(&binding, &config.macros, EventState::Down, slot);
-                let deps = trigger::PerformDeps::new(
+                let deps = trigger::PerformDeps::for_input_press(
                     &self.injector,
                     config,
                     &mut self.stepper,
                     self.toggle_lap_target,
                     self.toggle_autorepeat_schedule,
+                    machine_sequenced,
                 );
                 self.individual
                     .perform(decision, input, &binding, deps)
@@ -5436,17 +5392,6 @@ mod tests {
         }
     }
 
-    /// Like `settle()` but also waits real time past `FIRE_ONCE_KEY_DWELL`
-    /// (ticket 12): a single-key primary stage under Fire-once now holds its
-    /// key for the spliced dwell, so a `RepressPrimary` / fresh press landing
-    /// inside that window is dropped by `decide`'s ordinary same-key overlap
-    /// guard. A real dual-stage depth excursion is far slower than the dwell;
-    /// these tests just drive the reports back to back.
-    async fn settle_past_dwell() {
-        tokio::time::sleep(executor::FIRE_ONCE_KEY_DWELL + Duration::from_millis(20)).await;
-        settle().await;
-    }
-
     /// A multiset of decoded `(KeyCode, value)` events — for asserting two
     /// concurrently in-flight Fire-once firings both completed a full
     /// Down/Up pair without depending on how their individual steps
@@ -5474,22 +5419,23 @@ mod tests {
         // entirely, relying on this unmodified path.
         harness.press_analog(Input::Grid(1, 1), 150).await;
         harness.push_depth([(Input::Grid(1, 1), 150)]);
-        // Let the primary Fire-once press clear its spliced dwell (ticket 12)
-        // before the deep excursion, so the overlap guard is clear for the
-        // RepressPrimary below.
-        settle_past_dwell().await;
+        // A dual-stage key's primary press is machine-sequenced input — it
+        // carries no Fire-once dwell (ticket 17 Addendum), so the primary
+        // Down/Up pair lands back to back and the overlap guard is clear for
+        // the RepressPrimary below with a plain `settle()`.
+        settle().await;
 
         // The deep crossing, a separate report: primary's own hysteresis
         // never re-crosses its own Actuation/Release going from 150 to 250,
         // so capture emits nothing here — only `stage::Engine`, off the
         // depth watch, reacts (`ReleasePrimary` -> `FireDeep`).
         harness.push_depth([(Input::Grid(1, 1), 250)]);
-        settle_past_dwell().await;
+        settle().await;
 
         // Back out of the deep band, a separate report again (`ReleaseDeep`
         // -> `RepressPrimary`, a *fresh* Fire-once).
         harness.push_depth([(Input::Grid(1, 1), 150)]);
-        settle_past_dwell().await;
+        settle().await;
 
         // The full release: the real Analog-sourced Up — a no-op against
         // the already self-released `RepressPrimary` firing.
@@ -5644,18 +5590,19 @@ mod tests {
 
         harness.press_analog(Input::Grid(1, 1), 150).await;
         harness.push_depth([(Input::Grid(1, 1), 150)]);
-        // Let the primary Fire-once press clear its spliced dwell (ticket 12)
-        // so its self-balanced KeyUp lands here, not as a redundant trailing
-        // release after the handoff.
-        settle_past_dwell().await;
+        // A dual-stage primary carries no Fire-once dwell (ticket 17
+        // Addendum) — its self-balanced KeyUp lands right here, not as a
+        // redundant trailing release after the handoff, so a plain
+        // `settle()` suffices.
+        settle().await;
 
         harness.push_depth([(Input::Grid(1, 1), 250)]);
-        settle_past_dwell().await;
+        settle().await;
 
         // Back out of the deep band: No-Return releases the deep stage
         // only — no `RepressPrimary`, unlike Handoff's own equivalent row.
         harness.push_depth([(Input::Grid(1, 1), 150)]);
-        settle_past_dwell().await;
+        settle().await;
 
         harness.release_analog(Input::Grid(1, 1), 0).await;
         harness.push_depth([(Input::Grid(1, 1), 0)]);
@@ -5673,6 +5620,115 @@ mod tests {
             ],
             "No-Return must never repress the primary on the way back out — \
              the key stays quiet until a fresh press"
+        );
+    }
+
+    /// Ticket 17 Addendum: a dual-stage key's primary press is machine-
+    /// sequenced input, so a Fire-once single-key primary carries **no**
+    /// `FIRE_ONCE_KEY_DWELL`. Pressing the primary and crossing into the deep
+    /// band on the very next report — inside what used to be the 40 ms dwell
+    /// window — leaves exactly one balanced `[Down, Up]` for the primary,
+    /// with no redundant trailing `value=0` from a dwell task landing after
+    /// the deep excursion already released the key, and the primary's `Up` is
+    /// not deferred by the dwell.
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_primary_press_carries_no_fire_once_dwell() {
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        // The real Analog-sourced primary Down, then the deep crossing on the
+        // next report with no time advanced — the deep excursion lands well
+        // inside the old dwell window.
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        let after_primary: Vec<_> = harness
+            .sink
+            .batches()
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect();
+        assert_eq!(
+            after_primary,
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "the primary's Fire-once pair lands back to back — its Up is not \
+             held for a 40 ms dwell"
+        );
+
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        // A stray dwell task, had one been spawned, would land its redundant
+        // KEY_A `value=0` somewhere in this window.
+        tokio::time::advance(executor::FIRE_ONCE_KEY_DWELL * 2).await;
+        settle().await;
+
+        let batches = harness.shut_down().await;
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 0),
+                (evdev::KeyCode::KEY_B, 1),
+                (evdev::KeyCode::KEY_B, 0),
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 0),
+            ],
+            "every KEY_A press is a balanced Down/Up pair — no redundant \
+             trailing value=0 from a dwell task"
+        );
+    }
+
+    /// Ticket 17 Addendum: a dual-stage primary tapped as a plain key — never
+    /// crossing into the deep band — still fires its Fire-once pair exactly
+    /// once; it just no longer holds the ~40 ms plausibility dwell on that
+    /// press.
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_primary_tapped_without_crossing_deep_fires_dwell_free() {
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        // No time advanced: if the dwell were still on, only KEY_A `value=1`
+        // would be visible until 40 ms elapse.
+        settle().await;
+        let after_press: Vec<_> = harness
+            .sink
+            .batches()
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect();
+        assert_eq!(
+            after_press,
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "the Fire-once pair lands immediately, dwell-free"
+        );
+
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        tokio::time::advance(executor::FIRE_ONCE_KEY_DWELL * 2).await;
+        settle().await;
+
+        let batches = harness.shut_down().await;
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "a dual-stage primary that never crosses deep just fires its \
+             Fire-once pair once"
         );
     }
 
