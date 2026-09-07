@@ -93,12 +93,6 @@ STAGING_MODES = [
         "does not re-fire.",
     ),
     (
-        "additive",
-        "Additive",
-        "Both stages fire and stay held together — the deeper press adds "
-        "the deep stage, it does not release the primary.",
-    ),
-    (
         "quick_skip",
         "Quick-Skip",
         "Deep band reached within ~50ms of the primary Actuation point: the "

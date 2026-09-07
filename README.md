@@ -251,8 +251,6 @@ the key travels through both bands:
   stage held at a time.
 - **No-Return** — like Handoff going in, but the primary does not re-fire on
   the way back up.
-- **Additive** — the deep press adds the deep stage on top; the primary stays
-  held. Both release together.
 - **Quick-Skip** — reaching the deep band within about 50 ms of the primary
   point suppresses the primary's press entirely (for a fast full-press you
   never wanted the light press for); otherwise it behaves as Handoff.

@@ -21,7 +21,14 @@ is enforced by existing mechanism, not a central gate: `MIN_TOGGLE_LAP` /
 `combine_toggle_lap_target` floor the Toggle loop lap, `RepeatSchedule` seeds its
 envelope from the live kernel rate, `run_toggle_held` / `spawn_held` give a held button
 a single sustained press, `CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD` floors the digital
-pulse.
+pulse, `FIRE_ONCE_KEY_DWELL` floors the one-shot keyboard press below.
+
+A canned one-shot keyboard press — a Fire-once Keypress, and its single-key Macro /
+Stepper-step / Chord equivalents — carries a fixed 40 ms dwell between Down and Up
+(`FIRE_ONCE_KEY_DWELL`), rather than the near-zero-dwell pair the research names the
+clearest synthetic tell. This is a rate-plausibility consistency follow-up
+(`.scratch/humane-output-rate/` ticket 12), not a detection defense: a Macro fired once
+still keeps its author's cadence, and Analog-repeat's tap pulses are unchanged.
 
 **The audit.** `.scratch/humane-output-rate/` ticket 01 traced all twelve
 holding/repeating surfaces to their constants and ratified a verdict table. Eight
@@ -47,6 +54,12 @@ different item), button Toggles (`BTN_*` does not autorepeat), or multi-step Mac
 Acheron's held and repeated keyboard output is now timing-indistinguishable from a
 physical hold, and its one dynamic mode — the Analog-repeat depth ramp — is continuously
 hand-driven.
+
+One surface could not be reshaped to fit and was **deleted** instead: the Dual-stage
+**Additive** staging mode held both a primary and a deep key in autorepeat at once — two
+concurrent `value=2` streams from one press, a shape the kernel (single `repeat_key`)
+never produces. It is removed (ADR-0009); after the cut no staging mode emits two
+concurrent autorepeat streams.
 
 **The Macro exception.** A Macro is the sole deliberate exception: its author may
 sequence Keypresses at any cadence. A Macro fired once, and the keystroke cadence

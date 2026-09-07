@@ -977,12 +977,6 @@ STAGING_MODES: list[tuple[str, str, str]] = [
         "Like Handoff on the way in — but coming back up, the primary never re-fires.",
     ),
     (
-        "additive",
-        "Additive",
-        "The deeper press adds the deep stage on top; the primary stays held. "
-        "Both fire and release together.",
-    ),
-    (
         "quick_skip",
         "Quick-Skip",
         "Reaching the deep band within ~50 ms of the primary point suppresses the "

@@ -330,18 +330,72 @@ pub(crate) struct PerformDeps<'a> {
     /// (`capture::analog::resolve_toggle_autorepeat_schedule`) and threaded
     /// down as a plain value, exactly like `toggle_lap_target`.
     pub toggle_autorepeat_schedule: RepeatSchedule,
+    /// Whether a `D::SpawnFireOnce` whose compiled steps are a single held key
+    /// gets `executor::FIRE_ONCE_KEY_DWELL` spliced between the edges
+    /// (`.scratch/humane-output-rate/` ticket 12). Set by the constructor, not
+    /// per call site: `new` (the individual and Chord paths) is a canned
+    /// one-shot press the user physically initiated once, so `true`;
+    /// `new_machine_sequenced` (the `stage::Engine` path) is a depth-driven
+    /// re-press, so `false` — see that constructor's doc for why.
+    fire_once_key_dwell: bool,
 }
 
 impl<'a> PerformDeps<'a> {
-    /// The call-site constructor — takes `&Config` (read-only) and the two
+    /// The call-site constructor for a **user-initiated** firing — the
+    /// individual and Chord paths. Takes `&Config` (read-only) and the two
     /// disjoint `DispatchState` borrows, so each retargeted site is one line
-    /// instead of the field literal.
+    /// instead of the field literal. A single-key Fire-once firing built here
+    /// gets the `executor::FIRE_ONCE_KEY_DWELL` splice (ticket 12): the press
+    /// is a canned one-shot the user made once, not a machine-sequenced edge.
     pub(crate) fn new(
         injector: &'a Injector,
         config: &'a Config,
         cursors: &'a mut stepper::Cursors,
         toggle_lap_target: Duration,
         toggle_autorepeat_schedule: RepeatSchedule,
+    ) -> Self {
+        PerformDeps::build(
+            injector,
+            config,
+            cursors,
+            toggle_lap_target,
+            toggle_autorepeat_schedule,
+            true,
+        )
+    }
+
+    /// The call-site constructor for a **machine-sequenced** firing — every
+    /// `stage::Engine` deep-stage fire, primary (re-)press, `RepressPrimary`,
+    /// retroactive re-press, and deep repeat. Identical to `new` but the
+    /// single-key Fire-once dwell (ticket 12) is **off**: a deep-stage edge is
+    /// a machine-sequenced, depth-driven re-press, not a canned one-shot the
+    /// user made, and a 40 ms hold there would let `decide`'s ordinary
+    /// `FiringUnfinished` overlap guard swallow a fast deep-band wiggle's
+    /// re-press.
+    pub(crate) fn new_machine_sequenced(
+        injector: &'a Injector,
+        config: &'a Config,
+        cursors: &'a mut stepper::Cursors,
+        toggle_lap_target: Duration,
+        toggle_autorepeat_schedule: RepeatSchedule,
+    ) -> Self {
+        PerformDeps::build(
+            injector,
+            config,
+            cursors,
+            toggle_lap_target,
+            toggle_autorepeat_schedule,
+            false,
+        )
+    }
+
+    fn build(
+        injector: &'a Injector,
+        config: &'a Config,
+        cursors: &'a mut stepper::Cursors,
+        toggle_lap_target: Duration,
+        toggle_autorepeat_schedule: RepeatSchedule,
+        fire_once_key_dwell: bool,
     ) -> Self {
         PerformDeps {
             injector,
@@ -350,6 +404,7 @@ impl<'a> PerformDeps<'a> {
             cursors,
             toggle_lap_target,
             toggle_autorepeat_schedule,
+            fire_once_key_dwell,
         }
     }
 }
@@ -415,8 +470,26 @@ impl<K: Eq + Hash + Clone> Slots<K> {
         match decision {
             D::Nothing => {}
             D::SpawnFireOnce => {
-                let steps =
+                let mut steps =
                     compile_action(&binding.action, deps.macros, deps.steppers, deps.cursors);
+                // Ticket 12: a canned one-shot keyboard press otherwise goes out
+                // as `[KeyDown, KeyUp]` with no artificial dwell — the shape
+                // ADR-0008 names the clearest synthetic tell. Splice a fixed
+                // `FIRE_ONCE_KEY_DWELL` between the edges wherever the compiled
+                // steps are a single held key (`single_held_key`, the same
+                // bright line the `value=2` work uses — plain / modifier
+                // Keypress, single-key Macro, single-key Stepper `Key` step,
+                // single-key Chord), Fire-once only. `AnalogRepeat` — including
+                // the Digital-Capture fallback that also lands on
+                // `D::SpawnFireOnce` — keeps its already-audited tap cadence;
+                // a multi-step Macro's `single_held_key` is `None`, so the Macro
+                // exception holds by shape.
+                if deps.fire_once_key_dwell
+                    && binding.trigger == TriggerMode::FireOnce
+                    && let Some((mods, code)) = executor::single_held_key(&steps)
+                {
+                    steps = executor::fire_once_key_steps(mods, code);
+                }
                 let handle = executor::spawn_fire_once(deps.injector.clone(), steps);
                 self.firings.insert(key, handle);
             }
@@ -789,6 +862,53 @@ mod tests {
         }
     }
 
+    /// Ticket 12 leaves `decide` untouched: a Fire-once single keyboard key
+    /// still resolves to the plain, abstract `D::SpawnFireOnce` (and
+    /// Analog-repeat — including the Digital-Capture fallback that shares the
+    /// arm — is likewise unchanged). The `FIRE_ONCE_KEY_DWELL` splice is
+    /// entirely downstream in `Slots::perform`, gated on `fire_once_key_dwell`,
+    /// so the Analog-repeat path is provably unaffected here.
+    #[test]
+    fn decide_is_unchanged_by_the_fire_once_dwell_splice() {
+        use EventState::{Down, Repeat};
+        let no_macros: HashMap<MacroId, MacroDef> = HashMap::new();
+        let decide =
+            |b: &Binding, s: EventState, slot: Option<Slot>| super::decide(b, &no_macros, s, slot);
+
+        for slot in [None, Some(Slot::FiringFinished), Some(Slot::Toggle)] {
+            assert_eq!(
+                decide(&binding(TriggerMode::FireOnce, keyboard(KBD)), Down, slot),
+                TriggerDecision::SpawnFireOnce,
+                "Fire-once single key still decides to the plain SpawnFireOnce"
+            );
+            assert_eq!(
+                decide(
+                    &binding(TriggerMode::AnalogRepeat, keyboard(KBD)),
+                    Down,
+                    slot
+                ),
+                TriggerDecision::SpawnFireOnce,
+            );
+            assert_eq!(
+                decide(
+                    &binding(TriggerMode::AnalogRepeat, keyboard(KBD)),
+                    Repeat,
+                    slot
+                ),
+                TriggerDecision::SpawnFireOnce,
+            );
+        }
+        // The overlap guard still blocks a genuinely in-flight firing.
+        assert_eq!(
+            decide(
+                &binding(TriggerMode::FireOnce, keyboard(KBD)),
+                Down,
+                Some(Slot::FiringUnfinished),
+            ),
+            TriggerDecision::Nothing,
+        );
+    }
+
     #[test]
     fn overlap_guard_only_blocks_on_an_unfinished_firing() {
         let no_macros: HashMap<MacroId, MacroDef> = HashMap::new();
@@ -1026,6 +1146,10 @@ mod slots {
         }
 
         fn deps(&mut self) -> PerformDeps<'_> {
+            self.deps_with_dwell(true)
+        }
+
+        fn deps_with_dwell(&mut self, fire_once_key_dwell: bool) -> PerformDeps<'_> {
             PerformDeps {
                 injector: &self.inj,
                 macros: &self.macros,
@@ -1033,6 +1157,7 @@ mod slots {
                 cursors: &mut self.cursors,
                 toggle_lap_target: executor::MIN_TOGGLE_LAP,
                 toggle_autorepeat_schedule: RepeatSchedule::new(250, 33),
+                fire_once_key_dwell,
             }
         }
 
@@ -1357,6 +1482,260 @@ mod slots {
             events[2..].contains(&(KeyCode::KEY_LEFTCTRL, 0))
                 && events[2..].contains(&(KeyCode::KEY_A, 0)),
             "both the base key and its modifier are released: {events:?}"
+        );
+    }
+
+    /// Ticket 12: a Fire-once `D::SpawnFireOnce` whose compiled steps are a
+    /// single held key is re-compiled through `executor::fire_once_key_steps`,
+    /// so the key is genuinely held for `FIRE_ONCE_KEY_DWELL` between its
+    /// edges rather than emitting a near-zero-dwell `[Down, Up]` pair.
+    #[tokio::test(start_paused = true)]
+    async fn perform_fire_once_single_key_holds_the_key_for_the_spliced_dwell() {
+        let mut fx = Fixture::new();
+        let binding = kbd_binding(); // FireOnce, KEY_A, no modifiers
+        let mut slots: Slots<Key> = Slots::default();
+
+        tokio::task::yield_now().await;
+        slots
+            .perform(TriggerDecision::SpawnFireOnce, K, &binding, fx.deps())
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fx.key_events(),
+            vec![(KeyCode::KEY_A, 1)],
+            "only the Down until the spliced dwell elapses"
+        );
+
+        tokio::time::advance(executor::FIRE_ONCE_KEY_DWELL).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fx.key_events(),
+            vec![(KeyCode::KEY_A, 1), (KeyCode::KEY_A, 0)],
+            "the Up lands exactly one dwell later"
+        );
+    }
+
+    /// The dwell is off on the `stage::Engine` path (`fire_once_key_dwell:
+    /// false`) — a deep-stage / `RepressPrimary` fire is machine-sequenced,
+    /// not a user one-shot. There, and there only, a Fire-once single key
+    /// emits the bare back-to-back pair.
+    #[tokio::test(start_paused = true)]
+    async fn perform_fire_once_single_key_skips_the_dwell_when_disabled() {
+        let mut fx = Fixture::new();
+        let binding = kbd_binding();
+        let mut slots: Slots<Key> = Slots::default();
+
+        tokio::task::yield_now().await;
+        slots
+            .perform(
+                TriggerDecision::SpawnFireOnce,
+                K,
+                &binding,
+                fx.deps_with_dwell(false),
+            )
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fx.key_events(),
+            vec![(KeyCode::KEY_A, 1), (KeyCode::KEY_A, 0)],
+            "no spliced dwell — both edges land back to back"
+        );
+    }
+
+    /// A multi-step Macro fired once keeps its author's cadence — `single_
+    /// held_key` is `None`, so no dwell is spliced (the Macro exception holds
+    /// by shape, ticket 12 §2).
+    #[tokio::test(start_paused = true)]
+    async fn perform_fire_once_multi_step_macro_carries_no_dwell() {
+        let mut fx = Fixture::new();
+        fx.macros.insert(
+            MacroId::from("combo"),
+            MacroDef {
+                name: "combo".to_string(),
+                steps: vec![
+                    crate::config::MacroStepDto::KeyDown(KeyCode::KEY_A),
+                    crate::config::MacroStepDto::KeyUp(KeyCode::KEY_A),
+                    crate::config::MacroStepDto::KeyDown(KeyCode::KEY_B),
+                    crate::config::MacroStepDto::KeyUp(KeyCode::KEY_B),
+                ],
+            },
+        );
+        let binding = Binding {
+            trigger: TriggerMode::FireOnce,
+            action: Action::Macro {
+                macro_id: MacroId::from("combo"),
+            },
+        };
+        let mut slots: Slots<Key> = Slots::default();
+
+        tokio::task::yield_now().await;
+        slots
+            .perform(TriggerDecision::SpawnFireOnce, K, &binding, fx.deps())
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fx.key_events(),
+            vec![
+                (KeyCode::KEY_A, 1),
+                (KeyCode::KEY_A, 0),
+                (KeyCode::KEY_B, 1),
+                (KeyCode::KEY_B, 0),
+            ],
+            "multi-step Macro runs its steps back to back, no spliced dwell"
+        );
+    }
+
+    /// Ticket 12 §6, the remaining in-scope shapes that reach `D::SpawnFireOnce`
+    /// through a compile path other than a plain `Action::Keypress` — each still
+    /// resolves to a single held key, so `perform` splices exactly one
+    /// `FIRE_ONCE_KEY_DWELL` between the edges:
+    ///   - a Fire-once single-key `Macro` (`[KeyDown, KeyUp]`, no `Delay`);
+    ///   - a Fire-once Stepper `Key` step;
+    ///   - a Fire-once Chord whose Action is a single key.
+    /// Asserted the same way as `perform_fire_once_single_key_holds_the_key_for_
+    /// the_spliced_dwell`: only the Down until the dwell elapses, the Up exactly
+    /// one dwell later.
+    #[tokio::test(start_paused = true)]
+    async fn perform_fire_once_single_key_macro_holds_the_key_for_the_spliced_dwell() {
+        let mut fx = Fixture::new();
+        fx.macros.insert(
+            MacroId::from("hold-a"),
+            MacroDef {
+                name: "hold-a".to_string(),
+                steps: vec![
+                    crate::config::MacroStepDto::KeyDown(KeyCode::KEY_A),
+                    crate::config::MacroStepDto::KeyUp(KeyCode::KEY_A),
+                ],
+            },
+        );
+        let binding = Binding {
+            trigger: TriggerMode::FireOnce,
+            action: Action::Macro {
+                macro_id: MacroId::from("hold-a"),
+            },
+        };
+        let mut slots: Slots<Key> = Slots::default();
+
+        tokio::task::yield_now().await;
+        slots
+            .perform(TriggerDecision::SpawnFireOnce, K, &binding, fx.deps())
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fx.key_events(),
+            vec![(KeyCode::KEY_A, 1)],
+            "single-key Macro: only the Down until the spliced dwell elapses"
+        );
+
+        tokio::time::advance(executor::FIRE_ONCE_KEY_DWELL).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fx.key_events(),
+            vec![(KeyCode::KEY_A, 1), (KeyCode::KEY_A, 0)],
+            "single-key Macro: the Up lands exactly one dwell later"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn perform_fire_once_single_key_stepper_step_holds_the_key_for_the_spliced_dwell() {
+        let mut fx = Fixture::new();
+        fx.steppers.insert(
+            StepperId::from("s"),
+            StepperDef {
+                name: "s".to_string(),
+                items: vec![crate::config::StepperItem::Key {
+                    key: KeyCode::KEY_A,
+                    modifiers: Modifiers::default(),
+                }],
+            },
+        );
+        let binding = Binding {
+            trigger: TriggerMode::FireOnce,
+            action: Action::Step {
+                stepper: StepperId::from("s"),
+                direction: crate::config::StepDirection::Forward,
+            },
+        };
+        let mut slots: Slots<Key> = Slots::default();
+
+        tokio::task::yield_now().await;
+        slots
+            .perform(TriggerDecision::SpawnFireOnce, K, &binding, fx.deps())
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fx.key_events(),
+            vec![(KeyCode::KEY_A, 1)],
+            "Stepper `Key` step: only the Down until the spliced dwell elapses"
+        );
+
+        tokio::time::advance(executor::FIRE_ONCE_KEY_DWELL).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fx.key_events(),
+            vec![(KeyCode::KEY_A, 1), (KeyCode::KEY_A, 0)],
+            "Stepper `Key` step: the Up lands exactly one dwell later"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn perform_fire_once_single_key_chord_holds_the_key_for_the_spliced_dwell() {
+        use crate::config::ChordKey;
+        use crate::input::Input;
+
+        let mut fx = Fixture::new();
+        let binding = kbd_binding(); // FireOnce, KEY_A — a Chord's single-key Action
+        let chord_key = ChordKey::new([Input::Grid(1, 1), Input::Grid(1, 2)].into_iter().collect());
+        let mut slots: Slots<ChordKey> = Slots::default();
+
+        tokio::task::yield_now().await;
+        slots
+            .perform(
+                TriggerDecision::SpawnFireOnce,
+                chord_key,
+                &binding,
+                fx.deps(),
+            )
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fx.key_events(),
+            vec![(KeyCode::KEY_A, 1)],
+            "single-key Chord: only the Down until the spliced dwell elapses"
+        );
+
+        tokio::time::advance(executor::FIRE_ONCE_KEY_DWELL).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fx.key_events(),
+            vec![(KeyCode::KEY_A, 1), (KeyCode::KEY_A, 0)],
+            "single-key Chord: the Up lands exactly one dwell later"
         );
     }
 

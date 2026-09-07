@@ -1,7 +1,34 @@
 <!-- wayfinder:map -->
 
-Status: archived — destination reached 2026-09-07; all nine tickets resolved. Both gated
-specs handed off and implemented: `spec-kernel-shaped-repeat.md` →
+Status: **ARCHIVED 2026-09-07 (second time) — destination reached.** All thirteen tickets
+resolved. Tickets 01–09 landed the audit, the two gated specs (both since implemented —
+`kernel-shaped-repeat-impl/` and `output-safety-guidance/`), ADR-0008 and the
+"Physical-plausibility ceiling" `CONTEXT.md` term. The 2026-09-07 reopening for tickets 10
+and 11 is closed out: ticket 12 spliced the 40 ms Fire-once keyboard dwell (`FIRE_ONCE_KEY_DWELL`),
+and [ticket 13](issues/13-remove-additive-staging-mode.md) removed the Dual-stage
+**Additive** staging mode (new **ADR-0009**; hard `ConfigError::RemovedStagingModeAdditive`
+at load for an existing `"additive"` config). After the cut **no staging mode ever emits
+two concurrent autorepeat streams** — the invariant ADR-0008 now records. Nothing left to
+decide; effort complete.
+
+[Fire-once keyboard keystroke dwell](issues/10-fire-once-keyboard-keystroke-dwell.md)
+(**resolved**): a single Fire-once keyboard press emits the same near-zero-dwell
+`[KeyDown, KeyUp]` the audit flagged as its clearest synthetic tell, and it was never in the
+original "holds or repeats" scope → **yes, add a fixed 40 ms dwell** to a canned one-shot
+press (where `single_held_key` matches, under Fire-once), as a compliance/consistency
+follow-up to the `value=2` rebuild; execution
+[ticket 12](issues/12-splice-the-fire-once-keypress-dwell.md) **landed 2026-09-07** — see
+Decisions so far.
+[Additive Staging mode — fix or cut](issues/11-additive-staging-mode-fix-or-cut.md)
+(**resolved 2026-09-07**): the `value=2` rebuild (ticket 07) left the Dual-stage **Additive**
+mode emitting two concurrent `value=2` autorepeat streams from one press — a shape no
+physical keyboard produces (the kernel autorepeats only the most-recently-pressed key) → **cut
+the mode**; execution graduated as [ticket 13](issues/13-remove-additive-staging-mode.md)
+(**resolved 2026-09-07**). After the cut no staging mode ever emits two concurrent
+autorepeat streams.
+
+Prior archive note (2026-09-07, superseded): all nine tickets resolved. Both gated specs
+handed off and implemented: `spec-kernel-shaped-repeat.md` →
 [`kernel-shaped-repeat-impl/`](../kernel-shaped-repeat-impl/issues/) (2026-09-06),
 `spec-user-facing-output-safety-guidance.md` →
 [`output-safety-guidance/`](../output-safety-guidance/issues/) (2026-09-07). ADR-0008 +
@@ -17,6 +44,21 @@ for a **physically held key or button** — the kernel's configured autorepeat d
 for keys, and exactly one Down/Up (no repeat) for a held mouse/gamepad button. Any surface
 that fails the bar is **fixed within this map** (execution is in scope, not handed off).
 
+**Also in scope (added 2026-09-07):** a **Fire-once** press of a keyboard key — not a hold
+or a repeat, but a single canned `[KeyDown, KeyUp]` the user has no timing control over,
+which today goes out with ~0 ms dwell (no `Delay` in `keypress_steps`). The bar's spirit —
+timing a physical hand could reproduce — extends to that one-shot press: whether it needs a
+fixed dwell floor, and where, is [ticket
+10](issues/10-fire-once-keyboard-keystroke-dwell.md). (A *Macro* fired once stays out — its
+author sequences their own timing; see Out of scope.)
+
+**Also in scope (added 2026-09-07):** the Dual-stage **Additive** Staging mode, which this
+effort's `value=2` rebuild left emitting two concurrent kernel-autorepeat streams from a
+single finger press. [Ticket 11](issues/11-additive-staging-mode-fix-or-cut.md)
+(**resolved**) chose to **cut the mode** — two held autorepeating keys is a shape no
+physical keyboard produces. Execution is
+[ticket 13](issues/13-remove-additive-staging-mode.md), on this map.
+
 The finding then feeds two gated specs: a **`spec-user-facing-output-safety-guidance.md`**
 for the user-facing output-safety
 guidance (macro-editor disclaimer + best-practice tips covering anti-cheat plausibility and
@@ -31,9 +73,12 @@ stays only as this effort's working name) so future repeat-based features inheri
 invariant.
 
 Done when: the audit verdict is ratified, every flagged surface is fixed, the ADR + term
-are written, and both specs (`spec-user-facing-output-safety-guidance.md` and
-`spec-kernel-shaped-repeat.md`) are gated —
-ready for fresh implementation efforts.
+are written, both specs (`spec-user-facing-output-safety-guidance.md` and
+`spec-kernel-shaped-repeat.md`) are gated — ready for fresh implementation efforts — **and**
+the Fire-once keyboard-dwell question (ticket 10 → ticket 12, landed 2026-09-07) and
+the Additive fix-or-cut question (ticket 11 → ticket 13, cut, landed 2026-09-07) are
+decided, with the fixes each calls for made on this map. **All satisfied — effort
+complete, map archived.**
 
 ## Notes
 
@@ -59,6 +104,28 @@ ready for fresh implementation efforts.
   07): it is about "direct evdev/uinput instead of OpenRazer" only. No ADR in the repo
   records the "uinput origin is always detectable" premise. Ticket 04 writes it as a new
   ADR (0008); the glossary term and any rationale cite 0008, not 0002.
+- **Reopened for ticket 11 (2026-09-07).** The `value=2` kernel-shaped-repeat work
+  (ticket 07, shipped in `kernel-shaped-repeat-impl/`) converted single-key deep-stage
+  Hold-to-repeat to genuine kernel autorepeat — so a Dual-stage **Additive** key with both
+  stages Hold-to-repeat emitted *two* concurrent `value=2` streams from one press,
+  phase-locked to the one synthesized `RepeatSchedule` cadence. Owned here (not the archived
+  Dual-stage map) because this effort's work is what broke it and what raises the ceiling
+  question. **Resolved 2026-09-07: cut the mode** — two held autorepeating keys is a shape
+  no physical keyboard produces (the kernel autorepeats only the most-recently-pressed key),
+  so it is an ADR-0008 violation, not a borderline regularity call; no use case, always the
+  shakiest of the four modes. Execution on this map as
+  [ticket 13](issues/13-remove-additive-staging-mode.md) — `StagingMode` → Handoff /
+  No-Return / Quick-Skip, hard `ConfigError` at load for an existing `"additive"` config
+  (no known users), new **ADR-0009**. After the cut, no staging mode emits two concurrent
+  autorepeat streams (Handoff/No-Return hand the primary off, Quick-Skip suppresses it).
+  See Decisions so far.
+- **Reopened for ticket 10 (2026-09-07).** The bar as charted was "holds or repeats,
+  steady-state rate only." Ticket 10 extended the *spirit* of it — timing a physical hand
+  could reproduce — to a single **Fire-once keyboard press**, whose canned `[KeyDown,
+  KeyUp]` has ~0 ms dwell. **Resolved 2026-09-07:** yes, a fixed 40 ms dwell, execution
+  on this map as [ticket 12](issues/12-splice-the-fire-once-keypress-dwell.md), which
+  amends ADR-0008 and adds a clause to the `CONTEXT.md` "Physical-plausibility ceiling"
+  term (both currently worded "holding or repeating"). See Decisions so far.
 - **Prior art in-tree**: ticket 26 (`MIN_TOGGLE_LAP` 20 ms floor, added after a zero-delay
   toggled Keypress hard-froze a machine), ticket 68 (`resolve_toggle_lap_target` live
   kernel read), ticket 20 (Analog-repeat 2–20 Hz curve), ticket 18 §4 (`RepeatSchedule`
@@ -161,7 +228,96 @@ ready for fresh implementation efforts.
   analog_repeat}` rows → `false`); `rules.valid_triggers` + `binding_editor` drop the
   option for a Macro Action; CONTEXT.md **Trigger mode** entry gains a third "except…"
   clause (no ADR). **This was the last open ticket — the map's destination is reached and
-  it can be archived.**
+  it can be archived.** *(Superseded: the map was reopened 2026-09-07 for tickets 10 & 11.)*
+
+- [Remove the Additive staging mode](issues/13-remove-additive-staging-mode.md)
+  — execution ticket, done on `dev` 2026-09-07. `StagingMode` is now **Handoff / No-Return
+  / Quick-Skip**. Migration mechanism = a raw-`toml::Value` scan
+  (`config::find_removed_additive_staging`, run in `parse()` ahead of the typed deserialize,
+  mirroring the legacy-inline-Macro guard) → `ConfigError::RemovedStagingModeAdditive`
+  (names Additive, cites ADR-0009, points at Handoff/No-Return/Quick-Skip or a deep-stage
+  Macro); `Additive` fully removed from `enum StagingMode` — no retained marker variant
+  leaking into `match`es. At the D-Bus `SetStagingMode` boundary `"additive"` just gets the
+  ordinary unknown-mode error. `stage.rs` `additive()` + table + `advance` arm deleted, the
+  Additive-naming self-references (`QuickSkipPhase::Skipped` doc, `primary_handed_off` doc,
+  `Engine` doc, the `advance` doc) reworded to describe the ops directly,
+  `quick_skip_skipped_runs_additive_…` test renamed (assertions kept); `deep_repeat` /
+  `primary_handed_off` **stay** (Handoff/No-Return need them). Test fixtures re-pointed
+  (`edit.rs`, `dbus/mod.rs`, `dbus/wire.rs`, GUI `test_binding_editor` / `test_daemon_stub`
+  / `prototype`); `dual_stage_additive_holds_both_stages…` deleted (surviving-mode
+  deep-repeat coverage confirmed intact). New **ADR-0009**
+  (`0009-additive-staging-mode-removed.md`); ADR-0007 parenthetical trimmed + pointer;
+  ADR-0008 gains a note (Additive = first surface the ceiling *deleted*); `CONTEXT.md`
+  `Additive` entry removed + `Staging mode` list trimmed; README bullet removed.
+  Regression test: a `mode = "additive"` `config.toml` fails `load_or_seed` and is left
+  untouched on disk. Suite: daemon **525** pass, clippy `-D warnings` clean, `cargo fmt`
+  clean (also swept ticket 09's pre-existing `binding.rs` violation); GUI **504** pass.
+  `grep -i additive` clean (only ADR-0009 / the pointers / the `RemovedStagingModeAdditive`
+  machinery / unrelated prose). **Last open ticket — destination reached, map archived.**
+
+- [Additive Staging mode — fix or cut](issues/11-additive-staging-mode-fix-or-cut.md)
+  — grilling with Charon. **Cut the Dual-stage Additive mode.** `StagingMode` becomes
+  **Handoff / No-Return / Quick-Skip**. Decisive point: Additive with both stages
+  Hold-to-repeat emits **two concurrent `value=2` autorepeat streams from one press**
+  (`stage::Engine::deep_repeat` rides the primary's `RepeatSchedule`, so also phase-locked)
+  — and a real keyboard autorepeats only the *most-recently-pressed* key, so holding two is
+  physically impossible, not a borderline regularity tell → an ADR-0008 violation. Also: no
+  use case Charon can name, always the shakiest of the four (three `dual-stage-keys-impl` #03
+  post-ship corrections clustered here). **After the cut no staging mode ever emits two
+  concurrent autorepeat streams** (Handoff/No-Return hand the primary off via
+  `primary_handed_off`; Quick-Skip `Skipped` suppresses it). Q2 (ceiling per-stream vs
+  aggregate) is **moot** — the output is impossible either way; a user wanting a fast
+  alternating-keystroke macro that *looks* like autorepeat can build one (the Macro
+  exception working as intended). **Migration**: hard `ConfigError` at load for an existing
+  `staging_mode = "additive"` — no silent downgrade (no known users); mechanism is
+  ticket 13's, constraint = an Additive-specific message. **Record**: new **ADR-0009**
+  ("Additive staging mode removed — a real keyboard can't hold two autorepeating keys"),
+  citing ADR-0008/0007; one-line pointers into both; `CONTEXT.md` `Additive` entry removed +
+  `Staging mode` list trimmed, alongside the code. **Execution-in-scope** →
+  [ticket 13](issues/13-remove-additive-staging-mode.md) (`Blocked by: 11`). No README
+  "use a Macro" note (old behaviour was impossible; a note would describe a different
+  thing).
+
+- [Fire-once keyboard keystroke dwell](issues/10-fire-once-keyboard-keystroke-dwell.md)
+  — grilling with Charon. **Yes, floor a canned one-shot keyboard press with a fixed
+  `40 ms` dwell** between Down and Up — the zero-dwell `[KeyDown, KeyUp]` pair is the shape
+  ADR-0008 already calls "the clearest synthetic tell," erased everywhere else by the
+  `value=2` rebuild but still shipping on a plain Fire-once Keypress. Framed as
+  **compliance, not defense** (the `uinput` origin stays visible; the output just should
+  not be a shape no hand makes). **Scope = wherever `executor::single_held_key` matches,
+  under Fire-once** — plain + modifier Keypress, single-key Macro, single-key Stepper step,
+  single-key Chord; multi-step Macro, Analog-repeat (incl. Digital-Capture fallback), and
+  `ControllerButton` all excluded *by that predicate*, no new content inspection. New
+  `FIRE_ONCE_KEY_DWELL` constant in `executor.rs`, **not** shared with
+  `CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD`. **Execution-in-scope** →
+  [ticket 12](issues/12-splice-the-fire-once-keypress-dwell.md) (the splice + tests +
+  **amend ADR-0008** — no new ADR — + the `CONTEXT.md` ceiling-term clause; `CONTEXT.md`
+  "Fire-once" untouched). Mechanism (decide-split vs perform-branch) left to ticket 12
+  under three binding constraints (no Analog-repeat impact; reuse `single_held_key`;
+  Fire-once only).
+
+- [Splice the Fire-once keypress dwell](issues/12-splice-the-fire-once-keypress-dwell.md)
+  — execution ticket, done on `dev` 2026-09-07. New `executor::FIRE_ONCE_KEY_DWELL`
+  (`40 ms`, own doc comment, not shared with `CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD`) +
+  `executor::fire_once_key_steps` (= `keypress_steps` with a `Delay` between the base key's
+  edges). **Mechanism = `perform`-local branch**, not the decide-split ticket 10 preferred:
+  the split can't reach a Fire-once **Stepper `Key` step** (`decide` stays abstract for
+  `SpawnFireOnce`; `hold_repeat_kind` is `None` for `Action::Step`), so `Slots::perform`'s
+  `D::SpawnFireOnce` arm runs `single_held_key` on the *compiled* steps and swaps in the
+  dwelled sequence — covering plain/modifier Keypress, single-key Macro, Stepper `Key`
+  step, single-key Chord uniformly. `decide` untouched → the Analog-repeat arm
+  (incl. Digital-Capture fallback) is provably unaffected (locked by a decide-table test).
+  **New wrinkle:** `Slots::perform` is shared with `stage::Engine`, so a new
+  `fire_once_key_dwell: bool` on `PerformDeps` turns the dwell **off** for a dual-stage
+  `RepressPrimary` / deep fire (depth-driven, machine-sequenced — not a user one-shot; a
+  40 ms hold there would let the overlap guard swallow a fast deep-band wiggle's re-press).
+  **Accepted residual:** a sub-40 ms physical tap emits a redundant trailing `value=0`
+  (kernel-deduped; same shape as `CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD` on a sub-35 ms
+  Analog-repeat `Up`). ADR-0008 "The ceiling" + `CONTEXT.md` ceiling term amended (no new
+  ADR); "Fire-once" `CONTEXT.md` entry untouched. Suite: daemon 525 pass, clippy clean,
+  GUI 503 pass; no GUI / `rules.py` / `ConfigError` surface. *(Aside: `dev` carries a
+  pre-existing `cargo fmt` violation in `daemon/src/config/binding.rs` from ticket 09's
+  `afed7ce` — worth a sweep before `main` is rebuilt.)*
 
 ## Not yet specified
 
@@ -177,6 +333,13 @@ ready for fresh implementation efforts.
   (2026-09-06, all 7 tickets done). ADR-0008 un-gated, `CONTEXT.md` "Toggle" entry
   restructured, [ticket 08](issues/08-lock-macro-repetition-floor-tests.md) resolved.
 
+- ~~**The Additive fix or removal itself**~~ — **done.** Ticket 11 chose **cut**;
+  [ticket 13](issues/13-remove-additive-staging-mode.md) executed it on `dev`
+  2026-09-07 — `StagingMode::Additive` removed, `ConfigError::RemovedStagingModeAdditive`
+  load rejection, ADR-0009, and the `CONTEXT.md` / ADR-0007 / ADR-0008 / README edits.
+
+**Nothing outstanding — the map is archived.**
+
 ## Out of scope
 
 - **A speed ceiling on a Macro fired once, and on the keystroke cadence *within* one run
@@ -184,6 +347,9 @@ ready for fresh implementation efforts.
   Keypresses at any cadence. Ticket 03 **kept both out**: the once-fired burst is bounded
   by step count + injector backpressure (not ticket 26's unbounded loop), and a within-run
   floor would cap legitimate fast combos. Text-only guidance in ticket 05, no code.
+  *(Distinct from a plain `Action::Keypress` fired once — a canned Down/Up with no
+  author-controlled timing — which ticket 10 pulls back **in** scope. The distinction is
+  authorship of the timing, not the Trigger mode.)*
 - **A new floor for *trigger-driven Macro repetition*** (was pulled *in* by ticket 01, Q6)
   — ticket 03 found the Toggle→Macro loop-lap and the Hold-to-repeat→Macro re-fire cadence
   are **already** floored to `max(kernel period, MIN_TOGGLE_LAP)` by existing mechanism, so

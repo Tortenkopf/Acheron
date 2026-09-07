@@ -77,7 +77,7 @@ struct DispatchState {
     analog_repeat: analog_repeat::Engine,
     /// The third depth engine (`tartarus-dual-stage-keys` ticket 03),
     /// alongside `axis`/`analog_repeat` above — drives every dual-stage
-    /// grid key's Handoff/No-Return/Additive state machine off the same
+    /// grid key's Handoff/No-Return/Quick-Skip state machine off the same
     /// live-Depth stream `handle_depth_update`/`update_analog_repeats`
     /// already read (`update_stages`, called from the same `rx_depth` arm).
     stage: stage::Engine,
@@ -244,7 +244,7 @@ impl DispatchState {
         // primary-suppression buffer diverts here, gated on `event.depth.
         // is_some()` exactly like the AnalogRepeat swallow just below — a
         // Digital-mode primary press never diverts (the deep stage is inert
-        // for free in Digital mode), and Handoff/No-Return/Additive keys are
+        // for free in Digital mode), and Handoff/No-Return keys are
         // entirely unaffected (this only ever matches a `QuickSkip`-mode
         // Input carrying a live deep Binding on this Layer). `Down` always
         // diverts — `stage::Engine::begin_quick_skip` arms the ~50ms window
@@ -325,10 +325,8 @@ impl DispatchState {
             // swallow the pulse for the primary itself — the primary band is
             // still physically Down, so `capture::analog` keeps synthesizing
             // these, but a Hold-to-repeat primary must stay silent under the
-            // deep stage rather than machine-gun. Additive leaves
-            // `primary_handed_off` false, so its primary repeats through the
-            // ordinary path below, untouched. `stage::Engine` clears the flag
-            // on `RepressPrimary` (Handoff back out) and when the primary
+            // deep stage rather than machine-gun. `stage::Engine` clears the
+            // flag on `RepressPrimary` (Handoff back out) and when the primary
             // band itself goes Up, so repeats resume exactly when they should.
             if self.stage.primary_handed_off(event.input) {
                 return Ok(Vec::new());
@@ -2208,6 +2206,49 @@ mod tests {
                 (evdev::KeyCode::KEY_A, 2),
                 (evdev::KeyCode::KEY_A, 0),
             ],
+        );
+    }
+
+    /// Ticket 12: a Fire-once Keypress holds its key for `FIRE_ONCE_KEY_DWELL`
+    /// between the edges. Held past the dwell the firing self-balances, so the
+    /// physical `Up` force-releases nothing; and two presses spaced past the
+    /// dwell both fire a full pair, with no stray events.
+    #[tokio::test(start_paused = true)]
+    async fn fire_once_keypress_holds_the_dwell_then_back_to_back_presses_both_fire() {
+        let mut bindings = HashMap::new();
+        bindings.insert(Input::Grid(1, 1), keypress_binding(evdev::KeyCode::KEY_F1));
+        let mut seam = Seam::with_bindings(bindings);
+
+        seam.press(Input::Grid(1, 1)).await;
+        // Mid-dwell: only the Down has gone out.
+        assert_eq!(
+            seam.sink.batches().len(),
+            1,
+            "the Up is still inside the spliced dwell"
+        );
+        tokio::time::advance(executor::FIRE_ONCE_KEY_DWELL).await;
+        tokio::task::yield_now().await;
+        seam.release(Input::Grid(1, 1)).await;
+
+        // A second press, cleanly past the first firing's dwell.
+        seam.press(Input::Grid(1, 1)).await;
+        tokio::time::advance(executor::FIRE_ONCE_KEY_DWELL).await;
+        tokio::task::yield_now().await;
+        seam.release(Input::Grid(1, 1)).await;
+
+        let batches = seam.finish().await;
+        assert_eq!(
+            batches
+                .iter()
+                .map(|b| key_and_value(b[0]))
+                .collect::<Vec<_>>(),
+            vec![
+                (evdev::KeyCode::KEY_F1, 1),
+                (evdev::KeyCode::KEY_F1, 0),
+                (evdev::KeyCode::KEY_F1, 1),
+                (evdev::KeyCode::KEY_F1, 0),
+            ],
+            "two full press/release pairs, no stray force-release events"
         );
     }
 
@@ -4627,16 +4668,16 @@ mod tests {
             )
             .await
             .unwrap();
-        // Advance to index 2 (the last item of the 3-item list).
+        // Advance to index 2 (the last item of the 3-item list). The two
+        // presses are spaced past `FIRE_ONCE_KEY_DWELL` (ticket 12): a
+        // single-key Step under Fire-once now holds its key for the spliced
+        // dwell, so a second press landing inside that window would be
+        // dropped by `decide`'s ordinary same-key overlap guard.
         harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::sleep(executor::FIRE_ONCE_KEY_DWELL + Duration::from_millis(20)).await;
         harness.release(Input::Grid(1, 1)).await;
         harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::sleep(executor::FIRE_ONCE_KEY_DWELL + Duration::from_millis(20)).await;
         assert_eq!(harness.get_state().await.stepper_cursors[&stepper_id], 2);
 
         // Shrink to a single item — the stranded index-2 cursor must be
@@ -4709,10 +4750,12 @@ mod tests {
 
     #[tokio::test]
     async fn fire_once_step_binding_produces_no_extra_output_on_physical_release() {
-        // Mirrors `fire_once_binding_ignores_repeat_and_up_fires_only_on_down`
-        // for a Stepper: a Step compiles to an already-balanced
-        // KeyDown/KeyUp pair, so the physical `Up`'s force-release check
-        // (ticket 33) finds nothing left held and produces no extra output.
+        // A single-key Stepper `Key` step under Fire-once compiles to a
+        // single held key, so ticket 12 splices `FIRE_ONCE_KEY_DWELL` between
+        // its edges. Held past the dwell (the ordinary case — a real press is
+        // tens of ms), the firing self-balances its KeyDown/KeyUp before the
+        // physical `Up`'s force-release check (ticket 33) runs, so that check
+        // finds nothing held and no extra output lands.
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
         let stepper_id = harness
             .create_stepper(
@@ -4740,9 +4783,8 @@ mod tests {
             .unwrap();
 
         harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        // Hold past the spliced dwell so the firing balances itself.
+        tokio::time::sleep(executor::FIRE_ONCE_KEY_DWELL + Duration::from_millis(20)).await;
         harness.release(Input::Grid(1, 1)).await;
         for _ in 0..5 {
             tokio::task::yield_now().await;
@@ -5394,6 +5436,17 @@ mod tests {
         }
     }
 
+    /// Like `settle()` but also waits real time past `FIRE_ONCE_KEY_DWELL`
+    /// (ticket 12): a single-key primary stage under Fire-once now holds its
+    /// key for the spliced dwell, so a `RepressPrimary` / fresh press landing
+    /// inside that window is dropped by `decide`'s ordinary same-key overlap
+    /// guard. A real dual-stage depth excursion is far slower than the dwell;
+    /// these tests just drive the reports back to back.
+    async fn settle_past_dwell() {
+        tokio::time::sleep(executor::FIRE_ONCE_KEY_DWELL + Duration::from_millis(20)).await;
+        settle().await;
+    }
+
     /// A multiset of decoded `(KeyCode, value)` events — for asserting two
     /// concurrently in-flight Fire-once firings both completed a full
     /// Down/Up pair without depending on how their individual steps
@@ -5421,19 +5474,22 @@ mod tests {
         // entirely, relying on this unmodified path.
         harness.press_analog(Input::Grid(1, 1), 150).await;
         harness.push_depth([(Input::Grid(1, 1), 150)]);
-        settle().await;
+        // Let the primary Fire-once press clear its spliced dwell (ticket 12)
+        // before the deep excursion, so the overlap guard is clear for the
+        // RepressPrimary below.
+        settle_past_dwell().await;
 
         // The deep crossing, a separate report: primary's own hysteresis
         // never re-crosses its own Actuation/Release going from 150 to 250,
         // so capture emits nothing here — only `stage::Engine`, off the
         // depth watch, reacts (`ReleasePrimary` -> `FireDeep`).
         harness.push_depth([(Input::Grid(1, 1), 250)]);
-        settle().await;
+        settle_past_dwell().await;
 
         // Back out of the deep band, a separate report again (`ReleaseDeep`
         // -> `RepressPrimary`, a *fresh* Fire-once).
         harness.push_depth([(Input::Grid(1, 1), 150)]);
-        settle().await;
+        settle_past_dwell().await;
 
         // The full release: the real Analog-sourced Up — a no-op against
         // the already self-released `RepressPrimary` firing.
@@ -5578,79 +5634,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dual_stage_additive_holds_both_stages_on_independent_untouched_cadences() {
-        let config = dual_stage_config(
-            StagingMode::Additive,
-            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
-            hold_to_repeat_binding(evdev::KeyCode::KEY_B),
-        );
-        let harness = CommandHarness::spawn(config);
-
-        // Primary crossing: the real Down, then a synthesized Hold-to-repeat
-        // `Repeat` pulse (mirroring `capture::analog`'s own
-        // `RepeatSchedule`) — both fire normally; Additive never touches
-        // this crossing at all.
-        harness.press_analog(Input::Grid(1, 1), 150).await;
-        harness.push_depth([(Input::Grid(1, 1), 150)]);
-        settle().await;
-        harness.repeat_analog(Input::Grid(1, 1), 150).await;
-        settle().await;
-
-        // Deep crossing: Additive fires the deep stage without touching the
-        // primary's own liveness at all.
-        harness.push_depth([(Input::Grid(1, 1), 250)]);
-        settle().await;
-
-        // Ticket 04: both stages' single-key Hold-to-repeat now present as
-        // genuine kernel autorepeat. The opening firings, in order: primary
-        // Down (`KEY_A` `value=1`), primary Repeat (`KEY_A` `value=2`), then
-        // `FireDeep` on the crossing (`KEY_B` `value=1`).
-        let opening: Vec<_> = harness
-            .sink
-            .batches()
-            .iter()
-            .map(|b| key_and_value(b[0]))
-            .collect();
-        assert_eq!(
-            opening,
-            vec![
-                (evdev::KeyCode::KEY_A, 1),
-                (evdev::KeyCode::KEY_A, 2),
-                (evdev::KeyCode::KEY_B, 1),
-            ],
-        );
-
-        // One synthesized primary Repeat pulse while both bands are engaged:
-        // Additive never suppresses the primary, and the same pulse drives the
-        // deep stage's own Hold-to-repeat too — both stages emit one `value=2`
-        // (fire-and-forget, so the two may interleave — assert the multiset).
-        // The full release then balances each held `value=1` with a
-        // force-released `value=0`: `ReleaseDeep` for `KEY_B`, the primary's
-        // own `Up` for `KEY_A`.
-        harness.repeat_analog(Input::Grid(1, 1), 250).await;
-        settle().await;
-        harness.release_analog(Input::Grid(1, 1), 0).await;
-        harness.push_depth([(Input::Grid(1, 1), 0)]);
-        settle().await;
-
-        let batches = harness.shut_down().await;
-        let after: Vec<_> = batches[opening.len()..]
-            .iter()
-            .map(|b| key_and_value(b[0]))
-            .collect();
-        assert_eq!(
-            event_counts(&after),
-            event_counts(&[
-                (evdev::KeyCode::KEY_A, 2),
-                (evdev::KeyCode::KEY_A, 0),
-                (evdev::KeyCode::KEY_B, 2),
-                (evdev::KeyCode::KEY_B, 0),
-            ]),
-            "both stages autorepeat off the one primary pulse, then release cleanly"
-        );
-    }
-
-    #[tokio::test]
     async fn dual_stage_no_return_never_represses_the_primary_on_the_way_back_out() {
         let config = dual_stage_config(
             StagingMode::NoReturn,
@@ -5661,15 +5644,18 @@ mod tests {
 
         harness.press_analog(Input::Grid(1, 1), 150).await;
         harness.push_depth([(Input::Grid(1, 1), 150)]);
-        settle().await;
+        // Let the primary Fire-once press clear its spliced dwell (ticket 12)
+        // so its self-balanced KeyUp lands here, not as a redundant trailing
+        // release after the handoff.
+        settle_past_dwell().await;
 
         harness.push_depth([(Input::Grid(1, 1), 250)]);
-        settle().await;
+        settle_past_dwell().await;
 
         // Back out of the deep band: No-Return releases the deep stage
         // only — no `RepressPrimary`, unlike Handoff's own equivalent row.
         harness.push_depth([(Input::Grid(1, 1), 150)]);
-        settle().await;
+        settle_past_dwell().await;
 
         harness.release_analog(Input::Grid(1, 1), 0).await;
         harness.push_depth([(Input::Grid(1, 1), 0)]);

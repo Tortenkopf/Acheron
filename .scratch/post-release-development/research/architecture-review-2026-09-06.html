@@ -1,0 +1,474 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Architecture review — Acheron</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+      mermaid.initialize({ startOnLoad: true, theme: "neutral", securityLevel: "loose" });
+    </script>
+    <style>
+      .seam { stroke-dasharray: 5 4; }
+      .leak { stroke: #dc2626; }
+      body { font-feature-settings: "kern"; }
+      .mod { border: 1.5px solid #64748b; }
+      .deep { border: 3px solid #0f172a; background: linear-gradient(135deg,#f1f5f9,#e2e8f0); }
+      .ghost { opacity: .38; }
+      .lbl { font-size: 10px; letter-spacing: .12em; text-transform: uppercase; }
+      h2 { scroll-margin-top: 1.5rem; }
+    </style>
+  </head>
+  <body class="bg-stone-50 text-slate-900 font-sans antialiased">
+    <main class="max-w-5xl mx-auto px-6 py-12 space-y-14">
+      <header class="space-y-4">
+        <p class="lbl text-slate-500">Architecture review</p>
+        <h1 class="font-serif text-4xl text-slate-900">Acheron — deepening opportunities</h1>
+        <p class="text-slate-600 max-w-2xl text-[15px] leading-relaxed">
+          Six candidates, weighted toward the code the <em>Dual-stage keys</em> feature just
+          moved through — <code class="text-sm">dispatch.rs</code>, <code class="text-sm">stage.rs</code>,
+          <code class="text-sm">config.rs</code>, and the GUI binding editor. Each is a shallow
+          module or a leaking seam that a deepening would concentrate.
+        </p>
+        <div class="flex flex-wrap gap-4 text-xs text-slate-500 pt-2 border-t border-slate-200">
+          <span class="flex items-center gap-2"><span class="inline-block w-5 h-4 mod bg-white"></span> module</span>
+          <span class="flex items-center gap-2"><span class="inline-block w-5 h-4 deep"></span> deep module</span>
+          <span class="flex items-center gap-2"><svg width="26" height="10"><line x1="0" y1="5" x2="26" y2="5" class="seam" stroke="#475569" stroke-width="1.5"/></svg> seam</span>
+          <span class="flex items-center gap-2"><svg width="26" height="10"><line x1="0" y1="5" x2="26" y2="5" class="leak" stroke-width="2"/></svg> leak across seam</span>
+          <span class="flex items-center gap-2"><span class="inline-block w-5 h-4 border border-slate-400 ghost bg-white"></span> now internal</span>
+        </div>
+        <p class="text-xs text-slate-400">Generated 2026-09-06 · vocabulary: <code>/codebase-design</code> (module / interface / depth / seam / leverage / locality) + <code>CONTEXT.md</code></p>
+      </header>
+
+      <nav class="text-sm text-slate-600 grid sm:grid-cols-2 gap-x-8 gap-y-1.5 border-l-2 border-emerald-400 pl-5">
+        <a class="hover:text-emerald-700" href="#c1">1 · Fold Quick-Skip routing behind <code>stage::Engine</code> <span class="text-emerald-600 font-medium">— Strong</span></a>
+        <a class="hover:text-emerald-700" href="#c2">2 · Carve <code>config::validate</code> into named invariants <span class="text-emerald-600 font-medium">— Strong</span></a>
+        <a class="hover:text-emerald-700" href="#c3">3 · One teardown contract for the depth engines <span class="text-amber-600 font-medium">— Worth exploring</span></a>
+        <a class="hover:text-emerald-700" href="#c4">4 · A contract test + <code>ConfigView</code> for the <code>a{sv}</code> shape <span class="text-amber-600 font-medium">— Worth exploring</span></a>
+        <a class="hover:text-emerald-700" href="#c5">5 · Split the 638-line dual-stage editor panel <span class="text-amber-600 font-medium">— Worth exploring</span></a>
+        <a class="hover:text-emerald-700" href="#c6">6 · Split <code>config.rs</code> model from file lifecycle <span class="text-slate-400 font-medium">— Speculative</span></a>
+      </nav>
+
+      <section id="candidates" class="space-y-16">
+
+        <!-- ============ CANDIDATE 1 ============ -->
+        <article id="c1" class="space-y-6">
+          <div class="flex items-center gap-3 flex-wrap">
+            <span class="lbl text-slate-400">Candidate 1</span>
+            <span class="px-2 py-0.5 rounded text-xs font-semibold bg-emerald-100 text-emerald-800">Strong</span>
+            <span class="px-2 py-0.5 rounded text-xs font-medium bg-slate-100 text-slate-600">in-process</span>
+          </div>
+          <h2 class="font-serif text-2xl">Fold Quick-Skip routing behind <code>stage::Engine</code></h2>
+          <p class="font-mono text-sm text-slate-500">daemon/src/dispatch.rs · handle_event 231–321 &nbsp;|&nbsp; daemon/src/stage.rs · Engine 420–1008</p>
+
+          <div class="grid md:grid-cols-2 gap-4">
+            <div class="rounded-lg border border-slate-200 bg-white p-4 space-y-3">
+              <p class="lbl text-slate-400">Before — interface leaks the state machine</p>
+              <div class="relative" style="height:300px">
+                <div class="absolute inset-x-2 top-2 p-2 mod bg-white rounded" style="height:150px">
+                  <p class="lbl text-slate-500">dispatch::handle_event</p>
+                  <ul class="text-[11px] text-slate-600 mt-1 space-y-0.5 leading-tight">
+                    <li>re-derives <code>quick_skip_key</code> from Config</li>
+                    <li>branches on <code>event.state</code> × phase</li>
+                    <li>reads <code>is_late()</code>, <code>primary_handed_off()</code></li>
+                    <li>builds <code>EngineDeps</code> inline ×3</li>
+                    <li class="text-slate-400">~90 lines of routing</li>
+                  </ul>
+                </div>
+                <svg class="absolute inset-0 w-full h-full pointer-events-none">
+                  <line x1="50%" y1="162" x2="50%" y2="196" class="leak" stroke-width="2" marker-end="url(#a1)"/>
+                  <line x1="30%" y1="196" x2="30%" y2="162" class="leak" stroke-width="2" marker-end="url(#a1)"/>
+                  <defs><marker id="a1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#dc2626"/></marker></defs>
+                </svg>
+                <div class="absolute inset-x-2 bottom-2 p-2 mod bg-white rounded" style="height:96px">
+                  <p class="lbl text-slate-500">stage::Engine · 10 pub methods</p>
+                  <p class="text-[11px] text-slate-600 mt-1 leading-tight">
+                    <code>begin_quick_skip</code>, <code>is_late</code>, <code>primary_handed_off</code>,
+                    <code>deep_repeat</code>, <code>update</code>, <code>tick</code>, <code>next_deadline</code>,
+                    <code>stop_all</code>, <code>stop_stage</code>, <code>stop_all_toggles</code>
+                  </p>
+                </div>
+                <p class="absolute right-3 top-[168px] text-[10px] text-red-600 font-medium">phase interpretation<br/>lives on the wrong side</p>
+              </div>
+            </div>
+
+            <div class="rounded-lg border border-slate-200 bg-white p-4 space-y-3">
+              <p class="lbl text-slate-400">After — one entry point for a primary edge</p>
+              <div class="relative" style="height:300px">
+                <div class="absolute inset-x-2 top-2 p-2 mod bg-white rounded" style="height:84px">
+                  <p class="lbl text-slate-500">dispatch::handle_event</p>
+                  <p class="text-[11px] text-slate-600 mt-1 leading-tight">
+                    grid key with a deep stage?<br/>
+                    → <code>stage.on_primary_event(deps, event)</code><br/>
+                    match <code>Swallow | PassThrough | Edits</code>
+                  </p>
+                </div>
+                <svg class="absolute inset-0 w-full h-full pointer-events-none">
+                  <line x1="50%" y1="88" x2="50%" y2="128" stroke="#475569" stroke-width="1.5" class="seam" marker-end="url(#a2)"/>
+                  <defs><marker id="a2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#475569"/></marker></defs>
+                </svg>
+                <div class="absolute inset-x-2 bottom-2 p-3 deep rounded" style="height:168px">
+                  <p class="lbl text-slate-700">stage::Engine · ~5 pub methods</p>
+                  <p class="text-[11px] text-slate-500 mt-1 ghost leading-tight">
+                    Armed / Skipped / Late phase machine · handed-off tracking ·
+                    deep-repeat cadence · <code>begin_quick_skip</code> · <code>is_late</code> ·
+                    <code>primary_handed_off</code> — all now internal
+                  </p>
+                  <p class="text-[11px] text-slate-700 mt-2">exposed: <code>on_primary_event</code>, <code>update</code>, <code>tick</code>, <code>next_deadline</code>, <code>stop_all</code></p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid sm:grid-cols-2 gap-x-10 gap-y-3 text-sm">
+            <div><p class="lbl text-slate-400 mb-1">Problem</p><p class="text-slate-700">Dispatch re-derives a Config predicate the engine already tracks, then interprets the engine's <code>Armed</code>/<code>Late</code>/handed-off phases across ~90 lines and three inline <code>EngineDeps</code> builds.</p></div>
+            <div><p class="lbl text-slate-400 mb-1">Solution</p><p class="text-slate-700">One <code>on_primary_event(deps, event) → EventDisposition</code>. <code>handle_event</code> calls it for any deep-stage grid key and never learns what a phase means.</p></div>
+          </div>
+          <div>
+            <p class="lbl text-slate-400 mb-2">Wins</p>
+            <ul class="text-sm text-slate-700 grid sm:grid-cols-2 gap-x-10 gap-y-1 list-disc pl-5">
+              <li>interface: 10 methods → ~5</li>
+              <li>locality: phase interpretation joins phase storage</li>
+              <li>Quick-Skip machine testable end-to-end, no dispatch harness</li>
+              <li>the <code>EngineDeps</code>-built-inline-×3 smell disappears</li>
+            </ul>
+          </div>
+          <div class="rounded bg-amber-50 border border-amber-200 p-3 text-[13px] text-amber-900">
+            <strong>Refines ADR-0007, doesn't contradict it.</strong> The ADR places the divert in dispatch; this keeps it there but narrows the interface it diverts <em>through</em> — "all staged-depth interpretation lives in <code>stage.rs</code>" is the ADR's own stated aim.
+          </div>
+        </article>
+
+        <!-- ============ CANDIDATE 2 ============ -->
+        <article id="c2" class="space-y-6">
+          <div class="flex items-center gap-3 flex-wrap">
+            <span class="lbl text-slate-400">Candidate 2</span>
+            <span class="px-2 py-0.5 rounded text-xs font-semibold bg-emerald-100 text-emerald-800">Strong</span>
+            <span class="px-2 py-0.5 rounded text-xs font-medium bg-slate-100 text-slate-600">in-process</span>
+          </div>
+          <h2 class="font-serif text-2xl">Carve <code>config::validate</code> into named invariants</h2>
+          <p class="font-mono text-sm text-slate-500">daemon/src/config.rs · validate 1273–1520, ConfigError 915–1179 &nbsp;|&nbsp; gui/acheron_gui/daemon_stub.py · 635–783</p>
+
+          <div class="grid md:grid-cols-2 gap-4">
+            <div class="rounded-lg border border-slate-200 bg-white p-4">
+              <p class="lbl text-slate-400 mb-3">Before — a 250-line wall, appended in ticket order</p>
+              <div class="space-y-0.5 font-mono text-[10px] leading-tight">
+                <div class="px-2 py-1 bg-slate-100 text-slate-500">// active_profile, macro/stepper refs …</div>
+                <div class="px-2 py-1 bg-slate-100 text-slate-500">config.profiles.values().find_map(…) // axis conflict</div>
+                <div class="px-2 py-1 bg-amber-100 text-amber-700">// --- ticket 04 additions ---</div>
+                <div class="px-2 py-1 bg-slate-100 text-slate-500">find_map(…) // ReleaseNotBelowActuation</div>
+                <div class="px-2 py-1 bg-slate-100 text-slate-500">find_map(…) // ChordMemberSetConflict</div>
+                <div class="px-2 py-1 bg-amber-100 text-amber-700">// --- ticket NN additions ---</div>
+                <div class="px-2 py-1 bg-rose-100 text-rose-700">find_map(…) // InvalidDeepStageInput</div>
+                <div class="px-2 py-1 bg-rose-100 text-rose-700">find_map(…) // DeepStageReleaseNotBelowActuation</div>
+                <div class="px-2 py-1 bg-rose-100 text-rose-700">find_map(…) // DeepStageBandOverlapsPrimary</div>
+                <div class="px-2 py-1 bg-rose-100 text-rose-700">find_map(…) // DeepStageWithoutPrimary</div>
+                <div class="px-2 py-1 bg-rose-100 text-rose-700">find_map(…) // DeepStageMissingConfig</div>
+                <div class="px-2 py-1 bg-rose-100 text-rose-700">find_map(…) // AnalogRepeatOnDualStageKey</div>
+                <div class="px-2 py-1 bg-rose-100 text-rose-700">find_map(…) // ChordMemberDeepStageConflict</div>
+              </div>
+              <p class="text-[11px] text-slate-500 mt-3">~20 unnamed checks · dual-stage added 7 (rose). "Which check rejects X" = a linear scan.</p>
+            </div>
+
+            <div class="rounded-lg border border-slate-200 bg-white p-4">
+              <p class="lbl text-slate-400 mb-3">After — one deep module, invariants grouped &amp; named</p>
+              <div class="deep rounded p-3 space-y-2">
+                <p class="lbl text-slate-700">config::validate</p>
+                <div class="grid grid-cols-1 gap-1.5 font-mono text-[11px]">
+                  <div class="px-2 py-1 bg-white/70 rounded border border-slate-300">check_references(cfg)</div>
+                  <div class="px-2 py-1 bg-white/70 rounded border border-slate-300">check_actuation(cfg)</div>
+                  <div class="px-2 py-1 bg-white/70 rounded border border-slate-300">check_axis(cfg)</div>
+                  <div class="px-2 py-1 bg-white/70 rounded border border-slate-300">check_chords(cfg)</div>
+                  <div class="px-2 py-1 bg-white/70 rounded border border-slate-300">check_deep_stages(cfg)</div>
+                </div>
+                <p class="text-[11px] text-slate-500 ghost">ConfigError + its 130-line Display impl move here too</p>
+              </div>
+              <p class="text-[11px] text-slate-600 mt-3"><code>pub fn validate</code> stays the sole interface — calls the five in order.</p>
+            </div>
+          </div>
+
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="lbl text-slate-400 mb-2">The mirror this unblocks</p>
+            <pre class="mermaid">
+flowchart LR
+  V["config::validate<br/>check_deep_stages()"] -. "named seam<br/>a test + the stub can cite" .-> S["daemon_stub.py<br/>7 _reject_if_* helpers"]
+  V --> T["contract fixture<br/>daemon-schema.json"]
+  T -. verifies .-> S
+  classDef leak stroke:#dc2626,stroke-width:2px;
+  classDef deep fill:#e2e8f0,stroke:#0f172a,stroke-width:3px;
+  class V deep
+            </pre>
+            <p class="text-[12px] text-slate-500 mt-2">Today the <code>daemon_stub.py</code> deep-stage block (ADR-0005 hand-mirror) transcribes <code>validate</code>'s check <em>order</em> from a wall with no landmarks. Named groups give the mirror — and a future contract test — something to point at.</p>
+          </div>
+
+          <div>
+            <p class="lbl text-slate-400 mb-2">Wins</p>
+            <ul class="text-sm text-slate-700 grid sm:grid-cols-2 gap-x-10 gap-y-1 list-disc pl-5">
+              <li>locality: one invariant group = one file region</li>
+              <li>leverage: each check gets a name tests + stub cite</li>
+              <li>the "append under a ticket banner" reflex ends</li>
+              <li><code>ConfigError</code> stops bloating the type module</li>
+            </ul>
+          </div>
+          <div class="rounded bg-slate-100 border border-slate-200 p-3 text-[13px] text-slate-600">
+            Continues the <code>config::binding</code> carve (ticket 14) — that took the <em>per-Binding</em> half; this takes the <em>whole-Config</em> half that stayed behind.
+          </div>
+        </article>
+
+        <!-- ============ CANDIDATE 3 ============ -->
+        <article id="c3" class="space-y-6">
+          <div class="flex items-center gap-3 flex-wrap">
+            <span class="lbl text-slate-400">Candidate 3</span>
+            <span class="px-2 py-0.5 rounded text-xs font-semibold bg-amber-100 text-amber-800">Worth exploring</span>
+            <span class="px-2 py-0.5 rounded text-xs font-medium bg-slate-100 text-slate-600">in-process · trait seam</span>
+          </div>
+          <h2 class="font-serif text-2xl">One teardown contract for the depth engines</h2>
+          <p class="font-mono text-sm text-slate-500">daemon/src/dispatch.rs · handle_layer_switch 1032 · handle_connection_change 1078 · handle_capture_mode_change 1108 · run_effects 648</p>
+
+          <div class="grid md:grid-cols-2 gap-4">
+            <div class="rounded-lg border border-slate-200 bg-white p-4">
+              <p class="lbl text-slate-400 mb-3">Before — three engines, three shapes, divergent teardown</p>
+              <table class="w-full text-[11px] border-collapse">
+                <thead><tr class="text-slate-400 lbl"><th class="text-left py-1">teardown site</th><th class="py-1">axis</th><th class="py-1">a-repeat</th><th class="py-1">stage</th></tr></thead>
+                <tbody class="text-slate-600">
+                  <tr class="border-t border-slate-200"><td class="py-1">Layer switch</td><td class="text-center">reset</td><td class="text-center">stop_all</td><td class="text-center">stop_all</td></tr>
+                  <tr class="border-t border-slate-200"><td class="py-1">Disconnect</td><td class="text-center text-rose-500">—</td><td class="text-center text-rose-500">—</td><td class="text-center">stop_all</td></tr>
+                  <tr class="border-t border-slate-200"><td class="py-1">→ Digital</td><td class="text-center text-rose-500">—</td><td class="text-center">stop_all</td><td class="text-center">stop_all</td></tr>
+                  <tr class="border-t border-slate-200"><td class="py-1">Profile switch</td><td class="text-center">reset</td><td class="text-center">stop_all</td><td class="text-center">stop_all</td></tr>
+                </tbody>
+              </table>
+              <p class="text-[11px] text-slate-500 mt-3">Nothing structural says the <span class="text-rose-500">—</span>'s are decisions, not bugs. Each cell is a hand-threaded <code>&amp;mut self.engine</code> argument through a bespoke function.</p>
+              <div class="mt-3 font-mono text-[10px] text-slate-400 space-y-0.5">
+                <div>wait_for_stage_deadline() ≡ wait_for_chord_deadline() // byte copy</div>
+                <div>if !edits.is_empty() { commit_input_edits(…) } // ×4 in select!</div>
+              </div>
+            </div>
+
+            <div class="rounded-lg border border-slate-200 bg-white p-4">
+              <p class="lbl text-slate-400 mb-3">After — <code>Vec&lt;dyn DepthEngine&gt;</code>, one loop</p>
+              <div class="deep rounded p-3 space-y-2 text-[11px]">
+                <p class="lbl text-slate-700">trait DepthEngine</p>
+                <div class="font-mono space-y-1 text-slate-600">
+                  <div class="px-2 py-1 bg-white/70 rounded">wants(cfg, layer) → InputSet</div>
+                  <div class="px-2 py-1 bg-white/70 rounded">observe(snapshot) → Ops</div>
+                  <div class="px-2 py-1 bg-white/70 rounded">next_deadline() → Option&lt;Instant&gt;</div>
+                  <div class="px-2 py-1 bg-white/70 rounded">on_teardown(<b>reason</b>)</div>
+                </div>
+              </div>
+              <div class="mt-3 font-mono text-[10px] text-slate-600 bg-slate-100 rounded p-2 space-y-0.5">
+                <div>for e in &amp;mut self.depth_engines {</div>
+                <div>&nbsp;&nbsp;e.on_teardown(Reason::Disconnect); }</div>
+              </div>
+              <p class="text-[11px] text-slate-500 mt-3">"Which reason each engine responds to" moves <em>into the engine</em> — where a unit test can pin it.</p>
+            </div>
+          </div>
+
+          <div class="grid sm:grid-cols-2 gap-x-10 gap-y-3 text-sm">
+            <div><p class="lbl text-slate-400 mb-1">Problem</p><p class="text-slate-700">A 4th depth engine needs edits at ~12–16 non-mechanical sites because the three current engines share no interface — only the <code>rx_depth</code> snapshot value.</p></div>
+            <div><p class="lbl text-slate-400 mb-1">Solution</p><p class="text-slate-700">A <code>DepthEngine</code> contract. Even adopting only the <code>on_teardown(reason)</code> half collapses three near-identical transition→signal→teardown functions into one.</p></div>
+          </div>
+          <div>
+            <p class="lbl text-slate-400 mb-2">Wins</p>
+            <ul class="text-sm text-slate-700 grid sm:grid-cols-2 gap-x-10 gap-y-1 list-disc pl-5">
+              <li>locality: teardown policy per engine, not per call site</li>
+              <li>the disconnect-gap questions become visible in one table</li>
+              <li>one deadline arm, not one per engine</li>
+              <li>leverage: N engines, one wiring</li>
+            </ul>
+          </div>
+          <div class="rounded bg-amber-50 border border-amber-200 p-3 text-[13px] text-amber-900 space-y-1">
+            <p><strong>Raised in the 2026-09-03 review (#4) and deprioritised.</strong> Dual-stage made it concrete: <code>stage</code> is the third engine <em>and</em> the first to need a second <code>select!</code> arm.</p>
+            <p><strong>Latent bug this would surface:</strong> <code>ClearDeepStage</code> (edit.rs 711) emits no <code>Effect::StopStage</code>, but the primary-cascade path does — the GUI's <code>clear_deep_stage</code> call can orphan a live deep Toggle that <code>Engine::update</code>'s <code>deep_layer</code> guard then never releases.</p>
+          </div>
+        </article>
+
+        <!-- ============ CANDIDATE 4 ============ -->
+        <article id="c4" class="space-y-6">
+          <div class="flex items-center gap-3 flex-wrap">
+            <span class="lbl text-slate-400">Candidate 4</span>
+            <span class="px-2 py-0.5 rounded text-xs font-semibold bg-amber-100 text-amber-800">Worth exploring</span>
+            <span class="px-2 py-0.5 rounded text-xs font-medium bg-slate-100 text-slate-600">contract test · read-model</span>
+          </div>
+          <h2 class="font-serif text-2xl">A contract test + a <code>ConfigView</code> for the <code>a{sv}</code> shape</h2>
+          <p class="font-mono text-sm text-slate-500">daemon/src/dbus/wire.rs · config_to_dict 590 &nbsp;|&nbsp; daemon/src/schema.rs &nbsp;|&nbsp; gui/acheron_gui/wire.py (encode-only) · binding_editor.py ~42 raw-index sites</p>
+
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <pre class="mermaid">
+flowchart LR
+  subgraph daemon
+    C["Config"] --> CTD["config_to_dict()<br/>a{sv}, one-level nested"]
+  end
+  CTD -->|"GetConfig()"| U["GLib.Variant.unpack()"]
+  subgraph gui
+    U --> R1["config['profiles'][p]['deep_base']"]
+    U --> R2["...['deep_stages'][i]['actuation']['release']"]
+    U --> R3["+ ~40 more hardcoded key paths"]
+    U --> G["'deep_base' in cfg[...] // version-skew guard"]
+  end
+  CTD -. "no config_from_dict<br/>no golden fixture<br/>rename a key → every test still green" .-> X((( )))
+  classDef leak stroke:#dc2626,stroke-width:2px,color:#dc2626;
+  class R1,R2,R3,G leak
+            </pre>
+          </div>
+
+          <div class="grid md:grid-cols-2 gap-4">
+            <div class="rounded-lg border border-slate-200 bg-white p-4 space-y-2">
+              <p class="lbl text-slate-400">Before</p>
+              <p class="text-[13px] text-slate-600">The encode seam (<code>wire.rs</code>) is single-sided for big payloads. The GUI hardcodes key names at ~42 sites; <code>wire.py</code> mirrors only four leaf encoders. Rust round-trips and <code>test_wire.py</code> both pass while a renamed key breaks the GUI at runtime. The one-level nesting <code>DeepStageConfig</code> introduced lives only in a comment.</p>
+            </div>
+            <div class="rounded-lg border border-slate-200 bg-white p-4 space-y-2">
+              <p class="lbl text-slate-400">After</p>
+              <p class="text-[13px] text-slate-600"><code>schema.rs</code>'s golden fixture also emits a representative <code>config_to_dict</code> / <code>state_to_dict</code> payload. <code>gui/tests/test_wire_contract.py</code> asserts the GUI's expected key set against it — the <code>test_rules_contract.py</code> pattern. A typed <code>ConfigView</code> / <code>ProfileView</code> (<code>deep_layer</code>, <code>deep_cfg</code>, <code>resolved_actuation_point</code>) absorbs the 42 raw-index sites.</p>
+            </div>
+          </div>
+
+          <div class="relative rounded-lg border border-slate-200 bg-white p-4">
+            <p class="lbl text-slate-400 mb-3">Mass — the GUI-side read surface</p>
+            <div class="flex items-end gap-6 justify-center" style="height:160px">
+              <div class="text-center">
+                <div class="flex items-end gap-1">
+                  <div class="w-10 bg-rose-300" style="height:130px"></div>
+                  <div class="w-10 bg-slate-300" style="height:22px"></div>
+                </div>
+                <p class="text-[10px] text-slate-500 mt-1">before<br/><span class="text-rose-500">wide "interface"</span> (42 sites)<br/>+ tiny shared impl</p>
+              </div>
+              <div class="text-center">
+                <div class="flex items-end gap-1">
+                  <div class="w-10 bg-slate-800" style="height:26px"></div>
+                  <div class="w-10 bg-slate-400" style="height:130px"></div>
+                </div>
+                <p class="text-[10px] text-slate-500 mt-1">after<br/>small <code>ConfigView</code> interface<br/>+ one accessor impl</p>
+              </div>
+            </div>
+          </div>
+
+          <div>
+            <p class="lbl text-slate-400 mb-2">Wins</p>
+            <ul class="text-sm text-slate-700 grid sm:grid-cols-2 gap-x-10 gap-y-1 list-disc pl-5">
+              <li>a key rename fails a test, not a user</li>
+              <li>locality: the wire shape has one asserted description</li>
+              <li>the version-skew guards get a real basis</li>
+              <li>feeds Candidate 5 — the panel reads through the view</li>
+            </ul>
+          </div>
+          <div class="rounded bg-amber-50 border border-amber-200 p-3 text-[13px] text-amber-900">
+            Both halves were open items from the 2026-09-03 reviews (#5 "contract test for the <code>a{sv}</code> shape", #7 "typed read accessor"). Dual-stage widened the untested surface enough to move them up.
+          </div>
+        </article>
+
+        <!-- ============ CANDIDATE 5 ============ -->
+        <article id="c5" class="space-y-6">
+          <div class="flex items-center gap-3 flex-wrap">
+            <span class="lbl text-slate-400">Candidate 5</span>
+            <span class="px-2 py-0.5 rounded text-xs font-semibold bg-amber-100 text-amber-800">Worth exploring</span>
+            <span class="px-2 py-0.5 rounded text-xs font-medium bg-slate-100 text-slate-600">GUI · widget seam</span>
+          </div>
+          <h2 class="font-serif text-2xl">Split the 638-line dual-stage editor panel</h2>
+          <p class="font-mono text-sm text-slate-500">gui/acheron_gui/binding_editor.py · build_dual_stage_panel 969–1607 (⅓ of the file, ~30 nested closures)</p>
+
+          <div class="grid md:grid-cols-2 gap-4">
+            <div class="rounded-lg border border-slate-200 bg-white p-4">
+              <p class="lbl text-slate-400 mb-3">Before — four concerns in one closure scope</p>
+              <div class="relative mod rounded bg-white p-3" style="height:260px">
+                <p class="lbl text-slate-500">build_dual_stage_panel()</p>
+                <div class="mt-2 space-y-1.5 text-[11px]">
+                  <div class="px-2 py-1.5 bg-rose-50 border border-rose-200 rounded text-slate-700">config-dict read-model — <code>deep_map</code>, <code>deep_cfg</code>, <code>resolved_primary</code> … reinvented inline</div>
+                  <div class="px-2 py-1.5 bg-rose-50 border border-rose-200 rounded text-slate-700">draft / dirty tracking + <code>commit_stages()</code> ordering machine</div>
+                  <div class="px-2 py-1.5 bg-rose-50 border border-rose-200 rounded text-slate-700"><code>DepthTrack</code> 4-marker bar + anti-cross clamp — reimplemented</div>
+                  <div class="px-2 py-1.5 bg-rose-50 border border-rose-200 rounded text-slate-700">raw <code>client.*</code> D-Bus calls, interleaved</div>
+                </div>
+                <p class="text-[10px] text-red-600 mt-2">an unsaved-edit bug and a marker-clamp bug share this scope</p>
+              </div>
+            </div>
+
+            <div class="rounded-lg border border-slate-200 bg-white p-4">
+              <p class="lbl text-slate-400 mb-3">After — three deep modules + a thin panel</p>
+              <div class="space-y-2" style="height:260px">
+                <div class="deep rounded p-2 text-[11px]"><p class="lbl text-slate-700">DepthTrack(n_markers)</p><p class="text-slate-500 ghost">clamp, drag, hysteresis pairing — also replaces build_actuation_section's 1-marker bar</p></div>
+                <div class="deep rounded p-2 text-[11px]"><p class="lbl text-slate-700">StageDraft</p><p class="text-slate-500 ghost">capture / dirty / commit order — no GTK, unit-testable</p></div>
+                <div class="rounded p-2 text-[11px] border border-slate-300 bg-white"><p class="lbl text-slate-500">ConfigView</p><p class="text-slate-400">(from Candidate 4)</p></div>
+                <div class="mod rounded p-2 text-[11px] bg-white"><p class="lbl text-slate-500">build_dual_stage_panel()</p><p class="text-slate-500">layout + wiring only</p></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid sm:grid-cols-2 gap-x-10 gap-y-3 text-sm">
+            <div><p class="lbl text-slate-400 mb-1">Problem</p><p class="text-slate-700">One function holds a read-model, a state machine, a custom widget, and I/O — all as sibling closures. Nothing is reachable from a test except by building the whole panel.</p></div>
+            <div><p class="lbl text-slate-400 mb-1">Solution</p><p class="text-slate-700">Extract <code>DepthTrack</code> (deep widget), <code>StageDraft</code> (commit machine, GTK-free), and route reads through <code>ConfigView</code>. The panel shrinks to layout.</p></div>
+          </div>
+          <div>
+            <p class="lbl text-slate-400 mb-2">Wins</p>
+            <ul class="text-sm text-slate-700 grid sm:grid-cols-2 gap-x-10 gap-y-1 list-disc pl-5">
+              <li>commit sequencing testable without GTK</li>
+              <li>locality: clamp logic in one widget, both editors</li>
+              <li><code>build_actuation_section</code>'s bar de-duplicates</li>
+              <li>the plain vs dual-stage fork narrows</li>
+            </ul>
+          </div>
+        </article>
+
+        <!-- ============ CANDIDATE 6 ============ -->
+        <article id="c6" class="space-y-6">
+          <div class="flex items-center gap-3 flex-wrap">
+            <span class="lbl text-slate-400">Candidate 6</span>
+            <span class="px-2 py-0.5 rounded text-xs font-semibold bg-slate-200 text-slate-700">Speculative</span>
+            <span class="px-2 py-0.5 rounded text-xs font-medium bg-slate-100 text-slate-600">module split</span>
+          </div>
+          <h2 class="font-serif text-2xl">Split <code>config.rs</code> model from file lifecycle</h2>
+          <p class="font-mono text-sm text-slate-500">daemon/src/config.rs · 3339 lines · ~25 pub types + load_or_seed/parse/persist/serialize + ChordKey codec</p>
+
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <pre class="mermaid">
+flowchart TB
+  subgraph now["config.rs — one module, 12 dependents"]
+    M["model: Config, Profile, Binding, DeepStageConfig …"]
+    F["file: load_or_seed, parse, migrate, persist, serialize"]
+    K["ChordKey: FromStr + Serialize + Deserialize (~70 lines)"]
+  end
+  D1["dispatch, stage, chord, axis, edit, wire, executor …"] --> M
+  D2["main.rs, edit::apply"] --> F
+  M -.-> F
+  M -.-> K
+            </pre>
+            <p class="text-[12px] text-slate-500 mt-2">~2600 of 3339 lines (<code>validate</code>, <code>ConfigError</code>, file lifecycle, <code>ChordKey</code>) are touched by 2–3 call sites, yet the whole module is a dependency of a dozen.</p>
+          </div>
+
+          <div class="grid sm:grid-cols-3 gap-3 text-[13px]">
+            <div class="rounded border border-slate-200 bg-white p-3"><p class="lbl text-slate-400 mb-1">config::model</p><p class="text-slate-600">types + <code>Profile</code> accessors. What the daemon actually depends on.</p></div>
+            <div class="rounded border border-slate-200 bg-white p-3"><p class="lbl text-slate-400 mb-1">config::file</p><p class="text-slate-600">parse / migrate / persist. Two call sites.</p></div>
+            <div class="rounded border border-slate-200 bg-white p-3"><p class="lbl text-slate-400 mb-1">config::chord_key</p><p class="text-slate-600">the hand-written codec — parallel to the <code>config::binding</code> carve.</p></div>
+          </div>
+
+          <div class="grid sm:grid-cols-2 gap-x-10 gap-y-3 text-sm">
+            <div><p class="lbl text-slate-400 mb-1">Problem</p><p class="text-slate-700">No behaviour is wrong — but the module fuses five concerns and most consumers only want the type definitions.</p></div>
+            <div><p class="lbl text-slate-400 mb-1">Why speculative</p><p class="text-slate-700">Pure navigability / compile-surface gain, no seam actually varies. Do it <em>with</em> Candidate 2, or not yet.</p></div>
+          </div>
+        </article>
+
+      </section>
+
+      <!-- ============ TOP RECOMMENDATION ============ -->
+      <section id="top-recommendation" class="rounded-xl border-2 border-slate-900 bg-white p-8 space-y-4">
+        <p class="lbl text-slate-400">Start here</p>
+        <h2 class="font-serif text-3xl">Candidate 1 — fold Quick-Skip routing behind <code>stage::Engine</code></h2>
+        <p class="text-slate-700 text-[15px] leading-relaxed max-w-3xl">
+          Smallest change, highest locality, and it pays down debt the most recent feature just
+          added. <code>stage::Engine</code> is a genuinely deep pure core wearing a 10-method
+          interface because dispatch reaches past it to drive the Quick-Skip phases by hand. One
+          <code>on_primary_event</code> entry point makes the state machine testable end-to-end and
+          takes the interface to ~5 methods. It's also the precondition that makes
+          <a class="underline" href="#c3">Candidate 3</a> tractable — a depth-engine contract is far
+          easier to fit once <code>stage</code> presents one entry point instead of ten.
+        </p>
+        <p class="text-slate-500 text-sm">
+          Then <a class="underline" href="#c2">Candidate 2</a> (mechanical, unblocks the stub mirror and a contract test) and
+          <a class="underline" href="#c4">Candidate 4</a> (which <a class="underline" href="#c5">Candidate 5</a> builds on).
+        </p>
+      </section>
+
+      <footer class="text-xs text-slate-400 pt-6 border-t border-slate-200">
+        Deletion test applied to each candidate's target · vocabulary from <code>/codebase-design</code> and <code>CONTEXT.md</code> · no files written to the repo.
+      </footer>
+    </main>
+  </body>
+</html>

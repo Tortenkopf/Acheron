@@ -72,7 +72,7 @@ _DEEP_STAGE_DEFAULT_ACTUATION = {"actuation": 128, "release": 112}
 # `config::validate` rule, so it lives here (not `rules.py`, which mirrors
 # `validate` only) as the closest match to `set_axis_assignment`'s own
 # `rules.AXIS_TARGETS` membership check.
-_STAGING_MODES = frozenset({"handoff", "no_return", "additive", "quick_skip"})
+_STAGING_MODES = frozenset({"handoff", "no_return", "quick_skip"})
 
 
 class DaemonStub:

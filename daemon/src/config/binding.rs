@@ -189,10 +189,9 @@ mod tests {
         }
         // 3. site-shape
         match site {
-            BindingSite::Individual(Input::Grid(_, _)) => {
-                (trigger == TriggerMode::AnalogRepeat && kind == "macro")
-                    .then(|| ConfigError::AnalogRepeatMacro("grid_r1c1".to_string()))
-            }
+            BindingSite::Individual(Input::Grid(_, _)) => (trigger == TriggerMode::AnalogRepeat
+                && kind == "macro")
+                .then(|| ConfigError::AnalogRepeatMacro("grid_r1c1".to_string())),
             BindingSite::Individual(_) => (trigger == TriggerMode::AnalogRepeat)
                 .then(|| ConfigError::InvalidAnalogRepeatInput("mode_key".to_string())),
             BindingSite::Chord => {

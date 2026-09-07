@@ -2941,7 +2941,7 @@ mod tests {
             .expect("SetDeepActuation over D-Bus must succeed");
         server
             .proxy
-            .set_staging_mode("grid_r1c1", "additive")
+            .set_staging_mode("grid_r1c1", "no_return")
             .await
             .expect("SetStagingMode over D-Bus must succeed");
 
@@ -3010,12 +3010,12 @@ mod tests {
             .unwrap();
         assert_eq!((actuation, release), (220, 200));
         let mode: String = deep_stage.get("mode").unwrap().clone().try_into().unwrap();
-        assert_eq!(mode, "additive");
+        assert_eq!(mode, "no_return");
 
         let on_disk_before = std::fs::read_to_string(&server.config_path).unwrap();
         assert!(on_disk_before.contains("[profiles.Default.deep_base.grid_r1c1]"));
         assert!(on_disk_before.contains("[profiles.Default.deep_stages.grid_r1c1]"));
-        assert!(on_disk_before.contains("mode = \"additive\""));
+        assert!(on_disk_before.contains("mode = \"no_return\""));
 
         server
             .proxy

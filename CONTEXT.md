@@ -95,7 +95,7 @@ A `(ActuationPoint, Binding)` pair — an Actuation/Release point paired with a 
 _Avoid_: sub-binding, second binding, layer (Actuation stage is a depth concept, unrelated to the Base/Held Layer)
 
 **Staging mode**:
-A per-Input, per-Profile choice governing how a grid key's primary and deep Actuation stages hand off as Depth crosses the deep band: Handoff, No-Return, Additive, or Quick-Skip. Shared across Base and Held, like the deep stage's own Actuation point — it interprets physical travel, not what either stage does when triggered. A key with no deep stage has no meaningful Staging mode.
+A per-Input, per-Profile choice governing how a grid key's primary and deep Actuation stages hand off as Depth crosses the deep band: Handoff, No-Return, or Quick-Skip. Shared across Base and Held, like the deep stage's own Actuation point — it interprets physical travel, not what either stage does when triggered. A key with no deep stage has no meaningful Staging mode. (A fourth mode, Additive, was removed — ADR-0009.)
 _Avoid_: transition mode, handoff mode (reserved for the Handoff mode specifically)
 
 **Handoff**:
@@ -103,9 +103,6 @@ The Staging mode where crossing into the deep band releases the primary stage an
 
 **No-Return**:
 The Staging mode identical to Handoff on the way deeper, but the primary stage does not re-press on the way back up — once the deep stage has fired, the key stays quiet until fully released and pressed again.
-
-**Additive**:
-The Staging mode where both stages fire and are held simultaneously — reaching the deep band adds the deep stage's firing without releasing the primary.
 
 **Quick-Skip**:
 The Staging mode where the primary stage's Down is held back for a ~50ms window (the Chord-detection window's constant, reused): if the deep band is reached within that window, the primary is suppressed entirely for the rest of the press (never fires, and its eventual release does not fire it either — the release path behaves like No-Return); otherwise the primary fires late (delayed by up to the window) and the key runs as ordinary Handoff for the rest of the press. Costs up to 50ms of primary-Down latency by construction — the price of not knowing, at the moment of the primary crossing, whether the press will continue into the deep band.
@@ -137,7 +134,7 @@ A connected client's request that the Daemon withhold all synthetic output while
 _Avoid_: pause, mute, disable (all imply something is stopped, not just withheld)
 
 **Physical-plausibility ceiling**:
-The ceiling on how fast the Daemon emits synthetic key/button events: no holding or repeating Action produces events faster than the Linux input stack does for a physically held key — the machine's configured kernel autorepeat delay/period (`analog::read_kernel_auto_repeat`, fallback 250 ms / 33 ms) — and a held mouse or gamepad button emits exactly one Down/Up with no repeat. A held or repeated single key presents as genuine kernel autorepeat (`value=1` then `value=2` on the real delay→period envelope), not a stream of Down/Up pairs. A Macro is the sole deliberate exception: its author sequences Keypresses at any cadence, and only *trigger-driven Macro repetition* is floored (to `max(kernel period, MIN_TOGGLE_LAP)`); a Macro fired once and the keystroke cadence within one run are unrestricted, and Analog-repeat cannot wrap a Macro. Not a disguise — the `uinput` origin is always detectable (ADR-0008); the goal is plausibility of *rate*. The Daemon's compliance with this ceiling was audited surface by surface in `.scratch/humane-output-rate/`.
+The ceiling on how fast the Daemon emits synthetic key/button events: no holding or repeating Action produces events faster than the Linux input stack does for a physically held key — the machine's configured kernel autorepeat delay/period (`analog::read_kernel_auto_repeat`, fallback 250 ms / 33 ms) — and a held mouse or gamepad button emits exactly one Down/Up with no repeat. A held or repeated single key presents as genuine kernel autorepeat (`value=1` then `value=2` on the real delay→period envelope), not a stream of Down/Up pairs. A canned one-shot keyboard press carries a fixed ~40 ms Down→Up dwell rather than a zero-dwell pair. A Macro is the sole deliberate exception: its author sequences Keypresses at any cadence, and only *trigger-driven Macro repetition* is floored (to `max(kernel period, MIN_TOGGLE_LAP)`); a Macro fired once and the keystroke cadence within one run are unrestricted, and Analog-repeat cannot wrap a Macro. Not a disguise — the `uinput` origin is always detectable (ADR-0008); the goal is plausibility of *rate*. The Daemon's compliance with this ceiling was audited surface by surface in `.scratch/humane-output-rate/`.
 _Avoid_: humane output rate (the working name of the effort that established this — `.scratch/humane-output-rate/`, not a domain term), humanization, anti-cheat evasion, input sanitisation, jitter
 
 ### Interface

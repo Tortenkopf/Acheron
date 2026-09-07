@@ -2,8 +2,9 @@
 
 "Dual-stage keys" lets a grid key in analog Capture mode carry a second Actuation stage —
 its own Actuation/Release pair plus its own Binding — firing at a Depth strictly deeper than
-the primary stage, with a user-selectable staging mode (Handoff / No-Return / Additive /
-Quick-Skip) governing how the two stages hand off (see `.scratch/tartarus-dual-stage-keys/spec.md`).
+the primary stage, with a user-selectable staging mode (Handoff / No-Return / Quick-Skip)
+governing how the two stages hand off (see `.scratch/tartarus-dual-stage-keys/spec.md`).
+(A fourth mode, Additive, was later removed — ADR-0009.)
 
 The analog capture source (`daemon/src/capture/analog.rs`) is deliberately a dumb hysteresis
 reporter: it thresholds each grid key's raw Depth against **one** `ActuationPoint` via the pure

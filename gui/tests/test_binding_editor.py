@@ -1563,9 +1563,9 @@ def test_picking_a_staging_mode_calls_set_staging_mode():
     _add_deep_stage(editor)
     stub.calls.clear()
 
-    find_one(editor, lambda w: isinstance(w, Gtk.ToggleButton) and w.get_label() == "Additive").set_active(True)
+    find_one(editor, lambda w: isinstance(w, Gtk.ToggleButton) and w.get_label() == "No-Return").set_active(True)
 
-    assert ("set_staging_mode", "grid_r1c1", "additive") in stub.calls
+    assert ("set_staging_mode", "grid_r1c1", "no_return") in stub.calls
 
 
 def test_saving_the_deep_stage_sends_set_deep_stage_with_the_edited_binding():

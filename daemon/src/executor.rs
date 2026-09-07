@@ -75,6 +75,31 @@ fn modifier_codes(modifiers: Modifiers) -> Vec<KeyCode> {
 /// unrelated tuning knobs. Not final-tuned against a real game yet.
 pub(crate) const CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD: Duration = Duration::from_millis(35);
 
+/// The Down→Up dwell spliced into a canned one-shot keyboard press
+/// (`.scratch/humane-output-rate/` ticket 12): a Fire-once `Action::Keypress`,
+/// and its single-key `Macro` / Stepper-`Key`-step / Chord equivalents, otherwise
+/// compile to `[KeyDown, KeyUp]` with no `Delay` at all — the near-zero-dwell
+/// shape `docs/anti-cheat-input-heuristics.md` and ADR-0008 name the clearest
+/// synthetic tell, which the `value=2` rebuild erased everywhere it holds or
+/// repeats but not on a plain one-shot press. `trigger::Slots::perform` swaps the
+/// plain compiled steps for `fire_once_key_steps` when a Fire-once firing's steps
+/// satisfy `single_held_key`.
+///
+/// 40 ms: ~2.5 frames at 60 Hz, clears the CS2 "0 ms overlap/neutral" macro
+/// shape, sits inside the ~30–500 ms keystroke-dynamics typing band, and keeps
+/// ~2× headroom under the ~80 ms human same-key double-tap floor so
+/// `trigger::decide`'s `FiringUnfinished` overlap guard never drops a real user's
+/// second press. This is a rate-plausibility *consistency* follow-up, not a
+/// detection defense — the `uinput` origin stays visible, a Macro fired once
+/// keeps its author's cadence, and Analog-repeat's tap pulses are untouched.
+///
+/// Deliberately **not** shared with `CONTROLLER_BUTTON_DIGITAL_PULSE_HOLD`: that
+/// constant (35 ms) targets single-poll-frame coverage on a receiving game
+/// (≈ 2 frames at 60 fps); this one targets a human-plausible keystroke dwell.
+/// Different jobs — one constant would silently couple two unrelated tuning
+/// knobs.
+pub(crate) const FIRE_ONCE_KEY_DWELL: Duration = Duration::from_millis(40);
+
 /// The down-only prefix of a modified single-key press (spec-kernel-shaped-repeat.md
 /// §3.1): each modifier then the key, all `KeyDown`, no matching `KeyUp` — a
 /// deliberately *unbalanced* hold that mirrors a physically held `Ctrl+X`. Only
@@ -101,6 +126,28 @@ pub(crate) fn keypress_steps(modifiers: Modifiers, key: KeyCode) -> Vec<MacroSte
     let mut steps = Vec::with_capacity(mods.len() * 2 + 2);
     steps.extend(mods.iter().map(|&m| MacroStep::KeyDown(m)));
     steps.push(MacroStep::KeyDown(key));
+    steps.push(MacroStep::KeyUp(key));
+    steps.extend(mods.iter().rev().map(|&m| MacroStep::KeyUp(m)));
+    steps
+}
+
+/// `keypress_steps` with a `FIRE_ONCE_KEY_DWELL` `Delay` spliced between the base
+/// key's `KeyDown` and `KeyUp` (`.scratch/humane-output-rate/` ticket 12) —
+/// `[KeyDown(mods…), KeyDown(key), Delay(FIRE_ONCE_KEY_DWELL), KeyUp(key),
+/// KeyUp(mods…)]`. `trigger::Slots::perform` substitutes this for the plain
+/// compiled steps of a Fire-once firing whose steps satisfy `single_held_key`,
+/// so a canned one-shot press stops emitting the zero-dwell pair.
+///
+/// The `Delay` sits *between* the key edges, so `single_held_key` rejects the
+/// spliced output (`None`) — correct, since the classifier only ever runs on the
+/// *pre-splice* steps and a re-classification must not feed the spliced form
+/// back onto any `value=2` autorepeat path.
+pub(crate) fn fire_once_key_steps(modifiers: Modifiers, key: KeyCode) -> Vec<MacroStep> {
+    let mods = modifier_codes(modifiers);
+    let mut steps = Vec::with_capacity(mods.len() * 2 + 3);
+    steps.extend(mods.iter().map(|&m| MacroStep::KeyDown(m)));
+    steps.push(MacroStep::KeyDown(key));
+    steps.push(MacroStep::Delay(FIRE_ONCE_KEY_DWELL));
     steps.push(MacroStep::KeyUp(key));
     steps.extend(mods.iter().rev().map(|&m| MacroStep::KeyUp(m)));
     steps
@@ -1029,6 +1076,97 @@ mod tests {
             single_held_key(&[MacroStep::Delay(Duration::from_millis(5))]),
             None
         );
+    }
+
+    #[test]
+    fn fire_once_key_steps_splices_one_dwell_between_the_edges() {
+        // Plain unmodified key: exactly `[KeyDown(k), Delay, KeyUp(k)]`.
+        assert_eq!(
+            fire_once_key_steps(Modifiers::default(), KeyCode::KEY_X),
+            vec![
+                MacroStep::KeyDown(KeyCode::KEY_X),
+                MacroStep::Delay(FIRE_ONCE_KEY_DWELL),
+                MacroStep::KeyUp(KeyCode::KEY_X),
+            ]
+        );
+
+        // Modifier-wrapped: the dwell sits between the *base key's* edges,
+        // the modifiers still wrap the whole thing and release in reverse.
+        assert_eq!(
+            fire_once_key_steps(
+                Modifiers {
+                    ctrl: true,
+                    shift: true,
+                    ..Modifiers::default()
+                },
+                KeyCode::KEY_X,
+            ),
+            vec![
+                MacroStep::KeyDown(CTRL),
+                MacroStep::KeyDown(SHIFT),
+                MacroStep::KeyDown(KeyCode::KEY_X),
+                MacroStep::Delay(FIRE_ONCE_KEY_DWELL),
+                MacroStep::KeyUp(KeyCode::KEY_X),
+                MacroStep::KeyUp(SHIFT),
+                MacroStep::KeyUp(CTRL),
+            ]
+        );
+    }
+
+    #[test]
+    fn fire_once_key_steps_output_is_not_re_classified_as_a_single_held_key() {
+        // Ticket 12 §4: the spliced `Delay` sits *between* the key edges, so
+        // `single_held_key` rejects the spliced form — a re-classification
+        // must never feed it back onto the `value=2` autorepeat path. The
+        // classifier only ever runs on the pre-splice steps.
+        for mods in [
+            Modifiers::default(),
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+        ] {
+            let pre = keypress_steps(mods, KeyCode::KEY_X);
+            assert_eq!(single_held_key(&pre), Some((mods, KeyCode::KEY_X)));
+            let spliced = fire_once_key_steps(mods, KeyCode::KEY_X);
+            assert_eq!(single_held_key(&spliced), None);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fire_once_key_dwell_actually_elapses_before_the_up_write() {
+        // The dwell must be a genuine blocking sleep, not just a step in the
+        // compiled sequence — the Up write must not reach the sink until the
+        // full `FIRE_ONCE_KEY_DWELL` has elapsed.
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
+
+        tokio::task::yield_now().await;
+        spawn_fire_once(
+            inj.clone(),
+            fire_once_key_steps(Modifiers::default(), KeyCode::KEY_X),
+        );
+        tokio::task::yield_now().await;
+
+        assert_eq!(sink.batches().len(), 1, "the Down fires immediately");
+
+        tokio::time::advance(FIRE_ONCE_KEY_DWELL - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            sink.batches().len(),
+            1,
+            "the Up must not fire before the dwell elapses"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+
+        let batches = sink.batches();
+        assert_eq!(batches.len(), 2, "the Up fires once the dwell elapses");
+        assert_eq!(key_and_value(batches[0][0]), (KeyCode::KEY_X, 1));
+        assert_eq!(key_and_value(batches[1][0]), (KeyCode::KEY_X, 0));
     }
 
     #[tokio::test(start_paused = true)]

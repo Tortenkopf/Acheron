@@ -1824,7 +1824,7 @@ mod tests {
                     actuation: 220,
                     release: 200,
                 },
-                mode: StagingMode::Additive,
+                mode: StagingMode::NoReturn,
             },
         );
 
@@ -1844,7 +1844,7 @@ mod tests {
                 release: 210,
             }
         );
-        assert_eq!(cfg.mode, StagingMode::Additive);
+        assert_eq!(cfg.mode, StagingMode::NoReturn);
     }
 
     #[test]

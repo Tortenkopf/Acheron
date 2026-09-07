@@ -114,8 +114,10 @@ pub(crate) enum QuickSkipPhase {
     /// reached before `deadline`.
     Armed { deadline: Instant },
     /// The deep band was reached in time — the primary is permanently
-    /// suppressed for the rest of this press; every further crossing runs
-    /// Additive-with-no-primary, release path = No-Return.
+    /// suppressed for the rest of this press; every further dip into and out
+    /// of the deep band just fires and releases the deep stage on its own
+    /// (the primary is never touched — it never fired), and the final release
+    /// takes No-Return's shape (no `RepressPrimary`).
     Skipped,
     /// The deadline elapsed first — `tick` already emitted the retroactive
     /// `RepressPrimary`; the rest of this press runs plain Handoff.
@@ -123,12 +125,13 @@ pub(crate) enum QuickSkipPhase {
 }
 
 /// Advances one key's combined `(primary, deep)` band state by one
-/// transition, producing the ordered `Vec<StageOp>` spec.md's four
-/// Staging-mode tables specify, plus the Quick-Skip phase this transition
-/// leaves the key in (always `None` for every mode but `QuickSkip`). A
-/// same-report double-crossing is handled by mechanical replay: `prev`/
-/// `next` may differ by more than one band at once (the 1-report-skip
-/// rows), resolved as a single ordered op sequence, never short-circuited.
+/// transition, producing the ordered `Vec<StageOp>` spec.md's Staging-mode
+/// tables specify (Additive's was dropped — ADR-0009), plus the Quick-Skip
+/// phase this transition leaves the key in (always `None` for every mode but
+/// `QuickSkip`). A same-report double-crossing is handled by mechanical
+/// replay: `prev`/`next` may differ by more than one band at once (the
+/// 1-report-skip rows), resolved as a single ordered op sequence, never
+/// short-circuited.
 pub(crate) fn advance(
     prev: Bands,
     next: Bands,
@@ -140,7 +143,6 @@ pub(crate) fn advance(
     match mode {
         StagingMode::Handoff => (handoff(prev, next), None),
         StagingMode::NoReturn => (no_return(prev, next), None),
-        StagingMode::Additive => (additive(prev, next), None),
         StagingMode::QuickSkip => quick_skip_advance(prev, next, quick_skip),
     }
 }
@@ -213,25 +215,6 @@ fn no_return(prev: Bands, next: Bands) -> Vec<StageOp> {
         ((Down, Down), (Down, Up)) => vec![StageOp::ReleaseDeep],
         ((Down, Down), (Up, Up)) => vec![StageOp::ReleaseDeep, StageOp::ReleasePrimary],
         _ => handoff(prev, next),
-    }
-}
-
-/// **Additive**: the primary is never touched by the inner crossings — only
-/// `FireDeep`/`ReleaseDeep` at the inner transitions, real Primary Down/Up
-/// at the outer edges.
-fn additive(prev: Bands, next: Bands) -> Vec<StageOp> {
-    use Band::{Down, Up};
-    match (prev, next) {
-        ((Up, Up), (Up, Up)) | ((Down, Up), (Down, Up)) | ((Down, Down), (Down, Down)) => {
-            vec![StageOp::Nothing]
-        }
-        ((Up, Up), (Down, Up)) => vec![StageOp::FirePrimary],
-        ((Down, Up), (Down, Down)) => vec![StageOp::FireDeep],
-        ((Down, Down), (Down, Up)) => vec![StageOp::ReleaseDeep],
-        ((Down, Up), (Up, Up)) => vec![StageOp::ReleasePrimary],
-        ((Up, Up), (Down, Down)) => vec![StageOp::FirePrimary, StageOp::FireDeep],
-        ((Down, Down), (Up, Up)) => vec![StageOp::ReleaseDeep, StageOp::ReleasePrimary],
-        _ => unreachable_transition(prev, next),
     }
 }
 
@@ -365,8 +348,10 @@ struct KeyRuntime {
     /// queries `Engine::primary_handed_off` to swallow them, so a
     /// Hold-to-repeat primary genuinely stops rather than machine-gunning
     /// under the deep stage. Cleared the moment the primary band itself
-    /// crosses back Up (the press is over). Additive never emits an inner
-    /// `ReleasePrimary`, so its primary keeps repeating for free.
+    /// crosses back Up (the press is over). Quick-Skip's `Skipped` phase
+    /// suppresses the primary entirely instead, so it never sets this — but
+    /// no mode leaves the primary autorepeating alongside a live deep stage
+    /// (the Additive mode that did was removed — ADR-0009).
     primary_handed_off: bool,
 }
 
@@ -409,9 +394,10 @@ fn to_band(state: KeyState) -> Band {
 /// The non-pure third depth engine on `DispatchState`, alongside `axis::
 /// Engine`/`analog_repeat::Engine` (spec.md "Pipeline architecture"). Owns
 /// every dual-stage key's runtime band tracking plus the deep stage's own
-/// `trigger::Slots<StageKey>` — Additive can hold both stages live at once,
-/// each a fully independent Binding, so this is never shared with
-/// `DispatchState::individual`.
+/// `trigger::Slots<StageKey>` — the deep stage fires independently of the
+/// primary (Quick-Skip's `Skipped` phase runs the deep stage while the
+/// primary stays suppressed), each a fully independent Binding, so this is
+/// never shared with `DispatchState::individual`.
 #[derive(Default)]
 pub(crate) struct Engine {
     runtime: HashMap<Input, KeyRuntime>,
@@ -615,7 +601,7 @@ impl Engine {
                             individual,
                             input,
                             &primary_binding,
-                            PerformDeps::new(
+                            PerformDeps::new_machine_sequenced(
                                 injector,
                                 config,
                                 cursors,
@@ -637,7 +623,7 @@ impl Engine {
                             &mut self.slots,
                             StageKey(input),
                             &deep_binding,
-                            PerformDeps::new(
+                            PerformDeps::new_machine_sequenced(
                                 injector,
                                 config,
                                 cursors,
@@ -762,7 +748,7 @@ impl Engine {
                         &mut self.slots,
                         StageKey(input),
                         &deep_binding,
-                        PerformDeps::new(
+                        PerformDeps::new_machine_sequenced(
                             injector,
                             config,
                             cursors,
@@ -864,7 +850,7 @@ impl Engine {
         let key = StageKey(input);
         let slot = self.slots.slot(&key);
         let decision = trigger::decide(&deep_binding, &config.macros, EventState::Repeat, slot);
-        let perform_deps = PerformDeps::new(
+        let perform_deps = PerformDeps::new_machine_sequenced(
             injector,
             config,
             cursors,
@@ -945,7 +931,7 @@ impl Engine {
                             individual,
                             input,
                             &primary_binding,
-                            PerformDeps::new(
+                            PerformDeps::new_machine_sequenced(
                                 injector,
                                 config,
                                 cursors,
@@ -1115,36 +1101,6 @@ mod tests {
         }
     }
 
-    // ── Additive ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn additive_table() {
-        let cases: &[(Bands, Bands, &[StageOp])] = &[
-            ((Up, Up), (Up, Up), &[StageOp::Nothing]),
-            ((Down, Up), (Down, Up), &[StageOp::Nothing]),
-            ((Down, Down), (Down, Down), &[StageOp::Nothing]),
-            ((Up, Up), (Down, Up), &[StageOp::FirePrimary]),
-            ((Down, Up), (Down, Down), &[StageOp::FireDeep]),
-            ((Down, Down), (Down, Up), &[StageOp::ReleaseDeep]),
-            ((Down, Up), (Up, Up), &[StageOp::ReleasePrimary]),
-            (
-                (Up, Up),
-                (Down, Down),
-                &[StageOp::FirePrimary, StageOp::FireDeep],
-            ),
-            (
-                (Down, Down),
-                (Up, Up),
-                &[StageOp::ReleaseDeep, StageOp::ReleasePrimary],
-            ),
-        ];
-        for &(prev, next, expected) in cases {
-            let (ops, phase) = advance(prev, next, StagingMode::Additive, None);
-            assert_eq!(ops, expected, "additive {prev:?} -> {next:?}");
-            assert_eq!(phase, None);
-        }
-    }
-
     // ── Quick-Skip ───────────────────────────────────────────────────────
 
     #[test]
@@ -1240,7 +1196,7 @@ mod tests {
     }
 
     #[test]
-    fn quick_skip_skipped_runs_additive_with_no_primary_release_path_no_return() {
+    fn quick_skip_skipped_runs_the_deep_stage_alone_with_a_no_return_release_path() {
         let skipped = Some(QuickSkipPhase::Skipped);
 
         // Every dip into/out of the deep band: deep-only ops, primary
