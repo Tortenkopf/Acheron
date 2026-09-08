@@ -157,13 +157,23 @@ reachable:
   immediately to *skip* if the deep band is already hot (a same-report or already-arrived deep
   crossing — see "Staging-mode state machine" for why this can't produce an ordering hazard);
   otherwise it arms the ~50ms deadline.
-- `Up` while the buffered primary never fired → swallowed (unbalanced, tolerated the way
-  `force_release_stuck` already tolerates a lingering entry).
+- `Up` while the buffered primary never fired → the event is swallowed for the *primary
+  keyspace* (nothing there to force-release — the buffered Down was never given to
+  `individual`), but the `Armed` deadline is **disarmed on this `rx_events` edge itself**, in
+  `stage::Engine::feed` (`end_quick_skip`), driving the pure core with `next == (Up, Up)` the
+  same way `begin_quick_skip` owns the outer Down. It is *not* left to a later coalescing
+  `rx_depth` cancel tick: on a quick shallow tap the release edge can coalesce away in the
+  `watch` channel before `update` ever observes the excursion, so the deadline would elapse and
+  fire `RepressPrimary` into a press whose only real `Up` was already consumed — a permanently
+  stuck primary (`tartarus-dual-stage-keys-impl` ticket 13). The `update` cancel row is kept as
+  a harmless idempotent double-confirm. A `Skipped` key released in one report straight from
+  the deep band takes the same edge-driven path — `ReleaseDeep`, No-Return's release shape, no
+  `RepressPrimary`.
 - The deadline elapsing with no deep crossing fires the primary retroactively via
   `dispatch_individual_down` (a new fourth `select!` arm, `wait_for_stage_deadline`, mirroring
   `wait_for_chord_deadline`) and flips the key to run as ordinary Handoff for the rest of the
   press.
-- Handoff / No-Return / Additive keys are **entirely unaffected** — `handle_event` runs
+- Handoff / No-Return keys are **entirely unaffected** — `handle_event` runs
   unchanged for them; the engine only ever watches the deep excursion independently.
 
 **Teardown:** `stage::Engine::stop_all()` is wired to the same call sites as

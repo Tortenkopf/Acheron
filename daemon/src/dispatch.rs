@@ -6113,6 +6113,106 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn dual_stage_quick_skip_quick_shallow_tap_disarms_the_window_on_the_up_edge() {
+        // Ticket 13's stuck-key repro, made deterministic on the `Seam` seam:
+        // a coalescing `rx_depth` `{KEY: 0}` tick lands *first* (fresh runtime,
+        // a no-op), then the queued Down/Up drain. `feed` must disarm the
+        // window off the real `Up` edge itself — the depth path never gets
+        // another tick to run the cancel row, so if `feed` swallows the `Up`
+        // without disarming, the deadline fires `RepressPrimary` into a press
+        // with no release edge left and the Hold-to-repeat primary latches.
+        let config = dual_stage_config(
+            StagingMode::QuickSkip,
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_B),
+        );
+        let mut seam = Seam::new(config);
+
+        seam.state
+            .update_stages(&seam.config, &HashMap::from([(Input::Grid(1, 1), 0)]))
+            .await
+            .unwrap();
+
+        seam.feed(PhysicalEvent {
+            input: Input::Grid(1, 1),
+            state: EventState::Down,
+            depth: Some(150),
+        })
+        .await;
+        let deadline = seam
+            .state
+            .stage
+            .next_deadline()
+            .expect("the ~50ms window is armed");
+
+        seam.feed(PhysicalEvent {
+            input: Input::Grid(1, 1),
+            state: EventState::Up,
+            depth: Some(0),
+        })
+        .await;
+
+        assert!(
+            seam.state.stage.next_deadline().is_none(),
+            "the outer Up must disarm the window off the edge itself"
+        );
+
+        // Fire the deadline arm anyway — it must be inert now.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let edits = seam
+            .state
+            .tick_stages(&seam.config, deadline + Duration::from_millis(1))
+            .await
+            .unwrap();
+        assert!(edits.is_empty());
+
+        let batches = seam.finish().await;
+        assert!(
+            batches.is_empty(),
+            "neither stage ever fired — nothing must be emitted, least of all a \
+             stuck primary value=1: {batches:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_quick_skip_skipped_then_outer_up_releases_the_deep_stage() {
+        // Ticket 13's `Skipped` case: a fast full press skips the primary and
+        // fires the deep stage, then the key is released in one report straight
+        // from the deep band. `feed` must run the No-Return-shaped release off
+        // the `Up` edge — deep stage released, primary never touched, window
+        // never armed.
+        let config = dual_stage_config(
+            StagingMode::QuickSkip,
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let mut seam = Seam::new(config);
+
+        seam.feed(PhysicalEvent {
+            input: Input::Grid(1, 1),
+            state: EventState::Down,
+            depth: Some(250),
+        })
+        .await;
+        seam.feed(PhysicalEvent {
+            input: Input::Grid(1, 1),
+            state: EventState::Up,
+            depth: Some(0),
+        })
+        .await;
+
+        assert!(seam.state.stage.next_deadline().is_none());
+
+        let batches = seam.finish().await;
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![(evdev::KeyCode::KEY_B, 1), (evdev::KeyCode::KEY_B, 0)],
+            "the deep stage fires and releases; the primary KEY_A is never touched",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn dual_stage_quick_skip_layer_switch_while_armed_cancels_the_buffered_primary() {
         // A Layer/Profile switch or capture-mode flip to Digital while Armed
         // cancels outright via `stage::Engine::stop_all()` (already wired at

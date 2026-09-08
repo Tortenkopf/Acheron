@@ -672,11 +672,7 @@ impl Engine {
                     // must always fully clear the slot so the following
                     // `FireDeep` genuinely starts fresh, the same reasoning
                     // that makes `ReleasePrimary` unconditional.
-                    StageOp::ReleaseDeep => {
-                        let key = StageKey(input);
-                        self.slots.stop_toggle(&key).await;
-                        self.slots.force_release(&key, injector).await;
-                    }
+                    StageOp::ReleaseDeep => self.release_deep_slot(input, injector).await,
                     // Ticket 04: the buffered primary `Down` is dropped for
                     // good — genuinely a no-op here, since `begin_quick_skip`
                     // swallowed it before it ever reached `individual` at
@@ -713,7 +709,8 @@ impl Engine {
     /// | not a dual-stage key on this Layer, or no Depth on the edge | `NotMine { false }` |
     /// | non-Quick-Skip primary `Down` (Handoff / No-Return) | `NotMine { true }` |
     /// | Quick-Skip `Down` | `Handled` — `begin_quick_skip` arms or resolves Skipped |
-    /// | Quick-Skip `Up` / `Repeat` while `Armed` / `Skipped` | `Handled(vec![])` — swallowed |
+    /// | Quick-Skip `Repeat` while `Armed` / `Skipped` | `Handled(vec![])` — swallowed |
+    /// | Quick-Skip `Up` while `Armed` / `Skipped` | `Handled(vec![])` — `end_quick_skip` disarms the deadline / releases the deep stage |
     /// | Quick-Skip `Up` / `Repeat` once `Late` | runs the general rows (plain Handoff) |
     /// | any mode, `Repeat`, primary handed off to deep | drive deep repeat, `Handled(vec![])` |
     /// | any mode, `Repeat`, primary **not** handed off | drive deep repeat, `NotMine { true }` |
@@ -762,6 +759,13 @@ impl Engine {
                     return Ok(StageOutcome::Handled(Vec::new()));
                 }
                 EventState::Up if !self.is_late(event.input) => {
+                    // Disarm / resolve the Quick-Skip phase right here, off the
+                    // real `rx_events` release edge — never left to a later
+                    // coalescing `rx_depth` tick, which a quick shallow tap can
+                    // race past entirely, leaving the deadline to misfire
+                    // `RepressPrimary` into a press with no release edge left
+                    // (`tartarus-dual-stage-keys` ticket 13).
+                    self.end_quick_skip(deps.injector, event.input).await?;
                     return Ok(StageOutcome::Handled(Vec::new()));
                 }
                 // `Late`: the deadline already fired the primary retroactively,
@@ -902,6 +906,61 @@ impl Engine {
             }
         }
         Ok(edits)
+    }
+
+    /// Resolves a Quick-Skip key's real outer `Up` the same way
+    /// `begin_quick_skip` owns its outer `Down` — directly off the `rx_events`
+    /// edge in `feed`, rather than swallowing the event and delegating the
+    /// `Armed` deadline's cancellation entirely to `Engine::update`'s
+    /// coalescing `rx_depth` path (`tartarus-dual-stage-keys` ticket 13). That
+    /// delegation was unsound: `rx_events` is a non-lossy mpsc, `rx_depth` a
+    /// coalescing `watch`, so on a quick shallow tap the release edge can
+    /// coalesce away before `update` ever observes the excursion — the
+    /// deadline then elapses and fires `RepressPrimary` into a press whose
+    /// only real `Up` was already consumed, latching the primary down
+    /// (kernel autorepeat, permanent under a Hold-to-repeat primary).
+    ///
+    /// A no-op unless a Quick-Skip phase is actually live: `None` means an
+    /// `rx_depth` cancel tick already ran the pure core's
+    /// `((Down, Up), (Up, Up)) => (vec![], None)` row (kept as a harmless
+    /// idempotent double-confirm) or the key was never armed. Otherwise it
+    /// drives the pure core with `next == (Up, Up)` — dropping the phase to
+    /// `None` (which disarms `next_deadline`) and, for a `Skipped` key still
+    /// in the deep band on a 1-report skip straight to released, releasing the
+    /// deep stage (No-Return's release shape — the primary was suppressed for
+    /// the whole press and is never touched). The `Late` fall-through never
+    /// reaches here: `feed`'s `is_late` guard sends a `Late` key's real `Up`
+    /// down the ordinary path so the retroactively-fired primary is released.
+    async fn end_quick_skip(&mut self, injector: &Injector, input: Input) -> io::Result<()> {
+        let rt = self.runtime.entry(input).or_default();
+        if rt.quick_skip.is_none() {
+            return Ok(());
+        }
+        let prev = (to_band(rt.primary), to_band(rt.deep));
+        let (ops, phase) = advance(
+            prev,
+            (Band::Up, Band::Up),
+            StagingMode::QuickSkip,
+            rt.quick_skip,
+        );
+        rt.primary = KeyState::Up;
+        rt.deep = KeyState::Up;
+        rt.quick_skip = phase;
+        rt.primary_handed_off = false;
+        for op in ops {
+            match op {
+                StageOp::Nothing => {}
+                // No-Return's release shape — the primary was suppressed for
+                // the whole press (Skipped) and is never touched.
+                StageOp::ReleaseDeep => self.release_deep_slot(input, injector).await,
+                other => debug_assert!(
+                    false,
+                    "a Quick-Skip outer release only ever emits ReleaseDeep or \
+                     nothing, got {other:?}"
+                ),
+            }
+        }
+        Ok(())
     }
 
     /// Whether `input`'s Quick-Skip runtime state is currently `Late` — the
@@ -1116,10 +1175,22 @@ impl Engine {
     /// this `input` for good the moment the cascade lands — there's no next
     /// tick left to hand a stale entry to.
     pub(crate) async fn stop_stage(&mut self, input: Input, injector: &Injector) {
+        self.release_deep_slot(input, injector).await;
+        self.runtime.remove(&input);
+    }
+
+    /// Fully clears one key's deep slot — `stop_toggle` + `force_release`, both
+    /// unconditional: a stage's own release must leave nothing behind so the
+    /// next `FireDeep` genuinely starts fresh (a deep Toggle in particular
+    /// outlives a bare release under `decide`'s `(Toggle, Up)` rule, so
+    /// `FireDeep` would otherwise stack a second orphaned loop over it — see
+    /// `update`'s `ReleaseDeep` handling). Shared by every deep-slot teardown:
+    /// `update`'s `ReleaseDeep` op, `end_quick_skip`'s outer release, and
+    /// `stop_stage`'s cascade-delete.
+    async fn release_deep_slot(&mut self, input: Input, injector: &Injector) {
         let key = StageKey(input);
         self.slots.stop_toggle(&key).await;
         self.slots.force_release(&key, injector).await;
-        self.runtime.remove(&input);
     }
 
     /// Drains every live deep Toggle without touching firings or per-key
@@ -1676,5 +1747,126 @@ mod tests {
                 machine_sequenced: true
             }
         );
+    }
+
+    // ── Ticket 13: the outer `Up` disarms the Quick-Skip window in `feed` ──
+
+    #[tokio::test(start_paused = true)]
+    async fn feed_quick_skip_shallow_tap_disarms_the_window_on_the_up_edge() {
+        let config = dual_stage_cfg(
+            StagingMode::QuickSkip,
+            TriggerMode::HoldToRepeat,
+            TriggerMode::HoldToRepeat,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+
+        engine
+            .feed(fx.deps(&config), edge(EventState::Down, Some(150)))
+            .await
+            .unwrap();
+        let deadline = engine.next_deadline().expect("the ~50ms window is armed");
+
+        // A quick shallow release — never reached the deep band.
+        let out = engine
+            .feed(fx.deps(&config), edge(EventState::Up, Some(0)))
+            .await
+            .unwrap();
+        assert_eq!(out, StageOutcome::Handled(Vec::new()));
+
+        // The window is disarmed off the edge itself — no `rx_depth` tick needed.
+        assert_eq!(engine.runtime.get(&KEY).and_then(|rt| rt.quick_skip), None);
+        assert_eq!(engine.next_deadline(), None);
+
+        // The deadline that would have fired `RepressPrimary` is inert now.
+        let edits = engine
+            .tick(fx.deps(&config), deadline + Duration::from_millis(1))
+            .await
+            .unwrap();
+        assert!(edits.is_empty());
+        assert!(engine.slots.slot(&StageKey(KEY)).is_none());
+        assert!(fx.individual.slot(&KEY).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn feed_quick_skip_up_disarms_even_when_a_depth_zero_tick_landed_first() {
+        // The exact interleaving from ticket 13's repro: dispatch's `select!`
+        // services an `rx_depth` `{KEY: 0}` tick (fresh runtime, coalesced past
+        // the excursion — a no-op) *before* draining the queued Down/Up events.
+        let config = dual_stage_cfg(
+            StagingMode::QuickSkip,
+            TriggerMode::HoldToRepeat,
+            TriggerMode::HoldToRepeat,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+
+        engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 0u8)]))
+            .await
+            .unwrap();
+
+        engine
+            .feed(fx.deps(&config), edge(EventState::Down, Some(150)))
+            .await
+            .unwrap();
+        assert!(engine.next_deadline().is_some());
+
+        engine
+            .feed(fx.deps(&config), edge(EventState::Up, Some(0)))
+            .await
+            .unwrap();
+
+        // No further `rx_depth` change is pending — the window must already be
+        // disarmed, or the deadline latches the primary down forever.
+        assert_eq!(engine.runtime.get(&KEY).and_then(|rt| rt.quick_skip), None);
+        assert_eq!(engine.next_deadline(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn feed_quick_skip_skipped_then_outer_up_releases_the_deep_stage() {
+        let config = dual_stage_cfg(
+            StagingMode::QuickSkip,
+            TriggerMode::HoldToRepeat,
+            TriggerMode::HoldToRepeat,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+
+        // Down already past the deep Actuation point → resolves straight to
+        // `Skipped`, firing the deep stage; the primary is suppressed.
+        engine
+            .feed(fx.deps(&config), edge(EventState::Down, Some(250)))
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.runtime.get(&KEY).and_then(|rt| rt.quick_skip),
+            Some(QuickSkipPhase::Skipped),
+        );
+        assert!(
+            engine.slots.slot(&StageKey(KEY)).is_some(),
+            "deep stage held"
+        );
+
+        // A 1-report skip straight from the deep band to fully released.
+        let out = engine
+            .feed(fx.deps(&config), edge(EventState::Up, Some(0)))
+            .await
+            .unwrap();
+        assert_eq!(out, StageOutcome::Handled(Vec::new()));
+
+        let rt = engine.runtime.get(&KEY).expect("still tracked");
+        assert_eq!(rt.quick_skip, None);
+        // The outer release drove the pure core with `next == (Up, Up)`,
+        // running the No-Return-shaped `[ReleaseDeep]` row and writing the
+        // shadow bands back — `feed`'s own discipline, not a later `rx_depth`
+        // tick's. (The end-to-end deep `value=0` is asserted in
+        // `dual_stage_quick_skip_skipped_then_outer_up_*` at the dispatch
+        // level, where the firing task actually gets to run.)
+        assert_eq!(rt.primary, KeyState::Up);
+        assert_eq!(rt.deep, KeyState::Up);
+        assert!(!rt.primary_handed_off);
+        // The primary was never fired — nothing to release on the individual path.
+        assert!(fx.individual.slot(&KEY).is_none());
     }
 }
