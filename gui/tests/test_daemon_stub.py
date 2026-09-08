@@ -42,7 +42,7 @@ def test_fresh_stub_matches_the_seed_configs_shape():
         "active_toggles": [],
         "device_connected": True,
         "capture_mode": "digital",
-        "daemon_version": "1.2.0",
+        "daemon_version": "1.2.1",
         # Ticket 101: present because the stub starts "connected".
         "firmware_version": "v1.2",
         "serial_number": "PM2443F36300141",
@@ -942,12 +942,12 @@ def test_set_deep_actuation_creates_a_fresh_config_defaulting_to_handoff():
 def test_set_deep_actuation_on_an_existing_entry_leaves_its_mode_untouched():
     stub = DaemonStub()
     stub.set_deep_actuation("grid_r1c1", 220, 200)
-    stub.set_staging_mode("grid_r1c1", "additive")
+    stub.set_staging_mode("grid_r1c1", "no_return")
 
     stub.set_deep_actuation("grid_r1c1", 230, 210)
 
     cfg = stub.get_config()["profiles"]["Default"]["deep_stages"]["grid_r1c1"]
-    assert cfg == {"actuation": {"actuation": 230, "release": 210}, "mode": "additive"}
+    assert cfg == {"actuation": {"actuation": 230, "release": 210}, "mode": "no_return"}
 
 
 def test_set_deep_actuation_rejects_release_equal_to_actuation():
@@ -1030,14 +1030,25 @@ def test_set_staging_mode_rejects_a_band_overlap_when_creating_a_fresh_entry():
     stub = DaemonStub()
 
     with pytest.raises(InvalidBindingError):
-        stub.set_staging_mode("grid_r1c1", "additive")
+        stub.set_staging_mode("grid_r1c1", "no_return")
 
 
 def test_set_staging_mode_rejects_a_non_grid_input():
     stub = DaemonStub()
 
     with pytest.raises(InvalidBindingError):
-        stub.set_staging_mode("mode_key", "additive")
+        stub.set_staging_mode("mode_key", "no_return")
+
+
+def test_set_staging_mode_rejects_the_removed_additive_mode():
+    # humane-output-rate ticket 13 / ADR-0009: Additive was removed. At the
+    # wire boundary the stub treats it like any other unknown mode string
+    # (the Additive-specific load error lives in the Daemon's config parse).
+    stub = DaemonStub()
+    stub.set_deep_actuation("grid_r1c1", 220, 200)
+
+    with pytest.raises(InvalidBindingError):
+        stub.set_staging_mode("grid_r1c1", "additive")
 
 
 def test_set_staging_mode_rejects_an_unknown_mode_string():

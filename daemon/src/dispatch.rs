@@ -34,13 +34,12 @@ use zbus::object_server::SignalEmitter;
 
 use crate::analog_repeat;
 use crate::axis;
-use crate::capture::analog::DeviceInfo;
+use crate::capture::analog::{DeviceInfo, RepeatSchedule};
 use crate::capture::{CaptureMode, EventState, PhysicalEvent};
 use crate::chord;
 use crate::command::{Command, State};
 use crate::config::{
-    self, Action, ActuationPoint, ChordKey, Config, Layer, ModeKeyRole, StagingMode, StatusLeds,
-    TriggerMode,
+    self, Action, ActuationPoint, ChordKey, Config, Layer, ModeKeyRole, StatusLeds, TriggerMode,
 };
 use crate::dbus::Daemon;
 use crate::edit;
@@ -77,7 +76,7 @@ struct DispatchState {
     analog_repeat: analog_repeat::Engine,
     /// The third depth engine (`tartarus-dual-stage-keys` ticket 03),
     /// alongside `axis`/`analog_repeat` above — drives every dual-stage
-    /// grid key's Handoff/No-Return/Additive state machine off the same
+    /// grid key's Handoff/No-Return/Quick-Skip state machine off the same
     /// live-Depth stream `handle_depth_update`/`update_analog_repeats`
     /// already read (`update_stages`, called from the same `rx_depth` arm).
     stage: stage::Engine,
@@ -89,6 +88,15 @@ struct DispatchState {
     actuation_tx: watch::Sender<HashMap<Input, ActuationPoint>>,
     capture_control_tx: mpsc::Sender<bool>,
     toggle_lap_target: Duration,
+    /// The live kernel autorepeat envelope every self-driven `value=2` emitter
+    /// paces from (`spec-kernel-shaped-repeat.md` §5.2 single-key Toggle,
+    /// ticket 05; §5.3 Analog-repeat hold-solid, ticket 06) — resolved once at
+    /// Daemon startup (`main.rs`) and threaded to every spawn site as a plain
+    /// value, exactly like `toggle_lap_target`. Both emitters read the same
+    /// envelope; Analog-repeat's hold-solid phase runs it through
+    /// `RepeatSchedule::without_warmup` (no `delay_ms` gap before the first
+    /// `value=2` — §5.3), the Toggle path keeps the full envelope.
+    toggle_autorepeat_schedule: RepeatSchedule,
     /// The `led` task's `watch::Sender` (`tartarus-status-leds` ticket 02 /
     /// ADR-0006), handed in from `main.rs`. `push_status_leds` sends the
     /// active Profile's triple on it on device (re)connect and — from
@@ -108,6 +116,7 @@ impl DispatchState {
         actuation_tx: watch::Sender<HashMap<Input, ActuationPoint>>,
         capture_control_tx: mpsc::Sender<bool>,
         toggle_lap_target: Duration,
+        toggle_autorepeat_schedule: RepeatSchedule,
         led_tx: watch::Sender<Option<StatusLeds>>,
     ) -> Self {
         DispatchState {
@@ -127,6 +136,7 @@ impl DispatchState {
             actuation_tx,
             capture_control_tx,
             toggle_lap_target,
+            toggle_autorepeat_schedule,
             led_tx,
         }
     }
@@ -172,6 +182,7 @@ impl DispatchState {
                 &mut self.axis,
                 &mut self.analog_repeat,
                 &mut self.stage,
+                &mut self.individual,
                 event.state,
             )
             .await;
@@ -225,100 +236,35 @@ impl DispatchState {
             chord::ChordOutcome::NotMine => {}
         }
 
+        // The Staging-mode state machine (`tartarus-dual-stage-keys`,
+        // `post-release-development` ticket 17) runs unconditionally here,
+        // mirroring `chord::feed` just above — it owns the "is this a
+        // dual-stage key on the active Layer?" predicate and interprets this
+        // physical edge against the key's Quick-Skip / deep-repeat machine,
+        // folding what used to be two hand-rolled blocks (the `quick_skip_key`
+        // divert and the general deep-repeat swallow) plus the
+        // `begin_quick_skip` / `is_late` / `primary_handed_off` / `deep_repeat`
+        // reach-through into one call. `Handled` ⇒ the edge is consumed;
+        // `NotMine { machine_sequenced }` ⇒ run the ordinary Binding path,
+        // and — when `feed` tracks this key — build the following `perform`
+        // with `PerformDeps::new_machine_sequenced` so a dual-stage primary's
+        // press carries no Fire-once dwell (ticket 17 Addendum).
+        let deps = stage::EngineDeps {
+            config,
+            active_layer: self.active_layer,
+            individual: &mut self.individual,
+            injector: &self.injector,
+            cursors: &mut self.stepper,
+            toggle_lap_target: self.toggle_lap_target,
+            toggle_autorepeat_schedule: self.toggle_autorepeat_schedule,
+        };
+        let machine_sequenced = match self.stage.feed(deps, event).await? {
+            stage::StageOutcome::Handled(edits) => return Ok(edits),
+            stage::StageOutcome::NotMine { machine_sequenced } => machine_sequenced,
+        };
+
         let bindings = profile.layer(self.active_layer);
         let binding = bindings.get(&event.input).cloned();
-
-        // `tartarus-dual-stage-keys` ticket 04: Quick-Skip's dispatch-side
-        // primary-suppression buffer diverts here, gated on `event.depth.
-        // is_some()` exactly like the AnalogRepeat swallow just below — a
-        // Digital-mode primary press never diverts (the deep stage is inert
-        // for free in Digital mode), and Handoff/No-Return/Additive keys are
-        // entirely unaffected (this only ever matches a `QuickSkip`-mode
-        // Input carrying a live deep Binding on this Layer). `Down` always
-        // diverts — `stage::Engine::begin_quick_skip` arms the ~50ms window
-        // (or resolves synchronously to Skipped if the deep band is already
-        // hot on this same report) instead of firing the primary
-        // immediately. `Up`/`Repeat` divert too, unless this press already
-        // resolved to `Late` (the deadline already fired the primary
-        // retroactively): from `Late` on the key runs as ordinary Handoff, so
-        // its real events must reach the ordinary path below to actually
-        // release/repeat it.
-        let quick_skip_key = event.depth.is_some()
-            && profile
-                .deep_stages
-                .get(&event.input)
-                .is_some_and(|deep_cfg| deep_cfg.mode == StagingMode::QuickSkip)
-            && profile
-                .deep_layer(self.active_layer)
-                .contains_key(&event.input);
-        if quick_skip_key {
-            match event.state {
-                EventState::Down => {
-                    let depth = event.depth.expect("checked by `quick_skip_key` above");
-                    let deps = stage::EngineDeps {
-                        config,
-                        active_layer: self.active_layer,
-                        individual: &mut self.individual,
-                        injector: &self.injector,
-                        cursors: &mut self.stepper,
-                        toggle_lap_target: self.toggle_lap_target,
-                    };
-                    return self.stage.begin_quick_skip(deps, event.input, depth).await;
-                }
-                EventState::Repeat if !self.stage.is_late(event.input) => {
-                    // Quick-Skip's `Skipped` phase runs as Handoff for the
-                    // rest of the press — the deep stage's own Hold-to-repeat
-                    // still needs driving off this pulse (a no-op during
-                    // `Armed`, before the deep band is reached).
-                    let deps = stage::EngineDeps {
-                        config,
-                        active_layer: self.active_layer,
-                        individual: &mut self.individual,
-                        injector: &self.injector,
-                        cursors: &mut self.stepper,
-                        toggle_lap_target: self.toggle_lap_target,
-                    };
-                    self.stage.deep_repeat(deps, event.input).await?;
-                    return Ok(Vec::new());
-                }
-                EventState::Up if !self.stage.is_late(event.input) => {
-                    return Ok(Vec::new());
-                }
-                EventState::Up | EventState::Repeat => {}
-            }
-        }
-
-        // `tartarus-dual-stage-keys`: a synthesized primary `Repeat` pulse
-        // also drives a Hold-to-repeat *deep* stage's own repeat cadence
-        // while the deep band is engaged — the deep band has no independent
-        // `Repeat` source (see `stage::Engine::deep_repeat`). Runs for every
-        // Staging mode; a no-op unless the deep band is currently Down and
-        // the deep Binding is Hold-to-repeat. Gated on `depth.is_some()`
-        // like the diverts above (Digital mode has no deep stage).
-        if event.state == EventState::Repeat && event.depth.is_some() {
-            let deps = stage::EngineDeps {
-                config,
-                active_layer: self.active_layer,
-                individual: &mut self.individual,
-                injector: &self.injector,
-                cursors: &mut self.stepper,
-                toggle_lap_target: self.toggle_lap_target,
-            };
-            self.stage.deep_repeat(deps, event.input).await?;
-            // Then, if the stage machine has handed this key's primary off to
-            // the deep stage (Handoff/No-Return crossed into the deep band),
-            // swallow the pulse for the primary itself — the primary band is
-            // still physically Down, so `capture::analog` keeps synthesizing
-            // these, but a Hold-to-repeat primary must stay silent under the
-            // deep stage rather than machine-gun. Additive leaves
-            // `primary_handed_off` false, so its primary repeats through the
-            // ordinary path below, untouched. `stage::Engine` clears the flag
-            // on `RepressPrimary` (Handoff back out) and when the primary
-            // band itself goes Up, so repeats resume exactly when they should.
-            if self.stage.primary_handed_off(event.input) {
-                return Ok(Vec::new());
-            }
-        }
 
         // Real firing for an Analog-repeat Binding while Depth is available comes
         // entirely from `update_analog_repeats`'s own depth-driven background task
@@ -338,8 +284,11 @@ impl DispatchState {
                 // The bound → `trigger::decide` + `Slots::perform` /
                 // `ProfileSwitch` → `Edit` / unbound → passthrough tail, shared
                 // verbatim with the Chord machine's `FireIndividual` executor so
-                // the retroactive-fire logic exists once.
-                self.dispatch_individual_down(config, event.input).await
+                // the retroactive-fire logic exists once. `machine_sequenced`
+                // (a dual-stage key's primary press, per `stage::Engine::feed`)
+                // drops the Fire-once dwell — ticket 17 Addendum.
+                self.dispatch_individual_down(config, event.input, machine_sequenced)
+                    .await
             }
             EventState::Repeat | EventState::Up => {
                 let Some(binding) = binding else {
@@ -355,12 +304,19 @@ impl DispatchState {
                     return Ok(Vec::new());
                 }
                 let slot = self.individual.slot(&event.input);
-                let decision = trigger::decide(&binding, event.state, slot);
-                let deps = trigger::PerformDeps::new(
+                let decision = trigger::decide(&binding, &config.macros, event.state, slot);
+                // A dual-stage key's primary Repeat/Up is machine-sequenced
+                // input too (`stage::Engine::feed` → `NotMine { machine_
+                // sequenced: true }`); the Fire-once dwell never applies to a
+                // Repeat/Up decision, but the constructor choice stays
+                // consistent with the `Down` arm above.
+                let deps = trigger::PerformDeps::for_input_press(
                     &self.injector,
                     config,
                     &mut self.stepper,
                     self.toggle_lap_target,
+                    self.toggle_autorepeat_schedule,
+                    machine_sequenced,
                 );
                 self.individual
                     .perform(decision, event.input, &binding, deps)
@@ -397,12 +353,13 @@ impl DispatchState {
                     // ever emits `Down` / `Repeat`, so those `decide` arms are
                     // unreachable here.
                     let slot = self.chord_slots.slot(&key);
-                    let decision = trigger::decide(&binding, state, slot);
+                    let decision = trigger::decide(&binding, &config.macros, state, slot);
                     let deps = trigger::PerformDeps::new(
                         &self.injector,
                         config,
                         &mut self.stepper,
                         self.toggle_lap_target,
+                        self.toggle_autorepeat_schedule,
                     );
                     self.chord_slots
                         .perform(decision, key, &binding, deps)
@@ -417,7 +374,11 @@ impl DispatchState {
                     self.chord_slots.stop_toggle(&key).await;
                 }
                 chord::ChordEffect::FireIndividual { input } => {
-                    edits.extend(self.dispatch_individual_down(config, input).await?);
+                    // A Chord member can never be a dual-stage key
+                    // (`ChordMemberDeepStageConflict`), so this retroactive
+                    // Down is a genuine user one-shot — it keeps the Fire-once
+                    // dwell (`machine_sequenced: false`), ticket 17 Addendum.
+                    edits.extend(self.dispatch_individual_down(config, input, false).await?);
                 }
                 chord::ChordEffect::ForceReleaseIndividual { input } => {
                     self.individual.force_release(&input, &self.injector).await;
@@ -480,10 +441,19 @@ impl DispatchState {
     /// synthetic Down, which is wrong. Returns any `Edit::SwitchProfile` the
     /// member's own Binding produces — a Chord member's individual Binding can
     /// be any Action, unlike a Chord's own, which can never be `ProfileSwitch`.
+    ///
+    /// `machine_sequenced` selects the `PerformDeps` constructor (ticket 17
+    /// Addendum): the ordinary input path passes it through from
+    /// `stage::Engine::feed` (`true` for a dual-stage key's primary press, so
+    /// it carries no Fire-once dwell); the Chord `FireIndividual` executor
+    /// always passes `false` — a Chord member can never be a dual-stage key
+    /// (`ChordMemberDeepStageConflict`), so that retroactive Down is a genuine
+    /// user one-shot.
     async fn dispatch_individual_down(
         &mut self,
         config: &Config,
         input: Input,
+        machine_sequenced: bool,
     ) -> io::Result<Vec<edit::Edit>> {
         let profile = config
             .active_profile()
@@ -506,12 +476,14 @@ impl DispatchState {
                 // Analog-repeat-triggered is a narrow combination this
                 // fast-follow doesn't specially engineer for.
                 let slot = self.individual.slot(&input);
-                let decision = trigger::decide(&binding, EventState::Down, slot);
-                let deps = trigger::PerformDeps::new(
+                let decision = trigger::decide(&binding, &config.macros, EventState::Down, slot);
+                let deps = trigger::PerformDeps::for_input_press(
                     &self.injector,
                     config,
                     &mut self.stepper,
                     self.toggle_lap_target,
+                    self.toggle_autorepeat_schedule,
+                    machine_sequenced,
                 );
                 self.individual
                     .perform(decision, input, &binding, deps)
@@ -585,6 +557,13 @@ impl DispatchState {
                 input,
                 steps,
                 analog_repeat::pulse_hold_for(&binding.action),
+                // The same startup-resolved kernel envelope the Toggle path
+                // holds at — hold-solid's `value=2` stream paces from it
+                // (spec-kernel-shaped-repeat.md §5.3), minus the `delay_ms`
+                // warm-up (`RepeatSchedule::without_warmup`, applied in the
+                // loop). Not re-read here: an inline blocking read would break
+                // the `tokio::time::pause()` test harness (ticket 68).
+                self.toggle_autorepeat_schedule,
                 depth_rx.clone(),
             );
         }
@@ -611,6 +590,7 @@ impl DispatchState {
             injector: &self.injector,
             cursors: &mut self.stepper,
             toggle_lap_target: self.toggle_lap_target,
+            toggle_autorepeat_schedule: self.toggle_autorepeat_schedule,
         };
         self.stage.update(deps, snapshot).await
     }
@@ -633,6 +613,7 @@ impl DispatchState {
             injector: &self.injector,
             cursors: &mut self.stepper,
             toggle_lap_target: self.toggle_lap_target,
+            toggle_autorepeat_schedule: self.toggle_autorepeat_schedule,
         };
         self.stage.tick(deps, now).await
     }
@@ -679,6 +660,9 @@ impl DispatchState {
                     self.individual.stop_toggle(&input).await;
                 }
                 edit::Effect::StopAllToggles => self.individual.stop_all_toggles().await,
+                edit::Effect::ReleaseAllHolds => {
+                    self.individual.drain_firings(&self.injector).await
+                }
                 edit::Effect::StopAllAnalogRepeats => self.analog_repeat.stop_all().await,
                 edit::Effect::StopAllStages => self.stage.stop_all(&self.injector).await,
                 edit::Effect::StopStage(input) => {
@@ -808,7 +792,7 @@ impl DispatchState {
 /// silently. The command channel closing is not fatal: it only means the
 /// D-Bus server side has gone away, and this task's other job (capture ->
 /// injector passthrough/remapping) still has work to do.
-// The 13 startup parameters: the `rx_*` receivers (plus `config` /
+// The startup parameters: the `rx_*` receivers (plus `config` /
 // `config_path`) stay `run` locals — pure `select!`-loop plumbing no handler
 // touches — and the rest are threaded once into `DispatchState` below.
 // Clippy's arg-count lint fires only here now (ticket 09): the struct literal
@@ -832,6 +816,13 @@ pub async fn run(
     // press — the kernel autorepeat rate it reflects never changes while
     // the Daemon is running.
     toggle_lap_target: Duration,
+    // Ticket 05 / 06 / spec-kernel-shaped-repeat.md §5.2, §5.3: the live kernel
+    // autorepeat envelope every self-driven `value=2` emitter paces from — a
+    // single-key Toggle hold and Analog-repeat's hold-solid phase — resolved
+    // once at Daemon startup (`main.rs`) beside `toggle_lap_target` and
+    // threaded down the same way; an inline per-press blocking read would
+    // break the `tokio::time::pause()` test harness (ticket 68's finding).
+    toggle_autorepeat_schedule: RepeatSchedule,
     // Ticket 71: the same live-Depth watch channel the Analog grid task
     // already publishes into on every incoming report (`capture::analog`,
     // ticket 26) — reused here as the continuous half of Axis-assignment
@@ -874,6 +865,7 @@ pub async fn run(
         actuation_tx,
         capture_control_tx,
         toggle_lap_target,
+        toggle_autorepeat_schedule,
         led_tx,
     );
     // Pure `select!`-loop plumbing — the `rx_*` receivers stay `run` locals
@@ -934,6 +926,7 @@ pub async fn run(
                             &mut state.device_connected,
                             &state.signal_emitter,
                             &mut state.stage,
+                            &mut state.individual,
                             &state.injector,
                             connected,
                         )
@@ -962,6 +955,7 @@ pub async fn run(
                         &state.signal_emitter,
                         &mut state.analog_repeat,
                         &mut state.stage,
+                        &mut state.individual,
                         &state.injector,
                         mode,
                     )
@@ -1029,6 +1023,10 @@ async fn wait_for_stage_deadline(deadline: Option<Instant>) {
 /// for the same reason (ticket 39) — an incoming Layer's Bindings generally
 /// differ from the outgoing one's, so a task compiled against the old
 /// Layer's Action must not keep firing under the new one.
+// One over clippy's arg limit since ticket 04 added `individual` (the
+// spec §7 hold teardown); every arg is a distinct disjoint `&mut state.*`
+// borrow the `select!` loop can't hand over as one `&mut self`.
+#[allow(clippy::too_many_arguments)]
 async fn handle_layer_switch(
     injector: &Injector,
     active_layer: &mut Layer,
@@ -1036,6 +1034,7 @@ async fn handle_layer_switch(
     axis: &mut axis::Engine,
     analog_repeat: &mut analog_repeat::Engine,
     stage: &mut stage::Engine,
+    individual: &mut trigger::Slots<Input>,
     state: EventState,
 ) {
     let new_layer = match state {
@@ -1057,6 +1056,14 @@ async fn handle_layer_switch(
     // Binding must not keep running under the new one — same reasoning as
     // the `analog_repeat.stop_all()` call just above.
     stage.stop_all(injector).await;
+    // `spec-kernel-shaped-repeat.md` §7: every single-key Hold-to-repeat now
+    // holds a bare unbalanced `KeyDown` (`value=1`) for the life of the
+    // press (ticket 04). If the bound key is released on the incoming Layer
+    // where it is unbound or Toggle-bound, `decide`'s `Up` arm never
+    // force-releases it — so balance every held individual firing here, the
+    // same way the deep stage's is balanced just above. Individual Toggles
+    // deliberately survive the switch and are untouched.
+    individual.drain_firings(injector).await;
     if let Some(emitter) = signal_emitter {
         let _ = Daemon::active_layer_changed(emitter, new_layer.as_str()).await;
     }
@@ -1079,6 +1086,7 @@ async fn handle_connection_change(
     device_connected: &mut bool,
     signal_emitter: &Option<SignalEmitter<'static>>,
     stage: &mut stage::Engine,
+    individual: &mut trigger::Slots<Input>,
     injector: &Injector,
     connected: bool,
 ) {
@@ -1088,6 +1096,12 @@ async fn handle_connection_change(
     *device_connected = connected;
     if !connected {
         stage.stop_all(injector).await;
+        // Balance any bare `HoldKeyDown` hold (`spec-kernel-shaped-repeat.md`
+        // §7) the same way the deep stage's is balanced just above — capture's
+        // own synthetic-Up trick only ever covers the primary band, so a
+        // held single-key Hold-to-repeat would otherwise be stranded at the
+        // OS level on a dropout. Individual Toggles are left running.
+        individual.drain_firings(injector).await;
     }
     if let Some(emitter) = signal_emitter {
         let _ = Daemon::device_connection_changed(emitter, connected).await;
@@ -1110,6 +1124,7 @@ async fn handle_capture_mode_change(
     signal_emitter: &Option<SignalEmitter<'static>>,
     analog_repeat: &mut analog_repeat::Engine,
     stage: &mut stage::Engine,
+    individual: &mut trigger::Slots<Input>,
     injector: &Injector,
     mode: CaptureMode,
 ) {
@@ -1126,6 +1141,12 @@ async fn handle_capture_mode_change(
         // firing/Toggle still live from the outgoing Analog session, same
         // reasoning as `analog_repeat.stop_all()` just above.
         stage.stop_all(injector).await;
+        // And balance any bare `HoldKeyDown` hold (`spec-kernel-shaped-repeat.md`
+        // §7) an Analog-sourced single-key Hold-to-repeat left holding — the
+        // synthesized `Repeat` stream that would have driven it is gone, and
+        // Digital-sourced events for the same key may not reach `decide`'s
+        // `Up` arm as a firing mode. Individual Toggles are left running.
+        individual.drain_firings(injector).await;
     }
     if let Some(emitter) = signal_emitter {
         let _ = Daemon::capture_mode_changed(emitter, mode.as_str()).await;
@@ -1340,6 +1361,7 @@ mod tests {
                 actuation_channel(),
                 capture_control_channel(),
                 executor::MIN_TOGGLE_LAP,
+                RepeatSchedule::new(250, 33),
                 led_channel(),
             );
             Seam {
@@ -1561,7 +1583,7 @@ mod tests {
     #[tokio::test]
     async fn hold_to_repeat_controller_button_ignores_repeat_and_releases_on_physical_up() {
         // Ticket 75/76: unlike an ordinary Hold-to-repeat Binding (see
-        // `hold_to_repeat_fires_on_down_and_every_repeat_but_not_up` above),
+        // `hold_to_repeat_keyboard_key_emits_genuine_autorepeat_not_down_up_pairs`),
         // `Action::ControllerButton` fires exactly one KeyDown on the
         // physical Down, ignores every kernel-autorepeat Repeat outright
         // (no re-fire), and only releases on the physical Up.
@@ -1596,7 +1618,7 @@ mod tests {
     #[tokio::test]
     async fn hold_to_repeat_mouse_button_ignores_repeat_and_releases_on_physical_up() {
         // Ticket 79/80: unlike an ordinary Hold-to-repeat Binding (see
-        // `hold_to_repeat_fires_on_down_and_every_repeat_but_not_up` above),
+        // `hold_to_repeat_keyboard_key_emits_genuine_autorepeat_not_down_up_pairs`),
         // a mouse-button `Action::Keypress` (`BTN_LEFT`/etc.) fires exactly
         // one KeyDown on the physical Down, ignores every kernel-autorepeat
         // Repeat outright (no re-fire), and only releases on the physical
@@ -1631,13 +1653,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hold_to_repeat_keyboard_key_still_refires_on_every_repeat() {
-        // Regression coverage (ticket 79/80): the mouse-button-only
-        // carve-out must not bleed onto keyboard-key output — `is_mouse_
-        // button` rejects an ordinary keyboard `KeyCode`, so the ordinary
-        // Hold-to-repeat arm still applies. Mirrors ticket 76's own
-        // `hold_to_repeat_mouse_button_still_refires_on_every_repeat`
-        // negative test, but in the other direction.
+    async fn hold_to_repeat_keyboard_key_emits_genuine_autorepeat_not_down_up_pairs() {
+        // Ticket 04 / spec-kernel-shaped-repeat.md §3.1: a single keyboard key
+        // under Hold-to-repeat no longer emits a `[KeyDown, KeyUp]` pair per
+        // kernel autorepeat tick. It presents as real Linux autorepeat —
+        // `value=1` on the physical Down, one `value=2` per synthesized
+        // `EventState::Repeat`, `value=0` (force-released) on the physical Up.
         let mut bindings = HashMap::new();
         bindings.insert(
             Input::Grid(1, 1),
@@ -1653,17 +1674,279 @@ mod tests {
 
         seam.press(Input::Grid(1, 1)).await;
         seam.repeat(Input::Grid(1, 1)).await;
+        seam.repeat(Input::Grid(1, 1)).await;
         seam.release(Input::Grid(1, 1)).await;
 
         let batches = seam.finish().await;
 
-        // Down + one Repeat = two firings, each a KeyDown/KeyUp pair; the
-        // trailing Up produced nothing — unchanged from before ticket 79/80.
-        assert_eq!(batches.len(), 4);
-        for pair in batches.chunks(2) {
-            assert_eq!(key_and_value(pair[0][0]), (evdev::KeyCode::KEY_A, 1));
-            assert_eq!(key_and_value(pair[1][0]), (evdev::KeyCode::KEY_A, 0));
+        // value=1, then exactly one value=2 per Repeat, then value=0 — no
+        // intervening KeyUp/KeyDown, so the ~0ms dwell every pair implied is
+        // gone.
+        assert_eq!(
+            batches
+                .iter()
+                .map(|b| key_and_value(b[0]))
+                .collect::<Vec<_>>(),
+            vec![
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 2),
+                (evdev::KeyCode::KEY_A, 2),
+                (evdev::KeyCode::KEY_A, 0),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn analog_synth_grid_hold_to_repeat_emits_the_same_autorepeat_shape() {
+        // Spec §4 surface 2: an Analog-*sourced* Hold-to-repeat on a grid key
+        // (`event.depth: Some(_)`, the stream `capture::analog`'s
+        // `RepeatSchedule` synthesizes) rides the exact same `value=2` path as
+        // the digital surface 1 above — one `value=2` per synthesized `Repeat`.
+        // `RepeatSchedule` / `advance_fired` in `capture/analog.rs` are
+        // untouched: they still decide *when* a `Repeat` arrives; only the
+        // emitted event changed.
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::HoldToRepeat,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: evdev::KeyCode::KEY_A,
+                },
+            },
+        );
+        let mut seam = Seam::with_bindings(bindings);
+
+        // Analog-sourced edges (depth: Some) — what a grid key in Analog
+        // capture produces once its Actuation point is crossed.
+        for (state, depth) in [
+            (EventState::Down, 150u8),
+            (EventState::Repeat, 150),
+            (EventState::Repeat, 150),
+            (EventState::Up, 0),
+        ] {
+            seam.feed(PhysicalEvent {
+                input: Input::Grid(1, 1),
+                state,
+                depth: Some(depth),
+            })
+            .await;
         }
+
+        let batches = seam.finish().await;
+        assert_eq!(
+            batches
+                .iter()
+                .map(|b| key_and_value(b[0]))
+                .collect::<Vec<_>>(),
+            vec![
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 2),
+                (evdev::KeyCode::KEY_A, 2),
+                (evdev::KeyCode::KEY_A, 0),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn hold_to_repeat_modifier_wrapped_key_holds_the_modifier_and_autorepeats_only_the_base()
+    {
+        // Spec §3.1: `Ctrl`+key under Hold-to-repeat holds `Ctrl` `value=1`
+        // alongside the base key `value=1`, then only the base key autorepeats
+        // (`value=2`); the physical Up force-releases both. `Ctrl` never emits
+        // a `value=2` — exactly what the kernel does for a physically held
+        // `Ctrl+X`.
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::HoldToRepeat,
+                action: Action::Keypress {
+                    modifiers: Modifiers {
+                        ctrl: true,
+                        ..Modifiers::default()
+                    },
+                    key: evdev::KeyCode::KEY_X,
+                },
+            },
+        );
+        let mut seam = Seam::with_bindings(bindings);
+
+        seam.press(Input::Grid(1, 1)).await;
+        seam.repeat(Input::Grid(1, 1)).await;
+        seam.release(Input::Grid(1, 1)).await;
+
+        let events = seam
+            .finish()
+            .await
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            &events[..3],
+            &[
+                (evdev::KeyCode::KEY_LEFTCTRL, 1),
+                (evdev::KeyCode::KEY_X, 1),
+                (evdev::KeyCode::KEY_X, 2),
+            ],
+            "Ctrl held value=1, base key down then one autorepeat"
+        );
+        // The trailing two events are the force-released Ctrl + X in either
+        // order (a drained HashSet) — both value=0, and Ctrl never autorepeated.
+        let tail = &events[3..];
+        assert_eq!(tail.len(), 2);
+        assert!(tail.contains(&(evdev::KeyCode::KEY_LEFTCTRL, 0)));
+        assert!(tail.contains(&(evdev::KeyCode::KEY_X, 0)));
+        assert!(
+            !events.contains(&(evdev::KeyCode::KEY_LEFTCTRL, 2)),
+            "the modifier must never autorepeat"
+        );
+    }
+
+    #[tokio::test]
+    async fn layer_switch_while_holding_a_hold_to_repeat_key_force_releases_it() {
+        // Ticket 04 / spec §7: every single-key Hold-to-repeat now holds a
+        // bare `value=1` for the life of the press. A Layer switch (the
+        // default ModeKey action) while the key is held, then releasing it on
+        // a Layer where it is unbound, must not strand `KEY_A` down — the
+        // switch teardown (`Slots::drain_firings`) balances it. Pre-ticket-04
+        // this path used balanced `[Down, Up]` pairs and nothing could stick.
+        let mut base = HashMap::new();
+        base.insert(
+            Input::Grid(1, 1),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+        );
+        // Held layer left empty → Grid(1,1) is unbound there.
+        let mut seam = Seam::new(config_with_profile(Profile {
+            base,
+            ..Default::default()
+        }));
+
+        seam.press(Input::Grid(1, 1)).await;
+        seam.feed(PhysicalEvent {
+            input: Input::ModeKey,
+            state: EventState::Down,
+            depth: None,
+        })
+        .await;
+        assert_eq!(seam.get_state().await.layer, "held");
+        seam.release(Input::Grid(1, 1)).await;
+
+        let key_a: Vec<_> = seam
+            .finish()
+            .await
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .filter(|(code, _)| *code == evdev::KeyCode::KEY_A)
+            .collect();
+        assert_eq!(
+            key_a,
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "the Layer switch teardown force-released the held KEY_A"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hold_to_repeat_key_held_across_a_layer_switch_re_presses_on_the_new_layer() {
+        // The `decide` fallback that pairs with the teardown above: after
+        // `drain_firings` clears the firing, a `Repeat` on the still-held key
+        // sees `slot == None` and re-presses (`HoldKeyDown`) rather than
+        // emitting a dangling `value=2` for the new Layer's binding.
+        let mut base = HashMap::new();
+        base.insert(
+            Input::Grid(1, 1),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+        );
+        let mut held = HashMap::new();
+        held.insert(
+            Input::Grid(1, 1),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_B),
+        );
+        let mut seam = Seam::new(config_with_profile(Profile {
+            base,
+            held,
+            ..Default::default()
+        }));
+
+        seam.press(Input::Grid(1, 1)).await; // KEY_A value=1
+        seam.feed(PhysicalEvent {
+            input: Input::ModeKey,
+            state: EventState::Down,
+            depth: None,
+        })
+        .await; // drain → KEY_A value=0
+        seam.repeat(Input::Grid(1, 1)).await; // Held layer, no firing → re-press KEY_B value=1
+        seam.repeat(Input::Grid(1, 1)).await; // firing established → KEY_B value=2
+        seam.release(Input::Grid(1, 1)).await; // ForceReleaseStuck → KEY_B value=0
+
+        let events: Vec<_> = seam
+            .finish()
+            .await
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .filter(|(code, _)| *code == evdev::KeyCode::KEY_A || *code == evdev::KeyCode::KEY_B)
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 0),
+                (evdev::KeyCode::KEY_B, 1),
+                (evdev::KeyCode::KEY_B, 2),
+                (evdev::KeyCode::KEY_B, 0),
+            ],
+            "no dangling KEY_B value=2 — the held key re-presses first"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_switch_while_holding_a_hold_to_repeat_key_force_releases_it() {
+        // The `Effect::ReleaseAllHolds` half of the spec §7 teardown, through
+        // the full command harness — `SwitchProfile` drains every live
+        // individual firing alongside `StopAllToggles` / `StopAllStages`.
+        let mut base = HashMap::new();
+        base.insert(
+            Input::Grid(1, 1),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+        );
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            DEFAULT_PROFILE_NAME.to_string(),
+            Profile {
+                base,
+                ..Default::default()
+            },
+        );
+        profiles.insert("Gaming".to_string(), Profile::default());
+        let harness = CommandHarness::spawn(Config {
+            schema_version: config::SCHEMA_VERSION,
+            active_profile: DEFAULT_PROFILE_NAME.to_string(),
+            profiles,
+            force_digital: false,
+            macros: HashMap::new(),
+            steppers: HashMap::new(),
+        });
+
+        harness.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        harness.switch_profile("Gaming").await.unwrap();
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        let batches = harness.shut_down().await;
+        assert_eq!(
+            batches
+                .iter()
+                .map(|b| key_and_value(b[0]))
+                .collect::<Vec<_>>(),
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "the Profile switch drained the held KEY_A firing",
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1761,12 +2044,14 @@ mod tests {
         assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::BTN_SOUTH, 0));
     }
 
+    /// Spec §4 surface 6 / §3.2 (ticket 05): a Toggle whose held target is a
+    /// single keyboard key no longer loops `[Down, Up]` through
+    /// `run_toggle_loop` at `target_lap` — it holds a genuine Linux
+    /// autorepeat. `value=1` on the first press, the first `value=2` a full
+    /// `REP_DELAY` later, `value=2` every `REP_PERIOD` after that, and
+    /// `value=0` on the second press of the same key.
     #[tokio::test(start_paused = true)]
-    async fn toggle_keyboard_key_still_loops_at_dispatch_level() {
-        // Regression coverage (ticket 82/83): the mouse-button-only
-        // carve-out must not bleed onto keyboard-key output — `is_mouse_
-        // button` rejects an ordinary keyboard `KeyCode`, so the ordinary
-        // looping Toggle arm still applies.
+    async fn toggle_keyboard_key_holds_a_genuine_autorepeat_and_the_same_key_stops_it() {
         let mut bindings = HashMap::new();
         bindings.insert(
             Input::Grid(1, 1),
@@ -1781,18 +2066,299 @@ mod tests {
         let mut seam = Seam::with_bindings(bindings);
 
         seam.press(Input::Grid(1, 1)).await;
+        assert_eq!(
+            seam.sink.batches().len(),
+            1,
+            "one value=1 on the first press, nothing else yet"
+        );
+        assert_eq!(
+            key_and_value(seam.sink.batches()[0][0]),
+            (evdev::KeyCode::KEY_A, 1)
+        );
+
+        // The Seam's default schedule is `RepeatSchedule::new(250, 33)` — the
+        // full kernel envelope, exactly as a physically held key.
+        tokio::time::advance(Duration::from_millis(249)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            seam.sink.batches().len(),
+            1,
+            "no autorepeat before the full REP_DELAY elapses"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(33)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            seam.sink
+                .batches()
+                .iter()
+                .map(|b| key_and_value(b[0]))
+                .collect::<Vec<_>>(),
+            vec![
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 2),
+                (evdev::KeyCode::KEY_A, 2),
+            ],
+            "value=1 then value=2 at the kernel envelope — never a [Down, Up] loop"
+        );
+
+        // Same physical key, still toggled on: stops it with value=0.
+        seam.press(Input::Grid(1, 1)).await;
+        let batches = seam.finish().await;
+
+        let stream: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            stream,
+            vec![
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 2),
+                (evdev::KeyCode::KEY_A, 2),
+                (evdev::KeyCode::KEY_A, 0),
+            ],
+            "value=1, autorepeats, then a single value=0 — never a [Down, Up] pair stream"
+        );
+    }
+
+    /// Spec §4 surface 6b (ticket 05): a Toggle wrapping a *single-key* Macro
+    /// (identical compiled steps) produces the identical `value=1` … `value=2`
+    /// envelope as the equivalent Keypress — not a `target_lap`-paced
+    /// `[Down, Up]` loop.
+    #[tokio::test(start_paused = true)]
+    async fn toggle_single_key_macro_holds_the_same_autorepeat_as_the_equivalent_keypress() {
+        let (action, macros) = macro_action(
+            "hold-a",
+            vec![
+                MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
+                MacroStepDto::KeyUp(evdev::KeyCode::KEY_A),
+            ],
+        );
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::Toggle,
+                action,
+            },
+        );
+        let mut seam = Seam::new(config_with_bindings_and_macros(bindings, macros));
+
+        seam.press(Input::Grid(1, 1)).await;
+        tokio::time::advance(Duration::from_millis(250)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(33)).await;
+        tokio::task::yield_now().await;
+        seam.press(Input::Grid(1, 1)).await;
+        let batches = seam.finish().await;
+
+        assert_eq!(
+            batches
+                .iter()
+                .map(|b| key_and_value(b[0]))
+                .collect::<Vec<_>>(),
+            vec![
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 2),
+                (evdev::KeyCode::KEY_A, 2),
+                (evdev::KeyCode::KEY_A, 0),
+            ],
+        );
+    }
+
+    /// Ticket 12: a Fire-once Keypress holds its key for `FIRE_ONCE_KEY_DWELL`
+    /// between the edges. Held past the dwell the firing self-balances, so the
+    /// physical `Up` force-releases nothing; and two presses spaced past the
+    /// dwell both fire a full pair, with no stray events.
+    #[tokio::test(start_paused = true)]
+    async fn fire_once_keypress_holds_the_dwell_then_back_to_back_presses_both_fire() {
+        let mut bindings = HashMap::new();
+        bindings.insert(Input::Grid(1, 1), keypress_binding(evdev::KeyCode::KEY_F1));
+        let mut seam = Seam::with_bindings(bindings);
+
+        seam.press(Input::Grid(1, 1)).await;
+        // Mid-dwell: only the Down has gone out.
+        assert_eq!(
+            seam.sink.batches().len(),
+            1,
+            "the Up is still inside the spliced dwell"
+        );
+        tokio::time::advance(executor::FIRE_ONCE_KEY_DWELL).await;
+        tokio::task::yield_now().await;
+        seam.release(Input::Grid(1, 1)).await;
+
+        // A second press, cleanly past the first firing's dwell.
+        seam.press(Input::Grid(1, 1)).await;
+        tokio::time::advance(executor::FIRE_ONCE_KEY_DWELL).await;
+        tokio::task::yield_now().await;
+        seam.release(Input::Grid(1, 1)).await;
+
+        let batches = seam.finish().await;
+        assert_eq!(
+            batches
+                .iter()
+                .map(|b| key_and_value(b[0]))
+                .collect::<Vec<_>>(),
+            vec![
+                (evdev::KeyCode::KEY_F1, 1),
+                (evdev::KeyCode::KEY_F1, 0),
+                (evdev::KeyCode::KEY_F1, 1),
+                (evdev::KeyCode::KEY_F1, 0),
+            ],
+            "two full press/release pairs, no stray force-release events"
+        );
+    }
+
+    /// Spec §4 surface 9 (ticket 05): a Toggle wrapping a *multi-step* Macro
+    /// is the sole remaining `run_toggle_loop` user — it still loops the
+    /// whole macro, paced at `target_lap`, unchanged.
+    #[tokio::test(start_paused = true)]
+    async fn toggle_multi_step_macro_still_loops_at_target_lap() {
+        let (action, macros) = macro_action(
+            "combo",
+            vec![
+                MacroStepDto::KeyDown(evdev::KeyCode::KEY_A),
+                MacroStepDto::KeyUp(evdev::KeyCode::KEY_A),
+                MacroStepDto::KeyDown(evdev::KeyCode::KEY_B),
+                MacroStepDto::KeyUp(evdev::KeyCode::KEY_B),
+            ],
+        );
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::Toggle,
+                action,
+            },
+        );
+        let mut seam = Seam::new(config_with_bindings_and_macros(bindings, macros));
+
+        seam.press(Input::Grid(1, 1)).await;
         for _ in 0..7 {
             tokio::time::advance(executor::MIN_TOGGLE_LAP).await;
             tokio::task::yield_now().await;
         }
-
         seam.press(Input::Grid(1, 1)).await;
-
         let batches = seam.finish().await;
 
+        // Several full A-down/A-up/B-down/B-up laps ran — never a value=2.
         assert!(
-            batches.len() > 2,
-            "a keyboard-key Toggle must still loop (mash), unlike the mouse-button held variant: got {batches:?}"
+            batches.len() > 4,
+            "a multi-step Macro Toggle must still loop: got {} batches",
+            batches.len()
+        );
+        assert!(
+            batches.iter().all(|b| key_and_value(b[0]).1 != 2),
+            "a multi-step Macro Toggle loops [Down, Up] pairs — no kernel autorepeat"
+        );
+    }
+
+    /// Spec §3.2 / §7 (ticket 05): `StopAllToggles` (the GUI-focus stop, and
+    /// the Profile-switch effect) releases a running single-key autorepeat
+    /// Toggle with `value=0` — the loop-private `held` set is drained on
+    /// cancel exactly like the `[Down, Up]` loop variant.
+    #[tokio::test(start_paused = true)]
+    async fn stop_all_toggles_releases_a_running_single_key_autorepeat_toggle() {
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::Toggle,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: evdev::KeyCode::KEY_A,
+                },
+            },
+        );
+        let mut seam = Seam::with_bindings(bindings);
+
+        seam.press(Input::Grid(1, 1)).await;
+        tokio::time::advance(Duration::from_millis(300)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            seam.sink.batches().len() >= 2,
+            "the Toggle is autorepeating before the stop"
+        );
+
+        let (reply, rx) = oneshot::channel();
+        seam.state
+            .handle_command(
+                &mut seam.config,
+                &unused_config_path(),
+                Command::StopAllToggles { reply },
+            )
+            .await;
+        rx.await.unwrap();
+
+        let batches = seam.finish().await;
+        assert_eq!(
+            key_and_value(*batches.last().unwrap().last().unwrap()),
+            (evdev::KeyCode::KEY_A, 0),
+            "StopAllToggles force-releases the held key with value=0"
+        );
+    }
+
+    /// Spec.md's "Toggle behavior across Layer/Profile switches": an
+    /// *individual* Toggle deliberately survives a Layer switch —
+    /// `handle_layer_switch` leaves `individual` toggles running (it only
+    /// `drain_firings`). Ticket 05 does not change that: a running single-key
+    /// autorepeat Toggle keeps emitting `value=2` across the switch. (The
+    /// spec-kernel-shaped-repeat.md §7 "Layer / Profile switch" teardown row
+    /// is the Profile-switch `Effect::StopAllToggles` path, covered above.)
+    #[tokio::test(start_paused = true)]
+    async fn single_key_autorepeat_toggle_survives_a_layer_switch() {
+        let mut base = HashMap::new();
+        base.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::Toggle,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: evdev::KeyCode::KEY_A,
+                },
+            },
+        );
+        let mut seam = Seam::new(config_with_profile(Profile {
+            base,
+            ..Default::default()
+        }));
+
+        seam.press(Input::Grid(1, 1)).await;
+        tokio::time::advance(Duration::from_millis(300)).await;
+        tokio::task::yield_now().await;
+        let before = seam.sink.batches().len();
+
+        seam.feed(PhysicalEvent {
+            input: Input::ModeKey,
+            state: EventState::Down,
+            depth: None,
+        })
+        .await;
+        assert_eq!(seam.get_state().await.layer, "held");
+        assert_eq!(
+            seam.get_state().await.active_toggles,
+            vec![Input::Grid(1, 1)],
+            "the individual Toggle survives the Layer switch"
+        );
+
+        tokio::time::advance(Duration::from_millis(99)).await;
+        tokio::task::yield_now().await;
+        let after: Vec<_> = seam.sink.batches()[before..]
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect();
+        assert!(
+            !after.is_empty()
+                && after
+                    .iter()
+                    .all(|(c, v)| *c == evdev::KeyCode::KEY_A && *v == 2),
+            "it keeps autorepeating across the switch: {after:?}"
+        );
+
+        let batches = seam.finish().await;
+        assert_eq!(
+            key_and_value(*batches.last().unwrap().last().unwrap()),
+            (evdev::KeyCode::KEY_A, 0),
+            "teardown still balances the held key"
         );
     }
 
@@ -1837,6 +2403,7 @@ mod tests {
             capture_mode_channel(),
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
+            RepeatSchedule::new(250, 33),
             depth_channel(),
             device_info_channel(),
             led_channel(),
@@ -1895,6 +2462,7 @@ mod tests {
             capture_mode_channel(),
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
+            RepeatSchedule::new(250, 33),
             depth_rx,
             device_info_channel(),
             led_channel(),
@@ -2000,6 +2568,7 @@ mod tests {
             capture_mode_channel(),
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
+            RepeatSchedule::new(250, 33),
             depth_rx,
             device_info_channel(),
             led_channel(),
@@ -2079,6 +2648,7 @@ mod tests {
             capture_mode_channel(),
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
+            RepeatSchedule::new(250, 33),
             depth_rx,
             device_info_channel(),
             led_channel(),
@@ -2086,17 +2656,42 @@ mod tests {
 
         depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), u8::MAX)]));
         tokio::task::yield_now().await;
-        // Well past several ordinary ticks' worth of time — still holding
-        // solid the whole way through, not tapping.
-        tokio::time::advance(Duration::from_millis(500)).await;
-        tokio::task::yield_now().await;
 
-        let batches = sink.batches();
-        assert_eq!(batches.len(), 1, "expected exactly one KeyDown, no taps");
-        let evdev::EventSummary::Key(_, code, value) = batches[0][0].destructure() else {
-            panic!("expected a key event");
-        };
-        assert_eq!((code, value), (evdev::KeyCode::KEY_F1, 1));
+        // Crossing 235: a single value=1, nothing else yet — no [Down, Up]
+        // taps, and no immediate value=2 (spec-kernel-shaped-repeat.md §5.3).
+        assert_eq!(sink.batches().len(), 1, "one value=1 on crossing 235");
+        assert_eq!(
+            key_and_value(sink.batches()[0][0]),
+            (evdev::KeyCode::KEY_F1, 1)
+        );
+
+        // Just before the kernel period: still no autorepeat.
+        tokio::time::advance(Duration::from_millis(32)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            sink.batches().len(),
+            1,
+            "no value=2 before the first period_ms elapses"
+        );
+
+        // The first value=2 lands at period_ms (33) — not delay_ms (250):
+        // this is the top of a hand-driven tapping ramp, not a fresh press.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(sink.batches().len(), 2, "first value=2 at period_ms");
+        assert_eq!(
+            key_and_value(sink.batches()[1][0]),
+            (evdev::KeyCode::KEY_F1, 2)
+        );
+
+        // Steady value=2 every period_ms thereafter.
+        tokio::time::advance(Duration::from_millis(33)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(sink.batches().len(), 3, "second value=2 one period later");
+        assert_eq!(
+            key_and_value(sink.batches()[2][0]),
+            (evdev::KeyCode::KEY_F1, 2)
+        );
 
         // Falling back below the deadzone force-releases the held key.
         depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), 0u8)]));
@@ -2109,11 +2704,164 @@ mod tests {
         inj_handle.await.unwrap().unwrap();
 
         let batches = sink.batches();
-        assert_eq!(batches.len(), 2);
-        let evdev::EventSummary::Key(_, code, value) = batches[1][0].destructure() else {
-            panic!("expected a key event");
+        assert_eq!(
+            key_and_value(*batches.last().unwrap().last().unwrap()),
+            (evdev::KeyCode::KEY_F1, 0),
+            "a clean value=0 when Depth leaves hold-solid"
+        );
+        // Every value=1 for the key is balanced by a value=0 — nothing left down.
+        let net_downs = batches
+            .iter()
+            .flatten()
+            .filter(|e| key_and_value(**e).0 == evdev::KeyCode::KEY_F1)
+            .filter_map(|e| match key_and_value(*e).1 {
+                1 => Some(1i32),
+                0 => Some(-1),
+                _ => None,
+            })
+            .sum::<i32>();
+        assert_eq!(net_downs, 0, "the key is not left logically down");
+    }
+
+    /// Ticket 06 / spec-kernel-shaped-repeat.md §5.3: the full
+    /// tap → hold-solid → tap transition. Below 235: balanced [Down, Up]
+    /// pulse pairs (ticket 20's deliberately-human shape, untouched). At/above
+    /// 235: a value=1 + steady value=2 stream, first value=2 at period_ms.
+    /// Dropping back below: a clean value=0, then pulsed pairs resume — and
+    /// the key is never left down at any exit.
+    #[tokio::test(start_paused = true)]
+    async fn analog_repeat_tap_to_hold_solid_to_tap_transition() {
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::AnalogRepeat,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: evdev::KeyCode::KEY_F1,
+                },
+            },
+        );
+
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
+        let (tx, rx) = mpsc::channel(8);
+        let (_conn_tx, conn_rx) = mpsc::channel(8);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (depth_tx, depth_rx) = watch::channel(HashMap::new());
+        let dispatch_handle = tokio::spawn(run(
+            rx,
+            conn_rx,
+            cmd_rx,
+            inj.clone(),
+            config_with_bindings(bindings),
+            unused_config_path(),
+            None,
+            actuation_channel(),
+            capture_mode_channel(),
+            capture_control_channel(),
+            executor::MIN_TOGGLE_LAP,
+            RepeatSchedule::new(250, 33),
+            depth_rx,
+            device_info_channel(),
+            led_channel(),
+        ));
+
+        // Advance ~`ms` of paused time in 5ms steps so the clock drives each
+        // pulse edge / period sleep / injector round-trip in turn (the
+        // one-big-`advance` shortcut skips intermediate wakeups). The tap
+        // band's own `tap_pace_wait` sleep doesn't watch Depth, so a
+        // band-crossing isn't noticed until the in-flight pulse's pace sleep
+        // ends (~111ms worst case) — settle windows straddling a crossing are
+        // sized well past that.
+        async fn settle(ms: u64) {
+            for _ in 0..ms / 5 {
+                tokio::time::advance(Duration::from_millis(5)).await;
+                tokio::task::yield_now().await;
+            }
+        }
+        let values = |batches: &[Vec<evdev::InputEvent>]| -> Vec<i32> {
+            batches.iter().map(|b| key_and_value(b[0]).1).collect()
         };
-        assert_eq!((code, value), (evdev::KeyCode::KEY_F1, 0));
+
+        // ── tap band (depth 100 ≈ 9 Hz, ~111ms period) ──────────────────
+        depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), 100u8)]));
+        settle(300).await;
+
+        let tap = values(&sink.batches());
+        assert!(
+            tap.len() >= 2 && tap.len().is_multiple_of(2),
+            "balanced [Down, Up] pulse pairs below 235, got {tap:?}"
+        );
+        assert!(
+            tap.iter().all(|v| matches!(v, 0 | 1)),
+            "the tap band never emits value=2: {tap:?}"
+        );
+
+        // ── hold-solid (depth 250) ─────────────────────────────────────
+        depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), 250u8)]));
+        settle(300).await;
+
+        let solid = values(&sink.batches());
+        // The hold-solid press is the last value=1 in the log; everything
+        // after it is a bare value=2 stream — no [Down, Up] pulse pairs.
+        let press_at = solid.iter().rposition(|&v| v == 1).expect("a value=1");
+        assert!(
+            solid[press_at + 1..].iter().all(|&v| v == 2),
+            "hold-solid emits only value=2 after the press: {:?}",
+            &solid[press_at..]
+        );
+        let v2_in_solid = solid[press_at + 1..].len();
+        assert!(
+            v2_in_solid >= 5,
+            "a steady value=2 stream over 300ms at a 33ms period, got {v2_in_solid}"
+        );
+        let v2_total = solid.iter().filter(|&&v| v == 2).count();
+
+        // ── back to the tap band (depth 100) ───────────────────────────
+        depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), 100u8)]));
+        settle(300).await;
+
+        let after = values(&sink.batches());
+        // A clean value=0 closes the hold-solid stream…
+        assert_eq!(
+            after[solid.len()],
+            0,
+            "a clean value=0 on leaving hold-solid: {:?}",
+            &after[solid.len().saturating_sub(1)..]
+        );
+        // …and no further value=2 is emitted once Depth is back below 235.
+        assert_eq!(
+            after.iter().filter(|&&v| v == 2).count(),
+            v2_total,
+            "no value=2 in the tap band"
+        );
+        assert!(
+            after.len() > solid.len() + 1,
+            "pulsed pairs resume below 235"
+        );
+
+        depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), 0u8)]));
+        settle(40).await;
+        drop(tx);
+        drop(depth_tx);
+        dispatch_handle.await.unwrap().unwrap();
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+
+        // Nothing left logically down at the end of the whole ramp.
+        let net_downs = sink
+            .batches()
+            .iter()
+            .flatten()
+            .filter(|e| key_and_value(**e).0 == evdev::KeyCode::KEY_F1)
+            .filter_map(|e| match key_and_value(*e).1 {
+                1 => Some(1i32),
+                0 => Some(-1),
+                _ => None,
+            })
+            .sum::<i32>();
+        assert_eq!(net_downs, 0, "no key left down after tap→solid→tap");
     }
 
     #[tokio::test(start_paused = true)]
@@ -2152,6 +2900,7 @@ mod tests {
             capture_mode_channel(),
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
+            RepeatSchedule::new(250, 33),
             depth_channel(),
             device_info_channel(),
             led_channel(),
@@ -2370,6 +3119,7 @@ mod tests {
                 capture_mode_channel(),
                 capture_control_channel(),
                 executor::MIN_TOGGLE_LAP,
+                RepeatSchedule::new(250, 33),
                 depth_rx,
                 device_info_rx,
                 led_tx,
@@ -2953,6 +3703,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_key_chord_hold_to_repeat_emits_one_autorepeat_per_leader_repeat() {
+        // Spec §3.3 + ticket 04: a Chord whose Action is a single key inherits
+        // the `value=2` autorepeat path through the shared `decide` + `perform`
+        // seam. `chord::feed_repeat` re-fires only the `BTreeSet`-first
+        // "leader" member (`Grid(1,1)` here), so the Chord emits exactly one
+        // `value=2` per leader `Repeat` — a non-leader member's `Repeat` is a
+        // no-op — then a `value=0` when a member's `Up` dissolves it.
+        let mut profile = Profile::default();
+        profile.chords_base.insert(
+            ChordKey::new(BTreeSet::from([Input::Grid(1, 1), Input::Grid(1, 2)])),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_C),
+        );
+        let mut profiles = HashMap::new();
+        profiles.insert(DEFAULT_PROFILE_NAME.to_string(), profile);
+        let harness = CommandHarness::spawn(Config {
+            schema_version: config::SCHEMA_VERSION,
+            active_profile: DEFAULT_PROFILE_NAME.to_string(),
+            profiles,
+            force_digital: false,
+            macros: HashMap::new(),
+            steppers: HashMap::new(),
+        });
+
+        // Both members down within the window → the Chord fires: KEY_C value=1.
+        harness.press(Input::Grid(1, 1)).await;
+        harness.press(Input::Grid(1, 2)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        // The non-leader's Repeat is a no-op; the leader's drives one value=2 each.
+        harness.repeat(Input::Grid(1, 2)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        harness.repeat(Input::Grid(1, 1)).await;
+        harness.repeat(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        // Releasing one member dissolves the Chord → force-release KEY_C value=0.
+        harness.release(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        let batches = harness.shut_down().await;
+        assert_eq!(
+            batches
+                .iter()
+                .map(|b| key_and_value(b[0]))
+                .collect::<Vec<_>>(),
+            vec![
+                (evdev::KeyCode::KEY_C, 1),
+                (evdev::KeyCode::KEY_C, 2),
+                (evdev::KeyCode::KEY_C, 2),
+                (evdev::KeyCode::KEY_C, 0),
+            ],
+        );
+    }
+
+    #[tokio::test]
     async fn set_binding_command_applies_live_and_persists_to_disk() {
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
 
@@ -3442,21 +4255,13 @@ mod tests {
 
         let batches = harness.shut_down().await;
 
-        // Down + one Repeat = two Hold-to-repeat firings, each a
-        // KeyDown/KeyUp pair of the bound Keypress — not KEY_LEFTALT, and
-        // not a Layer switch.
-        assert_eq!(batches.len(), 4);
-        for pair in batches.chunks(2) {
-            let evdev::EventSummary::Key(_, down_code, down_value) = pair[0][0].destructure()
-            else {
-                panic!("expected a key event");
-            };
-            let evdev::EventSummary::Key(_, up_code, up_value) = pair[1][0].destructure() else {
-                panic!("expected a key event");
-            };
-            assert_eq!((down_code, down_value), (evdev::KeyCode::KEY_F1, 1));
-            assert_eq!((up_code, up_value), (evdev::KeyCode::KEY_F1, 0));
-        }
+        // Ticket 04: a single keyboard key under Hold-to-repeat now presents
+        // as genuine kernel autorepeat — the bound Keypress's `KEY_F1`
+        // `value=1` on Down, then one `value=2` per Repeat — not a stream of
+        // `[Down, Up]` pairs, not `KEY_LEFTALT`, and not a Layer switch.
+        assert_eq!(batches.len(), 2);
+        assert_eq!(key_and_value(batches[0][0]), (evdev::KeyCode::KEY_F1, 1));
+        assert_eq!(key_and_value(batches[1][0]), (evdev::KeyCode::KEY_F1, 2));
     }
 
     #[tokio::test]
@@ -3819,16 +4624,16 @@ mod tests {
             )
             .await
             .unwrap();
-        // Advance to index 2 (the last item of the 3-item list).
+        // Advance to index 2 (the last item of the 3-item list). The two
+        // presses are spaced past `FIRE_ONCE_KEY_DWELL` (ticket 12): a
+        // single-key Step under Fire-once now holds its key for the spliced
+        // dwell, so a second press landing inside that window would be
+        // dropped by `decide`'s ordinary same-key overlap guard.
         harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::sleep(executor::FIRE_ONCE_KEY_DWELL + Duration::from_millis(20)).await;
         harness.release(Input::Grid(1, 1)).await;
         harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::sleep(executor::FIRE_ONCE_KEY_DWELL + Duration::from_millis(20)).await;
         assert_eq!(harness.get_state().await.stepper_cursors[&stepper_id], 2);
 
         // Shrink to a single item — the stranded index-2 cursor must be
@@ -3901,10 +4706,12 @@ mod tests {
 
     #[tokio::test]
     async fn fire_once_step_binding_produces_no_extra_output_on_physical_release() {
-        // Mirrors `fire_once_binding_ignores_repeat_and_up_fires_only_on_down`
-        // for a Stepper: a Step compiles to an already-balanced
-        // KeyDown/KeyUp pair, so the physical `Up`'s force-release check
-        // (ticket 33) finds nothing left held and produces no extra output.
+        // A single-key Stepper `Key` step under Fire-once compiles to a
+        // single held key, so ticket 12 splices `FIRE_ONCE_KEY_DWELL` between
+        // its edges. Held past the dwell (the ordinary case — a real press is
+        // tens of ms), the firing self-balances its KeyDown/KeyUp before the
+        // physical `Up`'s force-release check (ticket 33) runs, so that check
+        // finds nothing held and no extra output lands.
         let harness = CommandHarness::spawn(config_with_bindings(HashMap::new()));
         let stepper_id = harness
             .create_stepper(
@@ -3932,9 +4739,8 @@ mod tests {
             .unwrap();
 
         harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        // Hold past the spliced dwell so the firing balances itself.
+        tokio::time::sleep(executor::FIRE_ONCE_KEY_DWELL + Duration::from_millis(20)).await;
         harness.release(Input::Grid(1, 1)).await;
         for _ in 0..5 {
             tokio::task::yield_now().await;
@@ -4613,6 +5419,10 @@ mod tests {
         // entirely, relying on this unmodified path.
         harness.press_analog(Input::Grid(1, 1), 150).await;
         harness.push_depth([(Input::Grid(1, 1), 150)]);
+        // A dual-stage key's primary press is machine-sequenced input — it
+        // carries no Fire-once dwell (ticket 17 Addendum), so the primary
+        // Down/Up pair lands back to back and the overlap guard is clear for
+        // the RepressPrimary below with a plain `settle()`.
         settle().await;
 
         // The deep crossing, a separate report: primary's own hysteresis
@@ -4770,78 +5580,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dual_stage_additive_holds_both_stages_on_independent_untouched_cadences() {
-        let config = dual_stage_config(
-            StagingMode::Additive,
-            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
-            hold_to_repeat_binding(evdev::KeyCode::KEY_B),
-        );
-        let harness = CommandHarness::spawn(config);
-
-        // Primary crossing: the real Down, then a synthesized Hold-to-repeat
-        // `Repeat` pulse (mirroring `capture::analog`'s own
-        // `RepeatSchedule`) — both fire normally; Additive never touches
-        // this crossing at all.
-        harness.press_analog(Input::Grid(1, 1), 150).await;
-        harness.push_depth([(Input::Grid(1, 1), 150)]);
-        settle().await;
-        harness.repeat_analog(Input::Grid(1, 1), 150).await;
-        settle().await;
-
-        // Deep crossing: Additive fires the deep stage without touching the
-        // primary's own liveness at all.
-        harness.push_depth([(Input::Grid(1, 1), 250)]);
-        settle().await;
-
-        // The first three firings, in order: primary Down, primary Repeat,
-        // then `FireDeep` on the crossing.
-        let opening: Vec<_> = harness
-            .sink
-            .batches()
-            .iter()
-            .map(|b| key_and_value(b[0]))
-            .collect();
-        assert_eq!(
-            opening,
-            vec![
-                (evdev::KeyCode::KEY_A, 1),
-                (evdev::KeyCode::KEY_A, 0),
-                (evdev::KeyCode::KEY_A, 1),
-                (evdev::KeyCode::KEY_A, 0),
-                (evdev::KeyCode::KEY_B, 1),
-                (evdev::KeyCode::KEY_B, 0),
-            ],
-        );
-
-        // One synthesized primary Repeat pulse while both bands are engaged:
-        // Additive never suppresses the primary, and the same pulse drives
-        // the deep stage's own Hold-to-repeat too — both stages tap, each a
-        // full Down/Up pair (the two are fire-and-forget, so their own pairs
-        // may interleave — assert the multiset).
-        harness.repeat_analog(Input::Grid(1, 1), 250).await;
-        settle().await;
-        harness.release_analog(Input::Grid(1, 1), 0).await;
-        harness.push_depth([(Input::Grid(1, 1), 0)]);
-        settle().await;
-
-        let batches = harness.shut_down().await;
-        let after: Vec<_> = batches[opening.len()..]
-            .iter()
-            .map(|b| key_and_value(b[0]))
-            .collect();
-        assert_eq!(
-            event_counts(&after),
-            event_counts(&[
-                (evdev::KeyCode::KEY_A, 1),
-                (evdev::KeyCode::KEY_A, 0),
-                (evdev::KeyCode::KEY_B, 1),
-                (evdev::KeyCode::KEY_B, 0),
-            ]),
-            "both stages repeat off the one primary pulse while the deep band stays engaged"
-        );
-    }
-
-    #[tokio::test]
     async fn dual_stage_no_return_never_represses_the_primary_on_the_way_back_out() {
         let config = dual_stage_config(
             StagingMode::NoReturn,
@@ -4852,6 +5590,10 @@ mod tests {
 
         harness.press_analog(Input::Grid(1, 1), 150).await;
         harness.push_depth([(Input::Grid(1, 1), 150)]);
+        // A dual-stage primary carries no Fire-once dwell (ticket 17
+        // Addendum) — its self-balanced KeyUp lands right here, not as a
+        // redundant trailing release after the handoff, so a plain
+        // `settle()` suffices.
         settle().await;
 
         harness.push_depth([(Input::Grid(1, 1), 250)]);
@@ -4881,6 +5623,115 @@ mod tests {
         );
     }
 
+    /// Ticket 17 Addendum: a dual-stage key's primary press is machine-
+    /// sequenced input, so a Fire-once single-key primary carries **no**
+    /// `FIRE_ONCE_KEY_DWELL`. Pressing the primary and crossing into the deep
+    /// band on the very next report — inside what used to be the 40 ms dwell
+    /// window — leaves exactly one balanced `[Down, Up]` for the primary,
+    /// with no redundant trailing `value=0` from a dwell task landing after
+    /// the deep excursion already released the key, and the primary's `Up` is
+    /// not deferred by the dwell.
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_primary_press_carries_no_fire_once_dwell() {
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        // The real Analog-sourced primary Down, then the deep crossing on the
+        // next report with no time advanced — the deep excursion lands well
+        // inside the old dwell window.
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        let after_primary: Vec<_> = harness
+            .sink
+            .batches()
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect();
+        assert_eq!(
+            after_primary,
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "the primary's Fire-once pair lands back to back — its Up is not \
+             held for a 40 ms dwell"
+        );
+
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        // A stray dwell task, had one been spawned, would land its redundant
+        // KEY_A `value=0` somewhere in this window.
+        tokio::time::advance(executor::FIRE_ONCE_KEY_DWELL * 2).await;
+        settle().await;
+
+        let batches = harness.shut_down().await;
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 0),
+                (evdev::KeyCode::KEY_B, 1),
+                (evdev::KeyCode::KEY_B, 0),
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 0),
+            ],
+            "every KEY_A press is a balanced Down/Up pair — no redundant \
+             trailing value=0 from a dwell task"
+        );
+    }
+
+    /// Ticket 17 Addendum: a dual-stage primary tapped as a plain key — never
+    /// crossing into the deep band — still fires its Fire-once pair exactly
+    /// once; it just no longer holds the ~40 ms plausibility dwell on that
+    /// press.
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_primary_tapped_without_crossing_deep_fires_dwell_free() {
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        // No time advanced: if the dwell were still on, only KEY_A `value=1`
+        // would be visible until 40 ms elapse.
+        settle().await;
+        let after_press: Vec<_> = harness
+            .sink
+            .batches()
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect();
+        assert_eq!(
+            after_press,
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "the Fire-once pair lands immediately, dwell-free"
+        );
+
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        tokio::time::advance(executor::FIRE_ONCE_KEY_DWELL * 2).await;
+        settle().await;
+
+        let batches = harness.shut_down().await;
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "a dual-stage primary that never crosses deep just fires its \
+             Fire-once pair once"
+        );
+    }
+
     #[tokio::test]
     async fn dual_stage_handoff_deep_stage_hold_to_repeat_actually_repeats() {
         // A Hold-to-repeat deep Binding must keep tapping while the deep
@@ -4900,33 +5751,55 @@ mod tests {
         settle().await;
         harness.push_depth([(Input::Grid(1, 1), 250)]);
         settle().await;
+        // Ticket 04: the deep single-key Hold-to-repeat now presents as
+        // genuine kernel autorepeat through the deep `Slots<StageKey>` —
+        // `value=1` on the `FireDeep` crossing (after the FireOnce primary's
+        // own `[Down, Up]` on its crossing).
+        assert_eq!(
+            key_and_value(harness.sink.batches().last().unwrap()[0]),
+            (evdev::KeyCode::KEY_B, 1),
+            "FireDeep taps KEY_B value=1 on the crossing"
+        );
         let after_crossing = harness.sink.batches().len();
-        assert!(after_crossing > 0, "FireDeep taps once on the crossing");
 
         // Synthesized primary Repeat pulses while both bands stay engaged:
-        // the deep Hold-to-repeat re-fires on every one.
+        // the deep Hold-to-repeat emits one `value=2` per pulse, not a
+        // `[Down, Up]` pair and not a single Fire-once.
         for _ in 0..3 {
             harness.repeat_analog(Input::Grid(1, 1), 250).await;
             settle().await;
         }
-        assert!(
-            harness.sink.batches().len() >= after_crossing + 3,
-            "the deep Hold-to-repeat must tap on every pulse, not act like Fire-once"
+        assert_eq!(
+            harness.sink.batches()[after_crossing..]
+                .iter()
+                .map(|b| key_and_value(b[0]))
+                .collect::<Vec<_>>(),
+            vec![
+                (evdev::KeyCode::KEY_B, 2),
+                (evdev::KeyCode::KEY_B, 2),
+                (evdev::KeyCode::KEY_B, 2),
+            ],
+            "the deep Hold-to-repeat must autorepeat on every pulse"
         );
-        for b in &harness.sink.batches()[after_crossing..] {
-            assert_eq!(key_and_value(b[0]).0, evdev::KeyCode::KEY_B);
-        }
+        let after_repeats = harness.sink.batches().len();
 
-        // Back out of the deep band: `ReleaseDeep` stops it.
+        // Back out of the deep band: `ReleaseDeep` force-releases the held
+        // deep `value=1` (`RepressPrimary` also re-fires the FireOnce primary).
         harness.push_depth([(Input::Grid(1, 1), 150)]);
         settle().await;
+        assert!(
+            harness.sink.batches()[after_repeats..]
+                .iter()
+                .any(|b| key_and_value(b[0]) == (evdev::KeyCode::KEY_B, 0)),
+            "ReleaseDeep must balance the deep hold's value=1"
+        );
         let after_release = harness.sink.batches().len();
         harness.repeat_analog(Input::Grid(1, 1), 150).await;
         settle().await;
         assert_eq!(
             harness.sink.batches().len(),
             after_release,
-            "no more deep taps once the deep band releases"
+            "no more deep autorepeat once the deep band releases"
         );
 
         harness.release_analog(Input::Grid(1, 1), 0).await;
@@ -5240,6 +6113,172 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn dual_stage_quick_skip_quick_shallow_tap_disarms_the_window_on_the_up_edge() {
+        // Ticket 13's stuck-key repro, made deterministic on the `Seam` seam:
+        // a coalescing `rx_depth` `{KEY: 0}` tick lands *first* (fresh runtime,
+        // a no-op), then the queued Down/Up drain. `feed` must disarm the
+        // window off the real `Up` edge itself — the depth path never gets
+        // another tick to run the cancel row, so if `feed` swallows the `Up`
+        // without disarming, the deadline fires `RepressPrimary` into a press
+        // with no release edge left and the Hold-to-repeat primary latches.
+        let config = dual_stage_config(
+            StagingMode::QuickSkip,
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_B),
+        );
+        let mut seam = Seam::new(config);
+
+        seam.state
+            .update_stages(&seam.config, &HashMap::from([(Input::Grid(1, 1), 0)]))
+            .await
+            .unwrap();
+
+        seam.feed(PhysicalEvent {
+            input: Input::Grid(1, 1),
+            state: EventState::Down,
+            depth: Some(150),
+        })
+        .await;
+        let deadline = seam
+            .state
+            .stage
+            .next_deadline()
+            .expect("the ~50ms window is armed");
+
+        seam.feed(PhysicalEvent {
+            input: Input::Grid(1, 1),
+            state: EventState::Up,
+            depth: Some(0),
+        })
+        .await;
+
+        assert!(
+            seam.state.stage.next_deadline().is_none(),
+            "the outer Up must disarm the window off the edge itself"
+        );
+
+        // Fire the deadline arm anyway — it must be inert now.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let edits = seam
+            .state
+            .tick_stages(&seam.config, deadline + Duration::from_millis(1))
+            .await
+            .unwrap();
+        assert!(edits.is_empty());
+
+        let batches = seam.finish().await;
+        assert!(
+            batches.is_empty(),
+            "neither stage ever fired — nothing must be emitted, least of all a \
+             stuck primary value=1: {batches:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_quick_skip_late_primary_is_released_when_a_depth_tick_beats_the_real_up() {
+        // Ticket 13, second hole: the deadline elapses first, so the buffered
+        // Hold-to-repeat primary fires retroactively (`value=1`, `Late`). Then
+        // the coalescing `rx_depth` `{KEY: 0}` tick is serviced *before* the
+        // queued real primary `Up`: `update` runs the `Late -> None` row, whose
+        // lone `ReleasePrimary` it `continue`s past (the ordinary `rx_events`
+        // edge is meant to release it). But for a Quick-Skip key `feed` swallows
+        // that ordinary edge — so `end_quick_skip` must force-release the
+        // primary itself, or `value=1` latches forever (kernel autorepeat).
+        let config = dual_stage_config(
+            StagingMode::QuickSkip,
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let mut seam = Seam::new(config);
+
+        seam.feed(PhysicalEvent {
+            input: Input::Grid(1, 1),
+            state: EventState::Down,
+            depth: Some(150),
+        })
+        .await;
+        let deadline = seam.state.stage.next_deadline().expect("armed");
+
+        // Deadline elapses -> retroactive primary `value=1`, phase `Late`.
+        tokio::time::advance(Duration::from_millis(60)).await;
+        seam.state
+            .tick_stages(&seam.config, deadline + Duration::from_millis(1))
+            .await
+            .unwrap();
+        settle().await;
+        assert_eq!(
+            seam.sink
+                .batches()
+                .iter()
+                .map(|b| key_and_value(b[0]))
+                .collect::<Vec<_>>(),
+            vec![(evdev::KeyCode::KEY_A, 1)],
+            "the buffered Hold-to-repeat primary fired retroactively",
+        );
+
+        // The `{KEY: 0}` depth tick wins the race against the real `Up`.
+        seam.state
+            .update_stages(&seam.config, &HashMap::from([(Input::Grid(1, 1), 0)]))
+            .await
+            .unwrap();
+
+        // Now the real `Up` finally drains.
+        seam.feed(PhysicalEvent {
+            input: Input::Grid(1, 1),
+            state: EventState::Up,
+            depth: Some(0),
+        })
+        .await;
+
+        let batches = seam.finish().await;
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "the retroactively-fired primary must be released on the real Up, \
+             not left latched: {events:?}",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_quick_skip_skipped_then_outer_up_releases_the_deep_stage() {
+        // Ticket 13's `Skipped` case: a fast full press skips the primary and
+        // fires the deep stage, then the key is released in one report straight
+        // from the deep band. `feed` must run the No-Return-shaped release off
+        // the `Up` edge — deep stage released, primary never touched, window
+        // never armed.
+        let config = dual_stage_config(
+            StagingMode::QuickSkip,
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let mut seam = Seam::new(config);
+
+        seam.feed(PhysicalEvent {
+            input: Input::Grid(1, 1),
+            state: EventState::Down,
+            depth: Some(250),
+        })
+        .await;
+        seam.feed(PhysicalEvent {
+            input: Input::Grid(1, 1),
+            state: EventState::Up,
+            depth: Some(0),
+        })
+        .await;
+
+        assert!(seam.state.stage.next_deadline().is_none());
+
+        let batches = seam.finish().await;
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![(evdev::KeyCode::KEY_B, 1), (evdev::KeyCode::KEY_B, 0)],
+            "the deep stage fires and releases; the primary KEY_A is never touched",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn dual_stage_quick_skip_layer_switch_while_armed_cancels_the_buffered_primary() {
         // A Layer/Profile switch or capture-mode flip to Digital while Armed
         // cancels outright via `stage::Engine::stop_all()` (already wired at
@@ -5311,6 +6350,7 @@ mod tests {
             capture_mode_rx,
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
+            RepeatSchedule::new(250, 33),
             depth_rx,
             device_info_channel(),
             led_channel(),
@@ -5447,6 +6487,63 @@ mod tests {
         harness.shut_down().await;
     }
 
+    #[tokio::test]
+    async fn dual_stage_layer_switch_mid_press_force_releases_a_live_deep_hold_to_repeat() {
+        // Ticket 04 / spec §7: a single-key deep Hold-to-repeat now holds a
+        // bare `value=1` while the deep band is engaged (the `value=2` stream
+        // is stateless). `stage::Engine::stop_all()` on a Layer switch must
+        // still balance that `value=1` with a force-released `value=0`, exactly
+        // as it does for a deep Toggle.
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        harness.repeat_analog(Input::Grid(1, 1), 250).await;
+        settle().await;
+        // After the FireOnce primary's own `[Down, Up]`, the deep hold's
+        // `value=1` on the crossing then one `value=2` on the pulse.
+        let deep: Vec<_> = harness
+            .sink
+            .batches()
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .filter(|(code, _)| *code == evdev::KeyCode::KEY_B)
+            .collect();
+        assert_eq!(
+            deep,
+            vec![(evdev::KeyCode::KEY_B, 1), (evdev::KeyCode::KEY_B, 2)]
+        );
+
+        harness.press(Input::ModeKey).await;
+        settle().await;
+        assert_eq!(
+            key_and_value(harness.sink.batches().last().unwrap()[0]),
+            (evdev::KeyCode::KEY_B, 0),
+            "the Layer switch's stop_all must force-release the held deep value=1"
+        );
+
+        let events: Vec<_> = harness
+            .sink
+            .batches()
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect();
+        let downs = events.iter().filter(|(_, v)| *v == 1).count();
+        let ups = events.iter().filter(|(_, v)| *v == 0).count();
+        assert_eq!(downs, ups, "no key left logically down: {events:?}");
+
+        harness.release(Input::ModeKey).await;
+        harness.shut_down().await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn dual_stage_digital_mode_flip_mid_press_force_releases_a_live_deep_toggle() {
         let config = dual_stage_config(
@@ -5473,6 +6570,7 @@ mod tests {
             capture_mode_rx,
             capture_control_channel(),
             executor::MIN_TOGGLE_LAP,
+            RepeatSchedule::new(250, 33),
             depth_rx,
             device_info_channel(),
             led_channel(),

@@ -56,7 +56,8 @@ Acheron is two cooperating pieces:
 - **Bindings** from any Input — the 20 grid keys, the Mode key, the four
   thumbstick directions, and the scroll wheel's up/down/click.
 - **Actions**: a **Keypress** (any key or modifier combination), a **Macro**,
-  a **Stepper** step, a **Profile Switch**, or a **Controller button**.
+  a **Stepper** step, a **Profile Switch**, or a **Controller button** — see
+  [Output safety](#output-safety).
 - **Output picker** covering the whole keyboard — letters, numbers, function
   keys through F24, the numpad, navigation/lock keys, and multimedia/consumer
   keys — plus the five mouse buttons (left / middle / right / back / forward)
@@ -65,7 +66,8 @@ Acheron is two cooperating pieces:
   (this is also how the thumbstick's four diagonals work).
 - **Trigger modes**: Fire-once, Hold-to-repeat, Toggle, and **Analog-repeat**
   ("Simulated Analog Key-Interlacing" — re-fire rate rises with how hard a grid
-  key is pressed, for keyboard-driven driving sims).
+  key is pressed, for keyboard-driven driving sims) — see
+  [Output safety](#output-safety).
 - **Macro library** and **Stepper library** — named, reusable sequences and
   ordered lists (a Stepper walks a cursor through a list, firing each item as
   you step; ideal on the scroll wheel for weapon wheels or hotkey pages).
@@ -163,8 +165,8 @@ membership take full effect (or unplug/replug the device).
 ### Building a release
 
 Both components self-label their version from git. A plain `main` checkout
-reports `1.2.0-dev+<short-hash>`; a checkout sitting exactly on the `v1.2.0`
-tag (or a tarball with no `.git`) reports the bare `1.2.0`. **Tag the release
+reports `1.2.1-dev+<short-hash>`; a checkout sitting exactly on the `v1.2.1`
+tag (or a tarball with no `.git`) reports the bare `1.2.1`. **Tag the release
 commit before building** the artifacts you hand to users. The canonical
 version numbers live in `daemon/Cargo.toml` and `gui/acheron_gui/__init__.py`
 (`_BASE_VERSION`); a release bumps both. `daemon/build.rs` honours an explicit
@@ -249,8 +251,6 @@ the key travels through both bands:
   stage held at a time.
 - **No-Return** — like Handoff going in, but the primary does not re-fire on
   the way back up.
-- **Additive** — the deep press adds the deep stage on top; the primary stays
-  held. Both release together.
 - **Quick-Skip** — reaching the deep band within about 50 ms of the primary
   point suppresses the primary's press entirely (for a fast full-press you
   never wanted the light press for); otherwise it behaves as Handoff.
@@ -275,6 +275,78 @@ a new build with:
 ```sh
 systemctl --user restart acheron-daemon
 ```
+
+## Output safety
+
+Acheron turns your key presses into synthetic input events. That output is always
+identifiable as synthetic — on Linux a `uinput` device can be told apart from real
+hardware — and Acheron doesn't try to hide it. What it *does* guarantee is that its
+own Trigger modes never emit events faster than the Linux input stack would for a
+physically held key: the kernel's own autorepeat delay and period for a held key, and
+exactly one press/release for a held mouse or gamepad button. Held or repeated single
+keys are emitted as genuine kernel autorepeat, not a stream of press/release pairs.
+(Rationale: [ADR-0008](docs/adr/0008-physical-plausibility-ceiling-for-synthetic-output.md);
+the input-timing heuristics behind it are collected in
+[docs/anti-cheat-input-heuristics.md](docs/anti-cheat-input-heuristics.md).)
+
+**Macros are the exception.** A Macro does exactly what you write, at the cadence you
+write it — Acheron does not pace the keystrokes inside a single run. That's
+deliberate: a macro is a shortcut for a sequence you could type yourself. It also
+means a badly-written macro is the one way to make Acheron produce output no hand
+could.
+
+### Keeping a macro plausible to a game
+
+Some games, and most competitive multiplayer anti-cheat, look for input no person
+could produce. **There are no safe numbers to quote** — it depends entirely on the
+game, and any threshold here would be guesswork — but the shapes that draw scrutiny
+are well understood:
+
+- **Prefer a built-in Trigger mode** when you don't actually need a sequence.
+  Hold-to-repeat, Toggle and Analog-repeat all stay within the kernel's rate; a macro
+  loop doesn't.
+- **Leave realistic gaps between steps** — tens of milliseconds and up. Gaps or key
+  holds under ~30 ms resemble nothing a physical keyboard produces.
+- **Don't fake a held key with a fast down/up loop.** A real held key sends repeat
+  events after an initial delay; it doesn't hammer press/release.
+- **Don't make every delay identical.** Perfectly uniform timing — a metronome, or
+  every gap an exact multiple of 10 ms — is the single most cited automation tell.
+  (Not a call to build a jitter engine; just don't go out of your way to make the
+  timing mathematically perfect.)
+- **Don't loop a macro unattended for hours.** An identical sequence repeated
+  forever, with timing that never drifts, is a classic macro signature.
+- **One physical press should map to one in-game action.** Turning a single keypress
+  into a burst of many actions is exactly what rules like Counter-Strike 2's
+  input-automation ban describe, however the events are produced.
+
+Depending on the game, running a macro at all can carry a real risk of a ban. That
+risk is yours to weigh.
+
+### Not locking up your own system
+
+A macro runs on *your* machine first. A few ways to wedge it, and how to recover:
+
+- **Zero or tiny delays under Toggle or Hold-to-repeat.** Acheron floors how often a
+  macro *re-fires* — it can't loop faster than the kernel's autorepeat period — but it
+  does not floor the cadence of keystrokes *within* one run. A long macro of no-delay
+  steps still fires them all in a sub-millisecond burst every loop.
+- **Unbalanced keys.** Every `KeyDown` step needs a matching `KeyUp`. A held modifier
+  (Ctrl, Alt, Super) with no release will fight every other app until you clear it.
+- **A macro that never returns**, or one that rapidly switches Profile or Layer, or
+  otherwise fights whatever window has focus.
+
+To stop a runaway:
+
+- **Focus the Acheron window** — it stops every running Toggle immediately.
+- **Pause the Daemon** from the tray icon (or `systemctl --user stop acheron-daemon`).
+- A connected client can also ask the Daemon to withhold all output without stopping
+  anything internally.
+
+### Your responsibility
+
+Acheron is free software provided with no warranty of any kind (see
+[Licence](#licence)). In plainer terms: any trouble you get yourself into using
+Acheron — and the Macro feature especially — is entirely your own responsibility.
 
 ## Troubleshooting
 

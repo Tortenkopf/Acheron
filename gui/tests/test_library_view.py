@@ -854,3 +854,207 @@ def test_editor_columns_mount_with_col3_at_its_natural_width_on_both_tabs():
         assert col2.get_hexpand() is True
         assert col3.get_hexpand() is False
     assert "wheel_scroll_up" not in stub.get_config()["profiles"]["Default"]["base"]
+
+
+# --- Macro-editor standing disclaimer (spec §2 / output-safety ticket 02) ---
+
+# The exact copy from `spec-user-facing output-safety guidance.md` §2 —
+# rendered as one wrapped line, leading with the ⚠️ emoji (a deliberate
+# exception to the GUI's no-emoji norm).
+_MACRO_DISCLAIMER_COPY = (
+    "⚠️ uinput input is always identifiable as synthetic; Acheron keeps its "
+    "own Trigger modes within physically-plausible rates, but a Macro does exactly what "
+    "you write. Use macros with caution!"
+)
+
+
+def _disclaimer_labels(root):
+    return find_all(
+        root, lambda w: isinstance(w, Gtk.Label) and w.get_label() == _MACRO_DISCLAIMER_COPY
+    )
+
+
+def test_macro_editor_shows_the_standing_disclaimer_as_a_dim_wrapped_line():
+    stub = DaemonStub()
+    stub.create_macro("M", [])
+
+    root = _build(stub, {})  # macros tab
+
+    label = find_one(
+        root, lambda w: isinstance(w, Gtk.Label) and w.get_label() == _MACRO_DISCLAIMER_COPY
+    )
+    assert label.get_xalign() == 0
+    assert label.get_wrap() is True
+    assert "dim" in label.get_css_classes()
+    assert label.get_opacity() == 1.0
+    assert "\n" not in label.get_label()  # one wrapped line, no hard breaks
+
+
+def test_disclaimer_sits_above_the_changes_save_automatically_hint():
+    stub = DaemonStub()
+    stub.create_macro("M", [])
+
+    root = _build(stub, {})
+    ordered = list(walk(root))
+    disclaimer = _disclaimer_labels(root)[0]
+    save_hint = find_one(
+        root,
+        lambda w: isinstance(w, Gtk.Label) and w.get_label() == "Changes save automatically.",
+    )
+    assert ordered.index(disclaimer) < ordered.index(save_hint)
+
+
+def test_stepper_editor_never_displays_the_disclaimer():
+    stub = DaemonStub()
+    stub.create_stepper("S", [])
+
+    root = _build_steppers(stub)
+
+    # Any copy of the line on the Stepper tab is the inert tab-flip reserve
+    # (opacity 0), never a visible advisory.
+    assert all(label.get_opacity() == 0 for label in _disclaimer_labels(root))
+
+
+def test_stepper_editor_keeps_an_inert_disclaimer_reserve_for_tab_flip_lockstep():
+    # Ticket 91: the two editors are built to identical measurements so
+    # nothing shifts when flipping tabs — the Macro-only disclaimer needs a
+    # matching inert reserve on the Stepper side.
+    stub = DaemonStub()
+    stub.create_stepper("S", [])
+
+    root = _build_steppers(stub)
+
+    reserves = _disclaimer_labels(root)
+    assert len(reserves) == 1
+    assert reserves[0].get_opacity() == 0  # inert: occupies height, shows nothing
+
+
+# --- "About macro safety" expander (spec §3 / output-safety ticket 03) ---
+
+_SAFETY_THEME_TITLES = ("Staying plausible to a game", "Not locking up your own system")
+
+
+def _safety_expander(root):
+    return find_one(
+        root,
+        lambda w: isinstance(w, Gtk.Expander) and w.get_label() == "About macro safety",
+    )
+
+
+def _expander_bullets(expander):
+    # `Gtk.Expander` only mounts its child into the widget tree once
+    # expanded, so reach the built body directly rather than walking the
+    # (collapsed) expander.
+    return [
+        w
+        for w in walk(expander.get_child())
+        if isinstance(w, Gtk.Label) and w.get_label().startswith("• ")
+    ]
+
+
+def test_macro_editor_has_a_collapsed_about_macro_safety_expander_under_the_disclaimer():
+    stub = DaemonStub()
+    stub.create_macro("M", [])
+
+    root = _build(stub, {})  # macros tab
+
+    expander = _safety_expander(root)
+    assert expander.get_expanded() is False
+    assert expander.get_opacity() == 1.0
+
+    ordered = list(walk(root))
+    disclaimer = _disclaimer_labels(root)[0]
+    save_hint = find_one(
+        root,
+        lambda w: isinstance(w, Gtk.Label) and w.get_label() == "Changes save automatically.",
+    )
+    assert ordered.index(disclaimer) < ordered.index(expander) < ordered.index(save_hint)
+
+
+def test_expander_body_is_the_two_spec_themes_with_the_right_bullet_counts():
+    stub = DaemonStub()
+    stub.create_macro("M", [])
+
+    expander = _safety_expander(_build(stub, {}))
+
+    headings = [
+        w.get_label()
+        for w in walk(expander.get_child())
+        if isinstance(w, Gtk.Label) and "heading" in w.get_css_classes()
+    ]
+    assert headings == list(_SAFETY_THEME_TITLES)
+
+    bullets = _expander_bullets(expander)
+    assert len(bullets) == 5 + 4  # spec §3: 5 under theme one, 4 under theme two
+    for bullet in bullets:
+        assert bullet.get_wrap() is True
+        assert "dim" in bullet.get_css_classes()
+        assert "\n" not in bullet.get_label()
+
+    joined = " ".join(b.get_label() for b in bullets)
+    assert "the one feature that can exceed that" in joined
+    assert "To stop a runaway:" in joined
+    assert "systemctl --user stop acheron-daemon" in joined
+
+
+def test_expander_link_row_targets_the_readme_output_safety_anchor():
+    stub = DaemonStub()
+    stub.create_macro("M", [])
+
+    expander = _safety_expander(_build(stub, {}))
+
+    link = find_one(expander.get_child(), lambda w: isinstance(w, Gtk.LinkButton))
+    assert link.get_label() == "Full guide: Output safety"
+    assert link.get_uri().endswith("#output-safety")
+
+
+def test_expander_link_row_falls_back_to_a_label_when_no_public_readme_url(monkeypatch):
+    import acheron_gui.library_view as library_view
+
+    monkeypatch.setattr(library_view, "_OUTPUT_SAFETY_README_URL", None)
+    stub = DaemonStub()
+    stub.create_macro("M", [])
+
+    body = _safety_expander(_build(stub, {})).get_child()
+
+    assert find_all(body, lambda w: isinstance(w, Gtk.LinkButton)) == []
+    assert find_one(
+        body,
+        lambda w: isinstance(w, Gtk.Label)
+        and w.get_label() == 'Full guide: the "Output safety" section of the README',
+    )
+
+
+def test_stepper_editor_keeps_the_expander_inert_for_tab_flip_lockstep():
+    # Ticket 91: the Macro-only expander needs a matching inert reserve on
+    # the Stepper side. A collapsed expander reserves a fixed height, so an
+    # opacity-0 insensitive copy keeps column 3 in lockstep without ever
+    # showing or announcing the tips.
+    stub = DaemonStub()
+    stub.create_stepper("S", [])
+
+    root = _build_steppers(stub)
+
+    expander = _safety_expander(root)
+    assert expander.get_opacity() == 0
+    assert expander.get_sensitive() is False
+    assert expander.get_expanded() is False
+
+
+def test_flipping_between_tabs_leaves_nothing_above_the_expander_shifted():
+    # Collapsed or expanded, the expander only ever pushes content *below*
+    # it; the disclaimer above stays put, and a rebuild (every tab flip)
+    # starts it collapsed again.
+    stub = DaemonStub()
+    stub.create_macro("M", [])
+    stub.create_stepper("S", [])
+
+    macro_root = _build(stub, {"library_tab": "macros"})
+    stepper_root = _build(stub, {"library_tab": "steppers"})
+
+    for root in (macro_root, stepper_root):
+        ordered = list(walk(root))
+        disclaimer = _disclaimer_labels(root)[0]
+        expander = _safety_expander(root)
+        assert ordered.index(disclaimer) < ordered.index(expander)
+        assert expander.get_expanded() is False

@@ -40,8 +40,9 @@ pub(crate) enum BindingSite {
 ///   1. action-payload — `ControllerButton { button }` must be a gamepad code
 ///   2. trigger legality — ProfileSwitch⇒FireOnce, ControllerButton≠FireOnce,
 ///      Step≠Toggle
-///   3. site-shape — AnalogRepeat needs `Individual(Grid)`; a `Chord` Binding
-///      may be neither ProfileSwitch nor analog-repeat
+///   3. site-shape — AnalogRepeat needs `Individual(Grid)` and cannot wrap a
+///      Macro Action; a `Chord` Binding may be neither ProfileSwitch nor
+///      analog-repeat
 pub(crate) fn check_binding(site: BindingSite, binding: &Binding) -> Result<(), ConfigError> {
     // 1. action-payload
     if let Action::ControllerButton { button } = binding.action
@@ -67,8 +68,16 @@ pub(crate) fn check_binding(site: BindingSite, binding: &Binding) -> Result<(), 
     // 3. site-shape
     match site {
         BindingSite::Individual(input) => {
-            if binding.trigger == TriggerMode::AnalogRepeat && !matches!(input, Input::Grid(_, _)) {
-                return Err(ConfigError::InvalidAnalogRepeatInput(input.to_string()));
+            if binding.trigger == TriggerMode::AnalogRepeat {
+                if !matches!(input, Input::Grid(_, _)) {
+                    return Err(ConfigError::InvalidAnalogRepeatInput(input.to_string()));
+                }
+                // humane-output-rate ticket 09: Analog-repeat collapses a
+                // multi-step Macro to one simultaneous pulse (Delay steps
+                // ignored) — banned outright rather than given semantics.
+                if matches!(binding.action, Action::Macro { .. }) {
+                    return Err(ConfigError::AnalogRepeatMacro(input.to_string()));
+                }
             }
         }
         BindingSite::Chord => {
@@ -180,7 +189,9 @@ mod tests {
         }
         // 3. site-shape
         match site {
-            BindingSite::Individual(Input::Grid(_, _)) => None,
+            BindingSite::Individual(Input::Grid(_, _)) => (trigger == TriggerMode::AnalogRepeat
+                && kind == "macro")
+                .then(|| ConfigError::AnalogRepeatMacro("grid_r1c1".to_string())),
             BindingSite::Individual(_) => (trigger == TriggerMode::AnalogRepeat)
                 .then(|| ConfigError::InvalidAnalogRepeatInput("mode_key".to_string())),
             BindingSite::Chord => {

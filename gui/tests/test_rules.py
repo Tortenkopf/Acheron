@@ -85,9 +85,16 @@ def test_analog_repeat_is_grid_key_only_and_never_on_a_chord():
     assert "analog_repeat" not in rules.valid_triggers("keypress", None)
 
 
-def test_keypress_and_macro_allow_every_trigger_on_a_grid_key():
-    for kind in ("keypress", "macro"):
-        assert rules.valid_triggers(kind, "grid_r1c1") == rules.ALL_TRIGGERS
+def test_keypress_allows_every_trigger_on_a_grid_key():
+    assert rules.valid_triggers("keypress", "grid_r1c1") == rules.ALL_TRIGGERS
+
+
+def test_macro_excludes_analog_repeat_even_on_a_grid_key():
+    # Ticket 09: Analog-repeat collapses a multi-step Macro to one simultaneous
+    # pulse, so the combination is banned (`ConfigError::AnalogRepeatMacro`).
+    assert rules.valid_triggers("macro", "grid_r1c1") == frozenset(
+        {"fire_once", "hold_to_repeat", "toggle"}
+    )
 
 
 def test_a_chord_binding_allows_the_three_non_analog_triggers_for_a_keypress():

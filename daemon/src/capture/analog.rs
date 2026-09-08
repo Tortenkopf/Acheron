@@ -269,6 +269,54 @@ impl RepeatSchedule {
         let due_at_ms = u128::from(self.delay_ms) + u128::from(fired) * u128::from(self.period_ms);
         held_for.as_millis() >= due_at_ms
     }
+
+    /// The offset from the start of a hold at which repeat number `fired`
+    /// falls due — `delay_ms + fired * period_ms`, the same due time
+    /// `repeat_due` checks against. A self-driven autorepeat emitter (the
+    /// Toggle sustained-hold loop, spec-kernel-shaped-repeat.md §5.2) sleeps
+    /// until `started + due_offset(fired)` before consulting `repeat_due` /
+    /// `advance_fired`; `capture::analog`'s own grid loop doesn't need it
+    /// because it is already woken by the incoming report stream.
+    pub fn due_offset(&self, fired: u32) -> Duration {
+        Duration::from_millis(
+            u64::from(self.delay_ms) + u64::from(fired) * u64::from(self.period_ms),
+        )
+    }
+
+    /// The `fired` count to advance to after emitting one Repeat at
+    /// `held_for` — normally `fired + 1`, but when the loop stalled long
+    /// enough that several repeats' due times slipped past (a full
+    /// `event_rx` back-pressuring `blocking_send`, or a scheduler hiccup),
+    /// it jumps straight to the count real elapsed time calls for, so the
+    /// caller emits exactly one Repeat now and the next falls due a full
+    /// `period_ms` later — not a sub-millisecond catch-up burst of the
+    /// missed ones. Mirrors the kernel's `input_repeat_key`, which re-arms
+    /// its timer from the current instant and never bursts (ticket 06).
+    pub fn advance_fired(&self, held_for: Duration, fired: u32) -> u32 {
+        let held_ms = held_for.as_millis();
+        let delay_ms = u128::from(self.delay_ms);
+        let elapsed_repeats = held_ms
+            .checked_sub(delay_ms)
+            .map(|since_delay| since_delay / u128::from(self.period_ms) + 1)
+            .unwrap_or(0);
+        let caught_up = u32::try_from(elapsed_repeats).unwrap_or(u32::MAX);
+        caught_up.max(fired + 1)
+    }
+
+    /// The same live envelope with its `delay_ms` warm-up collapsed to a
+    /// single `period_ms` — what Analog-repeat's hold-solid phase runs at
+    /// (`analog_repeat::run_analog_repeat_loop`, spec-kernel-shaped-repeat.md
+    /// §5.3): no `REP_DELAY` gap before the first `value=2` (the top of a
+    /// hand-driven tapping ramp, not a fresh press), just the steady
+    /// `period_ms` cadence from the outset. `due_offset` / `repeat_due` /
+    /// `advance_fired` then apply unchanged — the missed-deadline clamp (§5.4)
+    /// included — so this needs no siblings of its own.
+    pub fn without_warmup(&self) -> RepeatSchedule {
+        RepeatSchedule {
+            delay_ms: self.period_ms,
+            period_ms: self.period_ms,
+        }
+    }
 }
 
 /// Runtime (non-pure) bookkeeping for one Grid key's currently-held Down —
@@ -378,6 +426,23 @@ fn read_repeat_schedule() -> RepeatSchedule {
         Some(evdev::AutoRepeat { delay, period }) => RepeatSchedule::new(delay, period),
         None => RepeatSchedule::new(DEFAULT_REPEAT_DELAY_MS, DEFAULT_REPEAT_PERIOD_MS),
     }
+}
+
+/// Resolves the live kernel-autorepeat envelope once at Daemon startup for
+/// the self-driven `value=2` emitters — the single-key Toggle hold
+/// (spec-kernel-shaped-repeat.md §5.2) and Analog-repeat's hold-solid phase
+/// (§5.3): a `spawn_blocking` wrapper around `read_repeat_schedule` so the device
+/// open/ioctl never runs on an async task's own thread — the exact
+/// discipline `executor::resolve_toggle_lap_target` follows for `target_lap`.
+/// An inline per-Toggle-press blocking read breaks the `tokio::time::pause()`
+/// test harness (ticket 68's finding), so the resolved value is threaded
+/// down as a plain `RepeatSchedule` instead. A `spawn_blocking` panic (never
+/// observed, only theoretically possible) falls back to the kernel-default
+/// pair, same as a failed device read.
+pub async fn resolve_toggle_autorepeat_schedule() -> RepeatSchedule {
+    tokio::task::spawn_blocking(read_repeat_schedule)
+        .await
+        .unwrap_or_else(|_| RepeatSchedule::new(DEFAULT_REPEAT_DELAY_MS, DEFAULT_REPEAT_PERIOD_MS))
 }
 
 /// (Re)discover the Interface-2 control node and open it read+write on a
@@ -808,10 +873,13 @@ fn relay_grid_blocking(
         // read a fresh report, so a device report cadence sparser than
         // `REPORT_POLL_TIMEOUT` still can't starve Hold-to-repeat.
         for (i, hold) in holds.iter_mut().enumerate() {
-            if let Some(state) = hold
-                && schedule.repeat_due(state.started.elapsed(), state.fired)
-            {
-                state.fired += 1;
+            let Some(state) = hold else { continue };
+            let held_for = state.started.elapsed();
+            if schedule.repeat_due(held_for, state.fired) {
+                // Advance past any repeats whose due time slipped by while
+                // the loop was stalled, rather than `+= 1` and firing a
+                // bunched catch-up burst on the next ticks (ticket 06).
+                state.fired = schedule.advance_fired(held_for, state.fired);
                 if tx
                     .blocking_send(PhysicalEvent {
                         input: grid_input_for_byte(i),
@@ -1177,6 +1245,97 @@ mod tests {
         assert!(schedule.repeat_due(Duration::from_millis(11), 0));
         assert!(!schedule.repeat_due(Duration::from_millis(10), 1));
         assert!(schedule.repeat_due(Duration::from_millis(11), 1));
+    }
+
+    #[test]
+    fn advance_fired_steps_by_one_when_on_schedule() {
+        let schedule = RepeatSchedule::new(250, 33);
+        // First repeat, due right at the delay: 0 -> 1.
+        assert_eq!(schedule.advance_fired(Duration::from_millis(250), 0), 1);
+        // Second, exactly one period later: 1 -> 2.
+        assert_eq!(schedule.advance_fired(Duration::from_millis(283), 1), 2);
+        // A tick that fires a hair past due still only steps by one.
+        assert_eq!(schedule.advance_fired(Duration::from_millis(300), 1), 2);
+    }
+
+    #[test]
+    fn advance_fired_skips_missed_repeats_after_a_stall_and_the_next_is_a_full_period_out() {
+        let schedule = RepeatSchedule::new(250, 33);
+        // Held 5s but only the initial repeat emitted (fired == 1): the loop
+        // stalled through ~143 due times. `repeat_due` is true...
+        assert!(schedule.repeat_due(Duration::from_millis(5_000), 1));
+        // ...and advancing jumps straight to the count real elapsed time
+        // calls for — (5000 - 250) / 33 + 1 == 144 — so exactly one Repeat
+        // is emitted now, not a burst of the 143 missed ones.
+        let fired = schedule.advance_fired(Duration::from_millis(5_000), 1);
+        assert_eq!(fired, (5_000 - 250) / 33 + 1);
+        // The next repeat is due one full period later, not immediately.
+        assert!(!schedule.repeat_due(Duration::from_millis(5_000), fired));
+        assert!(!schedule.repeat_due(Duration::from_millis(5_001), fired));
+        let next_due = 250 + u64::from(fired) * 33;
+        assert!(!schedule.repeat_due(Duration::from_millis(next_due - 1), fired));
+        assert!(schedule.repeat_due(Duration::from_millis(next_due), fired));
+    }
+
+    #[test]
+    fn advance_fired_never_regresses_the_count() {
+        let schedule = RepeatSchedule::new(250, 33);
+        // A spurious call before the first repeat is even due still moves
+        // forward rather than backward.
+        assert_eq!(schedule.advance_fired(Duration::from_millis(0), 4), 5);
+    }
+
+    #[test]
+    fn due_offset_is_the_full_delay_then_one_period_per_fired_repeat() {
+        let schedule = RepeatSchedule::new(250, 33);
+        // The first repeat (fired == 0) falls due a full delay after the
+        // press — a Toggle-held key looks exactly like a physically held one.
+        assert_eq!(schedule.due_offset(0), Duration::from_millis(250));
+        assert_eq!(schedule.due_offset(1), Duration::from_millis(283));
+        assert_eq!(schedule.due_offset(5), Duration::from_millis(250 + 5 * 33));
+        // `due_offset(fired)` is exactly the boundary `repeat_due` checks.
+        for fired in 0..10 {
+            let at = schedule.due_offset(fired);
+            assert!(schedule.repeat_due(at, fired));
+            assert!(!schedule.repeat_due(at - Duration::from_millis(1), fired));
+        }
+    }
+
+    // -- without_warmup: Analog-repeat hold-solid (§5.3/§5.4) -------------
+
+    #[test]
+    fn without_warmup_collapses_the_delay_to_a_single_period() {
+        let steady = RepeatSchedule::new(250, 33).without_warmup();
+        // The first repeat (fired == 0) falls due one plain period in — no
+        // `delay_ms` gap (contrast `due_offset(0)` == 250ms on the source).
+        assert_eq!(steady.due_offset(0), Duration::from_millis(33));
+        assert_eq!(steady.due_offset(1), Duration::from_millis(66));
+        assert_eq!(steady.due_offset(5), Duration::from_millis(6 * 33));
+        // The whole `due_offset` / `repeat_due` contract still holds on it.
+        for fired in 0..10 {
+            let at = steady.due_offset(fired);
+            assert!(steady.repeat_due(at, fired));
+            assert!(!steady.repeat_due(at - Duration::from_millis(1), fired));
+        }
+    }
+
+    #[test]
+    fn without_warmup_still_clamps_missed_deadlines_without_bursting() {
+        let steady = RepeatSchedule::new(250, 33).without_warmup();
+        // On schedule: one step per period elapsed.
+        assert_eq!(steady.advance_fired(Duration::from_millis(33), 0), 1);
+        assert_eq!(steady.advance_fired(Duration::from_millis(66), 1), 2);
+        // Stalled 5s having emitted only the first repeat: jump straight to
+        // the elapsed-time count — one repeat now, not a burst of the missed
+        // ~150 — and the next is due within a period, never immediately.
+        let fired = steady.advance_fired(Duration::from_millis(5_000), 1);
+        assert_eq!(fired, (5_000 - 33) / 33 + 1);
+        let next_due = steady.due_offset(fired);
+        assert!(!steady.repeat_due(Duration::from_millis(5_000), fired));
+        assert!(!steady.repeat_due(next_due - Duration::from_millis(1), fired));
+        assert!(steady.repeat_due(next_due, fired));
+        // Never regresses on a spurious early call.
+        assert_eq!(steady.advance_fired(Duration::from_millis(0), 4), 5);
     }
 
     // -- byte -> Input mapping (ticket 16: byte n == keycap n) -------------

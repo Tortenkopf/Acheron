@@ -185,7 +185,6 @@ pub fn staging_mode_str(mode: StagingMode) -> &'static str {
     match mode {
         StagingMode::Handoff => "handoff",
         StagingMode::NoReturn => "no_return",
-        StagingMode::Additive => "additive",
         StagingMode::QuickSkip => "quick_skip",
     }
 }
@@ -194,7 +193,6 @@ pub fn staging_mode_from_str(s: &str) -> Result<StagingMode, String> {
     match s {
         "handoff" => Ok(StagingMode::Handoff),
         "no_return" => Ok(StagingMode::NoReturn),
-        "additive" => Ok(StagingMode::Additive),
         "quick_skip" => Ok(StagingMode::QuickSkip),
         other => Err(format!("{other:?} is not a valid staging mode")),
     }
@@ -1561,7 +1559,6 @@ mod tests {
         for mode in [
             StagingMode::Handoff,
             StagingMode::NoReturn,
-            StagingMode::Additive,
             StagingMode::QuickSkip,
         ] {
             let s = staging_mode_str(mode);
@@ -1572,5 +1569,14 @@ mod tests {
     #[test]
     fn staging_mode_from_str_rejects_an_unknown_string() {
         assert!(staging_mode_from_str("not_a_mode").is_err());
+    }
+
+    #[test]
+    fn staging_mode_from_str_rejects_the_removed_additive_mode() {
+        // `humane-output-rate` ticket 13 / ADR-0009. At the D-Bus boundary a
+        // client sending `"additive"` just gets the ordinary unknown-mode
+        // rejection (the Additive-specific, migration-flavoured message is
+        // for config *load*, in `config::find_removed_additive_staging`).
+        assert!(staging_mode_from_str("additive").is_err());
     }
 }

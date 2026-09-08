@@ -46,8 +46,8 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use crate::capture::EventState;
-use crate::capture::analog::{self, KeyState};
+use crate::capture::analog::{self, KeyState, RepeatSchedule};
+use crate::capture::{EventState, PhysicalEvent};
 use crate::config::{Action, Binding, Config, Layer, StagingMode, TriggerMode};
 use crate::edit::Edit;
 use crate::injector::Injector;
@@ -114,8 +114,10 @@ pub(crate) enum QuickSkipPhase {
     /// reached before `deadline`.
     Armed { deadline: Instant },
     /// The deep band was reached in time — the primary is permanently
-    /// suppressed for the rest of this press; every further crossing runs
-    /// Additive-with-no-primary, release path = No-Return.
+    /// suppressed for the rest of this press; every further dip into and out
+    /// of the deep band just fires and releases the deep stage on its own
+    /// (the primary is never touched — it never fired), and the final release
+    /// takes No-Return's shape (no `RepressPrimary`).
     Skipped,
     /// The deadline elapsed first — `tick` already emitted the retroactive
     /// `RepressPrimary`; the rest of this press runs plain Handoff.
@@ -123,12 +125,13 @@ pub(crate) enum QuickSkipPhase {
 }
 
 /// Advances one key's combined `(primary, deep)` band state by one
-/// transition, producing the ordered `Vec<StageOp>` spec.md's four
-/// Staging-mode tables specify, plus the Quick-Skip phase this transition
-/// leaves the key in (always `None` for every mode but `QuickSkip`). A
-/// same-report double-crossing is handled by mechanical replay: `prev`/
-/// `next` may differ by more than one band at once (the 1-report-skip
-/// rows), resolved as a single ordered op sequence, never short-circuited.
+/// transition, producing the ordered `Vec<StageOp>` spec.md's Staging-mode
+/// tables specify (Additive's was dropped — ADR-0009), plus the Quick-Skip
+/// phase this transition leaves the key in (always `None` for every mode but
+/// `QuickSkip`). A same-report double-crossing is handled by mechanical
+/// replay: `prev`/`next` may differ by more than one band at once (the
+/// 1-report-skip rows), resolved as a single ordered op sequence, never
+/// short-circuited.
 pub(crate) fn advance(
     prev: Bands,
     next: Bands,
@@ -140,7 +143,6 @@ pub(crate) fn advance(
     match mode {
         StagingMode::Handoff => (handoff(prev, next), None),
         StagingMode::NoReturn => (no_return(prev, next), None),
-        StagingMode::Additive => (additive(prev, next), None),
         StagingMode::QuickSkip => quick_skip_advance(prev, next, quick_skip),
     }
 }
@@ -213,25 +215,6 @@ fn no_return(prev: Bands, next: Bands) -> Vec<StageOp> {
         ((Down, Down), (Down, Up)) => vec![StageOp::ReleaseDeep],
         ((Down, Down), (Up, Up)) => vec![StageOp::ReleaseDeep, StageOp::ReleasePrimary],
         _ => handoff(prev, next),
-    }
-}
-
-/// **Additive**: the primary is never touched by the inner crossings — only
-/// `FireDeep`/`ReleaseDeep` at the inner transitions, real Primary Down/Up
-/// at the outer edges.
-fn additive(prev: Bands, next: Bands) -> Vec<StageOp> {
-    use Band::{Down, Up};
-    match (prev, next) {
-        ((Up, Up), (Up, Up)) | ((Down, Up), (Down, Up)) | ((Down, Down), (Down, Down)) => {
-            vec![StageOp::Nothing]
-        }
-        ((Up, Up), (Down, Up)) => vec![StageOp::FirePrimary],
-        ((Down, Up), (Down, Down)) => vec![StageOp::FireDeep],
-        ((Down, Down), (Down, Up)) => vec![StageOp::ReleaseDeep],
-        ((Down, Up), (Up, Up)) => vec![StageOp::ReleasePrimary],
-        ((Up, Up), (Down, Down)) => vec![StageOp::FirePrimary, StageOp::FireDeep],
-        ((Down, Down), (Up, Up)) => vec![StageOp::ReleaseDeep, StageOp::ReleasePrimary],
-        _ => unreachable_transition(prev, next),
     }
 }
 
@@ -365,8 +348,10 @@ struct KeyRuntime {
     /// queries `Engine::primary_handed_off` to swallow them, so a
     /// Hold-to-repeat primary genuinely stops rather than machine-gunning
     /// under the deep stage. Cleared the moment the primary band itself
-    /// crosses back Up (the press is over). Additive never emits an inner
-    /// `ReleasePrimary`, so its primary keeps repeating for free.
+    /// crosses back Up (the press is over). Quick-Skip's `Skipped` phase
+    /// suppresses the primary entirely instead, so it never sets this — but
+    /// no mode leaves the primary autorepeating alongside a live deep stage
+    /// (the Additive mode that did was removed — ADR-0009).
     primary_handed_off: bool,
 }
 
@@ -382,10 +367,7 @@ async fn fire<K: Eq + Hash + Clone>(
     slots: &mut Slots<K>,
     key: K,
     binding: &Binding,
-    injector: &Injector,
-    config: &Config,
-    cursors: &mut stepper::Cursors,
-    toggle_lap_target: Duration,
+    deps: PerformDeps<'_>,
 ) -> io::Result<Option<Edit>> {
     if let Action::ProfileSwitch { target } = &binding.action {
         return Ok(Some(Edit::SwitchProfile {
@@ -393,8 +375,7 @@ async fn fire<K: Eq + Hash + Clone>(
         }));
     }
     let slot = slots.slot(&key);
-    let decision = trigger::decide(binding, EventState::Down, slot);
-    let deps = PerformDeps::new(injector, config, cursors, toggle_lap_target);
+    let decision = trigger::decide(binding, deps.macros, EventState::Down, slot);
     slots.perform(decision, key, binding, deps).await?;
     Ok(None)
 }
@@ -413,9 +394,10 @@ fn to_band(state: KeyState) -> Band {
 /// The non-pure third depth engine on `DispatchState`, alongside `axis::
 /// Engine`/`analog_repeat::Engine` (spec.md "Pipeline architecture"). Owns
 /// every dual-stage key's runtime band tracking plus the deep stage's own
-/// `trigger::Slots<StageKey>` — Additive can hold both stages live at once,
-/// each a fully independent Binding, so this is never shared with
-/// `DispatchState::individual`.
+/// `trigger::Slots<StageKey>` — the deep stage fires independently of the
+/// primary (Quick-Skip's `Skipped` phase runs the deep stage while the
+/// primary stays suppressed), each a fully independent Binding, so this is
+/// never shared with `DispatchState::individual`.
 #[derive(Default)]
 pub(crate) struct Engine {
     runtime: HashMap<Input, KeyRuntime>,
@@ -424,9 +406,9 @@ pub(crate) struct Engine {
 
 /// `Engine::update`'s scattered dependencies, bundled into one parameter to
 /// stay under clippy's `too_many_arguments` — the same reason `trigger::
-/// PerformDeps` bundles `Slots::perform`'s own. Built at the one call site
-/// (`DispatchState::update_stages`) from `&Config` plus four disjoint
-/// `DispatchState` field borrows.
+/// PerformDeps` bundles `Slots::perform`'s own. Built at the call sites
+/// (`DispatchState::update_stages` / `tick_stages` / `handle_event`) from
+/// `&Config` plus disjoint `DispatchState` field borrows.
 pub(crate) struct EngineDeps<'a> {
     pub config: &'a Config,
     pub active_layer: Layer,
@@ -434,6 +416,30 @@ pub(crate) struct EngineDeps<'a> {
     pub injector: &'a Injector,
     pub cursors: &'a mut stepper::Cursors,
     pub toggle_lap_target: Duration,
+    pub toggle_autorepeat_schedule: RepeatSchedule,
+}
+
+/// The answer `Engine::feed` gives `handle_event` — mirrors
+/// `chord::ChordOutcome`, same shape, same place in the dispatch pipeline.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum StageOutcome {
+    /// The physical edge was consumed by the Staging-mode machine; commit
+    /// `edits` (empty in every case but a Quick-Skip `Down` that fired a deep
+    /// `Action::ProfileSwitch`) and run nothing else for this event.
+    Handled(Vec<Edit>),
+    /// Not an edge the Staging-mode machine owns — `handle_event` runs the
+    /// ordinary Binding path for this event. Any deep-side side effect the
+    /// `feed` call needed (driving a Hold-to-repeat deep stage's cadence off
+    /// a primary `Repeat`) has already been applied. `machine_sequenced` is
+    /// `true` when `feed` *does* track `event.input` as a dual-stage key
+    /// (a non-Quick-Skip primary, or a Quick-Skip key now running as plain
+    /// Handoff): its primary press is machine-sequenced input, so the
+    /// ordinary `perform` that follows must build
+    /// `trigger::PerformDeps::new_machine_sequenced` (no Fire-once dwell),
+    /// matching every other `stage::Engine`-driven firing. `false` is the
+    /// early-out — `event.input` is not a dual-stage key at all — and the
+    /// ordinary user-initiated press keeps its dwell.
+    NotMine { machine_sequenced: bool },
 }
 
 impl Engine {
@@ -516,6 +522,7 @@ impl Engine {
             injector,
             cursors,
             toggle_lap_target,
+            toggle_autorepeat_schedule,
         } = deps;
         let profile = config
             .active_profile()
@@ -617,10 +624,13 @@ impl Engine {
                             individual,
                             input,
                             &primary_binding,
-                            injector,
-                            config,
-                            cursors,
-                            toggle_lap_target,
+                            PerformDeps::new_machine_sequenced(
+                                injector,
+                                config,
+                                cursors,
+                                toggle_lap_target,
+                                toggle_autorepeat_schedule,
+                            ),
                         )
                         .await?
                         {
@@ -636,10 +646,13 @@ impl Engine {
                             &mut self.slots,
                             StageKey(input),
                             &deep_binding,
-                            injector,
-                            config,
-                            cursors,
-                            toggle_lap_target,
+                            PerformDeps::new_machine_sequenced(
+                                injector,
+                                config,
+                                cursors,
+                                toggle_lap_target,
+                                toggle_autorepeat_schedule,
+                            ),
                         )
                         .await?
                         {
@@ -659,11 +672,7 @@ impl Engine {
                     // must always fully clear the slot so the following
                     // `FireDeep` genuinely starts fresh, the same reasoning
                     // that makes `ReleasePrimary` unconditional.
-                    StageOp::ReleaseDeep => {
-                        let key = StageKey(input);
-                        self.slots.stop_toggle(&key).await;
-                        self.slots.force_release(&key, injector).await;
-                    }
+                    StageOp::ReleaseDeep => self.release_deep_slot(input, injector).await,
                     // Ticket 04: the buffered primary `Down` is dropped for
                     // good — genuinely a no-op here, since `begin_quick_skip`
                     // swallowed it before it ever reached `individual` at
@@ -676,9 +685,124 @@ impl Engine {
         Ok(edits)
     }
 
+    /// Routes one physical edge on a grid key against its Staging-mode
+    /// machine — the entry point `handle_event` calls in place of reaching
+    /// into `begin_quick_skip` / `is_late` / `primary_handed_off` /
+    /// `deep_repeat` by hand (`post-release-development` ticket 17). Mirrors
+    /// `chord::feed`: called for every event surviving `handle_event`'s
+    /// earlier guards (mode-key, Down-stops-Toggle, axis, `chord::feed`), it
+    /// owns the "is this a dual-stage key on the active Layer?" decision.
+    ///
+    /// - `StageOutcome::Handled(edits)` — the edge is consumed; commit
+    ///   `edits` and run nothing else for this event.
+    /// - `StageOutcome::NotMine { machine_sequenced }` — `handle_event` runs
+    ///   the ordinary Binding path; any deep-side side effect this call
+    ///   needed (driving a Hold-to-repeat deep stage off a primary `Repeat`)
+    ///   has already been applied. See `StageOutcome` for `machine_sequenced`.
+    ///
+    /// The routing matrix (every row is pre-ticket-17 `handle_event`
+    /// behaviour, relocated not rewritten — Additive's rows were dropped with
+    /// the mode, ADR-0009):
+    ///
+    /// | Situation | returns |
+    /// |---|---|
+    /// | not a dual-stage key on this Layer, or no Depth on the edge | `NotMine { false }` |
+    /// | non-Quick-Skip primary `Down` (Handoff / No-Return) | `NotMine { true }` |
+    /// | Quick-Skip `Down` | `Handled` — `begin_quick_skip` arms or resolves Skipped |
+    /// | Quick-Skip `Repeat` while `Armed` / `Skipped` | `Handled(vec![])` — swallowed |
+    /// | Quick-Skip `Up` while `Armed` / `Skipped` / `None` | `Handled(vec![])` — `end_quick_skip` disarms the deadline, releases the deep stage, force-releases the primary |
+    /// | Quick-Skip `Up` / `Repeat` once `Late` | runs the general rows (plain Handoff) |
+    /// | any mode, `Repeat`, primary handed off to deep | drive deep repeat, `Handled(vec![])` |
+    /// | any mode, `Repeat`, primary **not** handed off | drive deep repeat, `NotMine { true }` |
+    pub(crate) async fn feed(
+        &mut self,
+        deps: EngineDeps<'_>,
+        event: PhysicalEvent,
+    ) -> io::Result<StageOutcome> {
+        let config = deps.config;
+        let active_layer = deps.active_layer;
+        let profile = config
+            .active_profile()
+            .expect("load_or_seed validates active_profile names a real profile");
+        // The engine owns the "is this a dual-stage key?" predicate now
+        // (ticket 17 Q2) — the same `deep_stages` / `deep_layer` lookups
+        // `update` does per depth tick. `event.depth.is_none()` is a
+        // Digital-mode primary (the deep stage is inert for free) or the
+        // Chord machine's synthetic retroactive Down — neither diverts, and
+        // both keep the ordinary user-initiated Fire-once dwell.
+        let Some(deep_cfg) = profile.deep_stages.get(&event.input).copied() else {
+            return Ok(StageOutcome::NotMine {
+                machine_sequenced: false,
+            });
+        };
+        if event.depth.is_none() || !profile.deep_layer(active_layer).contains_key(&event.input) {
+            return Ok(StageOutcome::NotMine {
+                machine_sequenced: false,
+            });
+        }
+
+        // `event.input` is a dual-stage key carrying a live deep Binding on
+        // this Layer, and this edge carries a Depth.
+        if deep_cfg.mode == StagingMode::QuickSkip {
+            match event.state {
+                EventState::Down => {
+                    let depth = event.depth.expect("checked Some above");
+                    let edits = self.begin_quick_skip(deps, event.input, depth).await?;
+                    return Ok(StageOutcome::Handled(edits));
+                }
+                EventState::Repeat if !self.is_late(event.input) => {
+                    // Quick-Skip's `Skipped` phase runs as Handoff for the
+                    // rest of the press — the deep stage's own Hold-to-repeat
+                    // still needs driving off this pulse (a no-op during
+                    // `Armed`, before the deep band is reached).
+                    self.deep_repeat(deps, event.input).await?;
+                    return Ok(StageOutcome::Handled(Vec::new()));
+                }
+                EventState::Up if !self.is_late(event.input) => {
+                    // Disarm / resolve the Quick-Skip phase right here, off the
+                    // real `rx_events` release edge — never left to a later
+                    // coalescing `rx_depth` tick, which a quick shallow tap can
+                    // race past entirely, leaving the deadline to misfire
+                    // `RepressPrimary` into a press with no release edge left
+                    // (`tartarus-dual-stage-keys` ticket 13). Also force-
+                    // releases the primary itself — see `end_quick_skip`.
+                    self.end_quick_skip(deps.individual, deps.injector, event.input)
+                        .await?;
+                    return Ok(StageOutcome::Handled(Vec::new()));
+                }
+                // `Late`: the deadline already fired the primary retroactively,
+                // so the rest of the press runs as ordinary Handoff — fall to
+                // the general rows below, exactly as the pre-ticket-17
+                // `EventState::Up | EventState::Repeat => {}` empty arm did.
+                EventState::Up | EventState::Repeat => {}
+            }
+        }
+
+        // A synthesized primary `Repeat` pulse also drives a Hold-to-repeat
+        // *deep* stage's own repeat cadence while the deep band is engaged —
+        // the deep band has no independent `Repeat` source (see `deep_repeat`).
+        // Runs for every Staging mode; a no-op unless the deep band is
+        // currently Down and the deep Binding is Hold-to-repeat.
+        if event.state == EventState::Repeat {
+            self.deep_repeat(deps, event.input).await?;
+            // If the stage machine has handed this key's primary off to the
+            // deep stage (Handoff / No-Return crossed into the deep band),
+            // swallow the pulse for the primary itself — the primary band is
+            // still physically Down, so `capture::analog` keeps synthesizing
+            // these, but a Hold-to-repeat primary must stay silent under the
+            // deep stage rather than machine-gun.
+            if self.primary_handed_off(event.input) {
+                return Ok(StageOutcome::Handled(Vec::new()));
+            }
+        }
+        Ok(StageOutcome::NotMine {
+            machine_sequenced: true,
+        })
+    }
+
     /// The dispatch-side half of Quick-Skip's primary-suppression buffer
-    /// (`tartarus-dual-stage-keys` ticket 04) — `handle_event`'s divert calls
-    /// this on a fresh Quick-Skip primary `Down`, off the real `rx_events`
+    /// (`tartarus-dual-stage-keys` ticket 04) — `Engine::feed` calls this on a
+    /// fresh Quick-Skip primary `Down`, off the real `rx_events`
     /// edge rather than waiting for `update`'s own coalescing `rx_depth`
     /// tick, so the ~50ms window is armed at the exact moment the primary
     /// physically crosses. `depth` is that same `Down` `PhysicalEvent`'s own
@@ -694,7 +818,7 @@ impl Engine {
     /// sample first (code-review finding on this ticket) — handled below by
     /// deferring to `rt.deep` whenever that's happened, rather than trusting
     /// `depth` unconditionally.
-    pub(crate) async fn begin_quick_skip(
+    async fn begin_quick_skip(
         &mut self,
         deps: EngineDeps<'_>,
         input: Input,
@@ -706,6 +830,7 @@ impl Engine {
             injector,
             cursors,
             toggle_lap_target,
+            toggle_autorepeat_schedule,
             ..
         } = deps;
         let profile = config
@@ -715,7 +840,7 @@ impl Engine {
             .deep_stages
             .get(&input)
             .copied()
-            .expect("handle_event's divert only calls this for a configured Quick-Skip key");
+            .expect("feed only calls this for a configured Quick-Skip key");
         let rt = self.runtime.entry(input).or_default();
         // Structurally the key was at rest (`(Up, Up)`) the instant before
         // this real primary `Down` — *unless* `update`'s own `rx_depth`-
@@ -752,15 +877,18 @@ impl Engine {
                         .deep_layer(active_layer)
                         .get(&input)
                         .cloned()
-                        .expect("handle_event's divert only calls this for a live deep stage");
+                        .expect("feed only calls this for a live deep stage");
                     if let Some(edit) = fire(
                         &mut self.slots,
                         StageKey(input),
                         &deep_binding,
-                        injector,
-                        config,
-                        cursors,
-                        toggle_lap_target,
+                        PerformDeps::new_machine_sequenced(
+                            injector,
+                            config,
+                            cursors,
+                            toggle_lap_target,
+                            toggle_autorepeat_schedule,
+                        ),
                     )
                     .await?
                     {
@@ -782,14 +910,85 @@ impl Engine {
         Ok(edits)
     }
 
+    /// Resolves a Quick-Skip key's real outer `Up` the same way
+    /// `begin_quick_skip` owns its outer `Down` — directly off the `rx_events`
+    /// edge in `feed`, rather than swallowing the event and delegating the
+    /// `Armed` deadline's cancellation entirely to `Engine::update`'s
+    /// coalescing `rx_depth` path (`tartarus-dual-stage-keys` ticket 13). That
+    /// delegation was unsound: `rx_events` is a non-lossy mpsc, `rx_depth` a
+    /// coalescing `watch`, so on a quick shallow tap the release edge can
+    /// coalesce away before `update` ever observes the excursion — the
+    /// deadline then elapses and fires `RepressPrimary` into a press whose
+    /// only real `Up` was already consumed, latching the primary down
+    /// (kernel autorepeat, permanent under a Hold-to-repeat primary).
+    ///
+    /// When a Quick-Skip phase is live (`Armed` / `Skipped`) it drives the
+    /// pure core with `next == (Up, Up)` — dropping the phase to `None` (which
+    /// disarms `next_deadline`) and, for a `Skipped` key still in the deep band
+    /// on a 1-report skip straight to released, releasing the deep stage
+    /// (No-Return's release shape — the primary was suppressed for the whole
+    /// press and is never touched). `None` on entry means an `rx_depth` cancel
+    /// tick already ran the pure core's `((Down, Up), (Up, Up)) => (vec![],
+    /// None)` row (kept as a harmless idempotent double-confirm), or the key
+    /// was never armed.
+    ///
+    /// Either way it then **force-releases the primary** on `individual`. Every
+    /// Quick-Skip edge `feed` sees while not `Late` is swallowed for the
+    /// ordinary Binding path — so `feed`'s usual "leave a lone `FirePrimary` /
+    /// `ReleasePrimary` to the real `rx_events` edge" contract does *not* hold
+    /// for a Quick-Skip key. If the deadline fired a retroactive
+    /// `RepressPrimary` (`Late`) and an `rx_depth` `(Up, Up)` tick then raced
+    /// ahead of this real `Up` — clearing the phase to `None` and `continue`ing
+    /// past its own now-lone `ReleasePrimary` — nothing else would ever release
+    /// that held primary (kernel autorepeat, permanent under Hold-to-repeat).
+    /// `force_release` is the same op the ordinary `(_, Up)` path runs
+    /// (`ForceReleaseStuck`): a no-op when the primary never fired (`Armed` /
+    /// `Skipped`), and idempotent if the ordinary path did run.
+    async fn end_quick_skip(
+        &mut self,
+        individual: &mut Slots<Input>,
+        injector: &Injector,
+        input: Input,
+    ) -> io::Result<()> {
+        let rt = self.runtime.entry(input).or_default();
+        if rt.quick_skip.is_some() {
+            let prev = (to_band(rt.primary), to_band(rt.deep));
+            let (ops, phase) = advance(
+                prev,
+                (Band::Up, Band::Up),
+                StagingMode::QuickSkip,
+                rt.quick_skip,
+            );
+            rt.primary = KeyState::Up;
+            rt.deep = KeyState::Up;
+            rt.quick_skip = phase;
+            rt.primary_handed_off = false;
+            for op in ops {
+                match op {
+                    StageOp::Nothing => {}
+                    // No-Return's release shape — the primary was suppressed
+                    // for the whole press (Skipped) and is never touched.
+                    StageOp::ReleaseDeep => self.release_deep_slot(input, injector).await,
+                    other => debug_assert!(
+                        false,
+                        "a Quick-Skip outer release only ever emits ReleaseDeep or \
+                         nothing, got {other:?}"
+                    ),
+                }
+            }
+        }
+        individual.force_release(&input, injector).await;
+        Ok(())
+    }
+
     /// Whether `input`'s Quick-Skip runtime state is currently `Late` — the
     /// deadline already fired the primary retroactively, so this press now
-    /// runs as ordinary Handoff. `handle_event`'s divert queries this to
-    /// decide whether a real `Up`/`Repeat` should keep being swallowed (still
-    /// `Armed`/`Skipped`/`None`) or must instead reach the ordinary
-    /// individual-dispatch path below it, exactly like an ordinary Handoff
-    /// key's own real events would.
-    pub(crate) fn is_late(&self, input: Input) -> bool {
+    /// runs as ordinary Handoff. `feed` queries this to decide whether a real
+    /// `Up`/`Repeat` should keep being swallowed (still `Armed`/`Skipped`/
+    /// `None`) or must instead reach `handle_event`'s ordinary
+    /// individual-dispatch path, exactly like an ordinary Handoff key's own
+    /// real events would.
+    fn is_late(&self, input: Input) -> bool {
         matches!(
             self.runtime.get(&input).and_then(|rt| rt.quick_skip),
             Some(QuickSkipPhase::Late)
@@ -797,12 +996,12 @@ impl Engine {
     }
 
     /// Whether the stage machine currently holds `input`'s primary released
-    /// (a Handoff/No-Return hand-off to the deep stage). `handle_event`
-    /// swallows the primary's capture-synthesized `Repeat`s while this is
+    /// (a Handoff/No-Return hand-off to the deep stage). `feed` swallows the
+    /// primary's capture-synthesized `Repeat`s while this is
     /// set — the primary band is still physically Down, so they keep
     /// arriving, but a Hold-to-repeat primary must stay silent under the
     /// deep stage rather than machine-gun. See `KeyRuntime::primary_handed_off`.
-    pub(crate) fn primary_handed_off(&self, input: Input) -> bool {
+    fn primary_handed_off(&self, input: Input) -> bool {
         self.runtime
             .get(&input)
             .is_some_and(|rt| rt.primary_handed_off)
@@ -822,17 +1021,14 @@ impl Engine {
     /// the deep Binding is Hold-to-repeat — Fire-once fired once on the
     /// crossing, and a deep Toggle runs its own `MIN_TOGGLE_LAP` loop. A
     /// no-op for a non-dual-stage key (no deep Binding on this Layer).
-    pub(crate) async fn deep_repeat(
-        &mut self,
-        deps: EngineDeps<'_>,
-        input: Input,
-    ) -> io::Result<()> {
+    async fn deep_repeat(&mut self, deps: EngineDeps<'_>, input: Input) -> io::Result<()> {
         let EngineDeps {
             config,
             active_layer,
             injector,
             cursors,
             toggle_lap_target,
+            toggle_autorepeat_schedule,
             individual: _,
         } = deps;
         if !self
@@ -854,8 +1050,14 @@ impl Engine {
         let deep_binding = deep_binding.clone();
         let key = StageKey(input);
         let slot = self.slots.slot(&key);
-        let decision = trigger::decide(&deep_binding, EventState::Repeat, slot);
-        let perform_deps = PerformDeps::new(injector, config, cursors, toggle_lap_target);
+        let decision = trigger::decide(&deep_binding, &config.macros, EventState::Repeat, slot);
+        let perform_deps = PerformDeps::new_machine_sequenced(
+            injector,
+            config,
+            cursors,
+            toggle_lap_target,
+            toggle_autorepeat_schedule,
+        );
         self.slots
             .perform(decision, key, &deep_binding, perform_deps)
             .await
@@ -893,6 +1095,7 @@ impl Engine {
             injector,
             cursors,
             toggle_lap_target,
+            toggle_autorepeat_schedule,
         } = deps;
         let profile = config
             .active_profile()
@@ -929,10 +1132,13 @@ impl Engine {
                             individual,
                             input,
                             &primary_binding,
-                            injector,
-                            config,
-                            cursors,
-                            toggle_lap_target,
+                            PerformDeps::new_machine_sequenced(
+                                injector,
+                                config,
+                                cursors,
+                                toggle_lap_target,
+                                toggle_autorepeat_schedule,
+                            ),
                         )
                         .await?
                         {
@@ -987,10 +1193,22 @@ impl Engine {
     /// this `input` for good the moment the cascade lands — there's no next
     /// tick left to hand a stale entry to.
     pub(crate) async fn stop_stage(&mut self, input: Input, injector: &Injector) {
+        self.release_deep_slot(input, injector).await;
+        self.runtime.remove(&input);
+    }
+
+    /// Fully clears one key's deep slot — `stop_toggle` + `force_release`, both
+    /// unconditional: a stage's own release must leave nothing behind so the
+    /// next `FireDeep` genuinely starts fresh (a deep Toggle in particular
+    /// outlives a bare release under `decide`'s `(Toggle, Up)` rule, so
+    /// `FireDeep` would otherwise stack a second orphaned loop over it — see
+    /// `update`'s `ReleaseDeep` handling). Shared by every deep-slot teardown:
+    /// `update`'s `ReleaseDeep` op, `end_quick_skip`'s outer release, and
+    /// `stop_stage`'s cascade-delete.
+    async fn release_deep_slot(&mut self, input: Input, injector: &Injector) {
         let key = StageKey(input);
         self.slots.stop_toggle(&key).await;
         self.slots.force_release(&key, injector).await;
-        self.runtime.remove(&input);
     }
 
     /// Drains every live deep Toggle without touching firings or per-key
@@ -1096,36 +1314,6 @@ mod tests {
         }
     }
 
-    // ── Additive ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn additive_table() {
-        let cases: &[(Bands, Bands, &[StageOp])] = &[
-            ((Up, Up), (Up, Up), &[StageOp::Nothing]),
-            ((Down, Up), (Down, Up), &[StageOp::Nothing]),
-            ((Down, Down), (Down, Down), &[StageOp::Nothing]),
-            ((Up, Up), (Down, Up), &[StageOp::FirePrimary]),
-            ((Down, Up), (Down, Down), &[StageOp::FireDeep]),
-            ((Down, Down), (Down, Up), &[StageOp::ReleaseDeep]),
-            ((Down, Up), (Up, Up), &[StageOp::ReleasePrimary]),
-            (
-                (Up, Up),
-                (Down, Down),
-                &[StageOp::FirePrimary, StageOp::FireDeep],
-            ),
-            (
-                (Down, Down),
-                (Up, Up),
-                &[StageOp::ReleaseDeep, StageOp::ReleasePrimary],
-            ),
-        ];
-        for &(prev, next, expected) in cases {
-            let (ops, phase) = advance(prev, next, StagingMode::Additive, None);
-            assert_eq!(ops, expected, "additive {prev:?} -> {next:?}");
-            assert_eq!(phase, None);
-        }
-    }
-
     // ── Quick-Skip ───────────────────────────────────────────────────────
 
     #[test]
@@ -1221,7 +1409,7 @@ mod tests {
     }
 
     #[test]
-    fn quick_skip_skipped_runs_additive_with_no_primary_release_path_no_return() {
+    fn quick_skip_skipped_runs_the_deep_stage_alone_with_a_no_return_release_path() {
         let skipped = Some(QuickSkipPhase::Skipped);
 
         // Every dip into/out of the deep band: deep-only ops, primary
@@ -1266,5 +1454,437 @@ mod tests {
     #[should_panic(expected = "structurally impossible band state")]
     fn up_down_is_asserted_unreachable() {
         advance((Up, Down), (Up, Up), StagingMode::Handoff, None);
+    }
+
+    // ── `Engine::feed` routing matrix (`post-release-development` ticket 17) ─
+    //
+    // Every case here was previously reachable only through the dispatch
+    // task's `handle_event` — `feed` concentrates the routing so the
+    // Quick-Skip `Armed → Skipped → Late` decisions get a direct surface.
+    // The ~40 `dual_stage_*` pipeline tests stay as end-to-end proof that
+    // `handle_event` actually routes through `feed`.
+
+    use crate::capture::PhysicalEvent;
+    use crate::config::{ActuationPoint, DeepStageConfig, Modifiers};
+    use crate::injector::{self, testing::RecordingSink};
+
+    const KEY: Input = Input::Grid(1, 1);
+
+    fn binding(trigger: TriggerMode, key: evdev::KeyCode) -> Binding {
+        Binding {
+            trigger,
+            action: Action::Keypress {
+                modifiers: Modifiers::default(),
+                key,
+            },
+        }
+    }
+
+    /// A `Config` with one dual-stage key on the Base Layer: primary `KEY_A`,
+    /// deep `KEY_B`, deep band 220/200 stacked over the default 128/112
+    /// primary.
+    fn dual_stage_cfg(mode: StagingMode, primary: TriggerMode, deep: TriggerMode) -> Config {
+        let mut config = Config::seed();
+        let profile = config
+            .active_profile_mut()
+            .expect("seed sets a real active_profile");
+        profile
+            .base
+            .insert(KEY, binding(primary, evdev::KeyCode::KEY_A));
+        profile
+            .deep_base
+            .insert(KEY, binding(deep, evdev::KeyCode::KEY_B));
+        profile.deep_stages.insert(
+            KEY,
+            DeepStageConfig {
+                actuation: ActuationPoint {
+                    actuation: 220,
+                    release: 200,
+                },
+                mode,
+            },
+        );
+        config
+    }
+
+    /// The injector plus the disjoint `EngineDeps` field borrows a `feed` /
+    /// `update` / `tick` call needs — no dispatch task, no D-Bus.
+    struct StageFixture {
+        inj: Injector,
+        individual: Slots<Input>,
+        cursors: stepper::Cursors,
+    }
+
+    impl StageFixture {
+        fn new() -> Self {
+            let sink = RecordingSink::new();
+            let (inj, _handle) = injector::spawn(sink.clone(), sink.clone());
+            StageFixture {
+                inj,
+                individual: Slots::default(),
+                cursors: stepper::Cursors::default(),
+            }
+        }
+
+        fn deps<'a>(&'a mut self, config: &'a Config) -> EngineDeps<'a> {
+            EngineDeps {
+                config,
+                active_layer: Layer::Base,
+                individual: &mut self.individual,
+                injector: &self.inj,
+                cursors: &mut self.cursors,
+                toggle_lap_target: Duration::from_millis(30),
+                toggle_autorepeat_schedule: RepeatSchedule::new(250, 33),
+            }
+        }
+    }
+
+    fn edge(state: EventState, depth: Option<u8>) -> PhysicalEvent {
+        PhysicalEvent {
+            input: KEY,
+            state,
+            depth,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn feed_not_a_dual_stage_key_is_notmine_user_initiated() {
+        let config = dual_stage_cfg(
+            StagingMode::Handoff,
+            TriggerMode::FireOnce,
+            TriggerMode::FireOnce,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+        let out = engine
+            .feed(
+                fx.deps(&config),
+                PhysicalEvent {
+                    input: Input::Grid(3, 3),
+                    state: EventState::Down,
+                    depth: Some(200),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            StageOutcome::NotMine {
+                machine_sequenced: false
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn feed_dual_stage_key_without_depth_is_notmine_user_initiated() {
+        let config = dual_stage_cfg(
+            StagingMode::Handoff,
+            TriggerMode::FireOnce,
+            TriggerMode::FireOnce,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+        let out = engine
+            .feed(fx.deps(&config), edge(EventState::Down, None))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            StageOutcome::NotMine {
+                machine_sequenced: false
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn feed_non_quick_skip_primary_down_is_notmine_machine_sequenced() {
+        for mode in [StagingMode::Handoff, StagingMode::NoReturn] {
+            let config = dual_stage_cfg(mode, TriggerMode::FireOnce, TriggerMode::FireOnce);
+            let mut fx = StageFixture::new();
+            let mut engine = Engine::default();
+            let out = engine
+                .feed(fx.deps(&config), edge(EventState::Down, Some(150)))
+                .await
+                .unwrap();
+            assert_eq!(
+                out,
+                StageOutcome::NotMine {
+                    machine_sequenced: true
+                },
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn feed_quick_skip_down_shallow_arms_the_window_and_swallows() {
+        let config = dual_stage_cfg(
+            StagingMode::QuickSkip,
+            TriggerMode::FireOnce,
+            TriggerMode::FireOnce,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+        let out = engine
+            .feed(fx.deps(&config), edge(EventState::Down, Some(150)))
+            .await
+            .unwrap();
+        assert_eq!(out, StageOutcome::Handled(Vec::new()));
+        assert!(
+            engine.next_deadline().is_some(),
+            "the ~50ms window is armed"
+        );
+        assert!(!engine.is_late(KEY));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn feed_quick_skip_down_already_hot_resolves_skipped() {
+        let config = dual_stage_cfg(
+            StagingMode::QuickSkip,
+            TriggerMode::FireOnce,
+            TriggerMode::FireOnce,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+        let out = engine
+            .feed(fx.deps(&config), edge(EventState::Down, Some(250)))
+            .await
+            .unwrap();
+        assert_eq!(out, StageOutcome::Handled(Vec::new()));
+        assert_eq!(
+            engine.runtime.get(&KEY).and_then(|rt| rt.quick_skip),
+            Some(QuickSkipPhase::Skipped),
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn feed_quick_skip_up_and_repeat_are_swallowed_while_armed() {
+        let config = dual_stage_cfg(
+            StagingMode::QuickSkip,
+            TriggerMode::FireOnce,
+            TriggerMode::FireOnce,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+        engine
+            .feed(fx.deps(&config), edge(EventState::Down, Some(150)))
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .feed(fx.deps(&config), edge(EventState::Repeat, Some(150)))
+                .await
+                .unwrap(),
+            StageOutcome::Handled(Vec::new()),
+        );
+        assert_eq!(
+            engine
+                .feed(fx.deps(&config), edge(EventState::Up, Some(140)))
+                .await
+                .unwrap(),
+            StageOutcome::Handled(Vec::new()),
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn feed_quick_skip_armed_then_late_falls_through_to_the_ordinary_path() {
+        let config = dual_stage_cfg(
+            StagingMode::QuickSkip,
+            TriggerMode::FireOnce,
+            TriggerMode::FireOnce,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+        engine
+            .feed(fx.deps(&config), edge(EventState::Down, Some(150)))
+            .await
+            .unwrap();
+        let deadline = engine.next_deadline().expect("armed");
+        let late_edits = engine
+            .tick(fx.deps(&config), deadline + Duration::from_millis(1))
+            .await
+            .unwrap();
+        assert!(late_edits.is_empty());
+        assert!(
+            engine.is_late(KEY),
+            "the deadline elapsed with the deep band never reached"
+        );
+        // From `Late`, a real `Repeat`/`Up` runs as ordinary Handoff — `feed`
+        // hands it back for the ordinary path, machine-sequenced.
+        let out = engine
+            .feed(fx.deps(&config), edge(EventState::Repeat, Some(150)))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            StageOutcome::NotMine {
+                machine_sequenced: true
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn feed_repeat_swallowed_once_primary_handed_off_to_deep() {
+        let config = dual_stage_cfg(
+            StagingMode::Handoff,
+            TriggerMode::FireOnce,
+            TriggerMode::FireOnce,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+        // Drive the shadow bands straight into the deep band (one `update`
+        // tick) so the primary is now handed off.
+        engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 250u8)]))
+            .await
+            .unwrap();
+        assert!(engine.primary_handed_off(KEY));
+        let out = engine
+            .feed(fx.deps(&config), edge(EventState::Repeat, Some(250)))
+            .await
+            .unwrap();
+        assert_eq!(out, StageOutcome::Handled(Vec::new()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn feed_repeat_falls_through_when_primary_not_handed_off() {
+        let config = dual_stage_cfg(
+            StagingMode::Handoff,
+            TriggerMode::FireOnce,
+            TriggerMode::FireOnce,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+        let out = engine
+            .feed(fx.deps(&config), edge(EventState::Repeat, Some(150)))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            StageOutcome::NotMine {
+                machine_sequenced: true
+            }
+        );
+    }
+
+    // ── Ticket 13: the outer `Up` disarms the Quick-Skip window in `feed` ──
+
+    #[tokio::test(start_paused = true)]
+    async fn feed_quick_skip_shallow_tap_disarms_the_window_on_the_up_edge() {
+        let config = dual_stage_cfg(
+            StagingMode::QuickSkip,
+            TriggerMode::HoldToRepeat,
+            TriggerMode::HoldToRepeat,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+
+        engine
+            .feed(fx.deps(&config), edge(EventState::Down, Some(150)))
+            .await
+            .unwrap();
+        let deadline = engine.next_deadline().expect("the ~50ms window is armed");
+
+        // A quick shallow release — never reached the deep band.
+        let out = engine
+            .feed(fx.deps(&config), edge(EventState::Up, Some(0)))
+            .await
+            .unwrap();
+        assert_eq!(out, StageOutcome::Handled(Vec::new()));
+
+        // The window is disarmed off the edge itself — no `rx_depth` tick needed.
+        assert_eq!(engine.runtime.get(&KEY).and_then(|rt| rt.quick_skip), None);
+        assert_eq!(engine.next_deadline(), None);
+
+        // The deadline that would have fired `RepressPrimary` is inert now.
+        let edits = engine
+            .tick(fx.deps(&config), deadline + Duration::from_millis(1))
+            .await
+            .unwrap();
+        assert!(edits.is_empty());
+        assert!(engine.slots.slot(&StageKey(KEY)).is_none());
+        assert!(fx.individual.slot(&KEY).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn feed_quick_skip_up_disarms_even_when_a_depth_zero_tick_landed_first() {
+        // The exact interleaving from ticket 13's repro: dispatch's `select!`
+        // services an `rx_depth` `{KEY: 0}` tick (fresh runtime, coalesced past
+        // the excursion — a no-op) *before* draining the queued Down/Up events.
+        let config = dual_stage_cfg(
+            StagingMode::QuickSkip,
+            TriggerMode::HoldToRepeat,
+            TriggerMode::HoldToRepeat,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+
+        engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 0u8)]))
+            .await
+            .unwrap();
+
+        engine
+            .feed(fx.deps(&config), edge(EventState::Down, Some(150)))
+            .await
+            .unwrap();
+        assert!(engine.next_deadline().is_some());
+
+        engine
+            .feed(fx.deps(&config), edge(EventState::Up, Some(0)))
+            .await
+            .unwrap();
+
+        // No further `rx_depth` change is pending — the window must already be
+        // disarmed, or the deadline latches the primary down forever.
+        assert_eq!(engine.runtime.get(&KEY).and_then(|rt| rt.quick_skip), None);
+        assert_eq!(engine.next_deadline(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn feed_quick_skip_skipped_then_outer_up_releases_the_deep_stage() {
+        let config = dual_stage_cfg(
+            StagingMode::QuickSkip,
+            TriggerMode::HoldToRepeat,
+            TriggerMode::HoldToRepeat,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+
+        // Down already past the deep Actuation point → resolves straight to
+        // `Skipped`, firing the deep stage; the primary is suppressed.
+        engine
+            .feed(fx.deps(&config), edge(EventState::Down, Some(250)))
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.runtime.get(&KEY).and_then(|rt| rt.quick_skip),
+            Some(QuickSkipPhase::Skipped),
+        );
+        assert!(
+            engine.slots.slot(&StageKey(KEY)).is_some(),
+            "deep stage held"
+        );
+
+        // A 1-report skip straight from the deep band to fully released.
+        let out = engine
+            .feed(fx.deps(&config), edge(EventState::Up, Some(0)))
+            .await
+            .unwrap();
+        assert_eq!(out, StageOutcome::Handled(Vec::new()));
+
+        let rt = engine.runtime.get(&KEY).expect("still tracked");
+        assert_eq!(rt.quick_skip, None);
+        // The outer release drove the pure core with `next == (Up, Up)`,
+        // running the No-Return-shaped `[ReleaseDeep]` row and writing the
+        // shadow bands back — `feed`'s own discipline, not a later `rx_depth`
+        // tick's. (The end-to-end deep `value=0` is asserted in
+        // `dual_stage_quick_skip_skipped_then_outer_up_*` at the dispatch
+        // level, where the firing task actually gets to run.)
+        assert_eq!(rt.primary, KeyState::Up);
+        assert_eq!(rt.deep, KeyState::Up);
+        assert!(!rt.primary_handed_off);
+        // The primary was never fired — nothing to release on the individual path.
+        assert!(fx.individual.slot(&KEY).is_none());
     }
 }

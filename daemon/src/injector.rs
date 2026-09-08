@@ -198,6 +198,15 @@ enum InjectorMessage {
         code: AbsoluteAxisCode,
         value: i32,
     },
+    /// One Linux autorepeat event (`value=2`) for `key` — the kernel-shaped
+    /// repeat primitive (`spec-kernel-shaped-repeat.md` §2.1). A held/repeated
+    /// single key presents downstream as genuine kernel autorepeat instead of a
+    /// stream of `[KeyDown, KeyUp]` pairs. Fire-and-forget with no reply
+    /// channel, like `Physical` / `AxisValue`. **Subject to `suppressed`**
+    /// (unlike `ForceRelease`): a suppressed hold emits nothing and resumes on
+    /// unsuppress. `value=2` events are stateless — no `held` set is touched
+    /// (§7); every teardown path already balances the one `value=1`.
+    RepeatKey(KeyCode),
 }
 
 /// The injector task's channel has closed, meaning the task itself has
@@ -290,6 +299,21 @@ impl Injector {
             .await
             .map_err(|_| InjectorClosed)
     }
+
+    /// Emits one Linux autorepeat event (`value=2`) for `key` — the
+    /// kernel-shaped repeat primitive (`spec-kernel-shaped-repeat.md` §2.1).
+    /// A caller (tickets 04–06) drives this from the code that already decides
+    /// when a repeat is due, so a held/repeated single key presents downstream
+    /// as genuine kernel autorepeat rather than `[KeyDown, KeyUp]` pairs.
+    /// Fire-and-forget, mirroring `force_release_key`, but — unlike it —
+    /// withheld while suppression is on. `value=2` events are stateless: this
+    /// touches no `held` set (§7).
+    pub async fn repeat_key(&self, key: KeyCode) -> Result<(), InjectorClosed> {
+        self.tx
+            .send(InjectorMessage::RepeatKey(key))
+            .await
+            .map_err(|_| InjectorClosed)
+    }
 }
 
 /// Spawns the injector task, which owns both `sink` (keyboard/mouse) and
@@ -348,6 +372,18 @@ async fn injector_loop<S: InjectSink>(
             }
             InjectorMessage::ForceRelease(key) => {
                 sink_for(&mut sink, &mut gamepad_sink, key).emit(&[*KeyEvent::new(key, 0)])?;
+            }
+            InjectorMessage::RepeatKey(key) => {
+                if !suppressed {
+                    // No explicit `input_event` timestamp: `evdev`'s `.emit()`
+                    // leaves it zeroed and the kernel stamps at handling time
+                    // with its monotonic clock — exactly what real
+                    // `input_repeat_key` does (spec §5.1). A userspace
+                    // timestamp would put the repeat's regularity into a field
+                    // a detector reads directly. `.emit()` frames this with its
+                    // own `SYN_REPORT`, one frame per call, like `set_key_state`.
+                    sink_for(&mut sink, &mut gamepad_sink, key).emit(&[*KeyEvent::new(key, 2)])?;
+                }
             }
             InjectorMessage::SetSuppressed(value) => suppressed = value,
             InjectorMessage::AxisValue { code, value } => {
@@ -623,6 +659,113 @@ mod tests {
         handle.await.unwrap().unwrap();
 
         assert!(sink.batches().is_empty());
+    }
+
+    #[tokio::test]
+    async fn repeat_key_emits_one_batch_of_one_autorepeat_event() {
+        let sink = testing::RecordingSink::new();
+        let (injector, handle) = spawn(sink.clone(), sink.clone());
+
+        injector.repeat_key(KeyCode::KEY_F1).await.unwrap();
+        drop(injector);
+        handle.await.unwrap().unwrap();
+
+        let batches = sink.batches();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0]
+                .iter()
+                .copied()
+                .map(key_and_value)
+                .collect::<Vec<_>>(),
+            vec![(KeyCode::KEY_F1, 2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn repeat_key_routes_gamepad_codes_to_the_gamepad_sink() {
+        let sink = testing::RecordingSink::new();
+        let gamepad_sink = testing::RecordingSink::new();
+        let (injector, handle) = spawn(sink.clone(), gamepad_sink.clone());
+
+        injector.repeat_key(KeyCode::BTN_SOUTH).await.unwrap();
+        injector.repeat_key(KeyCode::KEY_F1).await.unwrap();
+        drop(injector);
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(
+            sink.batches()
+                .into_iter()
+                .flatten()
+                .map(key_and_value)
+                .collect::<Vec<_>>(),
+            vec![(KeyCode::KEY_F1, 2)],
+            "a keyboard code must never reach the gamepad device"
+        );
+        assert_eq!(
+            gamepad_sink
+                .batches()
+                .into_iter()
+                .flatten()
+                .map(key_and_value)
+                .collect::<Vec<_>>(),
+            vec![(KeyCode::BTN_SOUTH, 2)],
+            "a gamepad code must never reach the keyboard/mouse device"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeat_key_is_withheld_while_suppressed_and_resumes_after() {
+        let sink = testing::RecordingSink::new();
+        let (injector, handle) = spawn(sink.clone(), sink.clone());
+
+        injector.set_suppressed(true).await.unwrap();
+        injector.repeat_key(KeyCode::KEY_F1).await.unwrap();
+        injector.set_suppressed(false).await.unwrap();
+        injector.repeat_key(KeyCode::KEY_F1).await.unwrap();
+        drop(injector);
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(
+            sink.batches()
+                .into_iter()
+                .flatten()
+                .map(key_and_value)
+                .collect::<Vec<_>>(),
+            vec![(KeyCode::KEY_F1, 2)],
+            "the suppressed repeat emits nothing; the one after unsuppress emits"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queued_repeat_key_never_lands_after_the_force_release_that_follows_it() {
+        // Spec-kernel-shaped-repeat.md §7's required ordering lock: a `value=2`
+        // still queued on the one channel when the key's `Up` arrives must be
+        // delivered *before* the terminating `value=0`, never after it — so the
+        // key is never left logically down. Send order through the single mpsc
+        // channel is the guarantee; this test pins it.
+        let sink = testing::RecordingSink::new();
+        let (injector, handle) = spawn(sink.clone(), sink.clone());
+
+        // The dispatch task performs `RepeatKey` then, on `Up`,
+        // `ForceReleaseStuck` — two sends onto the same channel, in that order.
+        injector.repeat_key(KeyCode::KEY_A).await.unwrap();
+        injector.force_release_key(KeyCode::KEY_A).await.unwrap();
+        drop(injector);
+        handle.await.unwrap().unwrap();
+
+        let events: Vec<_> = sink
+            .batches()
+            .into_iter()
+            .flatten()
+            .map(key_and_value)
+            .collect();
+        assert_eq!(events, vec![(KeyCode::KEY_A, 2), (KeyCode::KEY_A, 0)]);
+        assert_eq!(
+            events.last(),
+            Some(&(KeyCode::KEY_A, 0)),
+            "the final event for the key is value=0 — never left logically down"
+        );
     }
 
     #[test]

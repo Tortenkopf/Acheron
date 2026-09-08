@@ -38,8 +38,9 @@ use std::time::Duration;
 use evdev::KeyCode;
 
 use crate::capture::EventState;
+use crate::capture::analog::RepeatSchedule;
 use crate::config::{
-    Action, Binding, Config, MacroDef, MacroId, StepperDef, StepperId, TriggerMode,
+    Action, Binding, Config, MacroDef, MacroId, Modifiers, StepperDef, StepperId, TriggerMode,
 };
 use crate::executor::{self, ActiveToggle, FiringHandle, MacroStep};
 use crate::injector::Injector;
@@ -77,48 +78,120 @@ pub(crate) enum TriggerDecision {
     Nothing,
     /// Compile `binding.action` and spawn a one-shot firing.
     SpawnFireOnce,
-    /// Hold a bare, unbalanced `KeyDown` — mouse-button / `ControllerButton`
-    /// Hold-to-repeat `Down` (tickets 75/76, 79/80). Released later by
+    /// Hold a bare, unbalanced `KeyDown` (preceded by any modifier `KeyDown`s)
+    /// — mouse-button / `ControllerButton` Hold-to-repeat `Down` with no
+    /// modifiers (tickets 75/76, 79/80), or a single keyboard key's
+    /// Hold-to-repeat `Down` carrying its modifier set
+    /// (`spec-kernel-shaped-repeat.md` §3.1: modifiers held `value=1` alongside,
+    /// only the base key goes on to autorepeat). Released later by
     /// `ForceReleaseStuck` on the individual path, or
-    /// `ChordEffect::ReleaseChordFiring` on the Chord path.
-    HoldKeyDown(KeyCode),
-    /// Compile `binding.action` and start a looping Toggle.
+    /// `ChordEffect::ReleaseChordFiring` on the Chord path — both drain the
+    /// firing's whole `held` set, key and modifiers together.
+    HoldKeyDown(Modifiers, KeyCode),
+    /// Emit one genuine Linux autorepeat event (`value=2`) for this key — a
+    /// single keyboard key's Hold-to-repeat `Repeat`
+    /// (`spec-kernel-shaped-repeat.md` §3.1, replacing the old `SpawnFireOnce`
+    /// `[Down, Up]` pair). Stateless: `perform` touches no `firings` / `held`
+    /// (§7 — the one `value=1` from the `Down` is balanced by every existing
+    /// teardown path; the `value=2` stream needs none of its own).
+    RepeatKey(KeyCode),
+    /// Compile `binding.action` and start a looping Toggle — the multi-step
+    /// Macro Toggle only (surface 9). A single-key Toggle takes
+    /// `StartToggleAutorepeat` instead (ticket 05).
     StartToggleLoop,
     /// Start a single-held Toggle — mouse-button / `ControllerButton` Toggle
     /// (tickets 78, 82/83).
     StartToggleHeld(KeyCode),
+    /// Start a sustained-autorepeat Toggle — a single keyboard key's Toggle
+    /// `Down` (`spec-kernel-shaped-repeat.md` §3.2, ticket 05). Holds a
+    /// genuine Linux autorepeat (`value=1`, then `value=2` at the full
+    /// `REP_DELAY`→`REP_PERIOD` envelope) rather than looping `[Down, Up]`
+    /// through `run_toggle_loop`; the modifiers are held `value=1` alongside
+    /// and released with the base key on the second press / any stop.
+    StartToggleAutorepeat(Modifiers, KeyCode),
     /// Force-release whatever this key's firing left stuck — Fire-once /
     /// Hold-to-repeat / Analog-repeat `Up` on the individual path.
     ForceReleaseStuck,
 }
 
-/// The `KeyCode` behind the two Action shapes that get *sustained-hold*
-/// treatment — a real mouse button (`Action::Keypress` on a `BTN_*` code) or a
-/// gamepad button (`Action::ControllerButton`) — instead of the ordinary
-/// pulse / repeat-tap: a bare unbalanced `KeyDown` under Hold-to-repeat
-/// (tickets 75/76, 79/80) and `spawn_held`'s single hold under Toggle
-/// (tickets 78, 82/83). `None` for a keyboard Keypress, a Macro, or a Step.
-fn sustained_hold_key(action: &Action) -> Option<KeyCode> {
-    match action {
-        Action::ControllerButton { button } => Some(*button),
-        Action::Keypress { key, .. } if is_mouse_button(*key) => Some(*key),
-        _ => None,
+/// How a Binding's held target behaves downstream when held or repeated
+/// (spec-kernel-shaped-repeat.md §2.1) — the classification `decide` needs to
+/// tell a "held single key" (which must present as genuine kernel autorepeat)
+/// apart from a mouse/gamepad button (which the kernel never autorepeats) and
+/// from a multi-step target. Replaces the bare `Option<KeyCode>` that
+/// `sustained_hold_key` returns today.
+///
+/// - `SustainedNoRepeat(code)` — today's `sustained_hold_key` set: an
+///   `Action::ControllerButton`, or an `Action::Keypress` on a mouse-button
+///   code. On `Repeat` these resolve to `D::Nothing`.
+/// - `AutorepeatKey(mods, code)` — a single keyboard key: an `Action::Keypress`
+///   (with or without modifiers) on a non-mouse code, or an `Action::Macro`
+///   whose compiled steps satisfy `executor::single_held_key`. Ticket 03 routes
+///   this onto exactly the decisions the old `sustained_hold_key`'s `None`
+///   produced (the ordinary keyboard arms); ticket 04 splits it onto the
+///   `value=2` autorepeat path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HoldKind {
+    SustainedNoRepeat(KeyCode),
+    AutorepeatKey(Modifiers, KeyCode),
+}
+
+/// A single held key's `HoldKind`, keyboard vs. mouse-button split — the
+/// kernel autorepeats keyboard keys but never `BTN_*`, so a mouse-button code
+/// is `SustainedNoRepeat` even though it arrived through the same
+/// `[KeyDown(k), KeyUp(k)]` shape. Shared by `hold_repeat_kind`'s `Keypress`
+/// and `Macro` arms so a single-key Macro classifies *exactly* like the
+/// equivalent Keypress (`Action::Keypress.key` and a macro step accept the
+/// same unvalidated `KeyCode`, `BTN_*` included).
+fn key_hold_kind(modifiers: Modifiers, key: KeyCode) -> HoldKind {
+    if is_mouse_button(key) {
+        HoldKind::SustainedNoRepeat(key)
+    } else {
+        HoldKind::AutorepeatKey(modifiers, key)
     }
 }
 
-/// The pure decision core. `binding` carries `.trigger` and `.action`; `slot`
+/// Classifies a Binding's held target into a `HoldKind` (spec §2.1) — the
+/// successor to `sustained_hold_key`. For `Action::Keypress` /
+/// `Action::ControllerButton` it reads `mods` + `key` straight off the action;
+/// for `Action::Macro` it resolves the `MacroDef`, compiles the steps
+/// (`executor::compile`), and runs `executor::single_held_key`. Multi-step
+/// Macro, Stepper, Profile switch → `None` (multi-step, or handled earlier).
+fn hold_repeat_kind(action: &Action, macros: &HashMap<MacroId, MacroDef>) -> Option<HoldKind> {
+    match action {
+        Action::ControllerButton { button } => Some(HoldKind::SustainedNoRepeat(*button)),
+        Action::Keypress { modifiers, key } => Some(key_hold_kind(*modifiers, *key)),
+        Action::Macro { .. } => {
+            let steps = executor::compile(action, macros);
+            executor::single_held_key(&steps).map(|(mods, key)| key_hold_kind(mods, key))
+        }
+        Action::Step { .. } | Action::ProfileSwitch { .. } => None,
+    }
+}
+
+/// The pure decision core. `binding` carries `.trigger` and `.action`; `macros`
+/// resolves an `Action::Macro`'s compiled shape for `hold_repeat_kind` (every
+/// call site already holds it — `config.macros` / `deps.config.macros`); `slot`
 /// is the liveness of this key's existing firing/toggle (`None` == absent).
 /// No I/O, no async. `ProfileSwitch` never reaches here — it is intercepted
 /// upstream (`dispatch_individual_down` / `handle_event`'s `Repeat | Up` arm),
 /// and a Chord's own Action can never be `ProfileSwitch`.
 ///
-/// This is the old `fire` / `execute_chord_fire` matrix, arm-for-arm. The
-/// bare-hold carve-out arms match `HoldToRepeat` only — `AnalogRepeat` rides
-/// the ordinary `SpawnFireOnce` arm exactly as it did in `fire`; the Chord
-/// path never reaches the `AnalogRepeat` or `Up` arms at all
+/// This is the old `fire` / `execute_chord_fire` matrix, arm-for-arm, plus
+/// ticket 04's kernel-shaped-repeat split (a single keyboard key's
+/// Hold-to-repeat now rides the `value=2` autorepeat path — `HoldKeyDown` on
+/// `Down`, `RepeatKey` on `Repeat` — instead of a `[Down, Up]` `SpawnFireOnce`
+/// per tick). The bare-hold / autorepeat arms match `HoldToRepeat` only —
+/// `AnalogRepeat` rides the ordinary `SpawnFireOnce` arm exactly as it did in
+/// `fire`; the Chord path never reaches the `AnalogRepeat` or `Up` arms at all
 /// (`config::validate` rejects an `AnalogRepeat` Chord, and `chord::feed` only
 /// ever emits `Down` / `Repeat`).
-pub(crate) fn decide(binding: &Binding, state: EventState, slot: Option<Slot>) -> TriggerDecision {
+pub(crate) fn decide(
+    binding: &Binding,
+    macros: &HashMap<MacroId, MacroDef>,
+    state: EventState,
+    slot: Option<Slot>,
+) -> TriggerDecision {
     use EventState::{Down, Repeat, Up};
     use TriggerDecision as D;
     use TriggerMode::{AnalogRepeat, FireOnce, HoldToRepeat, Toggle};
@@ -134,30 +207,72 @@ pub(crate) fn decide(binding: &Binding, state: EventState, slot: Option<Slot>) -
             proceed
         }
     };
-    let hold_key = sustained_hold_key(&binding.action);
+    // The held target's shape (spec-kernel-shaped-repeat.md §2.1). Only the
+    // `HoldToRepeat` and `Toggle` arms consult it, so the classification — an
+    // `executor::compile` of an `Action::Macro` among it — is skipped entirely
+    // for `FireOnce` / `AnalogRepeat`, which the old eager `sustained_hold_key`
+    // call also computed but never read.
+    //
+    // - `SustainedNoRepeat` (mouse-button / gamepad) takes the bare-hold
+    //   carve-out arms — the kernel never autorepeats `BTN_*` (tickets 75/76,
+    //   79/80).
+    // - `AutorepeatKey` (a single keyboard key) rides the genuine kernel
+    //   autorepeat path: a bare held `KeyDown` (plus modifiers) on `Down`, one
+    //   `value=2` per `Repeat` (ticket 04, spec §3.1).
+    // - `None` (multi-step Macro / Stepper) rides the ordinary
+    //   `SpawnFireOnce` arm — the whole target re-runs per `Repeat`.
+    let hold_kind = match binding.trigger {
+        HoldToRepeat | Toggle => hold_repeat_kind(&binding.action, macros),
+        FireOnce | AnalogRepeat => None,
+    };
 
     match (binding.trigger, state) {
-        // Tickets 75/76 & 79/80: a mouse / gamepad button under Hold-to-repeat
-        // holds one bare unbalanced `KeyDown` on `Down` (released later by
-        // `ForceReleaseStuck` / `ReleaseChordFiring`) and ignores every
-        // kernel-autorepeat `Repeat` — no hardware button autorepeats.
-        (HoldToRepeat, Repeat) if hold_key.is_some() => D::Nothing,
-        (HoldToRepeat, Down) if hold_key.is_some() => {
-            guarded(D::HoldKeyDown(hold_key.expect("matched by the arm guard")))
-        }
+        // Hold-to-repeat `Repeat`: a mouse / gamepad button ignores it (no
+        // hardware button autorepeats); a single keyboard key emits one genuine
+        // Linux autorepeat event — but only once a hold is actually
+        // established (this key's `HoldKeyDown` firing is present, live or
+        // just-finished). A `Repeat` with no such firing — the key was held
+        // into a Layer/Profile that freshly bound it, or held across daemon
+        // startup, or its firing was drained by a switch teardown — re-presses
+        // first, so a `value=2` never lands without a preceding `value=1`. A
+        // multi-step Macro re-runs whole, overlap-guarded.
+        (HoldToRepeat, Repeat) => match hold_kind {
+            Some(HoldKind::SustainedNoRepeat(_)) => D::Nothing,
+            Some(HoldKind::AutorepeatKey(mods, code)) => {
+                if matches!(slot, Some(Slot::FiringUnfinished | Slot::FiringFinished)) {
+                    D::RepeatKey(code)
+                } else {
+                    guarded(D::HoldKeyDown(mods, code))
+                }
+            }
+            None => guarded(D::SpawnFireOnce),
+        },
+        // Hold-to-repeat `Down`: a mouse / gamepad button and a single keyboard
+        // key both latch a bare unbalanced `KeyDown` (released later by
+        // `ForceReleaseStuck` / `ReleaseChordFiring`) — the keyboard key also
+        // presses its modifiers `value=1` alongside, and only the base key goes
+        // on to autorepeat. A multi-step Macro spawns an ordinary firing.
+        (HoldToRepeat, Down) => match hold_kind {
+            Some(HoldKind::SustainedNoRepeat(code)) => {
+                guarded(D::HoldKeyDown(Modifiers::default(), code))
+            }
+            Some(HoldKind::AutorepeatKey(mods, code)) => guarded(D::HoldKeyDown(mods, code)),
+            None => guarded(D::SpawnFireOnce),
+        },
 
-        // Fire-once fires only on `Down`; Hold-to-repeat / Analog-repeat on
-        // `Down` and every `Repeat`. `compile_action` runs in the executor,
-        // behind this same guard, so a dropped Step firing never advances the
-        // cursor.
-        (FireOnce, Down) | (HoldToRepeat | AnalogRepeat, Down | Repeat) => {
-            guarded(D::SpawnFireOnce)
-        }
+        // Fire-once fires only on `Down`; Analog-repeat on `Down` and every
+        // `Repeat`. `compile_action` runs in the executor, behind this same
+        // guard, so a dropped Step firing never advances the cursor.
+        (FireOnce, Down) | (AnalogRepeat, Down | Repeat) => guarded(D::SpawnFireOnce),
 
         // Toggle starts only on `Down`: a mouse / gamepad button latches as a
-        // single held `KeyDown` (tickets 78, 82/83), everything else loops.
-        (Toggle, Down) => match hold_key {
-            Some(code) => D::StartToggleHeld(code),
+        // single held `KeyDown` (tickets 78, 82/83); a single keyboard key
+        // holds a genuine kernel autorepeat (ticket 05, spec §3.2); a
+        // multi-step Macro loops `[Down, Up]` through `run_toggle_loop`
+        // (surface 9 — the sole remaining `StartToggleLoop` user).
+        (Toggle, Down) => match hold_kind {
+            Some(HoldKind::SustainedNoRepeat(code)) => D::StartToggleHeld(code),
+            Some(HoldKind::AutorepeatKey(mods, code)) => D::StartToggleAutorepeat(mods, code),
             None => D::StartToggleLoop,
         },
 
@@ -209,17 +324,101 @@ pub(crate) struct PerformDeps<'a> {
     pub steppers: &'a HashMap<StepperId, StepperDef>,
     pub cursors: &'a mut stepper::Cursors,
     pub toggle_lap_target: Duration,
+    /// The kernel autorepeat envelope a single-key `StartToggleAutorepeat`
+    /// hold runs at (`spec-kernel-shaped-repeat.md` §5.2, ticket 05) —
+    /// resolved once at Daemon startup
+    /// (`capture::analog::resolve_toggle_autorepeat_schedule`) and threaded
+    /// down as a plain value, exactly like `toggle_lap_target`.
+    pub toggle_autorepeat_schedule: RepeatSchedule,
+    /// Whether a `D::SpawnFireOnce` whose compiled steps are a single held key
+    /// gets `executor::FIRE_ONCE_KEY_DWELL` spliced between the edges
+    /// (`.scratch/humane-output-rate/` ticket 12). Set by the constructor, not
+    /// per call site: `new` (the individual and Chord paths) is a canned
+    /// one-shot press the user physically initiated once, so `true`;
+    /// `new_machine_sequenced` (the `stage::Engine` path) is a depth-driven
+    /// re-press, so `false` — see that constructor's doc for why.
+    fire_once_key_dwell: bool,
 }
 
 impl<'a> PerformDeps<'a> {
-    /// The call-site constructor — takes `&Config` (read-only) and the two
+    /// The call-site constructor for a **user-initiated** firing — the
+    /// individual and Chord paths. Takes `&Config` (read-only) and the two
     /// disjoint `DispatchState` borrows, so each retargeted site is one line
-    /// instead of the six-field literal.
+    /// instead of the field literal. A single-key Fire-once firing built here
+    /// gets the `executor::FIRE_ONCE_KEY_DWELL` splice (ticket 12): the press
+    /// is a canned one-shot the user made once, not a machine-sequenced edge.
     pub(crate) fn new(
         injector: &'a Injector,
         config: &'a Config,
         cursors: &'a mut stepper::Cursors,
         toggle_lap_target: Duration,
+        toggle_autorepeat_schedule: RepeatSchedule,
+    ) -> Self {
+        PerformDeps::build(
+            injector,
+            config,
+            cursors,
+            toggle_lap_target,
+            toggle_autorepeat_schedule,
+            true,
+        )
+    }
+
+    /// The call-site constructor for a **machine-sequenced** firing — every
+    /// `stage::Engine` deep-stage fire, primary (re-)press, `RepressPrimary`,
+    /// retroactive re-press, and deep repeat. Identical to `new` but the
+    /// single-key Fire-once dwell (ticket 12) is **off**: a deep-stage edge is
+    /// a machine-sequenced, depth-driven re-press, not a canned one-shot the
+    /// user made, and a 40 ms hold there would let `decide`'s ordinary
+    /// `FiringUnfinished` overlap guard swallow a fast deep-band wiggle's
+    /// re-press.
+    pub(crate) fn new_machine_sequenced(
+        injector: &'a Injector,
+        config: &'a Config,
+        cursors: &'a mut stepper::Cursors,
+        toggle_lap_target: Duration,
+        toggle_autorepeat_schedule: RepeatSchedule,
+    ) -> Self {
+        PerformDeps::build(
+            injector,
+            config,
+            cursors,
+            toggle_lap_target,
+            toggle_autorepeat_schedule,
+            false,
+        )
+    }
+
+    /// `new` / `new_machine_sequenced` chosen by predicate — the dispatch
+    /// *input* path's constructor, where whether a press is machine-sequenced
+    /// is only known at runtime (`stage::Engine::feed`'s `StageOutcome::NotMine
+    /// { machine_sequenced }`, ticket 17 Addendum). A dual-stage key's primary
+    /// press is machine-sequenced (dwell off); an ordinary key press is not.
+    pub(crate) fn for_input_press(
+        injector: &'a Injector,
+        config: &'a Config,
+        cursors: &'a mut stepper::Cursors,
+        toggle_lap_target: Duration,
+        toggle_autorepeat_schedule: RepeatSchedule,
+        machine_sequenced: bool,
+    ) -> Self {
+        PerformDeps::build(
+            injector,
+            config,
+            cursors,
+            toggle_lap_target,
+            toggle_autorepeat_schedule,
+            !machine_sequenced,
+        )
+    }
+
+    fn build(
+        injector: &'a Injector,
+        config: &'a Config,
+        cursors: &'a mut stepper::Cursors,
+        toggle_lap_target: Duration,
+        toggle_autorepeat_schedule: RepeatSchedule,
+        fire_once_key_dwell: bool,
     ) -> Self {
         PerformDeps {
             injector,
@@ -227,6 +426,8 @@ impl<'a> PerformDeps<'a> {
             steppers: &config.steppers,
             cursors,
             toggle_lap_target,
+            toggle_autorepeat_schedule,
+            fire_once_key_dwell,
         }
     }
 }
@@ -292,22 +493,50 @@ impl<K: Eq + Hash + Clone> Slots<K> {
         match decision {
             D::Nothing => {}
             D::SpawnFireOnce => {
-                let steps =
+                let mut steps =
                     compile_action(&binding.action, deps.macros, deps.steppers, deps.cursors);
+                // Ticket 12: a canned one-shot keyboard press otherwise goes out
+                // as `[KeyDown, KeyUp]` with no artificial dwell — the shape
+                // ADR-0008 names the clearest synthetic tell. Splice a fixed
+                // `FIRE_ONCE_KEY_DWELL` between the edges wherever the compiled
+                // steps are a single held key (`single_held_key`, the same
+                // bright line the `value=2` work uses — plain / modifier
+                // Keypress, single-key Macro, single-key Stepper `Key` step,
+                // single-key Chord), Fire-once only. `AnalogRepeat` — including
+                // the Digital-Capture fallback that also lands on
+                // `D::SpawnFireOnce` — keeps its already-audited tap cadence;
+                // a multi-step Macro's `single_held_key` is `None`, so the Macro
+                // exception holds by shape.
+                if deps.fire_once_key_dwell
+                    && binding.trigger == TriggerMode::FireOnce
+                    && let Some((mods, code)) = executor::single_held_key(&steps)
+                {
+                    steps = executor::fire_once_key_steps(mods, code);
+                }
                 let handle = executor::spawn_fire_once(deps.injector.clone(), steps);
                 self.firings.insert(key, handle);
             }
-            D::HoldKeyDown(code) => {
-                // A bare, unbalanced `KeyDown` mirroring the physical hold —
-                // released by a `ForceReleaseStuck` (individual) or
-                // `ChordEffect::ReleaseChordFiring` (Chord) later, reusing
-                // ticket 33's force-release path rather than inventing new
-                // architecture.
+            D::HoldKeyDown(modifiers, code) => {
+                // A bare, unbalanced `KeyDown` (preceded by any modifier
+                // `KeyDown`s) mirroring the physical hold — released by a
+                // `ForceReleaseStuck` (individual) or
+                // `ChordEffect::ReleaseChordFiring` (Chord) later, which drain
+                // the firing's whole `held` set, reusing ticket 33's
+                // force-release path rather than inventing new architecture.
                 let handle = executor::spawn_fire_once(
                     deps.injector.clone(),
-                    vec![MacroStep::KeyDown(code)],
+                    executor::held_key_down_steps(modifiers, code),
                 );
                 self.firings.insert(key, handle);
+            }
+            D::RepeatKey(code) => {
+                // One stateless Linux autorepeat event (`value=2`) — no
+                // `firings` / `held` mutation (spec-kernel-shaped-repeat.md §7):
+                // the one `value=1` from the `Down` is balanced by every
+                // existing teardown path, and the `value=2` stream needs none
+                // of its own. Best-effort like `force_release_stuck`'s own
+                // sends — a dead injector means the Daemon is going down.
+                let _ = deps.injector.repeat_key(code).await;
             }
             D::StartToggleLoop => {
                 let steps =
@@ -320,6 +549,24 @@ impl<K: Eq + Hash + Clone> Slots<K> {
             D::StartToggleHeld(code) => {
                 self.toggles
                     .insert(key, ActiveToggle::spawn_held(deps.injector.clone(), code));
+            }
+            D::StartToggleAutorepeat(modifiers, code) => {
+                // A single keyboard key's Toggle holds a genuine kernel
+                // autorepeat (spec-kernel-shaped-repeat.md §3.2, ticket 05) —
+                // `value=1` now, `value=2` at the full envelope, `value=0` for
+                // the key and its modifiers on the second press / any stop.
+                // The `run_toggle_autorepeat` task owns its own `held` set;
+                // `stop_toggle` / `stop_all_toggles` drive its teardown, so
+                // every existing caller works unchanged.
+                self.toggles.insert(
+                    key,
+                    ActiveToggle::spawn_autorepeat(
+                        deps.injector.clone(),
+                        modifiers,
+                        code,
+                        deps.toggle_autorepeat_schedule,
+                    ),
+                );
             }
             D::ForceReleaseStuck => {
                 self.force_release(&key, deps.injector).await;
@@ -391,6 +638,30 @@ impl<K: Eq + Hash + Clone> Slots<K> {
         }
         self.stop_all_toggles().await;
     }
+
+    /// Force-releases **and removes** every live firing, leaving Toggles
+    /// running — the individual `Slots<Input>`'s share of a Layer/Profile
+    /// switch, capture-mode flip, or device-disconnect teardown
+    /// (`spec-kernel-shaped-repeat.md` §7). A bare `HoldKeyDown` hold now
+    /// backs *every* single-key Hold-to-repeat (ticket 04), not just the rare
+    /// mouse-button / `ControllerButton` carve-outs, so its `value=1` would
+    /// otherwise be stranded at the OS level whenever the bound key is
+    /// released on a Layer/Profile where it is unbound or Toggle-bound
+    /// (`decide`'s `Up` arm only force-releases when *this* key's Binding is
+    /// still a firing mode). Entries are **removed**, not left lingering: the
+    /// config the firing compiled against is being discarded, so there is no
+    /// "finished firing distinct from absent" to preserve — and a subsequent
+    /// `Repeat` on a still-held key then sees `slot == None` and re-presses
+    /// via `decide`'s `(HoldToRepeat, Repeat)` fallback rather than emitting a
+    /// dangling `value=2`. Toggles are deliberately *not* touched — an
+    /// individual Toggle survives a Layer/Profile switch (spec.md's "Toggle
+    /// behavior across Layer/Profile switches"); `stop_all_toggles` is the
+    /// separate effect that drains those.
+    pub(crate) async fn drain_firings(&mut self, injector: &Injector) {
+        for (_, firing) in self.firings.drain() {
+            firing.force_release_stuck(injector).await;
+        }
+    }
 }
 
 /// Compiles a `Binding`'s `Action` into the flat step sequence `Slots::perform`
@@ -448,6 +719,18 @@ mod tests {
         use TriggerDecision as D;
         use TriggerMode::{AnalogRepeat, FireOnce, HoldToRepeat, Toggle};
 
+        // Most rows here are a Keypress / ControllerButton shape, so
+        // `hold_repeat_kind` never reads the macro map. The single-key Macro
+        // row below does — it shares this map, holding a `[KeyDown, KeyUp]`
+        // macro that must classify exactly like the equivalent Keypress.
+        use crate::config::MacroStepDto;
+        let macros = macros_with(
+            "hold-a",
+            vec![MacroStepDto::KeyDown(KBD), MacroStepDto::KeyUp(KBD)],
+        );
+        let decide =
+            |b: &Binding, s: EventState, slot: Option<Slot>| super::decide(b, &macros, s, slot);
+
         // Every slot state the overlap guard distinguishes.
         let slots = [
             None,
@@ -461,6 +744,11 @@ mod tests {
 
         for slot in slots {
             let guarded = |proceed: D| if clear(slot) { proceed } else { D::Nothing };
+            // A single keyboard key's Hold-to-repeat `Repeat` only emits a
+            // `value=2` once a `HoldKeyDown` firing is established for the key
+            // (live or just-finished); with no firing slot it re-presses first.
+            let hold_established =
+                matches!(slot, Some(Slot::FiringUnfinished | Slot::FiringFinished));
 
             // ── Fire-once (keyboard) ────────────────────────────────────────
             let fo = binding(FireOnce, keyboard(KBD));
@@ -468,13 +756,63 @@ mod tests {
             assert_eq!(decide(&fo, Repeat, slot), D::Nothing);
             assert_eq!(decide(&fo, Up, slot), D::ForceReleaseStuck);
 
-            // ── Hold-to-repeat (keyboard): Down + every Repeat, not Up ──────
+            // ── Hold-to-repeat (keyboard): a single key now presents as
+            //    genuine kernel autorepeat — a bare held `KeyDown` on `Down`
+            //    (no modifiers here), one `value=2` per `Repeat` (ticket 04),
+            //    force-release on `Up`. ─────────────────────────────────────
             let htr = binding(HoldToRepeat, keyboard(KBD));
-            assert_eq!(decide(&htr, Down, slot), guarded(D::SpawnFireOnce));
-            assert_eq!(decide(&htr, Repeat, slot), guarded(D::SpawnFireOnce));
+            assert_eq!(
+                decide(&htr, Down, slot),
+                guarded(D::HoldKeyDown(Modifiers::default(), KBD))
+            );
+            assert_eq!(
+                decide(&htr, Repeat, slot),
+                if hold_established {
+                    D::RepeatKey(KBD)
+                } else {
+                    guarded(D::HoldKeyDown(Modifiers::default(), KBD))
+                }
+            );
             assert_eq!(decide(&htr, Up, slot), D::ForceReleaseStuck);
 
-            // ── Analog-repeat rides the Hold-to-repeat arms ────────────────
+            // ── A modifier-wrapped single key: modifiers ride along in the
+            //    `HoldKeyDown` decision, only the base key autorepeats. ─────
+            let ctrl_htr = binding(
+                HoldToRepeat,
+                Action::Keypress {
+                    modifiers: Modifiers {
+                        ctrl: true,
+                        ..Modifiers::default()
+                    },
+                    key: KBD,
+                },
+            );
+            assert_eq!(
+                decide(&ctrl_htr, Down, slot),
+                guarded(D::HoldKeyDown(
+                    Modifiers {
+                        ctrl: true,
+                        ..Modifiers::default()
+                    },
+                    KBD
+                ))
+            );
+            assert_eq!(
+                decide(&ctrl_htr, Repeat, slot),
+                if hold_established {
+                    D::RepeatKey(KBD)
+                } else {
+                    guarded(D::HoldKeyDown(
+                        Modifiers {
+                            ctrl: true,
+                            ..Modifiers::default()
+                        },
+                        KBD,
+                    ))
+                }
+            );
+
+            // ── Analog-repeat still rides the ordinary SpawnFireOnce arm ───
             let ar = binding(AnalogRepeat, keyboard(KBD));
             assert_eq!(decide(&ar, Down, slot), guarded(D::SpawnFireOnce));
             assert_eq!(decide(&ar, Repeat, slot), guarded(D::SpawnFireOnce));
@@ -482,19 +820,29 @@ mod tests {
 
             // ── ControllerButton Hold-to-repeat carve (tickets 75/76) ──────
             let cb_htr = binding(HoldToRepeat, Action::ControllerButton { button: PAD });
-            assert_eq!(decide(&cb_htr, Down, slot), guarded(D::HoldKeyDown(PAD)));
+            assert_eq!(
+                decide(&cb_htr, Down, slot),
+                guarded(D::HoldKeyDown(Modifiers::default(), PAD))
+            );
             assert_eq!(decide(&cb_htr, Repeat, slot), D::Nothing);
             assert_eq!(decide(&cb_htr, Up, slot), D::ForceReleaseStuck);
 
             // ── mouse-button Hold-to-repeat carve (tickets 79/80) ──────────
             let mb_htr = binding(HoldToRepeat, keyboard(MOUSE));
-            assert_eq!(decide(&mb_htr, Down, slot), guarded(D::HoldKeyDown(MOUSE)));
+            assert_eq!(
+                decide(&mb_htr, Down, slot),
+                guarded(D::HoldKeyDown(Modifiers::default(), MOUSE))
+            );
             assert_eq!(decide(&mb_htr, Repeat, slot), D::Nothing);
             assert_eq!(decide(&mb_htr, Up, slot), D::ForceReleaseStuck);
 
-            // ── Toggle (keyboard): looping, Down only ──────────────────────
+            // ── Toggle (keyboard): a single key holds a genuine kernel
+            //    autorepeat (ticket 05), Down only ──────────────────────────
             let tg = binding(Toggle, keyboard(KBD));
-            assert_eq!(decide(&tg, Down, slot), D::StartToggleLoop);
+            assert_eq!(
+                decide(&tg, Down, slot),
+                D::StartToggleAutorepeat(Modifiers::default(), KBD)
+            );
             assert_eq!(decide(&tg, Repeat, slot), D::Nothing);
             assert_eq!(decide(&tg, Up, slot), D::Nothing);
 
@@ -510,30 +858,272 @@ mod tests {
             let ar_cb = binding(AnalogRepeat, Action::ControllerButton { button: PAD });
             assert_eq!(decide(&ar_cb, Down, slot), guarded(D::SpawnFireOnce));
             assert_eq!(decide(&ar_cb, Repeat, slot), guarded(D::SpawnFireOnce));
+
+            // ── Single-key Macro == the equivalent Keypress (ticket 03/04) ─
+            //    `hold-a` compiles to `[KeyDown(A), KeyUp(A)]` — the same
+            //    shape `keyboard(KBD)` produces. Every (mode, state) decision
+            //    must match, arm for arm: a single-key Macro rides the same
+            //    `value=2` autorepeat path as the equivalent Keypress
+            //    (`HoldKeyDown` on `Down`, `RepeatKey` on `Repeat`).
+            let mac = binding(HoldToRepeat, macro_action("hold-a"));
+            for state in [Down, Repeat, Up] {
+                assert_eq!(
+                    decide(&mac, state, slot),
+                    decide(&binding(HoldToRepeat, keyboard(KBD)), state, slot),
+                    "single-key Macro must decide like the equivalent Keypress ({state:?})"
+                );
+            }
+            let mac_tg = binding(Toggle, macro_action("hold-a"));
+            assert_eq!(
+                decide(&mac_tg, Down, slot),
+                decide(&binding(Toggle, keyboard(KBD)), Down, slot),
+            );
+            assert_eq!(
+                decide(&mac_tg, Down, slot),
+                D::StartToggleAutorepeat(Modifiers::default(), KBD)
+            );
         }
+    }
+
+    /// Ticket 12 leaves `decide` untouched: a Fire-once single keyboard key
+    /// still resolves to the plain, abstract `D::SpawnFireOnce` (and
+    /// Analog-repeat — including the Digital-Capture fallback that shares the
+    /// arm — is likewise unchanged). The `FIRE_ONCE_KEY_DWELL` splice is
+    /// entirely downstream in `Slots::perform`, gated on `fire_once_key_dwell`,
+    /// so the Analog-repeat path is provably unaffected here.
+    #[test]
+    fn decide_is_unchanged_by_the_fire_once_dwell_splice() {
+        use EventState::{Down, Repeat};
+        let no_macros: HashMap<MacroId, MacroDef> = HashMap::new();
+        let decide =
+            |b: &Binding, s: EventState, slot: Option<Slot>| super::decide(b, &no_macros, s, slot);
+
+        for slot in [None, Some(Slot::FiringFinished), Some(Slot::Toggle)] {
+            assert_eq!(
+                decide(&binding(TriggerMode::FireOnce, keyboard(KBD)), Down, slot),
+                TriggerDecision::SpawnFireOnce,
+                "Fire-once single key still decides to the plain SpawnFireOnce"
+            );
+            assert_eq!(
+                decide(
+                    &binding(TriggerMode::AnalogRepeat, keyboard(KBD)),
+                    Down,
+                    slot
+                ),
+                TriggerDecision::SpawnFireOnce,
+            );
+            assert_eq!(
+                decide(
+                    &binding(TriggerMode::AnalogRepeat, keyboard(KBD)),
+                    Repeat,
+                    slot
+                ),
+                TriggerDecision::SpawnFireOnce,
+            );
+        }
+        // The overlap guard still blocks a genuinely in-flight firing.
+        assert_eq!(
+            decide(
+                &binding(TriggerMode::FireOnce, keyboard(KBD)),
+                Down,
+                Some(Slot::FiringUnfinished),
+            ),
+            TriggerDecision::Nothing,
+        );
     }
 
     #[test]
     fn overlap_guard_only_blocks_on_an_unfinished_firing() {
+        let no_macros: HashMap<MacroId, MacroDef> = HashMap::new();
+        let decide =
+            |b: &Binding, s: EventState, slot: Option<Slot>| super::decide(b, &no_macros, s, slot);
+        // A single keyboard key's Hold-to-repeat `Down` is a guarded
+        // `HoldKeyDown` — the guard mechanism is what's under test here.
         let htr = binding(TriggerMode::HoldToRepeat, keyboard(KBD));
+        let proceed = TriggerDecision::HoldKeyDown(Modifiers::default(), KBD);
         assert_eq!(
             decide(&htr, EventState::Down, Some(Slot::FiringUnfinished)),
             TriggerDecision::Nothing
         );
         assert_eq!(
             decide(&htr, EventState::Down, Some(Slot::FiringFinished)),
-            TriggerDecision::SpawnFireOnce
+            proceed
         );
-        assert_eq!(
-            decide(&htr, EventState::Down, None),
-            TriggerDecision::SpawnFireOnce
-        );
+        assert_eq!(decide(&htr, EventState::Down, None), proceed);
         // A Toggle slot does not block a fresh individual fire (the guard
         // only ever inspected the firings map).
-        assert_eq!(
-            decide(&htr, EventState::Down, Some(Slot::Toggle)),
-            TriggerDecision::SpawnFireOnce
+        assert_eq!(decide(&htr, EventState::Down, Some(Slot::Toggle)), proceed);
+    }
+
+    /// The one place ticket 03's wiring is *not* verbatim-unchanged: a Macro
+    /// that compiles to a single mouse-button press used to classify as
+    /// `sustained_hold_key`'s `None` (Macro ⇒ never sustained) and loop /
+    /// pulse; ticket 02's `hold_repeat_kind` deliberately made a single-key
+    /// Macro classify like the equivalent Keypress, so it is now
+    /// `SustainedNoRepeat(BTN_LEFT)` and takes the latched-hold arms — exactly
+    /// what `keyboard(MOUSE)` already does. A `Keypress` on `BTN_LEFT` can
+    /// never itself be a Macro, so no keyboard-key path regresses. Locked here
+    /// so ticket 04+ don't silently move it again.
+    #[test]
+    fn single_mouse_button_macro_takes_the_sustained_hold_arms_like_the_equivalent_keypress() {
+        use crate::config::MacroStepDto;
+        use EventState::{Down, Repeat};
+        let macros = macros_with(
+            "hold-click",
+            vec![MacroStepDto::KeyDown(MOUSE), MacroStepDto::KeyUp(MOUSE)],
         );
+        let decide =
+            |b: &Binding, s: EventState, slot: Option<Slot>| super::decide(b, &macros, s, slot);
+
+        let mac_htr = binding(TriggerMode::HoldToRepeat, macro_action("hold-click"));
+        let kbd_htr = binding(TriggerMode::HoldToRepeat, keyboard(MOUSE));
+        assert_eq!(
+            decide(&mac_htr, Down, None),
+            decide(&kbd_htr, Down, None),
+            "== the equivalent mouse-button Keypress"
+        );
+        assert_eq!(
+            decide(&mac_htr, Down, None),
+            TriggerDecision::HoldKeyDown(Modifiers::default(), MOUSE)
+        );
+        assert_eq!(decide(&mac_htr, Repeat, None), TriggerDecision::Nothing);
+
+        let mac_tg = binding(TriggerMode::Toggle, macro_action("hold-click"));
+        assert_eq!(
+            decide(&mac_tg, Down, None),
+            TriggerDecision::StartToggleHeld(MOUSE),
+        );
+    }
+
+    fn macro_action(id: &str) -> Action {
+        Action::Macro {
+            macro_id: MacroId::from(id),
+        }
+    }
+
+    fn macros_with(
+        id: &str,
+        steps: Vec<crate::config::MacroStepDto>,
+    ) -> HashMap<MacroId, MacroDef> {
+        let mut macros = HashMap::new();
+        macros.insert(
+            MacroId::from(id),
+            MacroDef {
+                name: id.to_string(),
+                steps,
+            },
+        );
+        macros
+    }
+
+    #[test]
+    fn hold_repeat_kind_classifies_keypress_controller_and_step() {
+        let no_macros: HashMap<MacroId, MacroDef> = HashMap::new();
+
+        // keyboard Keypress, plain + modified → AutorepeatKey off the action.
+        assert_eq!(
+            hold_repeat_kind(&keyboard(KBD), &no_macros),
+            Some(HoldKind::AutorepeatKey(Modifiers::default(), KBD))
+        );
+        let mods = Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            hold_repeat_kind(
+                &Action::Keypress {
+                    modifiers: mods,
+                    key: KBD,
+                },
+                &no_macros
+            ),
+            Some(HoldKind::AutorepeatKey(mods, KBD))
+        );
+
+        // mouse-button Keypress and ControllerButton → SustainedNoRepeat.
+        assert_eq!(
+            hold_repeat_kind(&keyboard(MOUSE), &no_macros),
+            Some(HoldKind::SustainedNoRepeat(MOUSE))
+        );
+        assert_eq!(
+            hold_repeat_kind(&Action::ControllerButton { button: PAD }, &no_macros),
+            Some(HoldKind::SustainedNoRepeat(PAD))
+        );
+
+        // Step → None (multi-step: each Repeat targets a different item).
+        assert_eq!(
+            hold_repeat_kind(
+                &Action::Step {
+                    stepper: StepperId::from("s"),
+                    direction: crate::config::StepDirection::Forward,
+                },
+                &no_macros
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn hold_repeat_kind_single_key_macro_matches_the_equivalent_keypress() {
+        use crate::config::MacroStepDto;
+        let macros = macros_with(
+            "hold-x",
+            vec![
+                MacroStepDto::KeyDown(KeyCode::KEY_X),
+                MacroStepDto::KeyUp(KeyCode::KEY_X),
+            ],
+        );
+
+        let via_macro = hold_repeat_kind(&macro_action("hold-x"), &macros);
+        assert_eq!(
+            via_macro,
+            hold_repeat_kind(&keyboard(KeyCode::KEY_X), &macros),
+            "a single-key Macro classifies exactly like the equivalent Keypress"
+        );
+        assert_eq!(
+            via_macro,
+            Some(HoldKind::AutorepeatKey(
+                Modifiers::default(),
+                KeyCode::KEY_X
+            ))
+        );
+    }
+
+    #[test]
+    fn hold_repeat_kind_single_mouse_button_macro_matches_the_equivalent_keypress() {
+        // A macro step accepts any `KeyCode`, `BTN_*` included — a single
+        // mouse-button macro must classify as `SustainedNoRepeat`, exactly
+        // like the equivalent mouse-button Keypress, not as an autorepeat key
+        // (the kernel never autorepeats `BTN_*`).
+        use crate::config::MacroStepDto;
+        let macros = macros_with(
+            "hold-click",
+            vec![MacroStepDto::KeyDown(MOUSE), MacroStepDto::KeyUp(MOUSE)],
+        );
+
+        let via_macro = hold_repeat_kind(&macro_action("hold-click"), &macros);
+        assert_eq!(
+            via_macro,
+            hold_repeat_kind(&keyboard(MOUSE), &macros),
+            "a single mouse-button Macro classifies like the equivalent Keypress"
+        );
+        assert_eq!(via_macro, Some(HoldKind::SustainedNoRepeat(MOUSE)));
+    }
+
+    #[test]
+    fn hold_repeat_kind_multi_step_macro_is_none() {
+        use crate::config::MacroStepDto;
+        let macros = macros_with(
+            "combo",
+            vec![
+                MacroStepDto::KeyDown(KeyCode::KEY_A),
+                MacroStepDto::KeyUp(KeyCode::KEY_A),
+                MacroStepDto::KeyDown(KeyCode::KEY_B),
+                MacroStepDto::KeyUp(KeyCode::KEY_B),
+            ],
+        );
+        assert_eq!(hold_repeat_kind(&macro_action("combo"), &macros), None);
     }
 }
 
@@ -579,12 +1169,18 @@ mod slots {
         }
 
         fn deps(&mut self) -> PerformDeps<'_> {
+            self.deps_with_dwell(true)
+        }
+
+        fn deps_with_dwell(&mut self, fire_once_key_dwell: bool) -> PerformDeps<'_> {
             PerformDeps {
                 injector: &self.inj,
                 macros: &self.macros,
                 steppers: &self.steppers,
                 cursors: &mut self.cursors,
                 toggle_lap_target: executor::MIN_TOGGLE_LAP,
+                toggle_autorepeat_schedule: RepeatSchedule::new(250, 33),
+                fire_once_key_dwell,
             }
         }
 
@@ -728,10 +1324,28 @@ mod slots {
         assert!(is_firing(slots.snapshot().get(&20).copied()));
 
         slots
-            .perform(TriggerDecision::HoldKeyDown(BTN), 30, &binding, fx.deps())
+            .perform(
+                TriggerDecision::HoldKeyDown(Modifiers::default(), BTN),
+                30,
+                &binding,
+                fx.deps(),
+            )
             .await
             .unwrap();
         assert!(is_firing(slots.slot(&30)), "HoldKeyDown → the firings map");
+
+        // RepeatKey is stateless — no firings / toggles entry for its key.
+        slots
+            .perform(
+                TriggerDecision::RepeatKey(KeyCode::KEY_A),
+                35,
+                &binding,
+                fx.deps(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(slots.slot(&35), None, "RepeatKey touches neither map");
+        assert!(!slots.snapshot().contains_key(&35));
 
         slots
             .perform(TriggerDecision::StartToggleLoop, 40, &binding, fx.deps())
@@ -756,6 +1370,21 @@ mod slots {
             slots.slot(&50),
             Some(Slot::Toggle),
             "StartToggleHeld → the toggles map"
+        );
+
+        slots
+            .perform(
+                TriggerDecision::StartToggleAutorepeat(Modifiers::default(), KeyCode::KEY_A),
+                60,
+                &binding,
+                fx.deps(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            slots.slot(&60),
+            Some(Slot::Toggle),
+            "StartToggleAutorepeat → the toggles map"
         );
 
         slots.stop_all_toggles().await;
@@ -799,7 +1428,12 @@ mod slots {
 
         // A bare unbalanced KeyDown — the sustained-hold shape.
         slots
-            .perform(TriggerDecision::HoldKeyDown(BTN), K, &binding, fx.deps())
+            .perform(
+                TriggerDecision::HoldKeyDown(Modifiers::default(), BTN),
+                K,
+                &binding,
+                fx.deps(),
+            )
             .await
             .unwrap();
         for _ in 0..10 {
@@ -823,6 +1457,308 @@ mod slots {
             fx.key_events(),
             vec![(BTN, 1), (BTN, 0)],
             "the stuck KeyDown is now balanced by a force-released KeyUp"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn perform_hold_key_down_with_modifiers_presses_and_force_releases_the_whole_chord() {
+        // Spec §3.1: a modifier-wrapped single key holds each modifier
+        // `value=1` alongside the base key (no `KeyUp`s) — only `code` goes on
+        // to autorepeat — and `ForceReleaseStuck` on the physical `Up` drains
+        // the whole `held` set, key and modifiers together.
+        let mut fx = Fixture::new();
+        let binding = kbd_binding();
+        let mut slots: Slots<Key> = Slots::default();
+
+        let mods = Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        };
+        slots
+            .perform(
+                TriggerDecision::HoldKeyDown(mods, KeyCode::KEY_A),
+                K,
+                &binding,
+                fx.deps(),
+            )
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fx.key_events(),
+            vec![(KeyCode::KEY_LEFTCTRL, 1), (KeyCode::KEY_A, 1)],
+            "modifier held value=1 alongside the base key, no KeyUps"
+        );
+
+        slots
+            .perform(TriggerDecision::ForceReleaseStuck, K, &binding, fx.deps())
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let events = fx.key_events();
+        assert_eq!(events.len(), 4, "two presses, then two force-released ups");
+        assert!(
+            events[2..].contains(&(KeyCode::KEY_LEFTCTRL, 0))
+                && events[2..].contains(&(KeyCode::KEY_A, 0)),
+            "both the base key and its modifier are released: {events:?}"
+        );
+    }
+
+    /// Ticket 12: a Fire-once `D::SpawnFireOnce` whose compiled steps are a
+    /// single held key is re-compiled through `executor::fire_once_key_steps`,
+    /// so the key is genuinely held for `FIRE_ONCE_KEY_DWELL` between its
+    /// edges rather than emitting a near-zero-dwell `[Down, Up]` pair.
+    #[tokio::test(start_paused = true)]
+    async fn perform_fire_once_single_key_holds_the_key_for_the_spliced_dwell() {
+        let mut fx = Fixture::new();
+        let binding = kbd_binding(); // FireOnce, KEY_A, no modifiers
+        let mut slots: Slots<Key> = Slots::default();
+
+        tokio::task::yield_now().await;
+        slots
+            .perform(TriggerDecision::SpawnFireOnce, K, &binding, fx.deps())
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fx.key_events(),
+            vec![(KeyCode::KEY_A, 1)],
+            "only the Down until the spliced dwell elapses"
+        );
+
+        tokio::time::advance(executor::FIRE_ONCE_KEY_DWELL).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fx.key_events(),
+            vec![(KeyCode::KEY_A, 1), (KeyCode::KEY_A, 0)],
+            "the Up lands exactly one dwell later"
+        );
+    }
+
+    /// The dwell is off on the `stage::Engine` path (`fire_once_key_dwell:
+    /// false`) — a deep-stage / `RepressPrimary` fire is machine-sequenced,
+    /// not a user one-shot. There, and there only, a Fire-once single key
+    /// emits the bare back-to-back pair.
+    #[tokio::test(start_paused = true)]
+    async fn perform_fire_once_single_key_skips_the_dwell_when_disabled() {
+        let mut fx = Fixture::new();
+        let binding = kbd_binding();
+        let mut slots: Slots<Key> = Slots::default();
+
+        tokio::task::yield_now().await;
+        slots
+            .perform(
+                TriggerDecision::SpawnFireOnce,
+                K,
+                &binding,
+                fx.deps_with_dwell(false),
+            )
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fx.key_events(),
+            vec![(KeyCode::KEY_A, 1), (KeyCode::KEY_A, 0)],
+            "no spliced dwell — both edges land back to back"
+        );
+    }
+
+    /// A multi-step Macro fired once keeps its author's cadence — `single_
+    /// held_key` is `None`, so no dwell is spliced (the Macro exception holds
+    /// by shape, ticket 12 §2).
+    #[tokio::test(start_paused = true)]
+    async fn perform_fire_once_multi_step_macro_carries_no_dwell() {
+        let mut fx = Fixture::new();
+        fx.macros.insert(
+            MacroId::from("combo"),
+            MacroDef {
+                name: "combo".to_string(),
+                steps: vec![
+                    crate::config::MacroStepDto::KeyDown(KeyCode::KEY_A),
+                    crate::config::MacroStepDto::KeyUp(KeyCode::KEY_A),
+                    crate::config::MacroStepDto::KeyDown(KeyCode::KEY_B),
+                    crate::config::MacroStepDto::KeyUp(KeyCode::KEY_B),
+                ],
+            },
+        );
+        let binding = Binding {
+            trigger: TriggerMode::FireOnce,
+            action: Action::Macro {
+                macro_id: MacroId::from("combo"),
+            },
+        };
+        let mut slots: Slots<Key> = Slots::default();
+
+        tokio::task::yield_now().await;
+        slots
+            .perform(TriggerDecision::SpawnFireOnce, K, &binding, fx.deps())
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fx.key_events(),
+            vec![
+                (KeyCode::KEY_A, 1),
+                (KeyCode::KEY_A, 0),
+                (KeyCode::KEY_B, 1),
+                (KeyCode::KEY_B, 0),
+            ],
+            "multi-step Macro runs its steps back to back, no spliced dwell"
+        );
+    }
+
+    /// Ticket 12 §6, the remaining in-scope shapes that reach `D::SpawnFireOnce`
+    /// through a compile path other than a plain `Action::Keypress` — each still
+    /// resolves to a single held key, so `perform` splices exactly one
+    /// `FIRE_ONCE_KEY_DWELL` between the edges:
+    ///   - a Fire-once single-key `Macro` (`[KeyDown, KeyUp]`, no `Delay`);
+    ///   - a Fire-once Stepper `Key` step;
+    ///   - a Fire-once Chord whose Action is a single key.
+    /// Asserted the same way as `perform_fire_once_single_key_holds_the_key_for_
+    /// the_spliced_dwell`: only the Down until the dwell elapses, the Up exactly
+    /// one dwell later.
+    #[tokio::test(start_paused = true)]
+    async fn perform_fire_once_single_key_macro_holds_the_key_for_the_spliced_dwell() {
+        let mut fx = Fixture::new();
+        fx.macros.insert(
+            MacroId::from("hold-a"),
+            MacroDef {
+                name: "hold-a".to_string(),
+                steps: vec![
+                    crate::config::MacroStepDto::KeyDown(KeyCode::KEY_A),
+                    crate::config::MacroStepDto::KeyUp(KeyCode::KEY_A),
+                ],
+            },
+        );
+        let binding = Binding {
+            trigger: TriggerMode::FireOnce,
+            action: Action::Macro {
+                macro_id: MacroId::from("hold-a"),
+            },
+        };
+        let mut slots: Slots<Key> = Slots::default();
+
+        tokio::task::yield_now().await;
+        slots
+            .perform(TriggerDecision::SpawnFireOnce, K, &binding, fx.deps())
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fx.key_events(),
+            vec![(KeyCode::KEY_A, 1)],
+            "single-key Macro: only the Down until the spliced dwell elapses"
+        );
+
+        tokio::time::advance(executor::FIRE_ONCE_KEY_DWELL).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fx.key_events(),
+            vec![(KeyCode::KEY_A, 1), (KeyCode::KEY_A, 0)],
+            "single-key Macro: the Up lands exactly one dwell later"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn perform_fire_once_single_key_stepper_step_holds_the_key_for_the_spliced_dwell() {
+        let mut fx = Fixture::new();
+        fx.steppers.insert(
+            StepperId::from("s"),
+            StepperDef {
+                name: "s".to_string(),
+                items: vec![crate::config::StepperItem::Key {
+                    key: KeyCode::KEY_A,
+                    modifiers: Modifiers::default(),
+                }],
+            },
+        );
+        let binding = Binding {
+            trigger: TriggerMode::FireOnce,
+            action: Action::Step {
+                stepper: StepperId::from("s"),
+                direction: crate::config::StepDirection::Forward,
+            },
+        };
+        let mut slots: Slots<Key> = Slots::default();
+
+        tokio::task::yield_now().await;
+        slots
+            .perform(TriggerDecision::SpawnFireOnce, K, &binding, fx.deps())
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fx.key_events(),
+            vec![(KeyCode::KEY_A, 1)],
+            "Stepper `Key` step: only the Down until the spliced dwell elapses"
+        );
+
+        tokio::time::advance(executor::FIRE_ONCE_KEY_DWELL).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fx.key_events(),
+            vec![(KeyCode::KEY_A, 1), (KeyCode::KEY_A, 0)],
+            "Stepper `Key` step: the Up lands exactly one dwell later"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn perform_fire_once_single_key_chord_holds_the_key_for_the_spliced_dwell() {
+        use crate::config::ChordKey;
+        use crate::input::Input;
+
+        let mut fx = Fixture::new();
+        let binding = kbd_binding(); // FireOnce, KEY_A — a Chord's single-key Action
+        let chord_key = ChordKey::new([Input::Grid(1, 1), Input::Grid(1, 2)].into_iter().collect());
+        let mut slots: Slots<ChordKey> = Slots::default();
+
+        tokio::task::yield_now().await;
+        slots
+            .perform(
+                TriggerDecision::SpawnFireOnce,
+                chord_key,
+                &binding,
+                fx.deps(),
+            )
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fx.key_events(),
+            vec![(KeyCode::KEY_A, 1)],
+            "single-key Chord: only the Down until the spliced dwell elapses"
+        );
+
+        tokio::time::advance(executor::FIRE_ONCE_KEY_DWELL).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fx.key_events(),
+            vec![(KeyCode::KEY_A, 1), (KeyCode::KEY_A, 0)],
+            "single-key Chord: the Up lands exactly one dwell later"
         );
     }
 

@@ -448,19 +448,26 @@ pub struct DeepStageConfig {
     pub mode: StagingMode,
 }
 
-/// CONTEXT.md: Staging mode. The four staging modes governing how a grid
+/// CONTEXT.md: Staging mode. The three staging modes governing how a grid
 /// key's primary and deep stages hand off as Depth crosses the deep band.
 /// `Default = Handoff` — the canonical "camera shutter" mode — so
 /// `SetDeepActuation`/`SetStagingMode` can `.entry(input).or_default()` into
 /// a fresh `DeepStageConfig` without special-casing which field arrived
 /// first.
+///
+/// A fourth mode, **Additive** (both stages held at once), was removed in
+/// `humane-output-rate` ticket 13 — a real keyboard autorepeats only the
+/// most-recently-pressed key, so two held autorepeating keys is a shape no
+/// physical keyboard produces (ADR-0009). An existing `config.toml` carrying
+/// `mode = "additive"` is refused at load with
+/// `ConfigError::RemovedStagingModeAdditive` (see `find_removed_additive_staging`),
+/// not silently downgraded.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StagingMode {
     #[default]
     Handoff,
     NoReturn,
-    Additive,
     QuickSkip,
 }
 
@@ -980,6 +987,17 @@ pub enum ConfigError {
     /// discrete member-set completion, not a single grid key's continuous
     /// Depth, mirroring `InvalidChordProfileSwitch`'s exact precedent.
     InvalidChordAnalogRepeat,
+    /// A grid-key Binding whose trigger is `AnalogRepeat` and whose `Action`
+    /// is `Action::Macro` (humane-output-rate ticket 09) —
+    /// `analog_repeat::fire_analog_repeat_pulse` collapses a multi-step Macro
+    /// to a single simultaneous pulse, ignoring every embedded
+    /// `MacroStep::Delay`, so the combination has no coherent meaning. Ticket
+    /// 03 chose an outright ban over inventing semantics for it. The string is
+    /// the offending Input's `Display` form, like `AnalogRepeatOnDualStageKey`.
+    /// (A non-grid Input trips `InvalidAnalogRepeatInput` first; a Chord
+    /// Binding trips `InvalidChordAnalogRepeat` first — this variant is
+    /// reachable only where `analog_repeat` is otherwise legal.)
+    AnalogRepeatMacro(String),
     /// A `default_actuation` or `actuation_overrides` entry whose `release`
     /// point is not strictly below its `actuation` point (ticket 04) —
     /// `release >= actuation` defeats hysteresis entirely: a key held at a
@@ -1047,6 +1065,13 @@ pub enum ConfigError {
     /// `deep_base`/`deep_held` Binding on that same Layer — a Chord member
     /// cannot have a deep stage.
     ChordMemberDeepStageConflict(String),
+    /// A `deep_stages.<input>.mode = "additive"` entry — the Additive Staging
+    /// mode was removed (`humane-output-rate` ticket 13 / ADR-0009: a real
+    /// keyboard can't hold two autorepeating keys). Caught by the raw-TOML
+    /// scan (`find_removed_additive_staging`) ahead of the typed deserialize
+    /// so the error names Additive rather than surfacing as serde's generic
+    /// "unknown variant `additive`". Carries a dotted breadcrumb per hit.
+    RemovedStagingModeAdditive(Vec<String>),
 }
 
 impl fmt::Display for ConfigError {
@@ -1115,6 +1140,11 @@ impl fmt::Display for ConfigError {
                 "config.toml contains an old-style inline Action::Macro Binding (from before named macros were introduced) at: {} — replace each one with {{ type = \"macro\", macro_id = \"...\" }} referencing an entry under [macros.*], or recreate the Binding from the GUI",
                 paths.join(", ")
             ),
+            ConfigError::RemovedStagingModeAdditive(paths) => write!(
+                f,
+                "config.toml uses the Additive staging mode, which has been removed (a real keyboard can't hold two autorepeating keys — see ADR-0009), at: {} — rebind the deep stage to Handoff, No-Return, or Quick-Skip, or move the \"press two things\" behaviour into a Macro bound to the deep stage",
+                paths.join(", ")
+            ),
             ConfigError::InvalidAnalogRepeatInput(input) => write!(
                 f,
                 "an analog_repeat trigger on {input:?} is not allowed — only Grid Inputs can carry one"
@@ -1122,6 +1152,12 @@ impl fmt::Display for ConfigError {
             ConfigError::InvalidChordAnalogRepeat => {
                 write!(f, "a Chord Binding's trigger cannot be analog_repeat")
             }
+            ConfigError::AnalogRepeatMacro(input) => write!(
+                f,
+                "an analog_repeat trigger on the Macro Binding for {input:?} is not allowed — \
+                 Analog-repeat collapses a multi-step Macro to a single simultaneous pulse \
+                 (its Delay steps ignored); change the trigger mode"
+            ),
             ConfigError::ReleaseNotBelowActuation(locus) => write!(
                 f,
                 "the actuation point for {locus} has its release point at or above its actuation point (defeats hysteresis)"
@@ -1228,6 +1264,38 @@ fn find_legacy_macro_bindings(value: &toml::Value) -> Vec<String> {
     out
 }
 
+/// Walks `value` for a `deep_stages.<input>.mode = "additive"` entry — the
+/// Additive Staging mode, removed in `humane-output-rate` ticket 13 (ADR-0009:
+/// a real keyboard can't hold two autorepeating keys). Run against the raw
+/// TOML ahead of the strongly-typed deserialize — which, with `Additive` gone
+/// from `enum StagingMode`, would otherwise reject `"additive"` as serde's
+/// generic "unknown variant" — so the error names the removed mode and points
+/// the user at a fix. Returns a dotted breadcrumb per hit (e.g.
+/// `profiles.Default.deep_stages.grid_r1c1`).
+fn find_removed_additive_staging(value: &toml::Value) -> Vec<String> {
+    fn walk(value: &toml::Value, path: &str, out: &mut Vec<String>) {
+        let toml::Value::Table(table) = value else {
+            return;
+        };
+        let in_deep_stage = path.contains(".deep_stages.");
+        if in_deep_stage && table.get("mode").and_then(toml::Value::as_str) == Some("additive") {
+            out.push(path.to_string());
+            return;
+        }
+        for (key, child) in table {
+            let child_path = if path.is_empty() {
+                key.clone()
+            } else {
+                format!("{path}.{key}")
+            };
+            walk(child, &child_path, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(value, "", &mut out);
+    out
+}
+
 fn parse(contents: &str) -> Result<Config, ConfigError> {
     // Checked separately (and first) so a version mismatch is reported as
     // such, rather than surfacing as whatever generic deserialize error a
@@ -1244,6 +1312,13 @@ fn parse(contents: &str) -> Result<Config, ConfigError> {
     let legacy_macro_bindings = find_legacy_macro_bindings(&value);
     if !legacy_macro_bindings.is_empty() {
         return Err(ConfigError::LegacyInlineMacroBinding(legacy_macro_bindings));
+    }
+
+    let removed_additive_staging = find_removed_additive_staging(&value);
+    if !removed_additive_staging.is_empty() {
+        return Err(ConfigError::RemovedStagingModeAdditive(
+            removed_additive_staging,
+        ));
     }
 
     let config: Config = toml::from_str(contents).map_err(ConfigError::Parse)?;
@@ -2195,6 +2270,52 @@ action = { type = "macro", steps = [{ key_down = "KEY_A" }, { key_up = "KEY_A" }
     }
 
     #[test]
+    fn refuses_to_start_on_a_removed_additive_staging_mode_and_names_it() {
+        // humane-output-rate ticket 13 / ADR-0009: the Additive staging mode
+        // was removed. A config.toml still carrying `mode = "additive"` must
+        // surface as a specific, actionable error naming Additive — not
+        // serde's generic "unknown variant `additive`" — and must not be
+        // silently downgraded to Handoff.
+        let (_dir, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"schema_version = 1
+active_profile = "Default"
+
+[profiles.Default]
+default_actuation = { actuation = 128, release = 112 }
+
+[profiles.Default.base.grid_r1c1]
+trigger = "hold_to_repeat"
+action = { type = "keypress", key = "KEY_W" }
+
+[profiles.Default.deep_base.grid_r1c1]
+trigger = "hold_to_repeat"
+action = { type = "keypress", key = "KEY_E" }
+
+[profiles.Default.deep_stages.grid_r1c1]
+actuation = { actuation = 220, release = 200 }
+mode = "additive"
+"#;
+        fs::write(&path, original).unwrap();
+
+        let err =
+            load_or_seed(&path).expect_err("a removed Additive staging mode must refuse to start");
+        assert!(matches!(
+            err,
+            ConfigError::RemovedStagingModeAdditive(paths)
+                if paths == vec!["profiles.Default.deep_stages.grid_r1c1".to_string()]
+        ));
+        let message = load_or_seed(&path).unwrap_err().to_string();
+        assert!(
+            message.contains("Additive"),
+            "message must name Additive: {message}"
+        );
+
+        // Refused, not silently downgraded — the file on disk is untouched.
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
     fn parses_a_macro_binding_shape() {
         let toml = r#"
 schema_version = 1
@@ -2869,6 +2990,38 @@ action = { type = "keypress", key = "KEY_A" }
         let err =
             load_or_seed(&path).expect_err("an Analog-repeat Chord Binding must refuse to start");
         assert!(matches!(err, ConfigError::InvalidChordAnalogRepeat));
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn refuses_to_start_when_an_analog_repeat_grid_binding_wraps_a_macro() {
+        // humane-output-rate ticket 09: Analog-repeat collapses a multi-step
+        // Macro to one simultaneous pulse, so the combo is banned outright —
+        // no silent coercion, the Daemon refuses to start.
+        let (_dir, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"schema_version = 1
+active_profile = "Default"
+
+[macros.spin]
+name = "Spin"
+steps = [
+  { key_down = "KEY_A" }, { delay_ms = 40 }, { key_up = "KEY_A" },
+]
+
+[profiles.Default.base.grid_r1c1]
+trigger = "analog_repeat"
+action = { type = "macro", macro_id = "spin" }
+"#;
+        fs::write(&path, original).unwrap();
+
+        let err = load_or_seed(&path)
+            .expect_err("an Analog-repeat Binding wrapping a Macro must refuse to start");
+        assert!(
+            matches!(&err, ConfigError::AnalogRepeatMacro(input) if input == "grid_r1c1"),
+            "got {err:?}"
+        );
 
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }

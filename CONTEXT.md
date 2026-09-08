@@ -63,7 +63,7 @@ A per-Input, per-Layer assignment, structurally independent of Binding/Action, t
 _Avoid_: Action (Axis assignment is a parallel concept, not an Action variant — see Action), Controller (reserved for the discrete-button Action)
 
 **Trigger mode**:
-Governs how a Binding fires once its Input is pressed. One of Fire-once, Hold-to-repeat, Toggle, or Analog-repeat. Applies to every Binding, regardless of whether its Action is a Keypress or a Macro — except a Stepper's forward/backward Bindings, which disallow Toggle (there is no coherent continuously-running state for a cursor advance the way there is for a held Keypress or a looping Macro), and a Controller button Binding, which disallows Fire-once (ticket 78's Answer: Hold-to-repeat's sustained-hold behavior already covers a quick tap, and no real gamepad button press is decoupled from physical hold duration the way Fire-once's invented pulse is by design). Analog-repeat is further restricted to grid-key Bindings only, since it requires Depth.
+Governs how a Binding fires once its Input is pressed. One of Fire-once, Hold-to-repeat, Toggle, or Analog-repeat. Applies to every Binding, regardless of whether its Action is a Keypress or a Macro — except a Stepper's forward/backward Bindings, which disallow Toggle (there is no coherent continuously-running state for a cursor advance the way there is for a held Keypress or a looping Macro), and a Controller button Binding, which disallows Fire-once (ticket 78's Answer: Hold-to-repeat's sustained-hold behavior already covers a quick tap, and no real gamepad button press is decoupled from physical hold duration the way Fire-once's invented pulse is by design), and an Analog-repeat Binding, which disallows a Macro Action — Analog-repeat collapses a multi-step Macro to a single simultaneous pulse (its `Delay` steps ignored), so the combination has no coherent meaning (ticket 09). Analog-repeat is further restricted to grid-key Bindings only, since it requires Depth.
 _Avoid_: trigger type, activation mode
 
 **Fire-once**:
@@ -73,7 +73,7 @@ The Trigger mode where the Action fires exactly once per physical press.
 The Trigger mode where the Action re-fires continuously for as long as the Input is physically held.
 
 **Toggle**:
-The Trigger mode where a single press starts the Action running continuously (looping, for a Macro; held down, for a Keypress or a Controller button — ticket 78 gave Controller button the same sustained-hold treatment already given a mouse-button Keypress, ticket 82, and Controller button's own Hold-to-repeat, ticket 75/76: no real gamepad button has a "turbo" Toggle mode any more than it autorepeats) until the same Input is pressed again.
+The Trigger mode where a single press starts the Action running continuously until the same Input is pressed again. What "running continuously" means depends on the Action: a multi-step Macro loops; a single keyboard key — a plain Keypress or a single-key Macro alike — is held as genuine kernel autorepeat (`value=1` then `value=2` on the live delay→period envelope, see Physical-plausibility ceiling); a mouse-button Keypress or a Controller button is held as one solid press with no repeat (ticket 78 gave Controller button the same sustained-hold treatment already given a mouse-button Keypress, ticket 82, and Controller button's own Hold-to-repeat, ticket 75/76: no real gamepad button has a "turbo" Toggle mode any more than it autorepeats).
 
 **Analog-repeat**:
 The Trigger mode, grid-key-only, where the Action re-fires at a rate that varies continuously with Depth — slower near the deadzone, faster near full travel — rather than at Hold-to-repeat's fixed cadence. Starts once Depth crosses a small fixed deadzone (deliberately *not* the key's own Actuation point, so the rate curve gets the key's full travel range) and holds the key down solid, without further tapping, above a fixed near-full-travel threshold. Falls back to plain Hold-to-repeat when the Daemon is in Digital Capture mode (no Depth available). User-facing feature name: "Simulated Analog Key-Interlacing," for keyboard-driven driving sims and similar games where a player would otherwise hand-interlace keypresses to steer or accelerate.
@@ -95,7 +95,7 @@ A `(ActuationPoint, Binding)` pair — an Actuation/Release point paired with a 
 _Avoid_: sub-binding, second binding, layer (Actuation stage is a depth concept, unrelated to the Base/Held Layer)
 
 **Staging mode**:
-A per-Input, per-Profile choice governing how a grid key's primary and deep Actuation stages hand off as Depth crosses the deep band: Handoff, No-Return, Additive, or Quick-Skip. Shared across Base and Held, like the deep stage's own Actuation point — it interprets physical travel, not what either stage does when triggered. A key with no deep stage has no meaningful Staging mode.
+A per-Input, per-Profile choice governing how a grid key's primary and deep Actuation stages hand off as Depth crosses the deep band: Handoff, No-Return, or Quick-Skip. Shared across Base and Held, like the deep stage's own Actuation point — it interprets physical travel, not what either stage does when triggered. A key with no deep stage has no meaningful Staging mode. (A fourth mode, Additive, was removed — ADR-0009.)
 _Avoid_: transition mode, handoff mode (reserved for the Handoff mode specifically)
 
 **Handoff**:
@@ -103,9 +103,6 @@ The Staging mode where crossing into the deep band releases the primary stage an
 
 **No-Return**:
 The Staging mode identical to Handoff on the way deeper, but the primary stage does not re-press on the way back up — once the deep stage has fired, the key stays quiet until fully released and pressed again.
-
-**Additive**:
-The Staging mode where both stages fire and are held simultaneously — reaching the deep band adds the deep stage's firing without releasing the primary.
 
 **Quick-Skip**:
 The Staging mode where the primary stage's Down is held back for a ~50ms window (the Chord-detection window's constant, reused): if the deep band is reached within that window, the primary is suppressed entirely for the rest of the press (never fires, and its eventual release does not fire it either — the release path behaves like No-Return); otherwise the primary fires late (delayed by up to the window) and the key runs as ordinary Handoff for the rest of the press. Costs up to 50ms of primary-Down latency by construction — the price of not knowing, at the moment of the primary crossing, whether the press will continue into the deep band.
@@ -135,3 +132,17 @@ _Avoid_: driver mode (the research/prototype write-ups' working name for Analog)
 **Output suppression**:
 A connected client's request that the Daemon withhold all synthetic output while the request is active, without stopping anything internally — Trigger-mode firing, Macro looping, and a Toggle's running state continue unaffected, and only the write to the physical device is withheld. Distinct from a Toggle *stopping*: a suppressed Toggle is still active and resumes emitting the instant suppression clears. The GUI additionally stops every Toggle outright on its own window gaining focus (`StopAllToggles`, a separate call the GUI makes alongside suppression, not a side effect of suppression itself) — see spec.md's "Toggle behavior across Layer/Profile switches" and "Daemon output suppression" sections.
 _Avoid_: pause, mute, disable (all imply something is stopped, not just withheld)
+
+**Physical-plausibility ceiling**:
+The ceiling on how fast the Daemon emits synthetic key/button events: no holding or repeating Action produces events faster than the Linux input stack does for a physically held key — the machine's configured kernel autorepeat delay/period (`analog::read_kernel_auto_repeat`, fallback 250 ms / 33 ms) — and a held mouse or gamepad button emits exactly one Down/Up with no repeat. A held or repeated single key presents as genuine kernel autorepeat (`value=1` then `value=2` on the real delay→period envelope), not a stream of Down/Up pairs. A canned one-shot keyboard press carries a fixed ~40 ms Down→Up dwell rather than a zero-dwell pair. A Macro is the sole deliberate exception: its author sequences Keypresses at any cadence, and only *trigger-driven Macro repetition* is floored (to `max(kernel period, MIN_TOGGLE_LAP)`); a Macro fired once and the keystroke cadence within one run are unrestricted, and Analog-repeat cannot wrap a Macro. Not a disguise — the `uinput` origin is always detectable (ADR-0008); the goal is plausibility of *rate*. The Daemon's compliance with this ceiling was audited surface by surface in `.scratch/humane-output-rate/`.
+_Avoid_: humane output rate (the working name of the effort that established this — `.scratch/humane-output-rate/`, not a domain term), humanization, anti-cheat evasion, input sanitisation, jitter
+
+### Interface
+
+**Toast label**:
+A transient one-shot notice in the GUI — a short highlighted line shown once, immediately after the action that triggered it, and cleared on the next redraw of that view. Reports what just happened (a Stepper list moved off its former Input pair; an axis target already claimed). Never blocks, has no dismiss control, does not reappear.
+_Avoid_: notification (reserve for OS-level), banner, alert, snackbar
+
+**GUI hint**:
+A persistent advisory line in the GUI, shown for as long as its condition holds and removed once it no longer applies — dim, inline, non-blocking, no dismiss control. Attaches a caveat to a choice the user currently has in effect (a Macro step targeting a controller button; Analog-repeat selected as a Trigger mode; the standing macro-editor caution, whose condition is simply "the Macro editor is open"). Distinct from a Toast label, which fires once and vanishes regardless of state.
+_Avoid_: tooltip (hover-only — a distinct thing), inline warning, disclaimer (the macro-editor line is one instance, not the general term)
