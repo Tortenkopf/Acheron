@@ -6175,6 +6175,72 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn dual_stage_quick_skip_late_primary_is_released_when_a_depth_tick_beats_the_real_up() {
+        // Ticket 13, second hole: the deadline elapses first, so the buffered
+        // Hold-to-repeat primary fires retroactively (`value=1`, `Late`). Then
+        // the coalescing `rx_depth` `{KEY: 0}` tick is serviced *before* the
+        // queued real primary `Up`: `update` runs the `Late -> None` row, whose
+        // lone `ReleasePrimary` it `continue`s past (the ordinary `rx_events`
+        // edge is meant to release it). But for a Quick-Skip key `feed` swallows
+        // that ordinary edge — so `end_quick_skip` must force-release the
+        // primary itself, or `value=1` latches forever (kernel autorepeat).
+        let config = dual_stage_config(
+            StagingMode::QuickSkip,
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let mut seam = Seam::new(config);
+
+        seam.feed(PhysicalEvent {
+            input: Input::Grid(1, 1),
+            state: EventState::Down,
+            depth: Some(150),
+        })
+        .await;
+        let deadline = seam.state.stage.next_deadline().expect("armed");
+
+        // Deadline elapses -> retroactive primary `value=1`, phase `Late`.
+        tokio::time::advance(Duration::from_millis(60)).await;
+        seam.state
+            .tick_stages(&seam.config, deadline + Duration::from_millis(1))
+            .await
+            .unwrap();
+        settle().await;
+        assert_eq!(
+            seam.sink
+                .batches()
+                .iter()
+                .map(|b| key_and_value(b[0]))
+                .collect::<Vec<_>>(),
+            vec![(evdev::KeyCode::KEY_A, 1)],
+            "the buffered Hold-to-repeat primary fired retroactively",
+        );
+
+        // The `{KEY: 0}` depth tick wins the race against the real `Up`.
+        seam.state
+            .update_stages(&seam.config, &HashMap::from([(Input::Grid(1, 1), 0)]))
+            .await
+            .unwrap();
+
+        // Now the real `Up` finally drains.
+        seam.feed(PhysicalEvent {
+            input: Input::Grid(1, 1),
+            state: EventState::Up,
+            depth: Some(0),
+        })
+        .await;
+
+        let batches = seam.finish().await;
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "the retroactively-fired primary must be released on the real Up, \
+             not left latched: {events:?}",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn dual_stage_quick_skip_skipped_then_outer_up_releases_the_deep_stage() {
         // Ticket 13's `Skipped` case: a fast full press skips the primary and
         // fires the deep stage, then the key is released in one report straight

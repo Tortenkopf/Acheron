@@ -141,7 +141,10 @@ is correct today and must stay correct).
 - [x] `tartarus-dual-stage-keys/spec.md` §"Quick-Skip's primary suppression"
       corrected.
 - [x] Existing `dual_stage_*` dispatch tests + `stage.rs` unit tests green
-      (daemon 544 pass); `cargo clippy --all-targets` / `cargo fmt --check` clean.
+      (daemon 545 pass); `cargo clippy --all-targets` / `cargo fmt --check` clean.
+- [x] Follow-up (see Comments): `end_quick_skip` also force-releases the primary
+      on every non-`Late` outer `Up`, closing the `Late → None` depth-race hole
+      where the retroactively-fired primary was left latched.
 
 ## Answer
 
@@ -162,3 +165,31 @@ Spec §"Quick-Skip's primary suppression" updated; also dropped the stale
 "Additive" naming in the sibling bullet (mode removed by ADR-0009).
 
 ## Comments
+
+### 2026-09-08 — follow-up: a second hole (Charon retested, primary still stuck)
+
+The first fix disarmed the `Armed` deadline but Charon's retest still showed a
+Hold-to-repeat primary latching. Root cause of the remainder: `feed` swallows
+**every** non-`Late` Quick-Skip edge for the ordinary Binding path, so its
+"leave a lone `FirePrimary` / `ReleasePrimary` to the real `rx_events` edge"
+contract (what `Engine::update` relies on when it `continue`s past a 1-op
+primary transition) does not hold for a Quick-Skip key. Race:
+
+1. deadline elapses first → `RepressPrimary` fires the buffered primary
+   (`value=1`, phase `Late`).
+2. the coalescing `rx_depth` `{KEY: 0}` tick is serviced before the queued real
+   `Up`: `update` runs the `Late → None` row, whose lone `ReleasePrimary` it
+   `continue`s past.
+3. real `Up` reaches `feed` → phase is now `None` → not `Late` → old
+   `end_quick_skip` early-returned on `quick_skip.is_none()` → `Handled(vec![])`.
+   The `value=1` is never balanced. **Stuck.**
+
+Fix: `end_quick_skip` now takes `&mut Slots<Input>` and **always**
+`individual.force_release(&input, injector)` after the phase/deep handling —
+the same op the ordinary `(_, Up)` path runs (`ForceReleaseStuck`), a no-op
+when the primary never fired (`Armed` / `Skipped`), idempotent otherwise.
+`update`'s lone-edge skip is left alone; `feed`'s edge is now the reliable
+release point. New regression test
+`dual_stage_quick_skip_late_primary_is_released_when_a_depth_tick_beats_the_real_up`
+(verified red without the `force_release`). daemon 545 green, clippy + fmt clean.
+Spec bullet expanded.

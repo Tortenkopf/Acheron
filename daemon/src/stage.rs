@@ -710,7 +710,7 @@ impl Engine {
     /// | non-Quick-Skip primary `Down` (Handoff / No-Return) | `NotMine { true }` |
     /// | Quick-Skip `Down` | `Handled` — `begin_quick_skip` arms or resolves Skipped |
     /// | Quick-Skip `Repeat` while `Armed` / `Skipped` | `Handled(vec![])` — swallowed |
-    /// | Quick-Skip `Up` while `Armed` / `Skipped` | `Handled(vec![])` — `end_quick_skip` disarms the deadline / releases the deep stage |
+    /// | Quick-Skip `Up` while `Armed` / `Skipped` / `None` | `Handled(vec![])` — `end_quick_skip` disarms the deadline, releases the deep stage, force-releases the primary |
     /// | Quick-Skip `Up` / `Repeat` once `Late` | runs the general rows (plain Handoff) |
     /// | any mode, `Repeat`, primary handed off to deep | drive deep repeat, `Handled(vec![])` |
     /// | any mode, `Repeat`, primary **not** handed off | drive deep repeat, `NotMine { true }` |
@@ -764,8 +764,10 @@ impl Engine {
                     // coalescing `rx_depth` tick, which a quick shallow tap can
                     // race past entirely, leaving the deadline to misfire
                     // `RepressPrimary` into a press with no release edge left
-                    // (`tartarus-dual-stage-keys` ticket 13).
-                    self.end_quick_skip(deps.injector, event.input).await?;
+                    // (`tartarus-dual-stage-keys` ticket 13). Also force-
+                    // releases the primary itself — see `end_quick_skip`.
+                    self.end_quick_skip(deps.individual, deps.injector, event.input)
+                        .await?;
                     return Ok(StageOutcome::Handled(Vec::new()));
                 }
                 // `Late`: the deadline already fired the primary retroactively,
@@ -920,46 +922,62 @@ impl Engine {
     /// only real `Up` was already consumed, latching the primary down
     /// (kernel autorepeat, permanent under a Hold-to-repeat primary).
     ///
-    /// A no-op unless a Quick-Skip phase is actually live: `None` means an
-    /// `rx_depth` cancel tick already ran the pure core's
-    /// `((Down, Up), (Up, Up)) => (vec![], None)` row (kept as a harmless
-    /// idempotent double-confirm) or the key was never armed. Otherwise it
-    /// drives the pure core with `next == (Up, Up)` — dropping the phase to
-    /// `None` (which disarms `next_deadline`) and, for a `Skipped` key still
-    /// in the deep band on a 1-report skip straight to released, releasing the
-    /// deep stage (No-Return's release shape — the primary was suppressed for
-    /// the whole press and is never touched). The `Late` fall-through never
-    /// reaches here: `feed`'s `is_late` guard sends a `Late` key's real `Up`
-    /// down the ordinary path so the retroactively-fired primary is released.
-    async fn end_quick_skip(&mut self, injector: &Injector, input: Input) -> io::Result<()> {
+    /// When a Quick-Skip phase is live (`Armed` / `Skipped`) it drives the
+    /// pure core with `next == (Up, Up)` — dropping the phase to `None` (which
+    /// disarms `next_deadline`) and, for a `Skipped` key still in the deep band
+    /// on a 1-report skip straight to released, releasing the deep stage
+    /// (No-Return's release shape — the primary was suppressed for the whole
+    /// press and is never touched). `None` on entry means an `rx_depth` cancel
+    /// tick already ran the pure core's `((Down, Up), (Up, Up)) => (vec![],
+    /// None)` row (kept as a harmless idempotent double-confirm), or the key
+    /// was never armed.
+    ///
+    /// Either way it then **force-releases the primary** on `individual`. Every
+    /// Quick-Skip edge `feed` sees while not `Late` is swallowed for the
+    /// ordinary Binding path — so `feed`'s usual "leave a lone `FirePrimary` /
+    /// `ReleasePrimary` to the real `rx_events` edge" contract does *not* hold
+    /// for a Quick-Skip key. If the deadline fired a retroactive
+    /// `RepressPrimary` (`Late`) and an `rx_depth` `(Up, Up)` tick then raced
+    /// ahead of this real `Up` — clearing the phase to `None` and `continue`ing
+    /// past its own now-lone `ReleasePrimary` — nothing else would ever release
+    /// that held primary (kernel autorepeat, permanent under Hold-to-repeat).
+    /// `force_release` is the same op the ordinary `(_, Up)` path runs
+    /// (`ForceReleaseStuck`): a no-op when the primary never fired (`Armed` /
+    /// `Skipped`), and idempotent if the ordinary path did run.
+    async fn end_quick_skip(
+        &mut self,
+        individual: &mut Slots<Input>,
+        injector: &Injector,
+        input: Input,
+    ) -> io::Result<()> {
         let rt = self.runtime.entry(input).or_default();
-        if rt.quick_skip.is_none() {
-            return Ok(());
-        }
-        let prev = (to_band(rt.primary), to_band(rt.deep));
-        let (ops, phase) = advance(
-            prev,
-            (Band::Up, Band::Up),
-            StagingMode::QuickSkip,
-            rt.quick_skip,
-        );
-        rt.primary = KeyState::Up;
-        rt.deep = KeyState::Up;
-        rt.quick_skip = phase;
-        rt.primary_handed_off = false;
-        for op in ops {
-            match op {
-                StageOp::Nothing => {}
-                // No-Return's release shape — the primary was suppressed for
-                // the whole press (Skipped) and is never touched.
-                StageOp::ReleaseDeep => self.release_deep_slot(input, injector).await,
-                other => debug_assert!(
-                    false,
-                    "a Quick-Skip outer release only ever emits ReleaseDeep or \
-                     nothing, got {other:?}"
-                ),
+        if rt.quick_skip.is_some() {
+            let prev = (to_band(rt.primary), to_band(rt.deep));
+            let (ops, phase) = advance(
+                prev,
+                (Band::Up, Band::Up),
+                StagingMode::QuickSkip,
+                rt.quick_skip,
+            );
+            rt.primary = KeyState::Up;
+            rt.deep = KeyState::Up;
+            rt.quick_skip = phase;
+            rt.primary_handed_off = false;
+            for op in ops {
+                match op {
+                    StageOp::Nothing => {}
+                    // No-Return's release shape — the primary was suppressed
+                    // for the whole press (Skipped) and is never touched.
+                    StageOp::ReleaseDeep => self.release_deep_slot(input, injector).await,
+                    other => debug_assert!(
+                        false,
+                        "a Quick-Skip outer release only ever emits ReleaseDeep or \
+                         nothing, got {other:?}"
+                    ),
+                }
             }
         }
+        individual.force_release(&input, injector).await;
         Ok(())
     }
 
