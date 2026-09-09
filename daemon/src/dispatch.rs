@@ -634,14 +634,17 @@ impl DispatchState {
     /// Config-commit path (a `SwitchProfile` mutates `Config`, so its
     /// teardown must run from `run_effects` — the sole commit point).
     ///
-    /// The match body is **today's behaviour**, transcribed verbatim from the
-    /// four former call sites — this method changed none of it, including each
-    /// arm's own operation order (the former call site's; only
-    /// `ProfileSwitch`'s toggles-before-firings has a documented reason —
-    /// edit.rs). Turning one of the `//`-marked skips into a real call is
-    /// ticket 20's, one at a time, with its own reasoning (and possibly a
-    /// `spec.md` change — disconnect handling is currently declared out of
-    /// scope).
+    /// Each arm's own operation order follows the individual → chord order the
+    /// rest of dispatch uses (only `ProfileSwitch`'s toggles-before-firings
+    /// has a further documented reason — edit.rs). `post-release-development`
+    /// ticket 20 grilled every `//`-marked skip ticket 19 made visible;
+    /// ticket 21 turned the six that graduated into real calls (`axis` +
+    /// `analog_repeat` on disconnect, `axis` on the Digital flip,
+    /// `chord_machine.reset()` + `chord_slots.drain_firings` in every arm,
+    /// `chord_slots.stop_all_toggles` on a Profile switch), so Chord teardown
+    /// now matches individual teardown exactly. The `//` lines that remain
+    /// record the deliberate, spec-backed survivals (individual **and** Chord
+    /// Toggles outlive a Layer switch / disconnect / Digital flip).
     ///
     /// Not a `DepthEngine` trait: the engines are radically heterogeneous
     /// (`axis` is sync/infallible, `analog_repeat` owns tokio tasks, `stage`
@@ -656,11 +659,12 @@ impl DispatchState {
                 self.analog_repeat.stop_all().await;
                 self.stage.stop_all(&self.injector).await;
                 self.individual.drain_firings(&self.injector).await;
-                // individual toggles: survive a Layer switch (CONTEXT.md
-                //   Toggle — a Toggle held across a Layer switch keeps
-                //   running).
-                // chord_machine / chord_slots: NOT reset by a Layer switch
-                //   today — ticket 20.
+                self.chord_machine.reset();
+                self.chord_slots.drain_firings(&self.injector).await;
+                // individual + Chord toggles: survive a Layer switch
+                //   (keybinder spec.md "Layer change never touches an active
+                //   Toggle"; CONTEXT.md Toggle). Firings are not Toggles —
+                //   they drain, matching the individual path.
             }
             TeardownReason::ProfileSwitch => {
                 self.individual.stop_all_toggles().await;
@@ -668,28 +672,32 @@ impl DispatchState {
                 self.reset_axis_outputs().await;
                 self.analog_repeat.stop_all().await;
                 self.stage.stop_all(&self.injector).await;
-                // chord_slots: Chord Toggles survive a Profile switch
-                //   (edit.rs — `StopAllToggles` drains only the individual
-                //   `Slots<Input>`) — ticket 20.
-                // chord_machine: NOT reset by a Profile switch today —
-                //   ticket 20.
+                self.chord_machine.reset();
+                self.chord_slots.stop_all_toggles().await;
+                self.chord_slots.drain_firings(&self.injector).await;
+                // No `//` survivals: a Profile switch releases *every* active
+                //   Toggle immediately (keybinder spec.md), individual and
+                //   Chord alike (ticket 21, A6).
             }
             TeardownReason::Disconnect => {
-                self.stage.stop_all(&self.injector).await;
-                self.individual.drain_firings(&self.injector).await;
-                // axis / analog_repeat: NOT torn down on disconnect today.
-                //   analog_repeat has no dropout handling at all (dual-stage
-                //   spec.md, Out of Scope) — ticket 20.
-                // individual toggles: left running — ticket 20.
-                // chord_machine / chord_slots: untouched — ticket 20.
-            }
-            TeardownReason::CaptureModeToDigital => {
+                self.reset_axis_outputs().await;
                 self.analog_repeat.stop_all().await;
                 self.stage.stop_all(&self.injector).await;
                 self.individual.drain_firings(&self.injector).await;
-                // axis: NOT reset on the Digital flip today — ticket 20.
-                // individual toggles: left running — ticket 20.
-                // chord_machine / chord_slots: untouched — ticket 20.
+                self.chord_machine.reset();
+                self.chord_slots.drain_firings(&self.injector).await;
+                // individual + Chord toggles: left running — a disconnect is
+                //   not a Layer/Profile change (ticket 21).
+            }
+            TeardownReason::CaptureModeToDigital => {
+                self.reset_axis_outputs().await;
+                self.analog_repeat.stop_all().await;
+                self.stage.stop_all(&self.injector).await;
+                self.individual.drain_firings(&self.injector).await;
+                self.chord_machine.reset();
+                self.chord_slots.drain_firings(&self.injector).await;
+                // individual + Chord toggles: left running — the Digital flip
+                //   is not a Layer/Profile change (ticket 21).
             }
         }
     }
@@ -5388,6 +5396,10 @@ mod tests {
     /// | `Grid(2,3)`  | Analog-repeat task                           | KEY_G |
     /// | `Grid(1,3)+Grid(1,4)` | Chord Toggle                       | KEY_E |
     /// | `Grid(3,3)+Grid(3,4)` | Chord Hold-to-repeat firing        | KEY_F |
+    /// | `Grid(4,3)+Grid(4,4)+Grid(4,5)` | 3-member Chord, one member down: an open simultaneity window | KEY_H |
+    ///
+    /// Ticket 21 flips the Chord-path cells: `chord_machine` resets, Chord
+    /// firings drain, and Chord Toggles drain on a Profile switch.
     fn matrix_config() -> Config {
         config_with_profile(Profile {
             base: HashMap::from([
@@ -5432,6 +5444,14 @@ mod tests {
                     ChordKey::new(BTreeSet::from([Input::Grid(3, 3), Input::Grid(3, 4)])),
                     hold_to_repeat_binding(evdev::KeyCode::KEY_F),
                 ),
+                (
+                    ChordKey::new(BTreeSet::from([
+                        Input::Grid(4, 3),
+                        Input::Grid(4, 4),
+                        Input::Grid(4, 5),
+                    ])),
+                    hold_to_repeat_binding(evdev::KeyCode::KEY_H),
+                ),
             ]),
             ..Default::default()
         })
@@ -5441,8 +5461,10 @@ mod tests {
     /// fresh `Seam`: KEY_D held as a bare individual firing, KEY_C an
     /// individual Toggle, KEY_B a live deep-stage Toggle, `ABS_Z` a live axis
     /// output, KEY_G a spawned Analog-repeat task, KEY_E a Chord Toggle, KEY_F
-    /// a live Chord firing. The caller keeps the `depth_rx`'s `Sender` alive
-    /// for the life of the test (the Analog-repeat task holds a clone).
+    /// a live Chord firing, and one member of the KEY_H 3-member Chord down
+    /// to leave a `chord_machine` simultaneity window open. The caller keeps
+    /// the `depth_rx`'s `Sender` alive for the life of the test (the
+    /// Analog-repeat task holds a clone).
     async fn seed_every_teardown_participant(
         seam: &mut Seam,
         depth_rx: &watch::Receiver<HashMap<Input, u8>>,
@@ -5500,6 +5522,20 @@ mod tests {
             })
             .await;
         }
+
+        // One member of the 3-member KEY_H Chord: opens a simultaneity
+        // window that never completes — the state a lifecycle switch can
+        // catch mid-window (ticket 21, A4).
+        seam.feed(PhysicalEvent {
+            input: Input::Grid(4, 3),
+            state: EventState::Down,
+            depth: None,
+        })
+        .await;
+        assert!(
+            chord::next_deadline(&seam.state.chord_machine).is_some(),
+            "seed leaves a chord_machine window open"
+        );
         settle().await;
     }
 
@@ -5560,10 +5596,14 @@ mod tests {
             "the individual Toggle survives a Layer switch (CONTEXT.md): {released:?}"
         );
         assert!(
-            !released
-                .iter()
-                .any(|&(c, _)| c == evdev::KeyCode::KEY_E || c == evdev::KeyCode::KEY_F),
-            "the Chord path (Toggle + firing) is untouched by a Layer switch: {released:?}"
+            released.contains(&(evdev::KeyCode::KEY_F, 0)),
+            "the Chord Hold-to-repeat firing is drained on a Layer switch \
+             (ticket 21, A5): {released:?}"
+        );
+        assert!(
+            !released.iter().any(|&(c, _)| c == evdev::KeyCode::KEY_E),
+            "the Chord Toggle survives a Layer switch (keybinder spec.md — \
+             Layer change never touches an active Toggle): {released:?}"
         );
         assert_eq!(
             seam.state
@@ -5572,6 +5612,16 @@ mod tests {
                 .copied()
                 .collect::<Vec<_>>(),
             vec![Input::Grid(2, 1)]
+        );
+        assert_eq!(
+            seam.state.chord_slots.active_toggle_keys().count(),
+            1,
+            "the Chord Toggle is still live after a Layer switch"
+        );
+        assert_eq!(
+            chord::next_deadline(&seam.state.chord_machine),
+            None,
+            "the chord_machine window is reset on a Layer switch (ticket 21, A4)"
         );
 
         let axis_writes = flat_axis_writes(seam.gamepad_sink.batches()[gamepad_mark..].to_vec());
@@ -5589,7 +5639,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tear_down_profile_switch_is_the_strongest_sweep_and_also_drains_individual_toggles() {
+    async fn tear_down_profile_switch_is_the_strongest_sweep_and_drains_every_toggle() {
         let (_depth_tx, depth_rx) = watch::channel(HashMap::new());
         let mut seam = Seam::new(matrix_config());
         seed_every_teardown_participant(&mut seam, &depth_rx).await;
@@ -5613,14 +5663,28 @@ mod tests {
             "the live deep-stage Toggle is released: {released:?}"
         );
         assert!(
-            !released
-                .iter()
-                .any(|&(c, _)| c == evdev::KeyCode::KEY_E || c == evdev::KeyCode::KEY_F),
-            "the Chord path (Toggle + firing) still survives a Profile switch (edit.rs): {released:?}"
+            released.contains(&(evdev::KeyCode::KEY_F, 0)),
+            "the Chord Hold-to-repeat firing is drained on a Profile switch \
+             (ticket 21, A5): {released:?}"
+        );
+        assert!(
+            released.contains(&(evdev::KeyCode::KEY_E, 0)),
+            "the Chord Toggle drains on a Profile switch too (ticket 21, A6 — \
+             keybinder spec.md: every active Toggle): {released:?}"
         );
         assert!(
             seam.state.individual.active_toggle_keys().next().is_none(),
             "no individual Toggle survives a Profile switch"
+        );
+        assert_eq!(
+            seam.state.chord_slots.active_toggle_keys().count(),
+            0,
+            "no Chord Toggle survives a Profile switch either"
+        );
+        assert_eq!(
+            chord::next_deadline(&seam.state.chord_machine),
+            None,
+            "the chord_machine window is reset on a Profile switch (ticket 21, A4)"
         );
 
         let axis_writes = flat_axis_writes(seam.gamepad_sink.batches()[gamepad_mark..].to_vec());
@@ -5634,7 +5698,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tear_down_disconnect_touches_only_the_deep_stage_and_individual_firings() {
+    async fn tear_down_disconnect_centres_axis_stops_analog_drains_every_firing_and_keeps_toggles() {
         let (_depth_tx, depth_rx) = watch::channel(HashMap::new());
         let mut seam = Seam::new(matrix_config());
         seed_every_teardown_participant(&mut seam, &depth_rx).await;
@@ -5654,14 +5718,18 @@ mod tests {
             "individual firings are drained on a disconnect: {released:?}"
         );
         assert!(
+            released.contains(&(evdev::KeyCode::KEY_F, 0)),
+            "the Chord Hold-to-repeat firing is drained on a disconnect \
+             (ticket 21, A5): {released:?}"
+        );
+        assert!(
             !released.iter().any(|&(c, _)| c == evdev::KeyCode::KEY_C),
             "individual Toggles survive a disconnect: {released:?}"
         );
         assert!(
-            !released
-                .iter()
-                .any(|&(c, _)| c == evdev::KeyCode::KEY_E || c == evdev::KeyCode::KEY_F),
-            "the Chord path (Toggle + firing) is untouched by a disconnect: {released:?}"
+            !released.iter().any(|&(c, _)| c == evdev::KeyCode::KEY_E),
+            "the Chord Toggle survives a disconnect (not a Layer/Profile \
+             change — ticket 21): {released:?}"
         );
         assert_eq!(
             seam.state
@@ -5672,20 +5740,32 @@ mod tests {
             vec![Input::Grid(2, 1)]
         );
         assert_eq!(
-            seam.gamepad_sink.batches().len(),
-            gamepad_mark,
-            "axis is NOT reset on a disconnect today (ticket 20) — no new write"
+            seam.state.chord_slots.active_toggle_keys().count(),
+            1,
+            "the Chord Toggle is still live after a disconnect"
+        );
+        assert_eq!(
+            chord::next_deadline(&seam.state.chord_machine),
+            None,
+            "the chord_machine window is reset on a disconnect (ticket 21, A4)"
+        );
+
+        let axis_writes = flat_axis_writes(seam.gamepad_sink.batches()[gamepad_mark..].to_vec());
+        assert_eq!(
+            axis_writes,
+            vec![(evdev::AbsoluteAxisCode::ABS_Z, 0)],
+            "every live axis output is centered on a disconnect (ticket 21, A1)"
         );
         assert!(
-            !analog_repeat_task_gone(&mut seam).await,
-            "Analog-repeat has no dropout handling today (ticket 20) — its task keeps running"
+            analog_repeat_task_gone(&mut seam).await,
+            "the Analog-repeat task is stopped on a disconnect (ticket 21, A2)"
         );
 
         finish_matrix(seam).await;
     }
 
     #[tokio::test]
-    async fn tear_down_capture_mode_to_digital_stops_analog_and_stage_but_leaves_axis() {
+    async fn tear_down_capture_mode_to_digital_centres_axis_stops_analog_and_drains_every_firing() {
         let (_depth_tx, depth_rx) = watch::channel(HashMap::new());
         let mut seam = Seam::new(matrix_config());
         seed_every_teardown_participant(&mut seam, &depth_rx).await;
@@ -5707,19 +5787,35 @@ mod tests {
             "individual firings are drained on the Digital flip: {released:?}"
         );
         assert!(
+            released.contains(&(evdev::KeyCode::KEY_F, 0)),
+            "the Chord Hold-to-repeat firing is drained on the Digital flip \
+             (ticket 21, A5): {released:?}"
+        );
+        assert!(
             !released.iter().any(|&(c, _)| c == evdev::KeyCode::KEY_C),
             "individual Toggles survive the Digital flip: {released:?}"
         );
         assert!(
-            !released
-                .iter()
-                .any(|&(c, _)| c == evdev::KeyCode::KEY_E || c == evdev::KeyCode::KEY_F),
-            "the Chord path (Toggle + firing) is untouched by the Digital flip: {released:?}"
+            !released.iter().any(|&(c, _)| c == evdev::KeyCode::KEY_E),
+            "the Chord Toggle survives the Digital flip (not a Layer/Profile \
+             change — ticket 21): {released:?}"
         );
         assert_eq!(
-            seam.gamepad_sink.batches().len(),
-            gamepad_mark,
-            "axis is NOT reset on the Digital flip today (ticket 20) — no new write"
+            seam.state.chord_slots.active_toggle_keys().count(),
+            1,
+            "the Chord Toggle is still live after the Digital flip"
+        );
+        assert_eq!(
+            chord::next_deadline(&seam.state.chord_machine),
+            None,
+            "the chord_machine window is reset on the Digital flip (ticket 21, A4)"
+        );
+
+        let axis_writes = flat_axis_writes(seam.gamepad_sink.batches()[gamepad_mark..].to_vec());
+        assert_eq!(
+            axis_writes,
+            vec![(evdev::AbsoluteAxisCode::ABS_Z, 0)],
+            "every live axis output is centered on the Digital flip (ticket 21, A3)"
         );
         assert!(
             analog_repeat_task_gone(&mut seam).await,
@@ -5727,6 +5823,193 @@ mod tests {
         );
 
         finish_matrix(seam).await;
+    }
+
+    // ── ticket 21: the integration net — one pipeline test per genuinely
+    //    new stuck-output symptom the matrix additions close ──────────────
+
+    #[tokio::test]
+    async fn a_disconnect_centers_any_live_axis_output() {
+        // A1: a grid key Axis-assigned and pushed to full travel when the
+        // device drops leaves its last `ABS_*` value asserted with no key
+        // left to release it. `handle_connection_change` now runs
+        // `reset_axis_outputs` in its `tear_down` arm, exactly as a Layer
+        // switch does.
+        let mut config = config_with_bindings(HashMap::new());
+        config
+            .active_profile_mut()
+            .unwrap()
+            .axis_base
+            .insert(Input::Grid(1, 1), AxisTarget::LeftTrigger);
+        let harness = CommandHarness::spawn(config);
+
+        harness.push_depth([(Input::Grid(1, 1), 255)]);
+        tokio::task::yield_now().await;
+        harness.set_device_connected(false).await;
+        tokio::task::yield_now().await;
+
+        let writes = flat_axis_writes(harness.gamepad_batches());
+        harness.shut_down().await;
+
+        assert_eq!(
+            writes,
+            vec![
+                (evdev::AbsoluteAxisCode::ABS_Z, 255),
+                (evdev::AbsoluteAxisCode::ABS_Z, 0),
+            ],
+            "the disconnect centered the frozen axis output"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disconnect_stops_a_live_analog_repeat_task_and_releases_its_held_key() {
+        // A2: the dual-stage `spec.md` listed Analog-repeat's lack of
+        // dropout handling Out of Scope as "a separate effort"; ticket 20
+        // decided ticket 21 is that effort. A hold-solid Analog-repeat task
+        // holds `KEY_F1` down forever against a frozen Depth snapshot after
+        // the device drops — `analog_repeat.stop_all()` in the `Disconnect`
+        // arm cancels the task and force-releases the key.
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            Input::Grid(1, 1),
+            Binding {
+                trigger: TriggerMode::AnalogRepeat,
+                action: Action::Keypress {
+                    modifiers: Modifiers::default(),
+                    key: evdev::KeyCode::KEY_F1,
+                },
+            },
+        );
+        let harness = CommandHarness::spawn(config_with_bindings(bindings));
+
+        harness.push_depth([(Input::Grid(1, 1), u8::MAX)]);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            key_and_value(harness.sink.batches()[0][0]),
+            (evdev::KeyCode::KEY_F1, 1),
+            "the hold-solid task has KEY_F1 held down"
+        );
+
+        harness.set_device_connected(false).await;
+        tokio::task::yield_now().await;
+        let after_disconnect = harness.sink.batches().len();
+        assert_eq!(
+            key_and_value(harness.sink.batches()[after_disconnect - 1][0]),
+            (evdev::KeyCode::KEY_F1, 0),
+            "the disconnect force-released the held key"
+        );
+
+        // Advancing well past several kernel periods produces nothing more —
+        // the task is genuinely cancelled, not paused against a stale watch.
+        tokio::time::advance(Duration::from_millis(500)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            harness.sink.batches().len(),
+            after_disconnect,
+            "no further output after the disconnect stopped the task"
+        );
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn a_layer_switch_drains_a_live_chord_hold_to_repeat_firing() {
+        // A5: a live Chord Hold-to-repeat firing (its bare `value=1`
+        // `HoldKeyDown`) survives a Layer switch with no release edge — the
+        // member `Up` that would end it is on the old Layer's suppression
+        // path. `chord_slots.drain_firings` in the `LayerSwitch` arm is the
+        // stuck-key balance, matching `individual.drain_firings`.
+        let mut profile = Profile::default();
+        profile.chords_base.insert(
+            ChordKey::new(BTreeSet::from([Input::Grid(1, 1), Input::Grid(1, 2)])),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_C),
+        );
+        let mut seam = Seam::new(config_with_profile(profile));
+
+        seam.press(Input::Grid(1, 1)).await;
+        seam.press(Input::Grid(1, 2)).await;
+        settle().await;
+        let mark = seam.sink.batches().len();
+        assert!(
+            (0..mark)
+                .map(|i| key_and_value(seam.sink.batches()[i][0]))
+                .any(|kv| kv == (evdev::KeyCode::KEY_C, 1)),
+            "the Chord Hold-to-repeat is holding KEY_C down"
+        );
+
+        seam.feed(PhysicalEvent {
+            input: Input::ModeKey,
+            state: EventState::Down,
+            depth: None,
+        })
+        .await;
+        settle().await;
+
+        let released: Vec<_> = seam.sink.batches()[mark..]
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect();
+        assert!(
+            released.contains(&(evdev::KeyCode::KEY_C, 0)),
+            "the Layer switch drained the Chord firing, releasing KEY_C: {released:?}"
+        );
+
+        seam.state.chord_slots.stop_all_toggles().await;
+        seam.state.chord_slots.drain_firings(&seam.inj).await;
+        seam.finish().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_profile_switch_drains_a_live_chord_toggle() {
+        // A6: `edit.rs` documented "an active Chord Toggle survives a
+        // Profile switch today" as current behaviour, never as a decision.
+        // Keybinder `spec.md`: "Profile switch releases every active Toggle
+        // immediately" — unqualified. `chord_slots.stop_all_toggles()` now
+        // runs in the `ProfileSwitch` arm alongside the individual path's.
+        let mut profile = Profile::default();
+        profile.chords_base.insert(
+            ChordKey::new(BTreeSet::from([Input::Grid(1, 1), Input::Grid(1, 2)])),
+            toggle_binding(evdev::KeyCode::KEY_C),
+        );
+        let mut profiles = HashMap::new();
+        profiles.insert(DEFAULT_PROFILE_NAME.to_string(), profile);
+        profiles.insert("Gaming".to_string(), Profile::default());
+        let harness = CommandHarness::spawn(Config {
+            schema_version: config::SCHEMA_VERSION,
+            active_profile: DEFAULT_PROFILE_NAME.to_string(),
+            profiles,
+            force_digital: false,
+            macros: HashMap::new(),
+            steppers: HashMap::new(),
+        });
+
+        harness.press(Input::Grid(1, 1)).await;
+        harness.press(Input::Grid(1, 2)).await;
+        settle().await;
+        let mark = harness.sink.batches().len();
+        assert!(
+            (0..mark)
+                .map(|i| key_and_value(harness.sink.batches()[i][0]))
+                .any(|kv| kv == (evdev::KeyCode::KEY_C, 1)),
+            "the Chord Toggle turned KEY_C on"
+        );
+
+        harness
+            .switch_profile("Gaming")
+            .await
+            .expect("SwitchProfile must succeed");
+        settle().await;
+
+        let released: Vec<_> = harness.sink.batches()[mark..]
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect();
+        assert!(
+            released.contains(&(evdev::KeyCode::KEY_C, 0)),
+            "the Profile switch drained the Chord Toggle, releasing KEY_C: {released:?}"
+        );
+
+        harness.shut_down().await;
     }
 
     #[tokio::test(start_paused = true)]

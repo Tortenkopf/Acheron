@@ -231,8 +231,11 @@ and it can be verified before merge.
   `handle_connection_change` / `handle_capture_mode_change`; a Profile switch
   reaches it as `Effect::TearDown(TeardownReason::ProfileSwitch)` through
   `run_effects` (it mutates `Config`, so its teardown runs at the commit
-  point). Turning one of the `//`-marked skips into a real call is ticket
-  20's, one at a time with its own reasoning — not a drive-by.
+  point). The matrix cells themselves are decided — ticket 20 grilled every
+  `//` skip, ticket 21 landed the six that graduated (Chord teardown now
+  fully matches individual teardown); the `//` lines that remain record the
+  deliberate, spec-backed Toggle survivals. A change to one of those
+  surviving cells needs its own ticket and reasoning — not a drive-by.
 
 - **Changing Stepper cursor behaviour** (the wrap-around, which item a step
   lands on, the default-to-first, or how an edited/deleted list reconciles a

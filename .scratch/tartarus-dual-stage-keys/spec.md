@@ -623,11 +623,13 @@ Carried from the map so the implementation effort inherits the boundary:
   covers it; config stays the single source of truth.
 - **Any digital-mode approximation of the deep stage** — inert in Digital mode, full stop, no
   Hold-to-repeat-style degradation the way Analog-repeat gets.
-- **Fixing Analog-repeat's pre-existing lack of dropout/disconnect handling** — surfaced while
-  resolving the reconnect question (Analog-repeat has no disconnect hook today and would sit stale
-  on frozen Depth across a replug, with or without dual-stage keys). Pre-existing and unrelated to
-  this feature; the new deep-stage engine gets its own explicit disconnect hook so it doesn't
-  inherit the same gap, but the existing gap itself is a separate effort.
+- **~~Fixing Analog-repeat's pre-existing lack of dropout/disconnect handling~~** — *resolved by
+  `post-release-development` ticket 21* (2026-09-10). Was surfaced while resolving the reconnect
+  question (Analog-repeat had no disconnect hook and would sit stale on frozen Depth across a
+  replug). Ticket 20's lifecycle-teardown grilling decided ticket 21 *is* the "separate effort":
+  `analog_repeat.stop_all()` now runs in `DispatchState::tear_down(TeardownReason::Disconnect)`
+  alongside the deep-stage engine's own hook, so a device drop cancels every live Analog-repeat
+  task and force-releases whatever it held.
 - **README / user-facing copy beyond this spec's own prose** — a full "Dual-stage keys" README
   section with a driving-sim framing example is left to the implementation effort to draft
   alongside the feature, the same way most feature README copy is written during implementation
