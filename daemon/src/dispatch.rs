@@ -3176,6 +3176,12 @@ mod tests {
                 .map(|_| ())
         }
 
+        async fn clear_deep_stage(&self, input: Input, layer: Layer) -> Result<(), CommandError> {
+            self.apply(edit::Edit::ClearDeepStage { input, layer })
+                .await
+                .map(|_| ())
+        }
+
         async fn set_chord_binding(
             &self,
             inputs: impl IntoIterator<Item = Input>,
@@ -6901,6 +6907,122 @@ mod tests {
             stopped_count,
             "the deep Toggle must be genuinely stopped by the cascade-delete, not paused"
         );
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_clearing_the_deep_stage_force_releases_a_live_deep_toggle_immediately() {
+        // Ticket 18: the GUI's "Clear deep stage" button drives
+        // `Edit::ClearDeepStage` directly. Removing the deep Binding while it
+        // holds a live deep Toggle orphans that Toggle exactly as the
+        // primary-removal cascade would — `edit::plan` now pushes
+        // `Effect::StopStage`, force-releasing it immediately rather than
+        // leaving it stuck until the GUI's next focus-`StopAllToggles`.
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            toggle_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        tokio::time::advance(executor::MIN_TOGGLE_LAP * 3).await;
+        settle().await;
+        let running_count = harness.sink.batches().len();
+        assert!(
+            running_count > 0,
+            "the deep Toggle loop must already be tapping"
+        );
+
+        harness
+            .clear_deep_stage(Input::Grid(1, 1), Layer::Base)
+            .await
+            .unwrap();
+        settle().await;
+        let stopped_count = harness.sink.batches().len();
+
+        tokio::time::advance(executor::MIN_TOGGLE_LAP * 5).await;
+        settle().await;
+        assert_eq!(
+            harness.sink.batches().len(),
+            stopped_count,
+            "the deep Toggle must be genuinely stopped by the clear, not paused"
+        );
+
+        let events: Vec<_> = harness
+            .sink
+            .batches()
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .filter(|(code, _)| *code == evdev::KeyCode::KEY_B)
+            .collect();
+        let downs = events.iter().filter(|(_, v)| *v == 1).count();
+        let ups = events.iter().filter(|(_, v)| *v == 0).count();
+        assert_eq!(
+            downs, ups,
+            "the deep Toggle key is left logically released: {events:?}"
+        );
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn dual_stage_clearing_the_deep_stage_force_releases_a_live_deep_hold_to_repeat() {
+        // Ticket 18, single-key path: a live deep Hold-to-repeat holds a bare
+        // `value=1` while the deep band is engaged. Without a teardown effect
+        // it stays stuck until a Layer or Profile switch — `ClearDeepStage`
+        // must balance that `value=1` with a force-released `value=0` now.
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        harness.repeat_analog(Input::Grid(1, 1), 250).await;
+        settle().await;
+        let deep: Vec<_> = harness
+            .sink
+            .batches()
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .filter(|(code, _)| *code == evdev::KeyCode::KEY_B)
+            .collect();
+        assert_eq!(
+            deep,
+            vec![(evdev::KeyCode::KEY_B, 1), (evdev::KeyCode::KEY_B, 2)]
+        );
+
+        harness
+            .clear_deep_stage(Input::Grid(1, 1), Layer::Base)
+            .await
+            .unwrap();
+        settle().await;
+        assert_eq!(
+            key_and_value(harness.sink.batches().last().unwrap()[0]),
+            (evdev::KeyCode::KEY_B, 0),
+            "clearing the deep stage must force-release the held deep value=1"
+        );
+
+        let events: Vec<_> = harness
+            .sink
+            .batches()
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect();
+        let downs = events.iter().filter(|(_, v)| *v == 1).count();
+        let ups = events.iter().filter(|(_, v)| *v == 0).count();
+        assert_eq!(downs, ups, "no key left logically down: {events:?}");
 
         harness.shut_down().await;
     }

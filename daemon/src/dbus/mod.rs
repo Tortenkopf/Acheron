@@ -710,8 +710,11 @@ impl Daemon {
     }
 
     /// Removes the deep Binding on `layer`. Errors `NotFound` if `input`
-    /// has no deep Binding there. Does not cascade-clear the deep
-    /// Actuation/Staging-mode config or force-release a live slot.
+    /// has no deep Binding there. Leaves the deep Actuation/Staging-mode
+    /// config in place (inert without a matching deep Binding), but does
+    /// force-release a live deep slot for `input` immediately (ticket 18 —
+    /// `Edit::ClearDeepStage` pushes `Effect::StopStage`), so a Toggle or
+    /// Hold-to-repeat mid-press is not orphaned.
     async fn clear_deep_stage(&self, input: String, layer: String) -> Result<(), DaemonError> {
         let input = Self::parse_input(&input)?;
         let layer = wire::layer_from_str(&layer).map_err(DaemonError::InvalidBinding)?;

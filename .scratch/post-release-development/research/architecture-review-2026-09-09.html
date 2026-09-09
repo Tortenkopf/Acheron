@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Architecture review — Acheron</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+      mermaid.initialize({ startOnLoad: true, theme: "neutral", securityLevel: "loose", flowchart: { htmlLabels: true, curve: "basis" } });
+    </script>
+    <style>
+      body { font-feature-settings: "kern" 1, "liga" 1; }
+      .seam { stroke-dasharray: 5 4; }
+      .label { font-size: 0.65rem; letter-spacing: 0.12em; text-transform: uppercase; }
+      .mermaid { display: flex; justify-content: center; }
+      .mod { border: 1px solid #cbd5e1; background: #fff; border-radius: 0.4rem; }
+      .mod-deep { border: 2.5px solid #1e293b; background: linear-gradient(135deg, #f1f5f9, #e2e8f0); border-radius: 0.4rem; }
+      .faded { opacity: 0.4; }
+      table.matrix td, table.matrix th { border: 1px solid #e2e8f0; padding: 0.4rem 0.55rem; font-size: 0.72rem; vertical-align: top; }
+      .hole { background: #fef2f2; color: #b91c1c; font-weight: 600; }
+      .arrow-leak { color: #dc2626; }
+    </style>
+  </head>
+  <body class="bg-stone-50 text-slate-900 font-sans">
+    <main class="max-w-5xl mx-auto px-6 py-12 space-y-14">
+
+      <header class="space-y-5">
+        <div class="flex items-baseline justify-between flex-wrap gap-2">
+          <h1 class="font-serif text-4xl tracking-tight">Architecture review — Acheron</h1>
+          <p class="text-sm text-slate-500">2026-09-09 · branch <code class="font-mono">dev</code></p>
+        </div>
+        <p class="text-slate-600 max-w-3xl">
+          Six deepening opportunities in the Rust Daemon, ranked. The aim throughout: turn
+          <strong>shallow</strong> modules — interface nearly as wide as the implementation — into
+          <strong>deep</strong> ones, so bugs concentrate in one place (<em>locality</em>) and one
+          interface change reaches every call site (<em>leverage</em>). Nothing here re-opens an ADR.
+        </p>
+        <div class="flex flex-wrap gap-4 text-xs text-slate-500 border-t border-b border-slate-200 py-3">
+          <span class="flex items-center gap-2"><span class="inline-block w-6 h-4 mod"></span> module</span>
+          <span class="flex items-center gap-2"><span class="inline-block w-6 h-4 mod-deep"></span> deep module</span>
+          <span class="flex items-center gap-2"><svg width="34" height="10"><line x1="0" y1="5" x2="34" y2="5" class="seam" stroke="#475569" stroke-width="2"/></svg> seam</span>
+          <span class="flex items-center gap-2"><svg width="34" height="10"><line x1="0" y1="5" x2="28" y2="5" stroke="#dc2626" stroke-width="2"/><path d="M28 1 L34 5 L28 9 Z" fill="#dc2626"/></svg> leakage across a seam</span>
+          <span class="flex items-center gap-2"><span class="inline-block px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800">Strong</span><span class="inline-block px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">Worth exploring</span><span class="inline-block px-1.5 py-0.5 rounded bg-slate-200 text-slate-600">Speculative</span></span>
+        </div>
+        <p class="text-xs text-slate-500 max-w-3xl">
+          Orienting fact: the large line counts are test tonnage. <code class="font-mono">dispatch.rs</code>
+          is ~1,150 lines of implementation and ~5,850 of tests (83%); <code class="font-mono">config.rs</code>,
+          <code class="font-mono">stage.rs</code>, <code class="font-mono">dbus/mod.rs</code> the same. The
+          friction is <em>shape</em>, not size — and the test tonnage is itself a symptom (candidate 4).
+        </p>
+      </header>
+
+      <!-- ============================ CANDIDATE 1 ============================ -->
+      <article id="c1" class="space-y-6 border-t-2 border-slate-800 pt-6">
+        <div class="space-y-2">
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="px-2 py-0.5 rounded text-xs font-semibold bg-emerald-100 text-emerald-800">Strong</span>
+            <span class="px-2 py-0.5 rounded text-xs bg-slate-200 text-slate-600">in-process · one adapter per engine (4 real)</span>
+            <span class="px-2 py-0.5 rounded text-xs bg-slate-100 text-slate-500">flagged by the 2026-09-03 &amp; 2026-09-06 reviews — still open</span>
+          </div>
+          <h2 class="font-serif text-2xl">1 · Give the four runtime engines one <code class="font-mono text-xl">DepthEngine</code> interface</h2>
+        </div>
+
+        <dl class="grid sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+          <div><dt class="label text-slate-400">Files</dt>
+            <dd class="font-mono text-xs leading-relaxed">daemon/src/dispatch.rs:888–904, 1030, 1085, 1122, 1007<br>daemon/src/stage.rs · axis.rs · analog_repeat.rs · chord.rs<br>.scratch/tartarus-dual-stage-keys/issues/05-interaction-sweep.md</dd></div>
+          <div><dt class="label text-slate-400">Problem</dt>
+            <dd>Four engines interpret <em>Config</em>-aware Depth and timing, each with a different interface; the dispatch task hand-wires every one into the <code class="font-mono">select!</code> loop and re-implements teardown per engine per event — a 4×4 matrix with silent holes.</dd>
+          <dt class="label text-slate-400 mt-2">Solution</dt>
+            <dd>One <code class="font-mono">trait DepthEngine { wants(layer); observe(&amp;depths) -&gt; Vec&lt;Edit&gt;; next_deadline(); tick(now); teardown(Reason) }</code>. Dispatch holds <code class="font-mono">Vec&lt;Box&lt;dyn DepthEngine&gt;&gt;</code> and iterates it — one deadline arm, one teardown loop, one depth fan-out.</dd>
+          <dt class="label text-slate-400 mt-2">Wins</dt>
+            <dd><ul class="list-disc list-inside space-y-0.5">
+              <li>locality: teardown becomes one table</li>
+              <li>the <code class="font-mono">ClearDeepStage</code> orphan bug (below) can't recur</li>
+              <li>delete <code class="font-mono">wait_for_stage_deadline</code> (byte-copy of <code class="font-mono">wait_for_chord_deadline</code>)</li>
+              <li>leverage: a 5th engine is one <code class="font-mono">impl</code>, not four edits</li>
+              <li>interface is the test surface: one fake engine, not a spawned <code class="font-mono">run()</code></li>
+            </ul></dd>
+          </div>
+        </dl>
+
+        <div class="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          <strong>Latent bug this hole hides.</strong> <code class="font-mono">Edit::ClearDeepStage</code>
+          (edit.rs:727–735) pushes no <code class="font-mono">Effect::StopStage</code> — only the
+          primary cascade-delete path does. Clearing a deep stage that currently holds a live Toggle or a
+          <code class="font-mono">value=1</code> Hold-to-repeat orphans that firing: <code class="font-mono">stage::Engine::update</code>'s
+          "is this still a dual-stage key?" guard then skips the Input forever. A DepthEngine teardown contract
+          routes cascade-delete through the same <code class="font-mono">teardown(Reason::StageCleared(input))</code>
+          every other path uses.
+        </div>
+
+        <div class="rounded-lg border border-slate-200 bg-white p-3 text-xs text-slate-500">
+          Does not touch ADR-0007 — that decision keeps staged-Depth <em>interpretation</em> in the dispatch
+          task and out of the capture source. This organises the four engines already living in dispatch; it
+          moves nothing across the capture seam.
+        </div>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="label text-slate-400 mb-3">Before — four shapes, teardown re-derived per site</p>
+            <table class="matrix w-full border-collapse">
+              <thead><tr class="text-left"><th></th><th>axis</th><th>analog_repeat</th><th>stage</th><th>individual</th></tr></thead>
+              <tbody>
+                <tr><th class="text-left">Layer&nbsp;switch</th><td><code>reset()</code></td><td><code>stop_all()</code></td><td><code>stop_all()</code></td><td><code>drain_firings()</code></td></tr>
+                <tr><th class="text-left">Profile&nbsp;switch</th><td><code>Effect::ResetAxisOutputs</code></td><td><code>Effect::StopAllAnalogRepeats</code></td><td><code>Effect::StopAllStages</code></td><td><code>Effect::StopAllToggles</code></td></tr>
+                <tr><th class="text-left">Disconnect</th><td class="hole">— ?</td><td class="hole">— ?</td><td><code>stop_all()</code></td><td><code>drain_firings()</code></td></tr>
+                <tr><th class="text-left">→ Digital</th><td class="hole">— ?</td><td><code>stop_all()</code></td><td><code>stop_all()</code></td><td><code>drain_firings()</code></td></tr>
+              </tbody>
+            </table>
+            <p class="mt-3 text-xs text-slate-500">Four method names for one idea. The <span class="hole px-1">— ?</span>
+              cells: deliberate or missing? Nothing records which. Two byte-identical deadline futures
+              (<code class="font-mono">wait_for_chord_deadline</code> / <code class="font-mono">wait_for_stage_deadline</code>)
+              because there is no engine-deadline abstraction.</p>
+          </div>
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="label text-slate-400 mb-3">After — one seam, four adapters, one table</p>
+            <pre class="mermaid">
+flowchart TB
+  loop["dispatch select! loop<br/><span style='font-size:11px'>one depth arm · one deadline arm · one teardown loop</span>"]
+  seam{{"trait DepthEngine<br/><span style='font-size:11px'>wants · observe · next_deadline · tick · teardown(Reason)</span>"}}
+  a["axis::Engine"]
+  b["analog_repeat::Engine"]
+  s["stage::Engine"]
+  i["trigger::Slots&lt;Input&gt;"]
+  loop --> seam
+  seam --> a & b & s & i
+  classDef deep fill:#1e293b,color:#fff,stroke:#0f172a;
+  classDef seamc fill:#eef2ff,stroke:#4338ca,stroke-width:2px,stroke-dasharray:5 4;
+  class seam seamc
+  class loop deep
+            </pre>
+            <p class="mt-1 text-xs text-slate-500">Teardown is now <code class="font-mono">for e in &amp;mut engines { e.teardown(reason) }</code>
+              — the matrix collapses to the <code class="font-mono">Reason</code> enum plus each engine's own <code class="font-mono">match</code>.</p>
+          </div>
+        </div>
+      </article>
+
+      <!-- ============================ CANDIDATE 2 ============================ -->
+      <article id="c2" class="space-y-6 border-t border-slate-300 pt-6">
+        <div class="space-y-2">
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="px-2 py-0.5 rounded text-xs font-semibold bg-amber-100 text-amber-800">Worth exploring</span>
+            <span class="px-2 py-0.5 rounded text-xs bg-slate-200 text-slate-600">in-process · internal to one module</span>
+          </div>
+          <h2 class="font-serif text-2xl">2 · One <code class="font-mono text-xl">StageOp</code> interpreter inside <code class="font-mono text-xl">stage::Engine</code></h2>
+        </div>
+
+        <dl class="grid sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+          <div><dt class="label text-slate-400">Files</dt>
+            <dd class="font-mono text-xs leading-relaxed">daemon/src/stage.rs:610–683, 870–909, 966–978, 1119–1154</dd>
+          <dt class="label text-slate-400 mt-2">Problem</dt>
+            <dd>The pure core emits an ordered <code class="font-mono">Vec&lt;StageOp&gt;</code>; the shell walks that list in four hand-written <code class="font-mono">match op { … }</code> bodies, each with a different "legal" subset and its own <code class="font-mono">debug_assert!(false)</code> arms for the rest.</dd>
+          </div>
+          <div>
+          <dt class="label text-slate-400">Solution</dt>
+            <dd>One private <code class="font-mono">fn interpret(&amp;mut self, ops: Vec&lt;StageOp&gt;, deps) -&gt; Vec&lt;Edit&gt;</code>. <code class="font-mono">update</code> / <code class="font-mono">feed</code> / <code class="font-mono">tick</code> / the Quick-Skip hooks call it instead of re-deciding what each op means.</dd>
+          <dt class="label text-slate-400 mt-2">Wins</dt>
+            <dd><ul class="list-disc list-inside space-y-0.5">
+              <li>locality: one place maps op → action</li>
+              <li>the "is this a dual-stage key?" predicate resolves once, not 5×</li>
+              <li><code class="font-mono">EngineDeps</code> destructured once</li>
+              <li>shell shrinks; the deep pure core is untouched</li>
+            </ul></dd>
+          </div>
+        </dl>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="label text-slate-400 mb-3">Before — the op-walk, written four times</p>
+            <div class="mod p-3 space-y-2">
+              <p class="label text-slate-500">stage::Engine (shell, ~820 lines)</p>
+              <div class="grid grid-cols-2 gap-2 text-xs font-mono">
+                <div class="mod p-2 bg-rose-50">update()<br><span class="text-slate-400">match op {`{`}…{`}`} + assert</span></div>
+                <div class="mod p-2 bg-rose-50">begin_quick_skip()<br><span class="text-slate-400">match op {`{`}…{`}`} + assert</span></div>
+                <div class="mod p-2 bg-rose-50">end_quick_skip()<br><span class="text-slate-400">match op {`{`}…{`}`} + assert</span></div>
+                <div class="mod p-2 bg-rose-50">tick()<br><span class="text-slate-400">match op {`{`}…{`}`} + assert</span></div>
+              </div>
+              <p class="text-xs text-slate-500">Same <code class="font-mono">StageOp</code> enum, four partial readers. A new op means four edits and four asserts to re-check.</p>
+            </div>
+          </div>
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="label text-slate-400 mb-3">After — the callers hand the list to one reader</p>
+            <div class="mod-deep p-3 space-y-2">
+              <p class="label text-slate-600">stage::Engine</p>
+              <div class="mod p-2 text-xs font-mono bg-indigo-50 border-indigo-200">interpret(ops, deps) → Vec&lt;Edit&gt;<br><span class="text-slate-500">the only place StageOp is matched</span></div>
+              <div class="grid grid-cols-2 gap-2 text-xs font-mono faded">
+                <div class="mod p-2">update() → interpret(…)</div>
+                <div class="mod p-2">feed() → interpret(…)</div>
+                <div class="mod p-2">tick() → interpret(…)</div>
+                <div class="mod p-2">quick_skip → interpret(…)</div>
+              </div>
+            </div>
+            <p class="mt-2 text-xs text-slate-500">Exhaustiveness is now the compiler's job, once.</p>
+          </div>
+        </div>
+      </article>
+
+      <!-- ============================ CANDIDATE 3 ============================ -->
+      <article id="c3" class="space-y-6 border-t border-slate-300 pt-6">
+        <div class="space-y-2">
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="px-2 py-0.5 rounded text-xs font-semibold bg-emerald-100 text-emerald-800">Strong</span>
+            <span class="px-2 py-0.5 rounded text-xs bg-slate-200 text-slate-600">in-process · pure</span>
+            <span class="px-2 py-0.5 rounded text-xs bg-slate-100 text-slate-500">2026-09-06 review Candidate 2 — still open</span>
+          </div>
+          <h2 class="font-serif text-2xl">3 · Break <code class="font-mono text-xl">config::validate</code> into named invariant groups</h2>
+        </div>
+
+        <dl class="grid sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+          <div><dt class="label text-slate-400">Files</dt>
+            <dd class="font-mono text-xs leading-relaxed">daemon/src/config.rs:1348–~1520 (banner comments at :1433, :1509)<br>daemon/src/config/binding.rs (the per-Binding half — already carved, ticket 14)<br>gui/acheron_gui/rules.py · gui/tests/test_rules_contract.py</dd>
+          <dt class="label text-slate-400 mt-2">Problem</dt>
+            <dd>The whole-<em>Config</em> half of <code class="font-mono">validate</code> is a ~170-line wall of <code class="font-mono">profiles.values().find_map(…)</code> checks appended in ticket order, with literal <code class="font-mono">// --- ticket NN additions ---</code> banners in the source. "Which check rejects X" is a linear scan.</dd>
+          </div>
+          <div>
+          <dt class="label text-slate-400">Solution</dt>
+            <dd>Five pure functions — <code class="font-mono">check_references</code>, <code class="font-mono">check_actuation</code>, <code class="font-mono">check_axis</code>, <code class="font-mono">check_chords</code>, <code class="font-mono">check_deep_stages</code> — each owning one invariant group and its <code class="font-mono">ConfigError</code> variants. <code class="font-mono">validate</code> becomes five calls.</dd>
+          <dt class="label text-slate-400 mt-2">Wins</dt>
+            <dd><ul class="list-disc list-inside space-y-0.5">
+              <li>locality: one invariant group, one citable region</li>
+              <li>the GUI mirror (ADR-0005) can name what it mirrors</li>
+              <li>each group table-tested through its own interface</li>
+              <li>the next dual-stage-sized feature appends one function, not one stratum</li>
+            </ul></dd>
+          </div>
+        </dl>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="label text-slate-400 mb-3">Before — sedimentary, deposited by ticket</p>
+            <div class="border-l-4 border-slate-700">
+              <div class="h-10 px-3 flex items-center text-xs bg-slate-100 border-b border-white">original parse/validate checks</div>
+              <div class="h-9 px-3 flex items-center text-xs bg-slate-200 border-b border-white">// --- ticket 04 additions ---</div>
+              <div class="h-9 px-3 flex items-center text-xs bg-slate-300 border-b border-white">axis-assignment mutual-exclusion checks</div>
+              <div class="h-9 px-3 flex items-center text-xs bg-slate-400 text-white border-b border-white">// --- ticket 40 chord subset/superset ---</div>
+              <div class="h-10 px-3 flex items-center text-xs bg-slate-500 text-white">// --- dual-stage ticket 01 additions --- (7 checks, 7 errors)</div>
+            </div>
+            <p class="mt-3 text-xs text-slate-500">One function, ~170 lines, read top to bottom to find anything. The interface (<code class="font-mono">Config → Result</code>) is narrow, but the implementation has no internal seams.</p>
+          </div>
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="label text-slate-400 mb-3">After — five bands, each named</p>
+            <div class="space-y-2">
+              <div class="mod-deep h-12 flex items-center px-3 text-xs font-mono">check_references &nbsp;<span class="text-slate-500">— dangling macro_id / stepper_id, delete refusals</span></div>
+              <div class="mod-deep h-12 flex items-center px-3 text-xs font-mono">check_actuation &nbsp;<span class="text-slate-500">— release ≤ actuation, per-Profile scope</span></div>
+              <div class="mod-deep h-12 flex items-center px-3 text-xs font-mono">check_axis &nbsp;<span class="text-slate-500">— axis ↔ binding ↔ chord exclusion</span></div>
+              <div class="mod-deep h-12 flex items-center px-3 text-xs font-mono">check_chords &nbsp;<span class="text-slate-500">— subset / superset member sets</span></div>
+              <div class="mod-deep h-12 flex items-center px-3 text-xs font-mono">check_deep_stages &nbsp;<span class="text-slate-500">— disjoint bands, primary required, removed Additive</span></div>
+            </div>
+          </div>
+        </div>
+      </article>
+
+      <!-- ============================ CANDIDATE 4 ============================ -->
+      <article id="c4" class="space-y-6 border-t border-slate-300 pt-6">
+        <div class="space-y-2">
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="px-2 py-0.5 rounded text-xs font-semibold bg-amber-100 text-amber-800">Worth exploring</span>
+            <span class="px-2 py-0.5 rounded text-xs bg-slate-200 text-slate-600">in-process · shared intermediate representation</span>
+          </div>
+          <h2 class="font-serif text-2xl">4 · One owner for the compiled-Action step list</h2>
+        </div>
+
+        <dl class="grid sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+          <div><dt class="label text-slate-400">Files</dt>
+            <dd class="font-mono text-xs leading-relaxed">daemon/src/executor.rs:111–154, 173, 268–302<br>daemon/src/trigger.rs:495–516, 675<br>consumed in analog_repeat.rs, stage.rs</dd>
+          <dt class="label text-slate-400 mt-2">Problem</dt>
+            <dd>"Compile an <em>Action</em> to steps" has no single owner: <code class="font-mono">trigger::compile_action</code> sometimes calls <code class="font-mono">executor::compile</code>, which <code class="font-mono">unreachable!()</code>s on 2 of 5 <code class="font-mono">Action</code> variants. The resulting <code class="font-mono">Vec&lt;MacroStep&gt;</code> is a semi-transparent value four modules re-inspect and pattern-match — <code class="font-mono">trigger::Slots::perform</code> compiles steps then calls <code class="font-mono">executor::single_held_key</code> to re-classify what it just built. Interface as wide as the implementation.</dd>
+          </div>
+          <div>
+          <dt class="label text-slate-400">Solution</dt>
+            <dd>An <code class="font-mono">action_ir</code> module owns construction <em>and</em> classification: <code class="font-mono">compile(action, ctx) -&gt; CompiledAction</code> where <code class="font-mono">CompiledAction</code> answers <code class="font-mono">is_single_held_key()</code>, <code class="font-mono">is_multi_step()</code> etc. Consumers hold the opaque type, not a raw <code class="font-mono">Vec</code>.</dd>
+          <dt class="label text-slate-400 mt-2">Wins</dt>
+            <dd><ul class="list-disc list-inside space-y-0.5">
+              <li>locality: one module owns the IR and its shape</li>
+              <li>no <code class="font-mono">unreachable!()</code> — <code class="font-mono">ctx</code> carries the stepper cursor</li>
+              <li>interface shrinks: ~7 step-builders stop being <code class="font-mono">pub</code></li>
+              <li>classification computed once, not re-derived at each use</li>
+            </ul></dd>
+          </div>
+        </dl>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="label text-slate-400 mb-3">Before — a leaky value four modules reach into</p>
+            <pre class="mermaid">
+flowchart TB
+  ca["trigger::compile_action"]
+  ec["executor::compile<br/><span style='font-size:11px'>unreachable!() on Step, ProfileSwitch</span>"]
+  ir(["Vec&lt;MacroStep&gt;<br/><span style='font-size:11px'>semi-transparent IR</span>"])
+  t["trigger::Slots::perform"]
+  x["executor::spawn_*"]
+  ar["analog_repeat::Engine"]
+  st["stage::Engine"]
+  ca --> ec
+  ca --> ir
+  ec --> ir
+  ir --> t
+  ir --> x
+  ir --> ar
+  ir --> st
+  t -. re-classifies .-> ir
+  classDef leak stroke:#dc2626,stroke-width:2px,color:#b91c1c;
+  classDef irc fill:#fef2f2,stroke:#dc2626;
+  class ir irc
+  class ec leak
+            </pre>
+          </div>
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="label text-slate-400 mb-3">After — one deep module, opaque handle out</p>
+            <pre class="mermaid">
+flowchart TB
+  air["action_ir<br/><span style='font-size:11px'>compile(action, ctx) · classification lives here</span>"]
+  h(["CompiledAction<br/><span style='font-size:11px'>opaque</span>"])
+  t["trigger::Slots::perform"]
+  x["executor::spawn_*"]
+  ar["analog_repeat::Engine"]
+  st["stage::Engine"]
+  air --> h
+  h --> t & x & ar & st
+  classDef deep fill:#1e293b,color:#fff,stroke:#0f172a;
+  class air deep
+            </pre>
+          </div>
+        </div>
+      </article>
+
+      <!-- ============================ CANDIDATE 5 ============================ -->
+      <article id="c5" class="space-y-6 border-t border-slate-300 pt-6">
+        <div class="space-y-2">
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="px-2 py-0.5 rounded text-xs font-semibold bg-slate-200 text-slate-600">Speculative</span>
+            <span class="px-2 py-0.5 rounded text-xs bg-slate-200 text-slate-600">in-process · module relocation</span>
+            <span class="px-2 py-0.5 rounded text-xs bg-slate-100 text-slate-500">2026-09-03 review Candidate 3</span>
+          </div>
+          <h2 class="font-serif text-2xl">5 · Split the Interface-2 device-control mechanism out of <code class="font-mono text-xl">capture::analog</code></h2>
+        </div>
+
+        <dl class="grid sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+          <div><dt class="label text-slate-400">Files</dt>
+            <dd class="font-mono text-xs leading-relaxed">daemon/src/capture/analog.rs (1729 lines)<br>imported by led.rs, main.rs, supervisor.rs, dispatch.rs:38, executor.rs:25</dd>
+          <dt class="label text-slate-400 mt-2">Problem</dt>
+            <dd><code class="font-mono">capture::analog</code> is two things: the Analog capture source (<code class="font-mono">observe</code>, the grid task) and the Interface-2 hidraw mechanism (Razer frame + CRC, status-LED assert/clear, device-info read, <code class="font-mono">relock</code>, <code class="font-mono">read_kernel_auto_repeat</code>). <code class="font-mono">dispatch</code> and <code class="font-mono">executor</code> import from it purely by accident of location.</dd>
+          </div>
+          <div>
+          <dt class="label text-slate-400">Solution</dt>
+            <dd>A <code class="font-mono">device_control</code> module for the mechanism; <code class="font-mono">capture::analog</code> keeps only the source and calls into it like everyone else.</dd>
+          <dt class="label text-slate-400 mt-2">Wins</dt>
+            <dd><ul class="list-disc list-inside space-y-0.5">
+              <li>locality: the hidraw frame format lives in one place</li>
+              <li>imports name what they mean</li>
+              <li><code class="font-mono">capture::analog</code> is only a <em>CaptureSource</em> again</li>
+            </ul></dd>
+          <dt class="label text-slate-400 mt-2">Why speculative</dt>
+            <dd>Low churn, and the payoff is legibility rather than a new test surface. Worth it only when something else opens <code class="font-mono">analog.rs</code>.</dd>
+          </div>
+        </dl>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="label text-slate-400 mb-3">Before — one file, two responsibilities, five importers</p>
+            <div class="relative">
+              <div class="mod p-3">
+                <p class="label text-slate-500 mb-2">capture::analog — 1729 lines</p>
+                <div class="grid grid-cols-2 gap-2 text-xs">
+                  <div class="mod p-2 bg-emerald-50">capture source<br><span class="text-slate-400 font-mono">observe() · grid task · RepeatSchedule</span></div>
+                  <div class="mod p-2 bg-sky-50">Interface-2 control<br><span class="text-slate-400 font-mono">frame+CRC · status LEDs · DeviceInfo · relock · read_kernel_auto_repeat</span></div>
+                </div>
+              </div>
+              <div class="mt-2 text-xs font-mono text-slate-500 flex flex-wrap gap-x-3">
+                <span>led.rs&nbsp;→</span><span>main.rs&nbsp;→</span><span>supervisor.rs&nbsp;→</span>
+                <span class="arrow-leak">dispatch.rs → (DeviceInfo)</span><span class="arrow-leak">executor.rs → (read_kernel_auto_repeat)</span>
+              </div>
+            </div>
+          </div>
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="label text-slate-400 mb-3">After — the mechanism has its own name</p>
+            <div class="grid grid-cols-2 gap-2 text-xs">
+              <div class="mod-deep p-3">capture::analog<br><span class="text-slate-500 font-mono">only the CaptureSource</span></div>
+              <div class="mod-deep p-3">device_control<br><span class="text-slate-500 font-mono">the Interface-2 mechanism</span></div>
+            </div>
+            <div class="mt-3 text-xs font-mono text-slate-500 space-y-1">
+              <p>led.rs · main.rs · supervisor.rs&nbsp;→ device_control</p>
+              <p>dispatch.rs&nbsp;→ device_control::DeviceInfo</p>
+              <p>executor.rs&nbsp;→ device_control::read_kernel_auto_repeat</p>
+              <p>supervisor.rs&nbsp;→ capture::analog (the source)</p>
+            </div>
+          </div>
+        </div>
+      </article>
+
+      <!-- ============================ CANDIDATE 6 ============================ -->
+      <article id="c6" class="space-y-6 border-t border-slate-300 pt-6">
+        <div class="space-y-2">
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="px-2 py-0.5 rounded text-xs font-semibold bg-slate-200 text-slate-600">Speculative</span>
+            <span class="px-2 py-0.5 rounded text-xs bg-slate-200 text-slate-600">contract fixture across the process seam</span>
+            <span class="px-2 py-0.5 rounded text-xs bg-slate-100 text-slate-500">2026-09-06 review Candidate 4</span>
+          </div>
+          <h2 class="font-serif text-2xl">6 · Close the <code class="font-mono text-xl">config_to_dict</code> encode seam</h2>
+        </div>
+
+        <dl class="grid sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+          <div><dt class="label text-slate-400">Files</dt>
+            <dd class="font-mono text-xs leading-relaxed">daemon/src/dbus/wire.rs (~590, config_to_dict)<br>gui/acheron_gui/binding_editor.py · device_overview.py (~40 hardcoded key-paths)<br>daemon/contract/daemon-schema.json · gui/tests/test_rules_contract.py (the pattern to copy)</dd>
+          <dt class="label text-slate-400 mt-2">Problem</dt>
+            <dd><code class="font-mono">config_to_dict</code> is a single-sided encode: the Daemon writes an <code class="font-mono">a{sv}</code> tree, the GUI reads it by ~40 hardcoded key-paths (<code class="font-mono">config['profiles'][p]['deep_base']</code>…), and nothing checks the two agree. A Rust key rename passes every Rust test and breaks the GUI at runtime.</dd>
+          </div>
+          <div>
+          <dt class="label text-slate-400">Solution</dt>
+            <dd>A golden shape-fixture generated from <code class="font-mono">config_to_dict</code> (like <code class="font-mono">daemon-schema.json</code>), plus a GUI contract test asserting every key-path it reads exists in that fixture — the exact mechanism <code class="font-mono">test_rules_contract.py</code> already uses for the pure legality half.</dd>
+          <dt class="label text-slate-400 mt-2">Wins</dt>
+            <dd><ul class="list-disc list-inside space-y-0.5">
+              <li>the wire shape becomes a checked contract, not a convention</li>
+              <li>a Rust rename fails a test, not a user</li>
+              <li>reuses an accepted pattern; no new standing machinery</li>
+            </ul></dd>
+          </div>
+        </dl>
+
+        <div class="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          <strong>Weigh against ADR-0005.</strong> That ADR accepts the hand-mirrored <code class="font-mono">daemon_stub.py</code>
+          and tells reviews to stop re-suggesting a shared edit-validation harness. This is a narrower thing — the
+          <em>read</em> shape, one direction, one golden file — and ADR-0005 already blesses exactly this mechanism
+          (<code class="font-mono">rules.py</code> + contract fixture) for the pure half. Still: if the team reads
+          ADR-0005 as "the whole config seam is hand-audited, deliberately," this belongs in that ADR's "declined" list instead.
+        </div>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="label text-slate-400 mb-3">Before — encode with no matching decode, no check</p>
+            <div class="space-y-3 text-xs">
+              <div class="mod-deep p-2 font-mono">Rust: config_to_dict(&amp;Config) → a{sv}</div>
+              <div class="flex justify-center"><svg width="24" height="30"><line x1="12" y1="0" x2="12" y2="22" stroke="#475569" stroke-width="2"/><path d="M8 18 L12 26 L16 18 Z" fill="#475569"/></svg></div>
+              <div class="mod p-2 font-mono">GUI: config['profiles'][p]['deep_base'][input]  <span class="text-slate-400">× ~40 paths, by hand</span></div>
+              <div class="rounded bg-rose-50 border border-rose-200 p-2 text-rose-800">
+                <span class="font-mono">deep_base → deep_layer</span> in Rust → all Rust tests green → GUI <code class="font-mono">KeyError</code> at runtime
+              </div>
+            </div>
+          </div>
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="label text-slate-400 mb-3">After — a golden fixture both sides answer to</p>
+            <div class="space-y-3 text-xs">
+              <div class="mod-deep p-2 font-mono">Rust #[test] → config-shape.json <span class="text-slate-400">(generated, committed)</span></div>
+              <div class="flex justify-around">
+                <svg width="24" height="26"><line x1="12" y1="0" x2="12" y2="18" stroke="#475569" stroke-width="2"/><path d="M8 14 L12 22 L16 14 Z" fill="#475569"/></svg>
+                <svg width="24" height="26"><line x1="12" y1="0" x2="12" y2="18" stroke="#475569" stroke-width="2"/><path d="M8 14 L12 22 L16 14 Z" fill="#475569"/></svg>
+              </div>
+              <div class="flex gap-2">
+                <div class="mod p-2 flex-1 font-mono">Rust: config_to_dict stays in step</div>
+                <div class="mod p-2 flex-1 font-mono">GUI: test_config_contract asserts every path</div>
+              </div>
+              <div class="rounded bg-emerald-50 border border-emerald-200 p-2 text-emerald-800">rename → the fixture changes → the GUI contract test fails in CI</div>
+            </div>
+          </div>
+        </div>
+      </article>
+
+      <!-- ============================ ALREADY DEEP ============================ -->
+      <section class="border-t border-slate-300 pt-6 space-y-3">
+        <h2 class="font-serif text-xl">Already deep — leave alone</h2>
+        <p class="text-sm text-slate-600">The review found these done right. Named here so a future pass doesn't re-open them.</p>
+        <ul class="grid sm:grid-cols-2 gap-x-8 gap-y-1 text-sm text-slate-700 list-disc list-inside">
+          <li><code class="font-mono">injector.rs</code> — narrow <code class="font-mono">InjectorMessage</code> seam over uinput; no plausibility-ceiling leak</li>
+          <li><code class="font-mono">trigger::Slots&lt;K&gt;</code> — two maps, one interface, three keyspaces; ticket 15 deepening that worked</li>
+          <li><code class="font-mono">edit::plan</code> / <code class="font-mono">apply</code> — pure transaction, "rollback is don't assign"</li>
+          <li><code class="font-mono">capture::analog::observe</code> + the <code class="font-mono">CaptureSource</code> seam — 6-line pure primitive, <code class="font-mono">fake.rs</code> earns the seam</li>
+          <li><code class="font-mono">dbus::ConnectionScopedTask</code> — the epoch/abort race encapsulated, tested with fakes (ticket 16)</li>
+          <li><code class="font-mono">dbus/mod.rs</code> — thin adapter, ~40 methods of parse-then-<code class="font-mono">Edit</code>, no logic</li>
+          <li>the pure <code class="font-mono">stage::advance</code> core — full Handoff/No-Return/Quick-Skip matrix behind one 4-arg fn</li>
+        </ul>
+      </section>
+
+      <!-- ============================ TOP RECOMMENDATION ============================ -->
+      <section id="top-recommendation" class="rounded-xl border-2 border-slate-800 bg-white p-6 space-y-3">
+        <p class="label text-slate-400">Tackle first</p>
+        <h2 class="font-serif text-2xl">Candidate 1 — the <code class="font-mono">DepthEngine</code> interface</h2>
+        <p class="text-slate-700 text-sm max-w-3xl">
+          It has the most corroboration and a live defect attached. Two prior architecture reviews flagged the
+          teardown matrix and did not act; ADR-0007 records "none of these had a generic hook to reuse — each is
+          new machinery"; and the dual-stage post-ship corrections, per ADR-0009, "clustered on the primary↔deep
+          repeat interaction" — exactly the seam this creates. The <code class="font-mono">ClearDeepStage</code>
+          orphan bug is currently on <code class="font-mono">dev</code> and a teardown contract closes it structurally
+          rather than by adding a fifth special case. Start with the <code class="font-mono">teardown(Reason)</code>
+          half alone — one enum, one loop, the 4×4 matrix collapses — before deciding whether <code class="font-mono">observe</code>
+          and <code class="font-mono">next_deadline</code> also belong on the trait.
+        </p>
+        <p class="text-sm text-slate-500">
+          Low-risk warm-up if the team wants one first: <a href="#c3" class="underline">Candidate 3</a> — pure,
+          self-contained, and it gives the ADR-0005 GUI mirror something to name.
+        </p>
+      </section>
+
+      <p class="text-xs text-slate-400 pt-4">Vocabulary from the <code class="font-mono">/codebase-design</code> skill (module, interface, depth, seam, adapter, leverage, locality) and the domain from <code class="font-mono">CONTEXT.md</code>. This file lives in <code class="font-mono">/tmp</code> — nothing was written to the repo.</p>
+    </main>
+  </body>
+</html>

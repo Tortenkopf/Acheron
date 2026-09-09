@@ -256,11 +256,15 @@ pub enum Edit {
         binding: Binding,
     },
     /// Removes the deep Binding on `layer`. Fails `NotFound` if `input` has
-    /// no deep Binding there. Does **not** cascade-clear `deep_stages` or
-    /// force-release a live slot — ticket 06's runtime-teardown sweep covers
-    /// only a *primary* Binding's removal cascading the deep one away
-    /// (`SetBinding`/`ClearBinding` below); editing the deep Binding directly
-    /// isn't one of spec.md's five listed transitions, so this stays as-is.
+    /// no deep Binding there. Leaves `deep_stages` (the Actuation/mode config)
+    /// untouched — legal and inert with no matching `deep_base`/`deep_held`
+    /// entry, same as the primary-removal cascade. Pushes
+    /// `Effect::StopStage(input)` (ticket 18): *removing* the deep Binding
+    /// while it holds a live deep firing — a Toggle, or a single-key
+    /// Hold-to-repeat in `value=1` autorepeat — is the same orphan
+    /// `ClearBinding`'s cascade exists to prevent, so it force-releases the
+    /// live deep slot immediately rather than waiting for a next Up that may
+    /// never come.
     ClearDeepStage { input: Input, layer: Layer },
     /// Sets a grid key's deep Actuation/Release point pair on the active
     /// Profile, `.entry(input).or_default()`-creating a fresh
@@ -318,11 +322,15 @@ pub(crate) enum Effect {
     /// slots.
     ReleaseAllHolds,
     /// Force-release the given Input's live dual-stage deep slot immediately
-    /// (`stage::Engine::stop_stage`) — pushed by `SetBinding`/`ClearBinding`
-    /// when the edit cascades away an orphaned `deep_base`/`deep_held` entry
-    /// (ticket 06's "Cascade-delete": a live deep stage must not survive its
-    /// primary Binding's removal, and can't wait for a next Up that may
-    /// never come).
+    /// (`stage::Engine::stop_stage`). Two sources: `ClearBinding`'s cascade
+    /// (ticket 06's "Cascade-delete" — removing a primary Binding orphans the
+    /// `deep_base`/`deep_held` entry it carried, via
+    /// `cascade_orphaned_deep_stage`) and, as of ticket 18, `ClearDeepStage`
+    /// directly. `SetBinding` does *not* push this: it replaces a primary in
+    /// place, leaving the deep stage legal (and a replacement that would make
+    /// it illegal is rejected by `config::validate` first). Either way a live
+    /// deep slot must not linger past the Binding backing it, and can't wait
+    /// for a next Up that may never come.
     StopStage(Input),
     /// Center every live axis output and clear the axis engine's state.
     ResetAxisOutputs,
@@ -732,6 +740,16 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             {
                 return Err(CommandError::NotFound);
             }
+            // Removing the deep Binding while it holds a live deep firing — a
+            // Toggle, or a single-key Hold-to-repeat parked in `value=1`
+            // autorepeat — orphans that firing exactly as `ClearBinding`'s
+            // primary-removal cascade would: the `deep_layer` entry is gone,
+            // so `stage::Engine::update`'s `deep_layer(active_layer)
+            // .contains_key` guard skips the Input on every later tick and the
+            // engine never releases it. Force-release it now, mirroring
+            // `cascade_orphaned_deep_stage` (the `remove` already succeeded
+            // above, so the push is unconditional here).
+            effects.push(Effect::StopStage(input));
         }
         Edit::SetDeepActuation {
             input,
@@ -1789,6 +1807,30 @@ mod tests {
             ),
             CommandError::NotFound
         ));
+    }
+
+    #[test]
+    fn clear_deep_stage_pushes_stop_stage_to_force_release_a_live_deep_slot() {
+        // Ticket 18: mirrors `clear_binding_removing_a_primary_with_a_live_
+        // deep_binding_cascades_it_away` — removing the deep Binding directly
+        // orphans a live deep firing the same way the primary cascade does, so
+        // it must force-release the slot rather than leave it stuck.
+        let mut config = with_primary_and_deep_stage(Input::Grid(1, 1));
+        active(&mut config)
+            .deep_base
+            .insert(Input::Grid(1, 1), keypress());
+
+        let (next, outcome) = plan_ok(
+            &config,
+            Edit::ClearDeepStage {
+                input: Input::Grid(1, 1),
+                layer: Layer::Base,
+            },
+        );
+        assert!(next.profiles[DEFAULT_PROFILE_NAME].deep_base.is_empty());
+        // `deep_stages` (Actuation/mode config) is left behind, inert.
+        assert!(!next.profiles[DEFAULT_PROFILE_NAME].deep_stages.is_empty());
+        assert_eq!(outcome.effects, vec![Effect::StopStage(Input::Grid(1, 1))]);
     }
 
     #[test]
