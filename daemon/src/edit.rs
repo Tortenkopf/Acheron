@@ -283,6 +283,35 @@ pub enum Edit {
     SetStagingMode { input: Input, mode: StagingMode },
 }
 
+/// Why `DispatchState::tear_down` is running — the one place the "what
+/// ephemeral runtime state gets released on a Layer switch / Profile switch /
+/// disconnect / Digital-mode flip" matrix lives (`post-release-development`
+/// ticket 19, ADR-0010). Each variant's `tear_down` arm names every
+/// participant — `axis`, `analog_repeat`, `stage`, `individual` (firings and
+/// toggles separately), `chord_machine`, `chord_slots` — with an explicit
+/// `//` line for each participant it deliberately leaves alone. Behaviour is
+/// exactly today's, transcribed from the four former call sites; turning one
+/// of the `//`-marked skips into a real call is ticket 20's job.
+///
+/// A plain `Copy` data enum, it lives here next to `Effect` (and
+/// `CommandError`) so `edit` stays a leaf module — `dispatch` already
+/// imports `edit`, not the reverse, and `Effect::TearDown` needs the type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TeardownReason {
+    /// Mode key edge under `ModeKeyRole::LayerSwitch` — `active_layer`
+    /// flipped. Individual Toggles deliberately survive (a Toggle held
+    /// across a Layer switch keeps running — CONTEXT.md Toggle).
+    LayerSwitch,
+    /// `Edit::SwitchProfile` committed. Strongest sweep: individual
+    /// Toggles drain too. Chord Toggles still survive (an active Chord
+    /// Toggle survives a Profile switch today — see `SwitchProfile` below).
+    ProfileSwitch,
+    /// Device reported disconnected.
+    Disconnect,
+    /// Capture mode flipped to Digital (no Depth).
+    CaptureModeToDigital,
+}
+
 /// A post-commit effect the caller must run — described here by `plan`,
 /// performed by the dispatch task against the runtime state it owns
 /// (`dispatch::run_effects` + its private `EffectCtx`). `edit` never runs
@@ -303,24 +332,20 @@ pub(crate) enum Effect {
     SignalCaptureMode(bool),
     /// Force-stop the running Toggle on the given Input, if any.
     StopToggle(Input),
-    /// Force-stop every running Toggle.
-    StopAllToggles,
-    /// Force-stop every running Analog-repeat task.
-    StopAllAnalogRepeats,
-    /// Force-release every live dual-stage deep slot and reset `stage::
-    /// Engine`'s per-key runtime state (`stage::Engine::stop_all()`) —
-    /// `SwitchProfile`'s own share of `tartarus-dual-stage-keys` ticket 06's
-    /// runtime teardown, alongside `StopAllToggles`/`StopAllAnalogRepeats`.
-    StopAllStages,
-    /// Force-release and drop every live individual firing
-    /// (`trigger::Slots::drain_firings`), leaving individual Toggles running —
-    /// `SwitchProfile`'s share of `spec-kernel-shaped-repeat.md` §7: a
-    /// single-key Hold-to-repeat holds a bare unbalanced `KeyDown` for the
-    /// life of the press (ticket 04), and the new Profile's binding for that
-    /// key may not release it (unbound / Toggle-bound ⇒ `decide`'s `Up` arm
-    /// is inert). Alongside `StopAllStages`, which does the same for the deep
-    /// slots.
-    ReleaseAllHolds,
+    /// Run the dispatch task's one lifecycle-teardown matrix
+    /// (`DispatchState::tear_down`) for the given reason — the
+    /// Config-commit entry point into it (ticket 19, ADR-0010). Pushed only
+    /// by `SwitchProfile` (`TeardownReason::ProfileSwitch`): a Profile switch
+    /// mutates `Config`, so its ephemeral teardown — drain individual Toggles
+    /// and firings, reset axes, stop Analog-repeats, release deep stages —
+    /// must run from `run_effects`, the sole commit point, rather than as a
+    /// direct call the way the three momentary-state situations (Layer
+    /// switch, disconnect, Digital flip) reach `tear_down`. Replaced the five
+    /// separate `StopAllToggles` / `ReleaseAllHolds` / `ResetAxisOutputs` /
+    /// `StopAllAnalogRepeats` / `StopAllStages` variants, whose fan-out order
+    /// now lives in the `ProfileSwitch` arm of the match. `RepublishActuation`
+    /// / `AssertStatusLeds` / `AnnounceProfileChange` stay separate effects.
+    TearDown(TeardownReason),
     /// Force-release the given Input's live dual-stage deep slot immediately
     /// (`stage::Engine::stop_stage`). Two sources: `ClearBinding`'s cascade
     /// (ticket 06's "Cascade-delete" — removing a primary Binding orphans the
@@ -332,8 +357,6 @@ pub(crate) enum Effect {
     /// deep slot must not linger past the Binding backing it, and can't wait
     /// for a next Up that may never come.
     StopStage(Input),
-    /// Center every live axis output and clear the axis engine's state.
-    ResetAxisOutputs,
     /// Reconcile the given Stepper's Daemon-side runtime cursor against the
     /// just-committed `Config` — its list definition changed
     /// (`DeleteStepper` removes it, `SetStepperItems` reshapes it).
@@ -478,40 +501,35 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
                 return Err(CommandError::NotFound);
             }
             next.active_profile = name.clone();
-            // Ordering matters: Toggles and Analog-repeats stop, the new
-            // Profile's Actuation snapshot goes out, axes reset, then the
-            // signal fires — all after the D-Bus reply, uniformly, which is
-            // what deletes `SwitchProfile`'s old bespoke reply-before-signal
-            // reasoning (the hazard it dodged is now the default shape).
-            //
-            // `StopAllToggles` drains only the individual `Slots<Input>`
-            // (`dispatch`'s `individual` field), never the `ChordKey`-keyed
-            // `chord_slots` — an active Chord Toggle survives a Profile switch
-            // today. That is
-            // pre-existing behaviour, preserved unchanged by post-release
-            // ticket 07's mechanical carve; whether a Chord Toggle *should*
-            // outlive a Profile switch is an open question for the domain
-            // owner, not something to settle here.
-            effects.push(Effect::StopAllToggles);
-            // `spec-kernel-shaped-repeat.md` §7: a single-key Hold-to-repeat
-            // holds a bare unbalanced `KeyDown` for the life of the press
-            // (ticket 04); the incoming Profile's binding for that key may
-            // never release it, so drain every live individual firing here —
-            // same reasoning as `StopAllToggles` / `StopAllStages`. Individual
-            // Toggles deliberately survive the switch (see above).
-            effects.push(Effect::ReleaseAllHolds);
+            // The whole ephemeral teardown — drain individual Toggles and
+            // firings, reset axes, stop Analog-repeats, release deep stages,
+            // in that order — is the `ProfileSwitch` arm of dispatch's one
+            // lifecycle-teardown matrix (`DispatchState::tear_down`, ticket
+            // 19 / ADR-0010). A Profile switch mutates `Config`, so it reaches
+            // that matrix as an `Effect` through `run_effects` (the sole
+            // commit point), where the three momentary-state situations
+            // (Layer switch, disconnect, Digital flip) reach it by direct
+            // call. The matrix records the load-bearing survival rules that
+            // used to live in this comment: individual Toggles drain on a
+            // Profile switch (the strongest sweep) but Chord Toggles survive
+            // (`StopAllToggles` only ever drained the individual
+            // `Slots<Input>`), and a single-key Hold-to-repeat's bare
+            // unbalanced `KeyDown` (`spec-kernel-shaped-repeat.md` §7) is
+            // drained here because the incoming Profile's binding for that
+            // key may never release it. Safe to run after this firing's own
+            // `Edit::SwitchProfile` was already produced: `update_stages` /
+            // `stage::Engine::feed` fully complete (and this `Edit` is
+            // returned) before `commit_input_edits` ever reaches
+            // `edit::apply`, so the triggering firing is never interrupted by
+            // its own consequence.
+            effects.push(Effect::TearDown(TeardownReason::ProfileSwitch));
+            // The new Profile's resolved Actuation snapshot goes out after
+            // the teardown — `publish_actuation_snapshot` only re-pushes the
+            // actuation watch-channel snapshot to the capture grid task,
+            // independent of axis centering and hold draining, so its move
+            // from between `ReleaseAllHolds` and `ResetAxisOutputs` to here
+            // is behaviour-neutral (ticket 19).
             effects.push(Effect::RepublishActuation);
-            effects.push(Effect::ResetAxisOutputs);
-            effects.push(Effect::StopAllAnalogRepeats);
-            // Ticket 06: a live dual-stage deep press must not survive a
-            // Profile switch either — same reasoning as the Toggle/Analog-
-            // repeat stops just above. Safe to run after this firing's own
-            // `Edit::SwitchProfile` was already produced: `update_stages`/
-            // `stage::Engine::feed` fully complete (and this `Edit` is returned)
-            // before `commit_input_edits` ever reaches `edit::apply`, so the
-            // triggering firing itself is never interrupted by its own
-            // consequence.
-            effects.push(Effect::StopAllStages);
             // The physical indicator follows the active Profile deterministically
             // (`tartarus-status-leds` ticket 03). Order is irrelevant — the LEDs
             // are independent of Toggles / axes / Analog-repeat.
@@ -1428,15 +1446,16 @@ mod tests {
             },
         );
         assert_eq!(next.active_profile, "Gaming");
+        // The five former teardown effects collapsed into one
+        // `TearDown(ProfileSwitch)` (ticket 19); its fan-out order is asserted
+        // in `dispatch`'s `tear_down` matrix tests. `RepublishActuation` now
+        // trails the teardown rather than sitting mid-chain — a
+        // behaviour-neutral move.
         assert_eq!(
             outcome.effects,
             vec![
-                Effect::StopAllToggles,
-                Effect::ReleaseAllHolds,
+                Effect::TearDown(TeardownReason::ProfileSwitch),
                 Effect::RepublishActuation,
-                Effect::ResetAxisOutputs,
-                Effect::StopAllAnalogRepeats,
-                Effect::StopAllStages,
                 Effect::AssertStatusLeds,
                 Effect::AnnounceProfileChange("Gaming".to_string()),
             ]

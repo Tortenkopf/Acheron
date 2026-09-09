@@ -387,35 +387,75 @@ through it.
 Ticket 17 (`stage::Engine::feed`, the "one event entry point" precondition) is
 **done**.
 
-**Status:** open — filed 2026-09-09, not yet implemented.
+**Status:** done — filed 2026-09-09, implemented 2026-09-10 on `dev`.
 
-- [ ] `TeardownReason` enum + `DispatchState::tear_down(reason)` — the four
+- [x] `TeardownReason` enum + `DispatchState::tear_down(reason)` — the four
       arms transcribed from `HEAD`, every participant named, every skip
       `//`-marked.
-- [ ] `handle_layer_switch` / `handle_connection_change` /
+- [x] `handle_layer_switch` / `handle_connection_change` /
       `handle_capture_mode_change` reduced to state-mutation + `tear_down(…)` +
-      signal emit; per-engine args dropped from their signatures.
-- [ ] `Effect::TearDown(TeardownReason)` replaces the five profile-switch
-      teardown effects in `edit::plan`'s `SwitchProfile` arm; `run_effects`
-      gains one arm, loses five; `edit.rs` / `dbus` effect-assertion tests
-      updated. `Effect::StopStage(Input)` unchanged.
-- [ ] `RepublishActuation` reorder verified behaviour-neutral (two named tests
-      green unchanged).
-- [ ] `wait_for_chord_deadline` + `wait_for_stage_deadline` merged into
-      `wait_for_deadline(Option<Instant>)`; both `select!` arms call it.
-- [ ] `DispatchState::tear_down` unit tests — the matrix as assertions, one
-      per `TeardownReason`, seeded live state in every participant.
-- [ ] All `dual_stage_*` + layer/profile/disconnect/capture integration tests
+      signal emit; now `&mut self` methods on `DispatchState`, per-engine args
+      dropped, `#[allow(clippy::too_many_arguments)]` gone.
+- [x] `Effect::TearDown(TeardownReason)` replaces the five profile-switch
+      teardown effects (`StopAllToggles` / `ReleaseAllHolds` /
+      `ResetAxisOutputs` / `StopAllAnalogRepeats` / `StopAllStages` all
+      removed) in `edit::plan`'s `SwitchProfile` arm; `run_effects` gains one
+      arm, loses five; `edit.rs` effect-assertion test updated (no `dbus`
+      test asserted these). `Effect::StopStage(Input)` unchanged.
+- [x] `RepublishActuation` reorder verified behaviour-neutral —
+      `switch_profile_publishes_the_new_profiles_own_actuation_points` and
+      `a_layer_switch_centers_any_live_axis_output` green unchanged.
+- [x] `wait_for_chord_deadline` + `wait_for_stage_deadline` merged into
+      `wait_for_deadline(Option<Instant>)`; both `select!` arms call it. New
+      `wait_for_deadline` unit test (`None` never resolves; `Some(past)`
+      resolves promptly).
+- [x] `DispatchState::tear_down` unit tests — `dispatch::tests::tear_down_*`,
+      one per `TeardownReason`, seeded live state in every participant
+      (individual firing + Toggle, spawned Analog-repeat task, live deep
+      stage, live axis output, Chord Toggle) via the `Seam` seam.
+- [x] All `dual_stage_*` + layer/profile/disconnect/capture integration tests
       green unchanged.
-- [ ] `docs/adr/0010-*.md` written.
-- [ ] `CONTRIBUTING.md` — handler list refreshed, dual-stage bullet added,
+- [x] `docs/adr/0010-runtime-engine-teardown-one-match-not-a-trait.md` written.
+- [x] `CONTRIBUTING.md` — handler list refreshed (`update_stages` /
+      `tick_stages` + the three now-method handlers), dual-stage bullet added,
       lifecycle-teardown bullet added. `DispatchState` doc comment extended.
-- [ ] `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, full
-      daemon suite green; GUI suite unaffected.
-- [ ] `/code-review` on Standards + Spec axes.
-- [ ] `.scratch/README.md` `post-release-development` line extended.
+- [x] `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, full
+      daemon suite green (553, was 548); GUI suite unaffected.
+- [x] `/code-review` on Standards + Spec axes — Spec: faithful, no
+      behaviour change, all four arms match the `HEAD` call sites; Standards:
+      flagged the `edit → dispatch` import cycle and the co-located
+      axis-reset duplication. Both addressed (see Comments).
+- [x] `.scratch/README.md` `post-release-development` line extended.
 
 ## Comments
+
+**2026-09-10** — Implemented on `dev`. `DispatchState::tear_down(reason)` is
+the one lifecycle-teardown match; `handle_layer_switch` /
+`handle_connection_change` / `handle_capture_mode_change` are now `&mut self`
+methods that mutate state, call `tear_down`, and emit their signal (the
+`#[allow(clippy::too_many_arguments)]` and the disjoint-`&mut` threading are
+gone). `Effect::TearDown(TeardownReason)` replaces the five profile-switch
+teardown effects; `RepublishActuation` now trails the teardown (verified inert
+— `switch_profile_publishes_the_new_profiles_own_actuation_points` +
+`a_layer_switch_centers_any_live_axis_output` green unchanged). The two
+byte-identical deadline helpers merged into `wait_for_deadline`. New
+`dispatch::tests::tear_down_*` (one per reason, every participant seeded live
+on the `Seam` seam: an individual firing + Toggle, a spawned Analog-repeat
+task, a live deep stage, a live axis output, a Chord Toggle + a Chord firing)
+and a `wait_for_deadline` test. `cargo fmt` / `clippy -D warnings` clean;
+daemon suite 553 green (was 548); GUI untouched. ADR-0010 written;
+CONTRIBUTING.md — handler list refreshed, dual-stage and lifecycle-teardown
+bullets added; `DispatchState` doc comment extended.
+
+`/code-review` (Standards + Spec): **Spec** — faithful, no behaviour change,
+all four arms match the `HEAD` call sites line-for-line. **Standards** — two
+findings, both applied: (1) `TeardownReason` was defined in `dispatch.rs` and
+imported by `edit.rs`, making `edit` (a deliberately pure leaf module) depend
+on `dispatch` — moved the enum into `edit.rs` next to `Effect` /
+`CommandError`, `dispatch` imports it; (2) the axis-reset emit loop was
+verbatim in the `LayerSwitch` and `ProfileSwitch` arms — extracted
+`DispatchState::reset_axis_outputs`. Also fixed a stale doc table in the test
+helper and noted per-arm operation order is the former call site's.
 
 **2026-09-09** — Filed from the fifth architecture review
 (`research/architecture-review-2026-09-09.html`, candidate 1 of 6, the "Tackle

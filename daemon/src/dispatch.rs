@@ -42,7 +42,7 @@ use crate::config::{
     self, Action, ActuationPoint, ChordKey, Config, Layer, ModeKeyRole, StatusLeds, TriggerMode,
 };
 use crate::dbus::Daemon;
-use crate::edit;
+use crate::edit::{self, TeardownReason};
 use crate::injector::Injector;
 use crate::input::Input;
 use crate::stage;
@@ -57,7 +57,10 @@ use crate::trigger;
 /// them). No lifetime parameter — every handle below is owned and `'static`.
 /// Dispatch-internal: never part of any module's interface. Adding a new
 /// piece of dispatch runtime state means a field here, not a fresh `run`
-/// local or a new `handle_*` parameter (CONTRIBUTING.md).
+/// local or a new `handle_*` parameter (CONTRIBUTING.md). Lifecycle teardown
+/// of these fields — what gets released on a Layer switch / Profile switch /
+/// disconnect / Digital-mode flip — lives in the single `tear_down(reason)`
+/// match and nowhere else (ticket 19, ADR-0010).
 struct DispatchState {
     /// The individual (`Input`-keyed) firing/toggle handle pair — was the
     /// loose `in_flight` + `toggles` maps (post-release ticket 15).
@@ -175,17 +178,7 @@ impl DispatchState {
             .expect("load_or_seed validates active_profile names a real profile");
 
         if event.input == Input::ModeKey && profile.mode_key_role == ModeKeyRole::LayerSwitch {
-            handle_layer_switch(
-                &self.injector,
-                &mut self.active_layer,
-                &self.signal_emitter,
-                &mut self.axis,
-                &mut self.analog_repeat,
-                &mut self.stage,
-                &mut self.individual,
-                event.state,
-            )
-            .await;
+            self.handle_layer_switch(event.state).await;
             return Ok(Vec::new());
         }
 
@@ -618,6 +611,89 @@ impl DispatchState {
         self.stage.tick(deps, now).await
     }
 
+    /// Center every live axis output and clear the axis engine's state — the
+    /// former `Effect::ResetAxisOutputs`, now a `tear_down` step the
+    /// `LayerSwitch` and `ProfileSwitch` arms share. Every `ABS_*` write goes
+    /// through the one dispatch-side emit loop with the injector error
+    /// swallowed (`let _ =`), the ticket 10 unification.
+    async fn reset_axis_outputs(&mut self) {
+        for w in self.axis.reset() {
+            let _ = self.injector.set_axis_value(w.code, w.value).await;
+        }
+    }
+
+    /// The one place the lifecycle-teardown matrix lives
+    /// (`post-release-development` ticket 19, ADR-0010): a single
+    /// `match reason` naming every ephemeral participant — `axis`,
+    /// `analog_repeat`, `stage`, `individual` firings, `individual` toggles,
+    /// `chord_machine`, `chord_slots` — with an explicit `//` line for each
+    /// one an arm deliberately leaves alone. Two entry points feed it: a
+    /// direct call for the three momentary-state situations
+    /// (`handle_layer_switch` / `handle_connection_change` /
+    /// `handle_capture_mode_change`), and `Effect::TearDown` for the
+    /// Config-commit path (a `SwitchProfile` mutates `Config`, so its
+    /// teardown must run from `run_effects` — the sole commit point).
+    ///
+    /// The match body is **today's behaviour**, transcribed verbatim from the
+    /// four former call sites — this method changed none of it, including each
+    /// arm's own operation order (the former call site's; only
+    /// `ProfileSwitch`'s toggles-before-firings has a documented reason —
+    /// edit.rs). Turning one of the `//`-marked skips into a real call is
+    /// ticket 20's, one at a time, with its own reasoning (and possibly a
+    /// `spec.md` change — disconnect handling is currently declared out of
+    /// scope).
+    ///
+    /// Not a `DepthEngine` trait: the engines are radically heterogeneous
+    /// (`axis` is sync/infallible, `analog_repeat` owns tokio tasks, `stage`
+    /// is async/fallible with a 7-field `EngineDeps`, `chord`'s machine holds
+    /// no handles and its teardown target is a sibling field), edition-2024
+    /// `dyn` + `async-trait` is not this codebase's idiom, and the `rx_depth`
+    /// arm is a sub-millisecond hot path — see ADR-0010.
+    async fn tear_down(&mut self, reason: TeardownReason) {
+        match reason {
+            TeardownReason::LayerSwitch => {
+                self.reset_axis_outputs().await;
+                self.analog_repeat.stop_all().await;
+                self.stage.stop_all(&self.injector).await;
+                self.individual.drain_firings(&self.injector).await;
+                // individual toggles: survive a Layer switch (CONTEXT.md
+                //   Toggle — a Toggle held across a Layer switch keeps
+                //   running).
+                // chord_machine / chord_slots: NOT reset by a Layer switch
+                //   today — ticket 20.
+            }
+            TeardownReason::ProfileSwitch => {
+                self.individual.stop_all_toggles().await;
+                self.individual.drain_firings(&self.injector).await;
+                self.reset_axis_outputs().await;
+                self.analog_repeat.stop_all().await;
+                self.stage.stop_all(&self.injector).await;
+                // chord_slots: Chord Toggles survive a Profile switch
+                //   (edit.rs — `StopAllToggles` drains only the individual
+                //   `Slots<Input>`) — ticket 20.
+                // chord_machine: NOT reset by a Profile switch today —
+                //   ticket 20.
+            }
+            TeardownReason::Disconnect => {
+                self.stage.stop_all(&self.injector).await;
+                self.individual.drain_firings(&self.injector).await;
+                // axis / analog_repeat: NOT torn down on disconnect today.
+                //   analog_repeat has no dropout handling at all (dual-stage
+                //   spec.md, Out of Scope) — ticket 20.
+                // individual toggles: left running — ticket 20.
+                // chord_machine / chord_slots: untouched — ticket 20.
+            }
+            TeardownReason::CaptureModeToDigital => {
+                self.analog_repeat.stop_all().await;
+                self.stage.stop_all(&self.injector).await;
+                self.individual.drain_firings(&self.injector).await;
+                // axis: NOT reset on the Digital flip today — ticket 20.
+                // individual toggles: left running — ticket 20.
+                // chord_machine / chord_slots: untouched — ticket 20.
+            }
+        }
+    }
+
     /// Runs each `edit::Effect` an `edit::plan` derived, in order, against the
     /// `DispatchState` fields it touches (ticket 05). `config` is the
     /// just-committed `Config` — every effect that reads the new state
@@ -659,19 +735,9 @@ impl DispatchState {
                 edit::Effect::StopToggle(input) => {
                     self.individual.stop_toggle(&input).await;
                 }
-                edit::Effect::StopAllToggles => self.individual.stop_all_toggles().await,
-                edit::Effect::ReleaseAllHolds => {
-                    self.individual.drain_firings(&self.injector).await
-                }
-                edit::Effect::StopAllAnalogRepeats => self.analog_repeat.stop_all().await,
-                edit::Effect::StopAllStages => self.stage.stop_all(&self.injector).await,
+                edit::Effect::TearDown(reason) => self.tear_down(reason).await,
                 edit::Effect::StopStage(input) => {
                     self.stage.stop_stage(input, &self.injector).await;
-                }
-                edit::Effect::ResetAxisOutputs => {
-                    for w in self.axis.reset() {
-                        let _ = self.injector.set_axis_value(w.code, w.value).await;
-                    }
                 }
                 edit::Effect::ReconcileStepperCursor(stepper_id) => {
                     // Against the just-committed `Config`: `id` gone → drop
@@ -902,7 +968,7 @@ pub async fn run(
                     Err(_) => depth_open = false,
                 }
             }
-            () = wait_for_chord_deadline(chord::next_deadline(&state.chord_machine)) => {
+            () = wait_for_deadline(chord::next_deadline(&state.chord_machine)) => {
                 let edits = match chord::tick(&mut state.chord_machine, Instant::now()) {
                     chord::ChordOutcome::Handled(effects) => {
                         state.run_chord_effects(&config, effects).await?
@@ -913,7 +979,7 @@ pub async fn run(
                     state.commit_input_edits(edits, &mut config, &config_path).await;
                 }
             }
-            () = wait_for_stage_deadline(state.stage.next_deadline()) => {
+            () = wait_for_deadline(state.stage.next_deadline()) => {
                 let edits = state.tick_stages(&config, Instant::now()).await?;
                 if !edits.is_empty() {
                     state.commit_input_edits(edits, &mut config, &config_path).await;
@@ -922,15 +988,7 @@ pub async fn run(
             connected = rx_connection.recv(), if connection_open => {
                 match connected {
                     Some(connected) => {
-                        handle_connection_change(
-                            &mut state.device_connected,
-                            &state.signal_emitter,
-                            &mut state.stage,
-                            &mut state.individual,
-                            &state.injector,
-                            connected,
-                        )
-                        .await;
+                        state.handle_connection_change(connected).await;
                         // `tartarus-status-leds` ticket 02 / ADR-0006: the
                         // firmware reclaims the Status LEDs to its orange-only
                         // default on every USB enumeration, so re-assert the
@@ -950,16 +1008,7 @@ pub async fn run(
             }
             mode = rx_capture_mode.recv(), if capture_mode_open => {
                 match mode {
-                    Some(mode) => handle_capture_mode_change(
-                        &mut state.capture_mode,
-                        &state.signal_emitter,
-                        &mut state.analog_repeat,
-                        &mut state.stage,
-                        &mut state.individual,
-                        &state.injector,
-                        mode,
-                    )
-                    .await,
+                    Some(mode) => state.handle_capture_mode_change(mode).await,
                     None => capture_mode_open = false,
                 }
             }
@@ -985,171 +1034,96 @@ pub async fn run(
     Ok(())
 }
 
-/// Awaits the active Chord window's deadline, or never resolves if none is
-/// open — the `select!` branch in `run` re-creates this future every loop
-/// iteration, so a window opened, extended, or cleared by `handle_event` in
-/// between is always picked up on the very next iteration (recreating a
-/// `sleep_until` against the same absolute `Instant` doesn't lose progress).
-/// Replaces the old `chord_window_deadline`.
-async fn wait_for_chord_deadline(deadline: Option<Instant>) {
+/// Awaits an `Instant` deadline, or never resolves if there is none — the
+/// shared `select!` timeout-arm wrapper for both the Chord window
+/// (`chord::next_deadline`, a single global window) and Quick-Skip
+/// (`stage::Engine::next_deadline`, the earliest still-armed deadline across
+/// every Quick-Skip key). The two arms keep their own next-deadline source —
+/// different internals, same `Option<Instant>` — and only this wait wrapper
+/// is shared (`post-release-development` ticket 19; the two were
+/// byte-identical bar the name). The `select!` branch re-creates this future
+/// every loop iteration, so a deadline opened, extended, cancelled, or
+/// elapsed by a handler in between is always picked up on the very next
+/// iteration (recreating a `sleep_until` against the same absolute `Instant`
+/// doesn't lose progress).
+async fn wait_for_deadline(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending().await,
     }
 }
 
-/// Quick-Skip's own deadline-timeout wait (`tartarus-dual-stage-keys` ticket
-/// 04) — mirrors `wait_for_chord_deadline`'s exact shape one line above.
-/// `state.stage.next_deadline()` takes the earliest still-armed deadline
-/// across every Quick-Skip key (unlike Chord's single global window), so
-/// re-creating this future every loop iteration picks up a freshly-armed,
-/// cancelled, or elapsed deadline for any key on the very next iteration.
-async fn wait_for_stage_deadline(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
-        None => std::future::pending().await,
+impl DispatchState {
+    /// The `LayerSwitch` interception itself: `Down` activates Held, `Up`
+    /// reverts to Base, `Repeat` is a steady-state no-op (evdev autorepeat on
+    /// a held modifier key carries no new information here). Emits
+    /// `ActiveLayerChanged` only on an actual transition — a `signal_emitter`
+    /// of `None` (unit tests with no live D-Bus connection) simply skips the
+    /// push. On an actual transition the ephemeral teardown (axis reset,
+    /// Analog-repeat stop, deep-stage release, held-firing drain) runs through
+    /// `tear_down(TeardownReason::LayerSwitch)` — the one lifecycle-teardown
+    /// matrix (ticket 19).
+    async fn handle_layer_switch(&mut self, state: EventState) {
+        let new_layer = match state {
+            EventState::Down => Layer::Held,
+            EventState::Up => Layer::Base,
+            EventState::Repeat => return,
+        };
+        if new_layer == self.active_layer {
+            return;
+        }
+        self.active_layer = new_layer;
+        self.tear_down(TeardownReason::LayerSwitch).await;
+        if let Some(emitter) = &self.signal_emitter {
+            let _ = Daemon::active_layer_changed(emitter, new_layer.as_str()).await;
+        }
     }
-}
 
-/// The `LayerSwitch` interception itself: `Down` activates Held, `Up`
-/// reverts to Base, `Repeat` is a steady-state no-op (evdev autorepeat on a
-/// held modifier key carries no new information here). Emits
-/// `ActiveLayerChanged` only on an actual transition — a `signal_emitter` of
-/// `None` (unit tests with no live D-Bus connection) simply skips the push.
-/// Also resets every Axis output (ticket 71) on an actual transition — the
-/// outgoing Layer's Axis-assignment map generally differs from the incoming
-/// one, so any live output must not be left driving a target the newly-
-/// active Layer no longer even assigns. Force-stops every Analog-repeat task
-/// for the same reason (ticket 39) — an incoming Layer's Bindings generally
-/// differ from the outgoing one's, so a task compiled against the old
-/// Layer's Action must not keep firing under the new one.
-// One over clippy's arg limit since ticket 04 added `individual` (the
-// spec §7 hold teardown); every arg is a distinct disjoint `&mut state.*`
-// borrow the `select!` loop can't hand over as one `&mut self`.
-#[allow(clippy::too_many_arguments)]
-async fn handle_layer_switch(
-    injector: &Injector,
-    active_layer: &mut Layer,
-    signal_emitter: &Option<SignalEmitter<'static>>,
-    axis: &mut axis::Engine,
-    analog_repeat: &mut analog_repeat::Engine,
-    stage: &mut stage::Engine,
-    individual: &mut trigger::Slots<Input>,
-    state: EventState,
-) {
-    let new_layer = match state {
-        EventState::Down => Layer::Held,
-        EventState::Up => Layer::Base,
-        EventState::Repeat => return,
-    };
-    if new_layer == *active_layer {
-        return;
+    /// Updates the dispatch task's view of device connectivity (ticket 20)
+    /// and emits `DeviceConnectionChanged` only on an actual transition —
+    /// mirrors `handle_layer_switch`'s pattern for `ActiveLayerChanged`,
+    /// including skipping the push when `signal_emitter` is `None` (unit tests
+    /// with no live D-Bus connection). A transition to `connected == false`
+    /// runs `tear_down(TeardownReason::Disconnect)` — the deep-stage release +
+    /// held-firing drain that `tartarus-dual-stage-keys` ticket 06 introduced
+    /// here (no generic dropout hook exists — Analog-repeat has none at all,
+    /// spec.md's "Out of Scope"), now one arm of the lifecycle-teardown
+    /// matrix (ticket 19).
+    async fn handle_connection_change(&mut self, connected: bool) {
+        if connected == self.device_connected {
+            return;
+        }
+        self.device_connected = connected;
+        if !connected {
+            self.tear_down(TeardownReason::Disconnect).await;
+        }
+        if let Some(emitter) = &self.signal_emitter {
+            let _ = Daemon::device_connection_changed(emitter, connected).await;
+        }
     }
-    *active_layer = new_layer;
-    for w in axis.reset() {
-        let _ = injector.set_axis_value(w.code, w.value).await;
-    }
-    analog_repeat.stop_all().await;
-    // `tartarus-dual-stage-keys` ticket 03: the incoming Layer's dual-stage
-    // config generally differs from the outgoing one's (or has none at all),
-    // so any live deep firing/Toggle compiled against the old Layer's
-    // Binding must not keep running under the new one — same reasoning as
-    // the `analog_repeat.stop_all()` call just above.
-    stage.stop_all(injector).await;
-    // `spec-kernel-shaped-repeat.md` §7: every single-key Hold-to-repeat now
-    // holds a bare unbalanced `KeyDown` (`value=1`) for the life of the
-    // press (ticket 04). If the bound key is released on the incoming Layer
-    // where it is unbound or Toggle-bound, `decide`'s `Up` arm never
-    // force-releases it — so balance every held individual firing here, the
-    // same way the deep stage's is balanced just above. Individual Toggles
-    // deliberately survive the switch and are untouched.
-    individual.drain_firings(injector).await;
-    if let Some(emitter) = signal_emitter {
-        let _ = Daemon::active_layer_changed(emitter, new_layer.as_str()).await;
-    }
-}
 
-/// Updates the dispatch task's view of device connectivity (ticket 20) and
-/// emits `DeviceConnectionChanged` only on an actual transition — mirrors
-/// `handle_layer_switch`'s pattern for `ActiveLayerChanged` above, including
-/// skipping the push when `signal_emitter` is `None` (unit tests with no
-/// live D-Bus connection). A transition to `connected == false` is
-/// `tartarus-dual-stage-keys` ticket 06's new, explicit disconnect hook: no
-/// generic one exists anywhere else in the daemon today (Analog-repeat has
-/// no dropout handling at all — a pre-existing gap this ticket doesn't fix,
-/// spec.md's "Out of Scope"), so `stage::Engine::stop_all()` force-releases
-/// every live deep slot and resets its per-key `KeyState`/Quick-Skip runtime
-/// state here, independent of capture's own synthetic-Up trick for the
-/// primary band (`relay_grid_blocking`, `analog.rs`), which only ever covers
-/// the primary.
-async fn handle_connection_change(
-    device_connected: &mut bool,
-    signal_emitter: &Option<SignalEmitter<'static>>,
-    stage: &mut stage::Engine,
-    individual: &mut trigger::Slots<Input>,
-    injector: &Injector,
-    connected: bool,
-) {
-    if connected == *device_connected {
-        return;
-    }
-    *device_connected = connected;
-    if !connected {
-        stage.stop_all(injector).await;
-        // Balance any bare `HoldKeyDown` hold (`spec-kernel-shaped-repeat.md`
-        // §7) the same way the deep stage's is balanced just above — capture's
-        // own synthetic-Up trick only ever covers the primary band, so a
-        // held single-key Hold-to-repeat would otherwise be stranded at the
-        // OS level on a dropout. Individual Toggles are left running.
-        individual.drain_firings(injector).await;
-    }
-    if let Some(emitter) = signal_emitter {
-        let _ = Daemon::device_connection_changed(emitter, connected).await;
-    }
-}
-
-/// Updates the dispatch task's view of which capture path is running
-/// (ticket 23) and emits `CaptureModeChanged` only on an actual transition —
-/// mirrors `handle_connection_change` above exactly, including skipping the
-/// push when `signal_emitter` is `None` (unit tests with no live D-Bus
-/// connection). Also force-stops every Analog-repeat task on a transition to
-/// Digital (ticket 39): the live-Depth stream every task's rate curve reads
-/// goes stale the moment analog capture stops, and Digital-sourced
-/// Down/Repeat/Up events for the same Bindings are about to start reaching
-/// the individual Trigger-mode path's own Hold-to-repeat-equivalent fallback
-/// instead (`trigger::decide` treats Analog-repeat as Hold-to-repeat) — a
-/// still-running task would otherwise double-fire alongside it.
-async fn handle_capture_mode_change(
-    capture_mode: &mut CaptureMode,
-    signal_emitter: &Option<SignalEmitter<'static>>,
-    analog_repeat: &mut analog_repeat::Engine,
-    stage: &mut stage::Engine,
-    individual: &mut trigger::Slots<Input>,
-    injector: &Injector,
-    mode: CaptureMode,
-) {
-    if mode == *capture_mode {
-        return;
-    }
-    *capture_mode = mode;
-    if mode == CaptureMode::Digital {
-        analog_repeat.stop_all().await;
-        // `tartarus-dual-stage-keys` ticket 03: `stage::Engine::update` only
-        // ever runs off `rx_depth`, which the Digital-mode capture source
-        // never populates — a dual-stage key's deep stage is inert for free
-        // the moment this transition completes. Force-release any deep
-        // firing/Toggle still live from the outgoing Analog session, same
-        // reasoning as `analog_repeat.stop_all()` just above.
-        stage.stop_all(injector).await;
-        // And balance any bare `HoldKeyDown` hold (`spec-kernel-shaped-repeat.md`
-        // §7) an Analog-sourced single-key Hold-to-repeat left holding — the
-        // synthesized `Repeat` stream that would have driven it is gone, and
-        // Digital-sourced events for the same key may not reach `decide`'s
-        // `Up` arm as a firing mode. Individual Toggles are left running.
-        individual.drain_firings(injector).await;
-    }
-    if let Some(emitter) = signal_emitter {
-        let _ = Daemon::capture_mode_changed(emitter, mode.as_str()).await;
+    /// Updates the dispatch task's view of which capture path is running
+    /// (ticket 23) and emits `CaptureModeChanged` only on an actual
+    /// transition — mirrors `handle_connection_change` exactly, including
+    /// skipping the push when `signal_emitter` is `None`. A transition to
+    /// Digital runs `tear_down(TeardownReason::CaptureModeToDigital)`: the
+    /// live-Depth stream every Analog-repeat task and the deep stage read
+    /// goes stale the moment analog capture stops, and Digital-sourced
+    /// Down/Repeat/Up events for the same Bindings are about to start
+    /// reaching the individual Trigger-mode path — a still-running task or
+    /// deep firing would double-fire alongside them (ticket 39 / ticket 03,
+    /// now one arm of the lifecycle-teardown matrix, ticket 19).
+    async fn handle_capture_mode_change(&mut self, mode: CaptureMode) {
+        if mode == self.capture_mode {
+            return;
+        }
+        self.capture_mode = mode;
+        if mode == CaptureMode::Digital {
+            self.tear_down(TeardownReason::CaptureModeToDigital).await;
+        }
+        if let Some(emitter) = &self.signal_emitter {
+            let _ = Daemon::capture_mode_changed(emitter, mode.as_str()).await;
+        }
     }
 }
 
@@ -5396,6 +5370,377 @@ mod tests {
         for _ in 0..5 {
             tokio::task::yield_now().await;
         }
+    }
+
+    // ── ticket 19: `DispatchState::tear_down` — the lifecycle-teardown matrix ──
+
+    /// A Profile that carries one live-able participant of every kind
+    /// `tear_down` names, so a single `state.tear_down(reason)` call can be
+    /// asserted against the whole matrix at once (ticket 19):
+    ///
+    /// | Input        | participant                                  | key   |
+    /// |--------------|----------------------------------------------|-------|
+    /// | `Grid(1,1)`  | dual-stage key (Handoff): primary Hold-to-repeat | KEY_A |
+    /// | `Grid(1,1)`  | …its deep stage = Toggle                     | KEY_B |
+    /// | `Grid(2,1)`  | individual Toggle                            | KEY_C |
+    /// | `Grid(3,1)`  | individual Hold-to-repeat (bare held value=1) | KEY_D |
+    /// | `Grid(4,1)`  | axis assignment → `ABS_Z`                    | —     |
+    /// | `Grid(2,3)`  | Analog-repeat task                           | KEY_G |
+    /// | `Grid(1,3)+Grid(1,4)` | Chord Toggle                       | KEY_E |
+    /// | `Grid(3,3)+Grid(3,4)` | Chord Hold-to-repeat firing        | KEY_F |
+    fn matrix_config() -> Config {
+        config_with_profile(Profile {
+            base: HashMap::from([
+                (
+                    Input::Grid(1, 1),
+                    hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+                ),
+                (Input::Grid(2, 1), toggle_binding(evdev::KeyCode::KEY_C)),
+                (
+                    Input::Grid(3, 1),
+                    hold_to_repeat_binding(evdev::KeyCode::KEY_D),
+                ),
+                (
+                    Input::Grid(2, 3),
+                    Binding {
+                        trigger: TriggerMode::AnalogRepeat,
+                        action: Action::Keypress {
+                            modifiers: Modifiers::default(),
+                            key: evdev::KeyCode::KEY_G,
+                        },
+                    },
+                ),
+            ]),
+            deep_base: HashMap::from([(Input::Grid(1, 1), toggle_binding(evdev::KeyCode::KEY_B))]),
+            deep_stages: HashMap::from([(
+                Input::Grid(1, 1),
+                DeepStageConfig {
+                    actuation: ActuationPoint {
+                        actuation: 220,
+                        release: 200,
+                    },
+                    mode: StagingMode::Handoff,
+                },
+            )]),
+            axis_base: HashMap::from([(Input::Grid(4, 1), AxisTarget::LeftTrigger)]),
+            chords_base: HashMap::from([
+                (
+                    ChordKey::new(BTreeSet::from([Input::Grid(1, 3), Input::Grid(1, 4)])),
+                    toggle_binding(evdev::KeyCode::KEY_E),
+                ),
+                (
+                    ChordKey::new(BTreeSet::from([Input::Grid(3, 3), Input::Grid(3, 4)])),
+                    hold_to_repeat_binding(evdev::KeyCode::KEY_F),
+                ),
+            ]),
+            ..Default::default()
+        })
+    }
+
+    /// Drives every participant of `matrix_config` into a live state on a
+    /// fresh `Seam`: KEY_D held as a bare individual firing, KEY_C an
+    /// individual Toggle, KEY_B a live deep-stage Toggle, `ABS_Z` a live axis
+    /// output, KEY_G a spawned Analog-repeat task, KEY_E a Chord Toggle, KEY_F
+    /// a live Chord firing. The caller keeps the `depth_rx`'s `Sender` alive
+    /// for the life of the test (the Analog-repeat task holds a clone).
+    async fn seed_every_teardown_participant(
+        seam: &mut Seam,
+        depth_rx: &watch::Receiver<HashMap<Input, u8>>,
+    ) {
+        seam.press(Input::Grid(3, 1)).await;
+        seam.press(Input::Grid(2, 1)).await;
+
+        // Dual-stage key: baseline tick, primary press, then a deep-band tick
+        // that hands the primary off and fires the deep Toggle (KEY_B).
+        seam.state
+            .update_stages(&seam.config, &HashMap::from([(Input::Grid(1, 1), 0)]))
+            .await
+            .unwrap();
+        seam.feed(PhysicalEvent {
+            input: Input::Grid(1, 1),
+            state: EventState::Down,
+            depth: Some(150),
+        })
+        .await;
+        seam.state
+            .update_stages(&seam.config, &HashMap::from([(Input::Grid(1, 1), 150)]))
+            .await
+            .unwrap();
+        seam.state
+            .update_stages(&seam.config, &HashMap::from([(Input::Grid(1, 1), 250)]))
+            .await
+            .unwrap();
+
+        // Live axis output.
+        seam.state
+            .handle_depth_update(&seam.config, &HashMap::from([(Input::Grid(4, 1), 200)]))
+            .await;
+
+        // Spawned Analog-repeat task.
+        seam.state
+            .update_analog_repeats(
+                &seam.config,
+                depth_rx,
+                &HashMap::from([(Input::Grid(2, 3), 200)]),
+            )
+            .await;
+
+        // Chord Toggle (KEY_E) and Chord Hold-to-repeat firing (KEY_F) — both
+        // members of each down inside the window.
+        for input in [
+            Input::Grid(1, 3),
+            Input::Grid(1, 4),
+            Input::Grid(3, 3),
+            Input::Grid(3, 4),
+        ] {
+            seam.feed(PhysicalEvent {
+                input,
+                state: EventState::Down,
+                depth: None,
+            })
+            .await;
+        }
+        settle().await;
+    }
+
+    /// Stops every background task `seed_every_teardown_participant` may have
+    /// left running that `Seam::finish` doesn't (the two Chord-path handles),
+    /// then hands off to `finish`.
+    async fn finish_matrix(mut seam: Seam) {
+        seam.state.chord_slots.stop_all_toggles().await;
+        seam.state.chord_slots.drain_firings(&seam.inj).await;
+        seam.finish().await;
+    }
+
+    /// `(KeyCode, value)` of every batch the recording sink took at or after
+    /// `from` — the release edges a `tear_down` produced.
+    fn released_keys_since(seam: &Seam, from: usize) -> Vec<(evdev::KeyCode, i32)> {
+        seam.sink.batches()[from..]
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect()
+    }
+
+    /// True once the Analog-repeat task seeded on `Grid(2,3)` is gone —
+    /// `reconcile` only asks for a fresh `Spawn` when no task is active.
+    async fn analog_repeat_task_gone(seam: &mut Seam) -> bool {
+        !seam
+            .state
+            .analog_repeat
+            .update(
+                &HashSet::from([Input::Grid(2, 3)]),
+                &HashMap::from([(Input::Grid(2, 3), 200u8)]),
+            )
+            .await
+            .is_empty()
+    }
+
+    #[tokio::test]
+    async fn tear_down_layer_switch_drains_firings_axis_analog_stage_and_keeps_every_toggle() {
+        let (_depth_tx, depth_rx) = watch::channel(HashMap::new());
+        let mut seam = Seam::new(matrix_config());
+        seed_every_teardown_participant(&mut seam, &depth_rx).await;
+
+        let mark = seam.sink.batches().len();
+        let gamepad_mark = seam.gamepad_sink.batches().len();
+        seam.state.tear_down(TeardownReason::LayerSwitch).await;
+        settle().await;
+
+        let released = released_keys_since(&seam, mark);
+        assert!(
+            released.contains(&(evdev::KeyCode::KEY_D, 0)),
+            "the individual Hold-to-repeat's bare value=1 is drained: {released:?}"
+        );
+        assert!(
+            released.contains(&(evdev::KeyCode::KEY_B, 0)),
+            "the live deep-stage Toggle is released: {released:?}"
+        );
+        assert!(
+            !released.iter().any(|&(c, _)| c == evdev::KeyCode::KEY_C),
+            "the individual Toggle survives a Layer switch (CONTEXT.md): {released:?}"
+        );
+        assert!(
+            !released
+                .iter()
+                .any(|&(c, _)| c == evdev::KeyCode::KEY_E || c == evdev::KeyCode::KEY_F),
+            "the Chord path (Toggle + firing) is untouched by a Layer switch: {released:?}"
+        );
+        assert_eq!(
+            seam.state
+                .individual
+                .active_toggle_keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![Input::Grid(2, 1)]
+        );
+
+        let axis_writes = flat_axis_writes(seam.gamepad_sink.batches()[gamepad_mark..].to_vec());
+        assert_eq!(
+            axis_writes,
+            vec![(evdev::AbsoluteAxisCode::ABS_Z, 0)],
+            "every live axis output is centered on a Layer switch"
+        );
+        assert!(
+            analog_repeat_task_gone(&mut seam).await,
+            "the Analog-repeat task is stopped on a Layer switch"
+        );
+
+        finish_matrix(seam).await;
+    }
+
+    #[tokio::test]
+    async fn tear_down_profile_switch_is_the_strongest_sweep_and_also_drains_individual_toggles() {
+        let (_depth_tx, depth_rx) = watch::channel(HashMap::new());
+        let mut seam = Seam::new(matrix_config());
+        seed_every_teardown_participant(&mut seam, &depth_rx).await;
+
+        let mark = seam.sink.batches().len();
+        let gamepad_mark = seam.gamepad_sink.batches().len();
+        seam.state.tear_down(TeardownReason::ProfileSwitch).await;
+        settle().await;
+
+        let released = released_keys_since(&seam, mark);
+        assert!(
+            released.contains(&(evdev::KeyCode::KEY_C, 0)),
+            "the individual Toggle drains on a Profile switch: {released:?}"
+        );
+        assert!(
+            released.contains(&(evdev::KeyCode::KEY_D, 0)),
+            "the individual firing is drained: {released:?}"
+        );
+        assert!(
+            released.contains(&(evdev::KeyCode::KEY_B, 0)),
+            "the live deep-stage Toggle is released: {released:?}"
+        );
+        assert!(
+            !released
+                .iter()
+                .any(|&(c, _)| c == evdev::KeyCode::KEY_E || c == evdev::KeyCode::KEY_F),
+            "the Chord path (Toggle + firing) still survives a Profile switch (edit.rs): {released:?}"
+        );
+        assert!(
+            seam.state.individual.active_toggle_keys().next().is_none(),
+            "no individual Toggle survives a Profile switch"
+        );
+
+        let axis_writes = flat_axis_writes(seam.gamepad_sink.batches()[gamepad_mark..].to_vec());
+        assert_eq!(axis_writes, vec![(evdev::AbsoluteAxisCode::ABS_Z, 0)]);
+        assert!(
+            analog_repeat_task_gone(&mut seam).await,
+            "the Analog-repeat task is stopped on a Profile switch"
+        );
+
+        finish_matrix(seam).await;
+    }
+
+    #[tokio::test]
+    async fn tear_down_disconnect_touches_only_the_deep_stage_and_individual_firings() {
+        let (_depth_tx, depth_rx) = watch::channel(HashMap::new());
+        let mut seam = Seam::new(matrix_config());
+        seed_every_teardown_participant(&mut seam, &depth_rx).await;
+
+        let mark = seam.sink.batches().len();
+        let gamepad_mark = seam.gamepad_sink.batches().len();
+        seam.state.tear_down(TeardownReason::Disconnect).await;
+        settle().await;
+
+        let released = released_keys_since(&seam, mark);
+        assert!(
+            released.contains(&(evdev::KeyCode::KEY_B, 0)),
+            "the deep stage is released on a disconnect: {released:?}"
+        );
+        assert!(
+            released.contains(&(evdev::KeyCode::KEY_D, 0)),
+            "individual firings are drained on a disconnect: {released:?}"
+        );
+        assert!(
+            !released.iter().any(|&(c, _)| c == evdev::KeyCode::KEY_C),
+            "individual Toggles survive a disconnect: {released:?}"
+        );
+        assert!(
+            !released
+                .iter()
+                .any(|&(c, _)| c == evdev::KeyCode::KEY_E || c == evdev::KeyCode::KEY_F),
+            "the Chord path (Toggle + firing) is untouched by a disconnect: {released:?}"
+        );
+        assert_eq!(
+            seam.state
+                .individual
+                .active_toggle_keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![Input::Grid(2, 1)]
+        );
+        assert_eq!(
+            seam.gamepad_sink.batches().len(),
+            gamepad_mark,
+            "axis is NOT reset on a disconnect today (ticket 20) — no new write"
+        );
+        assert!(
+            !analog_repeat_task_gone(&mut seam).await,
+            "Analog-repeat has no dropout handling today (ticket 20) — its task keeps running"
+        );
+
+        finish_matrix(seam).await;
+    }
+
+    #[tokio::test]
+    async fn tear_down_capture_mode_to_digital_stops_analog_and_stage_but_leaves_axis() {
+        let (_depth_tx, depth_rx) = watch::channel(HashMap::new());
+        let mut seam = Seam::new(matrix_config());
+        seed_every_teardown_participant(&mut seam, &depth_rx).await;
+
+        let mark = seam.sink.batches().len();
+        let gamepad_mark = seam.gamepad_sink.batches().len();
+        seam.state
+            .tear_down(TeardownReason::CaptureModeToDigital)
+            .await;
+        settle().await;
+
+        let released = released_keys_since(&seam, mark);
+        assert!(
+            released.contains(&(evdev::KeyCode::KEY_B, 0)),
+            "the deep stage is released on the Digital flip: {released:?}"
+        );
+        assert!(
+            released.contains(&(evdev::KeyCode::KEY_D, 0)),
+            "individual firings are drained on the Digital flip: {released:?}"
+        );
+        assert!(
+            !released.iter().any(|&(c, _)| c == evdev::KeyCode::KEY_C),
+            "individual Toggles survive the Digital flip: {released:?}"
+        );
+        assert!(
+            !released
+                .iter()
+                .any(|&(c, _)| c == evdev::KeyCode::KEY_E || c == evdev::KeyCode::KEY_F),
+            "the Chord path (Toggle + firing) is untouched by the Digital flip: {released:?}"
+        );
+        assert_eq!(
+            seam.gamepad_sink.batches().len(),
+            gamepad_mark,
+            "axis is NOT reset on the Digital flip today (ticket 20) — no new write"
+        );
+        assert!(
+            analog_repeat_task_gone(&mut seam).await,
+            "the Analog-repeat task is stopped on the Digital flip"
+        );
+
+        finish_matrix(seam).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_deadline_never_resolves_without_one_and_resolves_promptly_for_a_past_instant()
+    {
+        // `None` never resolves — a 1s race against it must time out.
+        let raced = tokio::time::timeout(Duration::from_secs(1), wait_for_deadline(None)).await;
+        assert!(raced.is_err(), "wait_for_deadline(None) must never resolve");
+
+        // `Some(past)` resolves right away.
+        let past = Instant::now() - Duration::from_millis(1);
+        tokio::time::timeout(Duration::from_secs(1), wait_for_deadline(Some(past)))
+            .await
+            .expect("wait_for_deadline(Some(past)) must resolve promptly");
     }
 
     /// A multiset of decoded `(KeyCode, value)` events — for asserting two

@@ -205,6 +205,35 @@ and it can be verified before merge.
   (`analog_repeat::Engine`, `run_analog_repeat_loop`) and the
   `trigger::compile_action` handoff belong outside the pure core.
 
+- **Changing dual-stage / Staging-mode behaviour** (the deep-band
+  hysteresis, the Handoff / No-Return / Quick-Skip state machine, the ~50 ms
+  Quick-Skip window, primary suppression, deep-repeat phase-locking) —
+  `tartarus-dual-stage-keys` / post-release ticket 17, ADR-0007. The decision
+  lives in `daemon/src/stage.rs` as the pure `advance` / `tick` /
+  `next_deadline` functions and the per-mode transition tables — add or
+  adjust it there with a synchronous `stage::tests` case, never in
+  `dispatch`. Only the execution (`stage::Engine`'s seven `pub(crate)`
+  methods: `feed` / `update` / `next_deadline` / `tick` / `stop_all` /
+  `stop_stage` / `stop_all_toggles`, driven from the `rx_events` and
+  `rx_depth` arms and the shared `wait_for_deadline` timeout arm) belongs
+  outside the pure core. `edit::plan` emits `Effect::StopStage(input)` for a
+  targeted per-Input release (`ClearBinding`'s cascade, `ClearDeepStage`);
+  the matrix sweep is `tear_down`'s (below).
+
+- **Changing lifecycle teardown** (what ephemeral runtime state gets
+  released on a Layer switch / Profile switch / disconnect / capture-mode
+  flip to Digital) — post-release ticket 19, ADR-0010. The matrix lives in
+  `DispatchState::tear_down` + `TeardownReason` in `daemon/src/dispatch.rs`,
+  one `match reason` naming every participant with a `//` line for each one
+  an arm deliberately skips, asserted by `dispatch::tests::tear_down_*`. A
+  new engine adds a line to each arm. The three momentary-state situations
+  reach it by direct call from `handle_layer_switch` /
+  `handle_connection_change` / `handle_capture_mode_change`; a Profile switch
+  reaches it as `Effect::TearDown(TeardownReason::ProfileSwitch)` through
+  `run_effects` (it mutates `Config`, so its teardown runs at the commit
+  point). Turning one of the `//`-marked skips into a real call is ticket
+  20's, one at a time with its own reasoning — not a drive-by.
+
 - **Changing Stepper cursor behaviour** (the wrap-around, which item a step
   lands on, the default-to-first, or how an edited/deleted list reconciles a
   stored position) — post-release ticket 12. The decision lives in
@@ -224,17 +253,18 @@ and it can be verified before merge.
   one `DispatchState` struct in `daemon/src/dispatch.rs`, and each `select!`
   arm's handler (`handle_event`, `handle_command`, `run_chord_effects`,
   `run_effects`, `commit_input_edits`, `update_analog_repeats`,
-  `handle_depth_update`, `dispatch_individual_down`) is a `&mut self` method
-  on it. A new piece of that state is a `DispatchState` field, not a fresh
-  `run` local or another parameter threaded through those handlers. `run`
-  builds the struct once at task start and then only drives the `select!`
-  loop. `Config` (the committed half) stays a `run` local by design
-  (ticket 05), as do the `rx_*` receivers and their `*_open` liveness flags
-  (pure `select!` plumbing that no handler reads). A handful of leaf helpers
-  (`handle_layer_switch`, `handle_connection_change`,
-  `handle_capture_mode_change`) stay free functions taking `&mut` to only the
-  one or two fields they touch — that is fine; the rule is against
-  reintroducing the loose-local *bundle*, not against a narrow borrow.
+  `handle_depth_update`, `update_stages`, `tick_stages`,
+  `dispatch_individual_down`, `handle_layer_switch`,
+  `handle_connection_change`, `handle_capture_mode_change`) is a
+  `&mut self` method on it. A new piece of that state is a `DispatchState`
+  field, not a fresh `run` local or another parameter threaded through those
+  handlers. `run` builds the struct once at task start and then only drives
+  the `select!` loop. `Config` (the committed half) stays a `run` local by
+  design (ticket 05), as do the `rx_*` receivers and their `*_open` liveness
+  flags (pure `select!` plumbing that no handler reads). A leaf helper that
+  genuinely touches only one or two fields may still take those by `&mut`
+  directly rather than `&mut self` — the rule is against reintroducing the
+  loose-local *bundle*, not against a narrow borrow.
 
 - **Adding a device-catalog entry or a Binding-legality rule.** The GUI
   mirrors the Daemon's device vocabularies and the pure part of
