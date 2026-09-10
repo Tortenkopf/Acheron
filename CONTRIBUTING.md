@@ -151,11 +151,16 @@ and it can be verified before merge.
      `self.apply(Edit::…)` (or `self.apply_creating(Edit::…)` if it mints an
      id). There is no `command.rs` step and no `dispatch::handle_command`
      step — `Command::Apply` carries the `Edit` verbatim.
-  4. If the operation has a runtime side effect that isn't a `Config` write
-     (republishing actuation, recomputing axes, signalling the supervisor,
-     stopping a Toggle, reconciling a stepper cursor after its list changed,
-     emitting a signal…), add an `edit::Effect` variant and handle it in
-     `dispatch::run_effects`.
+  4. Releasing a live runtime slot the edit *orphaned* — an individual Toggle,
+     a Chord Toggle / firing, a dual-stage deep slot — is **automatic**: as
+     long as the mutation goes through the active Profile's binding / Chord /
+     deep / `deep_stages.mode` / `mode_key_role` maps, `edit::reconcile_teardowns`
+     derives the `StopToggle` / `StopStage` / `StopChord` by diffing `Config`
+     before vs. after (ADR-0011). Step 4 is only for a side effect that is
+     *not* a runtime orphan — republishing actuation, recomputing axes,
+     signalling the supervisor, reconciling a stepper cursor after its list
+     changed, emitting a signal…: add an `edit::Effect` variant and handle it
+     in `dispatch::run_effects`.
 
   A **structural invariant of a stored `Config`** — anything that could be
   written to `config.toml` and reloaded — goes in `config::validate` and
@@ -216,9 +221,10 @@ and it can be verified before merge.
   methods: `feed` / `update` / `next_deadline` / `tick` / `stop_all` /
   `stop_stage` / `stop_all_toggles`, driven from the `rx_events` and
   `rx_depth` arms and the shared `wait_for_deadline` timeout arm) belongs
-  outside the pure core. `edit::plan` emits `Effect::StopStage(input)` for a
-  targeted per-Input release (`ClearBinding`'s cascade, `ClearDeepStage`);
-  the matrix sweep is `tear_down`'s (below).
+  outside the pure core. A targeted per-Input `Effect::StopStage(input)` comes
+  from `edit::reconcile_teardowns` (a committed edit orphaned a deep slot —
+  ADR-0011, "Changing config-edit teardown" below); the matrix sweep is
+  `tear_down`'s (below).
 
 - **Changing lifecycle teardown** (what ephemeral runtime state gets
   released on a Layer switch / Profile switch / disconnect / capture-mode
@@ -236,6 +242,19 @@ and it can be verified before merge.
   fully matches individual teardown); the `//` lines that remain record the
   deliberate, spec-backed Toggle survivals. A change to one of those
   surviving cells needs its own ticket and reasoning — not a drive-by.
+
+- **Changing config-edit teardown** (which live runtime slot a committed
+  `Edit` orphans — an individual Toggle, a Chord Toggle / firing, a dual-stage
+  deep slot — and the `StopToggle` / `StopStage` / `StopChord` that releases
+  it) — post-release ticket 25, ADR-0011. The rule is one pure
+  `edit::reconcile_teardowns(before, after)` that diffs the active Profile's
+  runtime-bearing maps (`base` / `held` → `StopToggle`, `deep_*` → `StopStage`,
+  `chords_*` → `StopChord`, `deep_stages.mode` → `StopStage`, `mode_key_role`
+  `Bound → LayerSwitch` → `StopToggle(ModeKey)`), called once at the end of
+  `edit::plan`; no `plan` arm pushes a teardown `Effect`. Adjust the matrix
+  there with a `reconcile_teardowns` truth-table row, never in an arm. This is
+  the config-edit sibling of "Changing lifecycle teardown" above
+  (`dispatch::tear_down` — the two axes).
 
 - **Changing Stepper cursor behaviour** (the wrap-around, which item a step
   lands on, the default-to-first, or how an edited/deleted list reconciles a

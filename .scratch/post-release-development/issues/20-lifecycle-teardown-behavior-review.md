@@ -210,6 +210,16 @@ surprising enough to warrant one (B8 is the only keep and it is unremarkable).
 **Follow-on:** fix tickets 21 / 22 / 23 are mutually independent and can land
 in any order.
 
+**2026-09-10 — superseded for B7 / B9 / B10 / B11.** Ticket 25
+(`reconcile_teardowns` + ADR-0011) re-solves these four structurally: the
+per-arm `StopToggle` / `StopStage` / `StopChord` pushes those cases added
+(plus `cascade_replaced_toggle` / `cascade_orphaned_deep_stage`) are deleted,
+replaced by one pure diff of the active Profile's runtime-bearing maps called
+once at the end of `edit::plan`. The "fix in an arm" disposition above kept
+leaking (23-B7 after 22, then 23-B12, then 24); a diff removes the arm from
+the teardown loop entirely. B8 (keep), B12 and 24 (`stage.rs` internals
+downstream of the effect) are unaffected.
+
 ## Comments
 
 **2026-09-10** — Grilled all twelve cases against the code on `dev`

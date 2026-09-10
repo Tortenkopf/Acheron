@@ -85,3 +85,8 @@ on the minimal cut — the `match`, no trait — for reasons load-bearing enough
 
 Adjacent to **ADR-0007** (where staged Depth is interpreted) — this decision is about
 lifecycle, which was always out of ADR-0007's scope; it refines nothing there.
+
+**ADR-0011** is the sibling: the same "one place, not a per-site push" move for the
+**config-edit** axis (`edit::reconcile_teardowns` — the `StopToggle` / `StopStage` /
+`StopChord` a committed `Edit` orphans, derived by diffing the active Profile). The two
+ADRs are the two axes of one story.

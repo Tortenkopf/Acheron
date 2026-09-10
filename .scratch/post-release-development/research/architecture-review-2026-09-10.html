@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Architecture review — Acheron</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+      mermaid.initialize({ startOnLoad: true, theme: "neutral", securityLevel: "loose" });
+    </script>
+    <style>
+      .seam { stroke-dasharray: 5 4; }
+      .leak { stroke: #dc2626; }
+      body { -webkit-font-smoothing: antialiased; }
+      .lbl { font: 600 10px ui-sans-serif, system-ui; letter-spacing: .08em; text-transform: uppercase; }
+    </style>
+  </head>
+  <body class="bg-stone-50 text-slate-900 font-sans">
+    <main class="max-w-5xl mx-auto px-6 py-12 space-y-14">
+      <header class="space-y-5">
+        <p class="text-xs uppercase tracking-widest text-slate-500">Architecture review</p>
+        <h1 class="text-4xl font-serif">Acheron — deepening opportunities</h1>
+        <p class="text-sm text-slate-600">2026-09-10 · branch <code class="font-mono">dev</code> · scoped to the post-release deepening hot spots (<code class="font-mono">edit.rs</code>, <code class="font-mono">dispatch.rs</code>, the GUI binding editor)</p>
+        <div class="flex flex-wrap gap-4 text-xs text-slate-600 border-t border-b border-slate-200 py-3">
+          <span class="flex items-center gap-2"><span class="inline-block w-4 h-4 border-2 border-slate-700 bg-white"></span> module</span>
+          <span class="flex items-center gap-2"><svg width="26" height="8"><line x1="0" y1="4" x2="26" y2="4" class="seam" stroke="#475569" stroke-width="2"/></svg> seam</span>
+          <span class="flex items-center gap-2"><svg width="26" height="8"><line x1="0" y1="4" x2="26" y2="4" stroke="#dc2626" stroke-width="2"/></svg> leakage / hole</span>
+          <span class="flex items-center gap-2"><span class="inline-block w-4 h-4 bg-slate-900"></span> deep module</span>
+        </div>
+        <div class="flex flex-wrap gap-2 text-xs">
+          <a href="#c1" class="px-3 py-1 rounded-full bg-emerald-600 text-white">1 · Runtime-orphan reconciliation</a>
+          <a href="#c2" class="px-3 py-1 rounded-full bg-amber-500 text-white">2 · BindingDraft model</a>
+          <a href="#c3" class="px-3 py-1 rounded-full bg-slate-500 text-white">3 · Dispatch ActiveView</a>
+        </div>
+      </header>
+
+      <!-- ============================================ CANDIDATE 1 -->
+      <article id="c1" class="space-y-6">
+        <div class="flex flex-wrap items-center gap-3">
+          <h2 class="text-2xl font-serif">1 · Concentrate the runtime-orphan cascade in <code class="font-mono text-xl">edit</code></h2>
+          <span class="px-2.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 text-xs font-semibold">Strong</span>
+          <span class="px-2.5 py-0.5 rounded-full bg-slate-100 text-slate-700 text-xs font-mono">in-process</span>
+        </div>
+
+        <div class="font-mono text-sm text-slate-600">
+          daemon/src/edit.rs · <span class="text-slate-400">plan() arms + cascade_replaced_toggle / cascade_orphaned_deep_stage</span><br />
+          daemon/src/dispatch.rs · <span class="text-slate-400">run_effects (StopToggle / StopStage / StopChord)</span>
+        </div>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <!-- BEFORE -->
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="lbl text-slate-400 mb-3">Before — every arm re-derives its own teardown</p>
+            <svg viewBox="0 0 320 300" class="w-full" style="max-height:320px">
+              <rect x="8" y="8" width="304" height="284" fill="none" stroke="#cbd5e1"/>
+              <text x="16" y="26" class="lbl" fill="#64748b">edit::plan  match edit</text>
+              <!-- arms -->
+              <g font-family="ui-monospace, monospace" font-size="10" fill="#0f172a">
+                <rect x="20" y="38" width="150" height="20" fill="#f1f5f9" stroke="#94a3b8"/><text x="26" y="52">SetBinding</text>
+                <rect x="20" y="64" width="150" height="20" fill="#f1f5f9" stroke="#94a3b8"/><text x="26" y="78">ClearBinding</text>
+                <rect x="20" y="90" width="150" height="20" fill="#f1f5f9" stroke="#94a3b8"/><text x="26" y="104">SetChordBinding</text>
+                <rect x="20" y="116" width="150" height="20" fill="#f1f5f9" stroke="#94a3b8"/><text x="26" y="130">ClearChordBinding</text>
+                <rect x="20" y="142" width="150" height="20" fill="#f1f5f9" stroke="#94a3b8"/><text x="26" y="156">SetAxisAssignment</text>
+                <rect x="20" y="168" width="150" height="20" fill="#f1f5f9" stroke="#94a3b8"/><text x="26" y="182">ClearDeepStage</text>
+                <rect x="20" y="194" width="150" height="20" fill="#f1f5f9" stroke="#94a3b8"/><text x="26" y="208">SetStagingMode</text>
+                <rect x="20" y="220" width="150" height="20" fill="#fee2e2" stroke="#dc2626"/><text x="26" y="234" fill="#b91c1c">SetDeepStage — hole</text>
+                <rect x="20" y="246" width="150" height="20" fill="#fee2e2" stroke="#dc2626"/><text x="26" y="260" fill="#b91c1c">feed-path re-press — hole</text>
+              </g>
+              <!-- tendrils to effects -->
+              <g stroke="#94a3b8" stroke-width="1.5" fill="none">
+                <path d="M170 48 C 210 48 210 60 246 60"/>
+                <path d="M170 74 C 210 74 210 88 246 92"/>
+                <path d="M170 100 C 214 100 214 120 246 124"/>
+                <path d="M170 126 C 214 126 214 128 246 140"/>
+                <path d="M170 152 C 210 152 210 175 246 175"/>
+                <path d="M170 178 C 210 178 210 205 246 208"/>
+                <path d="M170 204 C 210 204 210 235 246 240"/>
+              </g>
+              <g stroke="#dc2626" stroke-width="1.5" stroke-dasharray="3 3" fill="none">
+                <path d="M170 230 C 205 230 205 258 246 265"/>
+                <path d="M170 256 C 200 256 200 275 246 280"/>
+              </g>
+              <g font-family="ui-monospace, monospace" font-size="9" fill="#0f172a">
+                <rect x="246" y="52" width="66" height="16" fill="#e0e7ff" stroke="#6366f1"/><text x="250" y="63">StopToggle</text>
+                <rect x="246" y="86" width="66" height="16" fill="#e0e7ff" stroke="#6366f1"/><text x="250" y="97">StopStage</text>
+                <rect x="246" y="118" width="66" height="16" fill="#e0e7ff" stroke="#6366f1"/><text x="250" y="129">StopChord</text>
+                <rect x="246" y="150" width="66" height="16" fill="#e0e7ff" stroke="#6366f1"/><text x="250" y="161">×N ...</text>
+              </g>
+              <text x="16" y="292" font-family="ui-monospace,monospace" font-size="9" fill="#b91c1c">tickets 18 · 21 · 22 · 23 · 24 — one omission each</text>
+            </svg>
+          </div>
+          <!-- AFTER -->
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="lbl text-slate-400 mb-3">After — arms mutate; one module diffs before/after</p>
+            <svg viewBox="0 0 320 300" class="w-full" style="max-height:320px">
+              <rect x="8" y="8" width="304" height="140" fill="none" stroke="#cbd5e1"/>
+              <text x="16" y="26" class="lbl" fill="#64748b">edit::plan  match edit</text>
+              <g font-family="ui-monospace, monospace" font-size="10" fill="#0f172a">
+                <rect x="20" y="36" width="128" height="16" fill="#f1f5f9" stroke="#94a3b8"/><text x="24" y="48">SetBinding</text>
+                <rect x="20" y="56" width="128" height="16" fill="#f1f5f9" stroke="#94a3b8"/><text x="24" y="68">ClearBinding</text>
+                <rect x="20" y="76" width="128" height="16" fill="#f1f5f9" stroke="#94a3b8"/><text x="24" y="88">SetChordBinding</text>
+                <rect x="20" y="96" width="128" height="16" fill="#f1f5f9" stroke="#94a3b8"/><text x="24" y="108">SetAxisAssignment</text>
+                <rect x="20" y="116" width="128" height="16" fill="#f1f5f9" stroke="#94a3b8"/><text x="24" y="128">… mutate `next` only</text>
+              </g>
+              <text x="160" y="70" font-family="ui-monospace,monospace" font-size="9" fill="#475569">before: &amp;Config</text>
+              <text x="160" y="92" font-family="ui-monospace,monospace" font-size="9" fill="#475569">after:  &amp;next</text>
+              <path d="M150 84 C 175 84 190 180 60 180" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#a)"/>
+              <defs><marker id="a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0 0 L6 3 L0 6 z" fill="#475569"/></marker></defs>
+              <rect x="20" y="168" width="280" height="60" fill="#0f172a"/>
+              <text x="32" y="190" class="lbl" fill="#e2e8f0">edit::reconcile(before, after)</text>
+              <text x="32" y="208" font-family="ui-monospace,monospace" font-size="9" fill="#94a3b8">diff bindings · chords · deep stages · axes</text>
+              <text x="32" y="221" font-family="ui-monospace,monospace" font-size="9" fill="#94a3b8">→ every StopToggle / StopStage / StopChord</text>
+              <g font-family="ui-monospace, monospace" font-size="9" fill="#0f172a">
+                <rect x="20" y="244" width="88" height="16" fill="#e0e7ff" stroke="#6366f1"/><text x="24" y="255">Vec&lt;Effect&gt;</text>
+              </g>
+              <text x="120" y="256" font-family="ui-monospace,monospace" font-size="9" fill="#475569">one truth-table test file</text>
+            </svg>
+          </div>
+        </div>
+
+        <dl class="grid sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+          <div><dt class="font-semibold text-slate-500 text-xs uppercase tracking-wide">Problem</dt>
+            <dd>Eight <code class="font-mono">plan</code> arms each hand-derive which live runtime slot they just orphaned and push its teardown <code class="font-mono">Effect</code> — a shallow rule smeared across the match.</dd></div>
+          <div><dt class="font-semibold text-slate-500 text-xs uppercase tracking-wide">Solution</dt>
+            <dd>Arms mutate the <code class="font-mono">Config</code> clone only. One pure <code class="font-mono">reconcile(before, after)</code> module diffs the two and emits every <code class="font-mono">Stop*</code> effect.</dd></div>
+          <div><dt class="font-semibold text-slate-500 text-xs uppercase tracking-wide">Deletion test</dt>
+            <dd>Delete the cascade helpers → the orphan rules reappear in 8 callers. Concentrates: a real seam.</dd></div>
+          <div><dt class="font-semibold text-slate-500 text-xs uppercase tracking-wide">Fits the existing contract</dt>
+            <dd><code class="font-mono">plan</code> is already pure and blind to liveness; it already emits <code class="font-mono">Stop*</code> unconditionally and <code class="font-mono">run_effects</code> already no-ops when nothing is live.</dd></div>
+        </dl>
+
+        <ul class="grid sm:grid-cols-2 gap-x-8 gap-y-1.5 text-sm list-disc pl-5 marker:text-emerald-500">
+          <li>locality: one place owns "edit X orphans slot Y"</li>
+          <li>leverage: one diff path, every Edit variant</li>
+          <li>interface shrinks; arms lose their tendrils</li>
+          <li>a new engine adds one diff clause, not N arm edits</li>
+          <li>tests: <code class="font-mono">(before, after) → effects</code> truth table</li>
+          <li>closes the ticket 18→24 omission class structurally</li>
+        </ul>
+
+        <div class="rounded-md bg-amber-50 border border-amber-200 text-amber-900 text-sm px-4 py-3">
+          <strong>Cuts against ticket 20's per-arm disposition</strong> and CONTRIBUTING's "add an <code class="font-mono">Effect</code> only if there's a side effect" pattern — no ADR forbids it (ticket 20 wrote none). Worth reopening: tickets <strong>18, 21, 22, 23, 24</strong> are five consecutive patches to the same missing-teardown class, and ticket 24's fix landed this week. Adjacent to <strong>ADR-0010</strong> (the <em>lifecycle</em> matrix) but a different axis — <code class="font-mono">tear_down</code> handles Layer/Profile/disconnect sweeps; this handles config-edit orphans.
+        </div>
+      </article>
+
+      <!-- ============================================ CANDIDATE 2 -->
+      <article id="c2" class="space-y-6 border-t border-slate-200 pt-12">
+        <div class="flex flex-wrap items-center gap-3">
+          <h2 class="text-2xl font-serif">2 · Extract a pure <code class="font-mono text-xl">BindingDraft</code> from the binding editor</h2>
+          <span class="px-2.5 py-0.5 rounded-full bg-amber-100 text-amber-800 text-xs font-semibold">Worth exploring</span>
+          <span class="px-2.5 py-0.5 rounded-full bg-slate-100 text-slate-700 text-xs font-mono">local-substitutable</span>
+        </div>
+
+        <div class="font-mono text-sm text-slate-600">
+          gui/acheron_gui/binding_editor.py · <span class="text-slate-400">build_dual_stage_panel (~640 L), build_action_and_trigger_fields (~500 L), build_binding_editor</span><br />
+          gui/tests/test_binding_editor.py · <span class="text-slate-400">2212 L — the largest file in the repo</span>
+        </div>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <!-- BEFORE mass -->
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="lbl text-slate-400 mb-3">Before — interface ≈ implementation (shallow)</p>
+            <svg viewBox="0 0 320 300" class="w-full" style="max-height:320px">
+              <text x="20" y="20" class="lbl" fill="#64748b">build_dual_stage_panel()</text>
+              <!-- interface bar -->
+              <rect x="20" y="30" width="120" height="210" fill="#fca5a5" stroke="#b91c1c"/>
+              <text x="26" y="46" font-family="ui-monospace,monospace" font-size="9" fill="#7f1d1d">~50 nested closures</text>
+              <text x="26" y="60" font-family="ui-monospace,monospace" font-size="8.5" fill="#7f1d1d">get_binding()</text>
+              <text x="26" y="72" font-family="ui-monospace,monospace" font-size="8.5" fill="#7f1d1d">commit_stages()</text>
+              <text x="26" y="84" font-family="ui-monospace,monospace" font-size="8.5" fill="#7f1d1d">resolved_primary()</text>
+              <text x="26" y="96" font-family="ui-monospace,monospace" font-size="8.5" fill="#7f1d1d">deep_map() / deep_cfg()</text>
+              <text x="26" y="108" font-family="ui-monospace,monospace" font-size="8.5" fill="#7f1d1d">stage_snapshot()</text>
+              <text x="26" y="120" font-family="ui-monospace,monospace" font-size="8.5" fill="#7f1d1d">has_primary/has_deep</text>
+              <text x="26" y="132" font-family="ui-monospace,monospace" font-size="8.5" fill="#7f1d1d">capture_draft()</text>
+              <text x="26" y="144" font-family="ui-monospace,monospace" font-size="8.5" fill="#7f1d1d">on_pick_mode / rebuild</text>
+              <text x="26" y="156" font-family="ui-monospace,monospace" font-size="8.5" fill="#7f1d1d">… + widget refs</text>
+              <!-- impl bar -->
+              <rect x="150" y="30" width="150" height="240" fill="#e2e8f0" stroke="#94a3b8"/>
+              <text x="156" y="46" font-family="ui-monospace,monospace" font-size="9" fill="#475569">GTK tree + draft state</text>
+              <text x="156" y="60" font-family="ui-monospace,monospace" font-size="8.5" fill="#64748b">interleaved in closure captures</text>
+              <line x1="140" y1="30" x2="150" y2="30" stroke="#475569"/><line x1="140" y1="240" x2="150" y2="240" stroke="#475569"/>
+              <text x="20" y="262" font-family="ui-monospace,monospace" font-size="9" fill="#b91c1c">no seam — tests build the whole widget tree</text>
+            </svg>
+          </div>
+          <!-- AFTER -->
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="lbl text-slate-400 mb-3">After — thin interface, deep model + adapter</p>
+            <svg viewBox="0 0 320 300" class="w-full" style="max-height:320px">
+              <text x="20" y="20" class="lbl" fill="#64748b">BindingDraft (pure, no GTK)</text>
+              <rect x="20" y="28" width="70" height="150" fill="#0f172a"/>
+              <text x="26" y="44" font-family="ui-monospace,monospace" font-size="8.5" fill="#e2e8f0">set_*(...)</text>
+              <text x="26" y="58" font-family="ui-monospace,monospace" font-size="8.5" fill="#e2e8f0">is_valid</text>
+              <text x="26" y="72" font-family="ui-monospace,monospace" font-size="8.5" fill="#e2e8f0">edits()</text>
+              <rect x="20" y="28" width="70" height="248" fill="none" stroke="#0f172a" stroke-width="2"/>
+              <text x="26" y="200" font-family="ui-monospace,monospace" font-size="8" fill="#94a3b8">primary/deep</text>
+              <text x="26" y="212" font-family="ui-monospace,monospace" font-size="8" fill="#94a3b8">composition</text>
+              <text x="26" y="224" font-family="ui-monospace,monospace" font-size="8" fill="#94a3b8">seed / reset</text>
+              <text x="26" y="236" font-family="ui-monospace,monospace" font-size="8" fill="#94a3b8">rules.py checks</text>
+              <!-- adapter -->
+              <line x1="98" y1="20" x2="98" y2="285" class="seam" stroke="#475569" stroke-width="2"/>
+              <rect x="120" y="40" width="180" height="120" fill="#f1f5f9" stroke="#94a3b8"/>
+              <text x="128" y="58" font-family="ui-monospace,monospace" font-size="9" fill="#475569">dual_stage_panel (adapter)</text>
+              <text x="128" y="74" font-family="ui-monospace,monospace" font-size="8.5" fill="#64748b">render(draft) · forward input</text>
+              <text x="128" y="88" font-family="ui-monospace,monospace" font-size="8.5" fill="#64748b">no draft logic left</text>
+              <text x="120" y="200" font-family="ui-monospace,monospace" font-size="9" fill="#166534">tests hit BindingDraft directly —</text>
+              <text x="120" y="213" font-family="ui-monospace,monospace" font-size="9" fill="#166534">no widget tree for draft cases</text>
+            </svg>
+          </div>
+        </div>
+
+        <dl class="grid sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+          <div><dt class="font-semibold text-slate-500 text-xs uppercase tracking-wide">Problem</dt>
+            <dd>Draft validity and primary/deep composition live as ~50 closures over GTK widget state; the interface is as wide as the implementation.</dd></div>
+          <div><dt class="font-semibold text-slate-500 text-xs uppercase tracking-wide">Solution</dt>
+            <dd>A plain <code class="font-mono">BindingDraft</code> value owns the draft, its validity, and the edits to push on Save. The panel renders it and forwards input.</dd></div>
+          <div><dt class="font-semibold text-slate-500 text-xs uppercase tracking-wide">Not a rules.py duplicate</dt>
+            <dd><code class="font-mono">rules.py</code> mirrors daemon <em>legality</em>; <code class="font-mono">BindingDraft</code> owns <em>editor composition</em> and calls into <code class="font-mono">rules</code>.</dd></div>
+          <div><dt class="font-semibold text-slate-500 text-xs uppercase tracking-wide">Signal</dt>
+            <dd>Recent bugs — dual-stage seed, unbound-key picker default, reset-to-default deep band — all hid in closure coordination, not GTK.</dd></div>
+        </dl>
+
+        <ul class="grid sm:grid-cols-2 gap-x-8 gap-y-1.5 text-sm list-disc pl-5 marker:text-amber-500">
+          <li>interface is the test surface: construct a draft, assert</li>
+          <li>locality: composition bugs concentrate in one value</li>
+          <li>the 2212-line test file sheds its widget scaffolding</li>
+          <li>leverage: the same draft feeds grid, non-grid, and Chord panels</li>
+        </ul>
+
+        <div class="rounded-md bg-amber-50 border border-amber-200 text-amber-900 text-sm px-4 py-3">
+          Consistent with <strong>ADR-0003</strong> (split-language stack): the GUI keeps its own copied, contract-tested model. This deepens that model rather than reaching across the D-Bus seam.
+        </div>
+      </article>
+
+      <!-- ============================================ CANDIDATE 3 -->
+      <article id="c3" class="space-y-6 border-t border-slate-200 pt-12">
+        <div class="flex flex-wrap items-center gap-3">
+          <h2 class="text-2xl font-serif">3 · A <code class="font-mono text-xl">dispatch::ActiveView</code> computed once per tick</h2>
+          <span class="px-2.5 py-0.5 rounded-full bg-slate-200 text-slate-700 text-xs font-semibold">Speculative</span>
+          <span class="px-2.5 py-0.5 rounded-full bg-slate-100 text-slate-700 text-xs font-mono">in-process</span>
+        </div>
+
+        <div class="font-mono text-sm text-slate-600">
+          daemon/src/dispatch.rs · <span class="text-slate-400">handle_event · handle_depth_update · update_analog_repeats · update_stages · tick_stages · dispatch_individual_down</span>
+        </div>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="lbl text-slate-400 mb-3">Before — each handler re-resolves the active view</p>
+            <pre class="mermaid">
+flowchart TD
+  D["rx_depth arm — one snapshot"] --> H1["handle_depth_update"]
+  D --> H2["update_analog_repeats"]
+  D --> H3["update_stages"]
+  H1 --> R1["active_profile().expect()<br/>+ .axis_layer(active_layer)"]
+  H2 --> R2["active_profile().expect()<br/>+ .layer(active_layer)"]
+  H3 --> R3["active_profile().expect()<br/>+ EngineDeps{7 fields}"]
+  classDef dup stroke:#dc2626,stroke-width:2px,fill:#fee2e2;
+  class R1,R2,R3 dup
+            </pre>
+            <p class="text-xs text-slate-500 mt-1">~7 <code class="font-mono">active_profile().expect()</code> sites · <code class="font-mono">EngineDeps</code> literal built identically 3×</p>
+          </div>
+          <div class="rounded-lg border border-slate-200 bg-white p-4">
+            <p class="lbl text-slate-400 mb-3">After — resolve once, pass the view</p>
+            <pre class="mermaid">
+flowchart TD
+  D["rx_depth arm — one snapshot"] --> V["ActiveView::resolve(&amp;config, active_layer)"]
+  V --> H1["handle_depth_update(view)"]
+  V --> H2["update_analog_repeats(view)"]
+  V --> H3["update_stages(view)"]
+  classDef deep fill:#0f172a,color:#e2e8f0,stroke:#0f172a;
+  class V deep
+            </pre>
+            <p class="text-xs text-slate-500 mt-1">one resolve point · <code class="font-mono">bindings</code>, <code class="font-mono">chords</code>, <code class="font-mono">axis_map</code>, resolved actuation held together</p>
+          </div>
+        </div>
+
+        <dl class="grid sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+          <div><dt class="font-semibold text-slate-500 text-xs uppercase tracking-wide">Problem</dt>
+            <dd>"The active Profile's active-Layer resolved view" is re-derived ~10× across dispatch handlers, each with the same <code class="font-mono">.expect()</code> preamble.</dd></div>
+          <div><dt class="font-semibold text-slate-500 text-xs uppercase tracking-wide">Solution</dt>
+            <dd>One <code class="font-mono">ActiveView</code> value resolved per <code class="font-mono">rx_events</code> / <code class="font-mono">rx_depth</code> tick, handed to the handlers.</dd></div>
+        </dl>
+
+        <ul class="grid sm:grid-cols-2 gap-x-8 gap-y-1.5 text-sm list-disc pl-5 marker:text-slate-400">
+          <li>locality: layer/profile resolution in one place</li>
+          <li>interface: handlers take one param, not <code class="font-mono">&amp;config + active_layer</code></li>
+          <li>the repeated <code class="font-mono">EngineDeps</code> literal collapses</li>
+        </ul>
+
+        <div class="rounded-md bg-amber-50 border border-amber-200 text-amber-900 text-sm px-4 py-3">
+          <strong>Not a <code class="font-mono">DepthEngine</code> trait</strong> — <strong>ADR-0010</strong> rejected unifying the engines, and ticket 10 declined a <code class="font-mono">depth::</code> umbrella. This is a read-model over <code class="font-mono">Config</code>, not engine unification — but the area has twice resisted consolidation, so weight the win modestly. Value is small: each duplicated site is short and type-checked today.
+        </div>
+      </article>
+
+      <!-- ============================================ TOP REC -->
+      <section id="top-recommendation" class="border-t border-slate-200 pt-12">
+        <div class="rounded-xl bg-slate-900 text-slate-100 p-8 space-y-4">
+          <p class="lbl text-slate-400">Top recommendation</p>
+          <h2 class="text-2xl font-serif">1 · Runtime-orphan reconciliation in <code class="font-mono">edit</code></h2>
+          <p class="text-sm text-slate-300 max-w-2xl">
+            It is the codebase's live wound: tickets 18, 21, 22, 23, and 24 are five consecutive fixes for one arm or another of <code class="font-mono">plan</code> forgetting its teardown <code class="font-mono">Effect</code>, and 24 landed days ago. The lifecycle matrix already got this treatment (<code class="font-mono">tear_down</code> + ADR-0010); the config-edit axis is still open-coded per arm. A pure <code class="font-mono">reconcile(before, after)</code> concentrates the rule, gives it a truth-table test, and makes the whole omission class structurally impossible — the strongest locality win on the board.
+          </p>
+          <a href="#c1" class="inline-block text-emerald-400 text-sm hover:underline">→ jump to candidate 1</a>
+        </div>
+      </section>
+
+      <footer class="text-xs text-slate-400 border-t border-slate-200 pt-6">
+        Vocabulary: <span class="font-mono">module · interface · implementation · depth · seam · adapter · leverage · locality</span> (codebase-design) · domain terms from <span class="font-mono">CONTEXT.md</span>.
+      </footer>
+    </main>
+  </body>
+</html>
