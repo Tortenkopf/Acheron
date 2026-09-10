@@ -748,7 +748,12 @@ impl Daemon {
     /// fresh deep-stage config (Actuation/Release defaulting to
     /// `ActuationPoint::default()`) if none exists yet. Errors
     /// `InvalidBinding` if `mode` doesn't parse or the resulting `Config`
-    /// fails `config::validate`.
+    /// fails `config::validate`. When the mode actually changes, force-
+    /// releases a live deep slot for `input` immediately
+    /// (`Edit::SetStagingMode` pushes `Effect::StopStage` — post-release
+    /// ticket 23): a mid-press mode flip can strand Quick-Skip's per-press
+    /// phase machine, so the deep stage is force-released and the new mode
+    /// starts from a known state.
     async fn set_staging_mode(&self, input: String, mode: String) -> Result<(), DaemonError> {
         let input = Self::parse_input(&input)?;
         let mode = wire::staging_mode_from_str(&mode).map_err(DaemonError::InvalidBinding)?;

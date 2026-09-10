@@ -7655,6 +7655,146 @@ mod tests {
         harness.shut_down().await;
     }
 
+    // ── `post-release-development` ticket 23: cross-Layer clear + mid-press mode flip ──
+
+    #[tokio::test]
+    async fn dual_stage_cross_layer_clear_does_not_re_press_the_still_held_deep_stage() {
+        // Ticket 23 B12: a grid key carries a deep stage on both Base and
+        // Held. Physically held into the deep band on Held (active),
+        // `ClearDeepStage` for **Base** must not release-then-re-press the
+        // live Held deep key — `stop_stage`'s reset-and-keep lets the next
+        // `Engine::update` tick silently re-adopt the unmoved Depth. (One
+        // brief `release_deep_slot` drop is the accepted residual; a full
+        // `value=0` then `value=1` re-press is the regression.)
+        let mut config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_C),
+        );
+        {
+            let profile = config.active_profile_mut().expect("seed profile");
+            profile
+                .held
+                .insert(Input::Grid(1, 1), keypress_binding(evdev::KeyCode::KEY_A));
+            profile.deep_held.insert(
+                Input::Grid(1, 1),
+                hold_to_repeat_binding(evdev::KeyCode::KEY_B),
+            );
+        }
+        let harness = CommandHarness::spawn(config);
+
+        // Switch to the Held Layer, then hand off into its deep Hold-to-repeat.
+        harness.press(Input::ModeKey).await;
+        settle().await;
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+
+        let deep_b_downs = |h: &CommandHarness| {
+            h.sink
+                .batches()
+                .iter()
+                .map(|b| key_and_value(b[0]))
+                .filter(|(c, v)| *c == evdev::KeyCode::KEY_B && *v == 1)
+                .count()
+        };
+        assert_eq!(deep_b_downs(&harness), 1, "the Held deep stage fired once");
+
+        // Clear the *Base* deep Binding while the key is still held deep on
+        // Held — the active-Layer (`Held`) `deep_layer` guard stays true.
+        harness
+            .clear_deep_stage(Input::Grid(1, 1), Layer::Base)
+            .await
+            .unwrap();
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+
+        assert_eq!(
+            deep_b_downs(&harness),
+            1,
+            "a Base clear must not re-press the still-valid Held deep stage"
+        );
+
+        harness.release(Input::ModeKey).await;
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn dual_stage_set_staging_mode_mid_press_releases_the_live_deep_stage() {
+        // Ticket 23 B7: `SetStagingMode` under a live deep firing pushes
+        // `Effect::StopStage` — the deep key is force-released and nothing
+        // more is emitted until a fresh physical deep crossing (under the new
+        // mode).
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        harness.repeat_analog(Input::Grid(1, 1), 250).await;
+        settle().await;
+        let deep: Vec<_> = harness
+            .sink
+            .batches()
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .filter(|(c, _)| *c == evdev::KeyCode::KEY_B)
+            .collect();
+        assert_eq!(
+            deep,
+            vec![(evdev::KeyCode::KEY_B, 1), (evdev::KeyCode::KEY_B, 2)]
+        );
+
+        harness
+            .apply(edit::Edit::SetStagingMode {
+                input: Input::Grid(1, 1),
+                mode: StagingMode::NoReturn,
+            })
+            .await
+            .unwrap();
+        settle().await;
+        assert_eq!(
+            key_and_value(harness.sink.batches().last().unwrap()[0]),
+            (evdev::KeyCode::KEY_B, 0),
+            "SetStagingMode must force-release the held deep value=1"
+        );
+        let after = harness.sink.batches().len();
+
+        // A further repeat pulse at the same held Depth: no phantom re-press
+        // (the runtime was reset-and-kept, re-adopting the current band
+        // silently).
+        harness.repeat_analog(Input::Grid(1, 1), 250).await;
+        settle().await;
+        assert_eq!(
+            harness.sink.batches().len(),
+            after,
+            "no output until the deep band is physically re-crossed"
+        );
+
+        // Dip out of and back into the deep band — a fresh physical crossing —
+        // and the deep stage fires again under the new mode.
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        assert_eq!(
+            key_and_value(harness.sink.batches().last().unwrap()[0]),
+            (evdev::KeyCode::KEY_B, 1),
+            "a fresh deep crossing re-fires the deep stage under the new mode"
+        );
+
+        harness.shut_down().await;
+    }
+
     // Overwriting (not removing) a primary Binding no longer tears its deep
     // stage down — covered as a `plan` unit test
     // (`edit::tests::set_binding_overwriting_a_primary_keeps_its_live_deep_binding`),

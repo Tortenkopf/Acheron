@@ -271,15 +271,34 @@ pub enum Edit {
     /// `DeepStageConfig` (mode defaulting to `StagingMode::Handoff`) if none
     /// exists yet. **No `Effect`** — unlike `SetActuationPoint`, nothing
     /// needs a live snapshot pushed to it: `stage::Engine` lives in dispatch
-    /// and reads `Config` directly each tick.
+    /// and reads `Config` directly each tick. Safe to move the point under a
+    /// key that is *currently* holding a live deep slot (post-release ticket
+    /// 20 case B8, decided keep): the next `Engine::update` tick re-thresholds
+    /// `rt.deep` against the new point exactly as `SetActuationPoint` does
+    /// under a held primary, and a band the point now excludes emits a clean
+    /// `ReleaseDeep` + `RepressPrimary` — no orphan is reachable.
     SetDeepActuation {
         input: Input,
         actuation: u8,
         release: u8,
     },
     /// Sets a grid key's Staging mode on the active Profile, the same
-    /// `.or_default()`-creation as `SetDeepActuation`. No `Effect`, same
-    /// reasoning.
+    /// `.or_default()`-creation as `SetDeepActuation`. Pushes
+    /// `Effect::StopStage(input)` whenever the mode actually changes
+    /// (post-release ticket 23 case B7): a mode change — unlike an
+    /// Actuation-point change — can
+    /// strand Quick-Skip's own per-press phase machine (`rt.quick_skip`),
+    /// since the next `advance` would run the *new* mode's transition table
+    /// against a phase value the *old* mode wrote. There is no clean "the
+    /// next tick reconciles" guarantee here (there is for `SetDeepActuation`,
+    /// where `analog::observe` just re-thresholds). Force-releasing the live
+    /// deep slot lets the new mode start from a known state — the next
+    /// `Engine::update` tick re-adopts at the current Depth under the new
+    /// mode with a clean `quick_skip = None`. Only sound because ticket 23
+    /// also makes `stage::Engine::stop_stage` reset-and-keep the runtime
+    /// entry: a `SetStagingMode` on the active Layer with the key held would
+    /// otherwise hit the same re-fire bug B12 fixes (the deep Binding is
+    /// untouched, so the `deep_layer` guard stays true).
     SetStagingMode { input: Input, mode: StagingMode },
 }
 
@@ -347,15 +366,23 @@ pub(crate) enum Effect {
     /// / `AssertStatusLeds` / `AnnounceProfileChange` stay separate effects.
     TearDown(TeardownReason),
     /// Force-release the given Input's live dual-stage deep slot immediately
-    /// (`stage::Engine::stop_stage`). Two sources: `ClearBinding`'s cascade
+    /// (`stage::Engine::stop_stage`, which resets-and-keeps the runtime entry
+    /// — post-release ticket 23). Three sources: `ClearBinding`'s cascade
     /// (ticket 06's "Cascade-delete" — removing a primary Binding orphans the
     /// `deep_base`/`deep_held` entry it carried, via
-    /// `cascade_orphaned_deep_stage`) and, as of ticket 18, `ClearDeepStage`
-    /// directly. `SetBinding` does *not* push this: it replaces a primary in
-    /// place, leaving the deep stage legal (and a replacement that would make
-    /// it illegal is rejected by `config::validate` first). Either way a live
-    /// deep slot must not linger past the Binding backing it, and can't wait
-    /// for a next Up that may never come.
+    /// `cascade_orphaned_deep_stage`); `ClearDeepStage` directly (ticket 18);
+    /// and `SetStagingMode` when the mode actually changes (ticket 23 B7 — a
+    /// mid-press mode flip can strand Quick-Skip's phase machine, so the live
+    /// slot is force-released to start the new mode from a known state; an
+    /// idempotent same-mode re-apply is a config no-op and pushes nothing).
+    /// `SetBinding` does *not* push
+    /// this: it replaces a primary in place, leaving the deep stage legal
+    /// (and a replacement that would make it illegal is rejected by
+    /// `config::validate` first). `SetDeepActuation` does *not* either — a
+    /// point move just re-thresholds cleanly on the next tick (ticket 20
+    /// B8). Where it is pushed, a live deep slot must not linger past the
+    /// Binding or mode backing it, and can't wait for a next Up that may
+    /// never come.
     StopStage(Input),
     /// Reconcile the given Stepper's Daemon-side runtime cursor against the
     /// just-committed `Config` — its list definition changed
@@ -781,11 +808,27 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
                 .actuation = ActuationPoint { actuation, release };
         }
         Edit::SetStagingMode { input, mode } => {
-            active_profile_mut(&mut next)
+            let entry = active_profile_mut(&mut next)
                 .deep_stages
                 .entry(input)
-                .or_default()
-                .mode = mode;
+                .or_default();
+            let mode_changed = entry.mode != mode;
+            entry.mode = mode;
+            // A mode change under a live deep firing can strand Quick-Skip's
+            // per-press phase machine — the next `advance` would run the new
+            // mode's table against a phase the old mode wrote. Force-release
+            // the live deep slot so the new mode starts from a known state
+            // (post-release ticket 23 B7). Pushed without inspecting runtime
+            // state (a no-op via `stop_stage` when nothing is staged), but
+            // *only* when the mode actually changed: an idempotent re-apply
+            // of the current mode is a config no-op and must not drop a deep
+            // firing the user is holding (ticket 23 `/code-review`). Sound
+            // only because ticket 23 also makes `stop_stage` reset-and-keep,
+            // so an active-Layer mode flip with the key held re-adopts
+            // cleanly instead of mechanically replaying a fresh press.
+            if mode_changed {
+                effects.push(Effect::StopStage(input));
+            }
         }
     }
 
@@ -1934,7 +1977,68 @@ mod tests {
             next.profiles[DEFAULT_PROFILE_NAME].deep_stages[&Input::Grid(1, 1)].mode,
             StagingMode::QuickSkip
         );
-        assert!(outcome.effects.is_empty());
+        // Ticket 23 B7: a mode flip can strand Quick-Skip's phase machine, so
+        // `SetStagingMode` force-releases the live deep slot.
+        assert_eq!(outcome.effects, vec![Effect::StopStage(Input::Grid(1, 1))]);
+    }
+
+    #[test]
+    fn set_staging_mode_pushes_stop_stage_even_on_an_existing_entry() {
+        // Ticket 23 B7: the force-release is unconditional — pushed whether or
+        // not a `DeepStageConfig` already existed, mirroring `ClearDeepStage`.
+        let mut config = seed();
+        active(&mut config).deep_stages.insert(
+            Input::Grid(1, 1),
+            crate::config::DeepStageConfig {
+                actuation: ActuationPoint {
+                    actuation: 220,
+                    release: 200,
+                },
+                mode: StagingMode::Handoff,
+            },
+        );
+
+        let (next, outcome) = plan_ok(
+            &config,
+            Edit::SetStagingMode {
+                input: Input::Grid(1, 1),
+                mode: StagingMode::QuickSkip,
+            },
+        );
+        assert_eq!(
+            next.profiles[DEFAULT_PROFILE_NAME].deep_stages[&Input::Grid(1, 1)].mode,
+            StagingMode::QuickSkip
+        );
+        assert_eq!(outcome.effects, vec![Effect::StopStage(Input::Grid(1, 1))]);
+    }
+
+    #[test]
+    fn set_staging_mode_to_the_same_mode_pushes_no_effect() {
+        // Ticket 23 `/code-review`: an idempotent re-apply is a config no-op
+        // and must not force-release a deep firing the user is holding.
+        let mut config = seed();
+        active(&mut config).deep_stages.insert(
+            Input::Grid(1, 1),
+            crate::config::DeepStageConfig {
+                actuation: ActuationPoint {
+                    actuation: 220,
+                    release: 200,
+                },
+                mode: StagingMode::NoReturn,
+            },
+        );
+
+        let (_next, outcome) = plan_ok(
+            &config,
+            Edit::SetStagingMode {
+                input: Input::Grid(1, 1),
+                mode: StagingMode::NoReturn,
+            },
+        );
+        assert!(
+            outcome.effects.is_empty(),
+            "same-mode re-apply is a no-op — no StopStage"
+        );
     }
 
     // --- preconditions and invariants, one row each ---------------------------

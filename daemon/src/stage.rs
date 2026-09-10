@@ -328,12 +328,15 @@ struct KeyRuntime {
     primary: KeyState,
     deep: KeyState,
     quick_skip: Option<QuickSkipPhase>,
-    /// Set by `Engine::stop_all()` for every key it resets — the *next*
-    /// `Engine::update` tick for that key silently re-adopts whatever bands
-    /// Depth currently reads, with no emitted ops, rather than treating a
-    /// Depth that never moved as `(Up, Up)` and mechanically replaying a
-    /// spurious full press through it the instant a Layer/Profile switch
-    /// completes (code-review finding, ticket 03). A key with no
+    /// Set by `Engine::stop_all()` (every key) and `Engine::stop_stage()`
+    /// (one key) when they reset a key — the *next* `Engine::update` tick for
+    /// that key silently re-adopts whatever bands Depth currently reads, with
+    /// no emitted ops, rather than treating a Depth that never moved as
+    /// `(Up, Up)` and mechanically replaying a spurious full press through it
+    /// the instant a Layer/Profile switch completes, or the instant a
+    /// cross-Layer deep-stage clear lands on a key still held on the other
+    /// Layer (code-review finding, ticket 03; ticket 23 for the
+    /// `stop_stage` cross-Layer case). A key with no
     /// `KeyRuntime` yet at all (this flag's default, via `or_default`) is
     /// genuinely new — a fast double-crossing landing on a key's very first
     /// observed tick is a real, tested scenario (the mechanical-replay
@@ -1178,23 +1181,51 @@ impl Engine {
         }
     }
 
-    /// Force-releases one key's live deep firing/Toggle and drops its
-    /// runtime tracking entirely — `tartarus-dual-stage-keys` ticket 06's
+    /// Force-releases one key's live deep firing/Toggle and resets its
+    /// per-key runtime tracking — `tartarus-dual-stage-keys` ticket 06's
     /// `Effect::StopStage`, wired into `run_effects` for the cascade-delete
-    /// case (`edit::plan`'s `SetBinding`/`ClearBinding` arms, when the edit
-    /// orphans a live `deep_base`/`deep_held` entry). Scoped to `input`
-    /// alone, unlike `stop_all`'s whole-`Engine` sweep — every other key's
-    /// tracking is untouched. Runs **immediately** on commit rather than
-    /// waiting for `input`'s next Up: nothing guarantees one ever arrives
-    /// once the deep Binding backing it is gone from `Config`. The runtime
-    /// entry is removed outright (not reset-and-kept, unlike `stop_all`'s
-    /// per-key `just_reset` dance) because `Engine::update`'s own `profile.
-    /// deep_layer(active_layer).contains_key(&input)` guard already skips
-    /// this `input` for good the moment the cascade lands — there's no next
-    /// tick left to hand a stale entry to.
+    /// case (`edit::plan`'s `ClearBinding` cascade / `ClearDeepStage`, when
+    /// the edit orphans a live `deep_base`/`deep_held` entry) and, as of
+    /// `post-release-development` ticket 23, `SetStagingMode`. Scoped to
+    /// `input` alone, unlike `stop_all`'s whole-`Engine` sweep — every other
+    /// key's tracking is untouched. Runs **immediately** on commit rather
+    /// than waiting for `input`'s next Up: nothing guarantees one ever
+    /// arrives once the deep Binding backing it is gone from `Config` (nor
+    /// after a mid-press mode flip).
+    ///
+    /// The runtime entry is **reset-and-kept** (`just_reset = true`), exactly
+    /// like `stop_all` does per key — *not* removed outright. The old
+    /// "remove, because `Engine::update`'s `deep_layer(active_layer)
+    /// .contains_key(&input)` guard already skips this `input` for good"
+    /// reasoning holds only when the cleared deep Binding is on the *active*
+    /// Layer. A grid key can carry a deep stage on both Base and Held; clear
+    /// one Layer's deep Binding (`ClearDeepStage` for the non-active Layer,
+    /// or a `ClearBinding` cascade) while the key is physically held into the
+    /// deep band on the *other*, still-valid Layer, and that guard stays
+    /// **true** — a bare `runtime.remove` then lets the next `update` tick
+    /// `or_default()` a fresh entry with `just_reset = false` and mechanically
+    /// replay a full press through every band, re-firing a deep stage that
+    /// never physically moved. `just_reset = true` makes that next tick
+    /// silently re-adopt wherever Depth currently sits, no ops emitted. In
+    /// the common same-Layer case the guard goes false on the next tick and
+    /// the inert `just_reset` entry is simply never ticked again — a harmless
+    /// `HashMap` entry bounded by grid size, identical to `stop_all`'s.
+    ///
+    /// Residual (accepted): `release_deep_slot` still runs unconditionally,
+    /// so a cross-Layer held deep stage *is* briefly force-released for one
+    /// frame before `update` re-adopts it. Removing that too needs the
+    /// cleared `Layer` threaded through the effect so `release_deep_slot` can
+    /// be skipped when it isn't the active Layer — flagged in ticket 23, not
+    /// required; the `just_reset` change removes the user-visible
+    /// double-actuation (the re-fire).
     pub(crate) async fn stop_stage(&mut self, input: Input, injector: &Injector) {
         self.release_deep_slot(input, injector).await;
-        self.runtime.remove(&input);
+        if let Some(rt) = self.runtime.get_mut(&input) {
+            *rt = KeyRuntime {
+                just_reset: true,
+                ..KeyRuntime::default()
+            };
+        }
     }
 
     /// Fully clears one key's deep slot — `stop_toggle` + `force_release`, both
@@ -1886,5 +1917,151 @@ mod tests {
         assert!(!rt.primary_handed_off);
         // The primary was never fired — nothing to release on the individual path.
         assert!(fx.individual.slot(&KEY).is_none());
+    }
+
+    // ── `post-release-development` ticket 23: `stop_stage` reset-and-keep ──
+    //
+    // B12: a cross-Layer deep-stage clear (`ClearDeepStage` for the non-active
+    // Layer, or a `ClearBinding` cascade) while the key is physically held into
+    // the deep band on the *other*, still-valid Layer. `stop_stage`'s bare
+    // `runtime.remove` used to let the next `update` tick `or_default()` a
+    // fresh entry and mechanically replay a full press — re-firing the deep
+    // stage. Reset-and-keep (`just_reset = true`) makes that tick re-adopt
+    // silently instead.
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_stage_reset_and_keep_lets_a_cross_layer_held_stage_re_adopt_without_re_firing() {
+        // A deep *Toggle* makes the re-fire visible: `release_deep_slot`
+        // removes a Toggle slot outright, so a `FireDeep` replay on the next
+        // tick would show up as a fresh `Slot::Toggle` — whereas the fix's
+        // silent re-adoption leaves the slot empty.
+        let config = dual_stage_cfg(
+            StagingMode::Handoff,
+            TriggerMode::FireOnce,
+            TriggerMode::Toggle,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+
+        // Drive the key into the deep band — the deep Toggle is now live.
+        engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 250u8)]))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                engine.slots.slot(&StageKey(KEY)),
+                Some(trigger::Slot::Toggle)
+            ),
+            "deep Toggle must be live before the clear"
+        );
+
+        // The other Layer's deep Binding is cleared while this Layer's stays
+        // valid — the active-Layer `deep_layer` guard is still true.
+        engine.stop_stage(KEY, &fx.inj).await;
+        assert!(
+            engine.slots.slot(&StageKey(KEY)).is_none(),
+            "the live deep slot is force-released (accepted one-frame residual)"
+        );
+        assert!(
+            engine.runtime.get(&KEY).is_some_and(|rt| rt.just_reset),
+            "the runtime entry is reset-and-kept, not removed"
+        );
+
+        // Next `update` tick, same in-band Depth, guard still true: the
+        // `just_reset` entry silently re-adopts (Down, Down) with no ops —
+        // no `FireDeep` replay of a stage that never physically moved.
+        let edits = engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 250u8)]))
+            .await
+            .unwrap();
+        assert!(edits.is_empty());
+        assert!(
+            engine.slots.slot(&StageKey(KEY)).is_none(),
+            "no phantom re-press of the deep stage"
+        );
+        let rt = engine.runtime.get(&KEY).expect("still tracked");
+        assert!(!rt.just_reset, "the re-adoption consumed the flag");
+        assert_eq!(rt.primary, KeyState::Down);
+        assert_eq!(rt.deep, KeyState::Down);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_stage_same_layer_clear_leaves_an_inert_entry_no_panic_no_ops() {
+        let config = dual_stage_cfg(
+            StagingMode::Handoff,
+            TriggerMode::FireOnce,
+            TriggerMode::Toggle,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+
+        engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 250u8)]))
+            .await
+            .unwrap();
+
+        // The common case: the cleared deep Binding *was* the active Layer's,
+        // so from now on the `deep_layer(active_layer).contains_key` guard is
+        // false — model that by dropping the deep Binding from the config the
+        // subsequent tick reads.
+        let mut config_cleared = config.clone();
+        config_cleared
+            .active_profile_mut()
+            .expect("seed profile")
+            .deep_base
+            .remove(&KEY);
+
+        engine.stop_stage(KEY, &fx.inj).await;
+
+        let edits = engine
+            .update(fx.deps(&config_cleared), &HashMap::from([(KEY, 250u8)]))
+            .await
+            .unwrap();
+        assert!(edits.is_empty(), "guard is false — nothing runs");
+        assert!(engine.slots.slot(&StageKey(KEY)).is_none());
+        assert!(
+            engine.runtime.get(&KEY).is_some_and(|rt| rt.just_reset),
+            "the inert `just_reset` entry is simply never ticked again"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_stage_resets_a_stranded_quick_skip_phase_to_none() {
+        // B7: `SetStagingMode` mid-press pushes `Effect::StopStage`. A key in
+        // Quick-Skip's `Skipped` phase with a live deep slot must come back
+        // with `quick_skip = None` so the new mode starts from a known state.
+        let config = dual_stage_cfg(
+            StagingMode::QuickSkip,
+            TriggerMode::HoldToRepeat,
+            TriggerMode::Toggle,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+
+        // Down already past the deep Actuation point → resolves to `Skipped`,
+        // firing the deep stage.
+        engine
+            .feed(fx.deps(&config), edge(EventState::Down, Some(250)))
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.runtime.get(&KEY).and_then(|rt| rt.quick_skip),
+            Some(QuickSkipPhase::Skipped),
+        );
+        assert!(engine.slots.slot(&StageKey(KEY)).is_some());
+
+        engine.stop_stage(KEY, &fx.inj).await;
+
+        let rt = engine
+            .runtime
+            .get(&KEY)
+            .expect("reset-and-kept, not removed");
+        assert_eq!(rt.quick_skip, None, "the stranded phase is cleared");
+        assert!(rt.just_reset);
+        assert!(
+            engine.slots.slot(&StageKey(KEY)).is_none(),
+            "the live deep slot is force-released"
+        );
     }
 }
