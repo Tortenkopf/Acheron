@@ -1,0 +1,214 @@
+<!--
+SPDX-License-Identifier: GPL-3.0-or-later
+Copyright © 2026 Justin Milatz
+-->
+
+# 24 — `stop_stage`'s reset-and-keep is incomplete: `deep_repeat` and a handed-off primary still machine-gun after it
+
+**What to fix:** `stage::Engine::stop_stage` (ticket 23's B12 reset-and-keep)
+quiesces the `Engine::update` (`rx_depth`) path but not the `Engine::feed`
+(`rx_events` `Repeat`) path. After `Effect::StopStage` force-releases a live
+deep stage and resets the key's `KeyRuntime`, a still-physically-held key on a
+*still-valid* deep stage resumes emitting synthetic output on the next
+primary `Repeat` pulse:
+
+- **B12-residual** — a **Hold-to-repeat deep** stage: `deep_repeat` re-fires
+  it as a phantom `value=2` autorepeat stream.
+- **B7-residual** — a **Hold-to-repeat primary** that had been handed off
+  (Handoff / No-Return): the primary resumes machine-gunning, the exact thing
+  `KeyRuntime::primary_handed_off` exists to prevent.
+
+Both surfaced by ticket 22's `/code-review`. Neither is reachable by ticket
+22's own new push (`SetAxisAssignment` → `cascade_orphaned_deep_stage`)
+*except* in the same cross-Layer / deep-stage-on-both-Layers shape as the
+cross-Layer `ClearDeepStage` case; the dominant triggers are ticket 23's
+`SetStagingMode` and cross-Layer `ClearDeepStage` / `ClearBinding`-cascade.
+
+## Root cause
+
+`stop_stage` does:
+
+```rust
+self.release_deep_slot(input, injector).await;   // stop_toggle + force_release
+if let Some(rt) = self.runtime.get_mut(&input) {
+    *rt = KeyRuntime { just_reset: true, ..KeyRuntime::default() };
+}
+```
+
+and `Engine::update`'s `just_reset` re-adoption (`stage.rs:552`) rebuilds
+**only** `rt.primary` / `rt.deep` from the current Depth, then `continue`s:
+
+```rust
+if rt.just_reset {
+    rt.primary = new_primary;
+    rt.deep = new_deep;
+    rt.just_reset = false;
+    continue;
+}
+```
+
+It never reconstructs `rt.primary_handed_off`, and it does nothing to keep the
+`feed` path in step with the reset. Two concrete failures:
+
+### 1. `deep_repeat` re-fires a Hold-to-repeat deep stage (phantom `value=2`)
+
+`release_deep_slot` = `stop_toggle` + `force_release`. For a deep
+Hold-to-repeat single key the slot holds a `HoldKeyDown` firing;
+`force_release` releases the held key (the `value=0` ticket 23 intends) but
+**keeps the entry** (`trigger::Slots::force_release`'s documented contract),
+so `slots.slot(&StageKey(input))` is now `Some(Slot::FiringFinished)`, not
+`None`.
+
+Then, once an `update` tick has consumed `just_reset` and re-adopted
+`rt.deep = Down` (the key is still held in the deep band), the next
+capture-synthesized primary `Repeat` reaches `feed` → `deep_repeat`
+(`stage.rs:1027`):
+
+- `rt.deep == KeyState::Down` ✓ (re-adopted)
+- the deep Binding still exists on the active Layer ✓ (`SetStagingMode`
+  never touched it; a cross-Layer clear only removed the *other* Layer's)
+- `deep_binding.trigger == HoldToRepeat` ✓
+- `slot == Some(FiringFinished)` → `trigger::decide((HoldToRepeat, Repeat),
+  Some(FiringFinished))` returns `D::RepeatKey(code)` (`trigger.rs:242` — the
+  `FiringFinished` branch is **not** `guarded`)
+- `perform(RepeatKey)` → `injector.repeat_key(code)` → one `value=2`
+
+…once per primary `Repeat` pulse, for the whole remaining hold. The deep key
+was logically released by `stop_stage`; it now types phantom characters until
+the user lets go.
+
+(If `release_deep_slot` were changed to *remove* the firing entry so the slot
+reads `None`, `decide` takes the `else` branch — `guarded(D::HoldKeyDown)` —
+which is a phantom **`value=1` re-press**, worse. The slot state is a trap
+either way; the real fix is elsewhere — see below.)
+
+### 2. A handed-off Hold-to-repeat primary resumes machine-gunning
+
+Handoff / No-Return, primary = Hold-to-repeat, held into the deep band:
+`update` performed `ReleasePrimary` (`individual.stop_toggle` +
+`individual.force_release` — entry kept → primary slot `Some(FiringFinished)`)
+and set `rt.primary_handed_off = true`, so `feed` swallows the primary's
+`Repeat` pulses (`stage.rs:797`).
+
+`stop_stage` resets `rt.primary_handed_off = false`. The `just_reset`
+re-adoption never restores it. Now every primary `Repeat`:
+
+- `feed`: `event.state == Repeat` → `deep_repeat` (failure 1), then
+  `self.primary_handed_off(input)` → **false** → `feed` returns
+  `NotMine { machine_sequenced: true }`
+- `handle_event` runs the ordinary primary path →
+  `decide((HoldToRepeat, Repeat), Some(FiringFinished))` → `D::RepeatKey` →
+  the primary key emits `value=2` while the finger is still in the deep band
+
+i.e. the primary autorepeats *underneath* the deep stage — the machine-gun
+`primary_handed_off` was added to stop.
+
+## Why ticket 23's tests miss it
+
+- `stop_stage_reset_and_keep_lets_a_cross_layer_held_stage_re_adopt_without_re_firing`
+  (`stage.rs`) and `dual_stage_cross_layer_clear_does_not_re_press_the_still_held_deep_stage`
+  (`dispatch.rs`) use a deep **Toggle** — `release_deep_slot`'s `stop_toggle`
+  removes the toggle entry outright, so the slot genuinely reads `None` and
+  `deep_repeat`'s Hold-to-repeat-only guard is never entered. A deep
+  **Hold-to-repeat** leaves the `FiringFinished` entry that trips `RepeatKey`.
+- `dual_stage_set_staging_mode_mid_press_releases_the_live_deep_stage`
+  (`dispatch.rs`, B7) *does* use a deep Hold-to-repeat, but after
+  `SetStagingMode` it drives `repeat_analog` **without a preceding
+  `push_depth`**, so `just_reset` is never consumed, `rt.deep` stays `Up`, and
+  `deep_repeat`'s `rt.deep == Down` guard returns early. In production
+  `capture::analog` sends a fresh Depth snapshot (→ `update` → `just_reset`
+  consumed, `rt.deep = Down`) *and* `Repeat` pulses per report — the ordering
+  the test omits.
+- Every ticket-23 test uses a Fire-once primary, so `primary_handed_off` is
+  never exercised (failure 2).
+
+## Fix options (pick during grilling)
+
+1. **Thread the cleared `Layer` through `Effect::StopStage`** — ticket 23
+   already flags this ("`release_deep_slot` still runs unconditionally …
+   removing that needs the cleared `Layer` threaded through the effect").
+   `stop_stage(input, layer)` becomes a no-op (no `release_deep_slot`, no
+   `rt` reset) when `layer != active_layer`, killing the cross-Layer
+   `ClearDeepStage` / `ClearBinding`-cascade / `SetAxisAssignment` route
+   entirely. Does **not** help `SetStagingMode` (same-Layer, deep Binding
+   unchanged) — that still needs option 2 or 3.
+2. **Make the `just_reset` re-adoption reconstruct the full band state**, not
+   just `primary`/`deep`: re-derive `primary_handed_off` from
+   `(new_primary, new_deep, mode)` (Handoff/No-Return with primary Up-in-band
+   and deep Down ⇒ handed off), and have `feed`'s `Repeat` path skip
+   `deep_repeat` on the tick(s) immediately after a reset (a `just_reset`
+   check in `feed`, or a dedicated `deep_repeat`-suppression flag cleared by
+   the same re-adoption).
+3. **`stop_stage` fully clears the deep slot** (`release_deep_slot` →
+   `stop_firing`-style remove) **and** the re-adoption re-fires the deep
+   stage cleanly (a `FireDeep` on re-adopt when `new_deep == Down`, replacing
+   the current silent `continue`) so the stage is genuinely re-established
+   rather than left half-alive. Heavier; changes the "silent re-adopt"
+   contract B12 introduced.
+
+Option 1 + a narrow version of option 2 (just the `SetStagingMode` case) is
+likely the smallest sound fix.
+
+## Tests to add
+
+- **`stage.rs`** — `stop_stage` then an `update` tick (consuming `just_reset`,
+  `rt.deep → Down`) then a `feed(Repeat)`: a deep **Hold-to-repeat** must emit
+  **nothing** (no `RepeatKey`, no `HoldKeyDown`).
+- **`stage.rs`** — Handoff, Hold-to-repeat primary handed off, `stop_stage`,
+  `update` re-adopt, `feed(Repeat)`: the primary must **not** emit
+  `RepeatKey` / re-press; `primary_handed_off` is restored (or the pulse is
+  otherwise swallowed).
+- **`dispatch.rs` pipeline** — the B7 test's own sequence with a `push_depth`
+  at the held Depth **between** `SetStagingMode` and the `repeat_analog`, plus
+  a Hold-to-repeat primary variant: no phantom `KEY_B` / `KEY_A` output after
+  the release until a genuine physical re-crossing.
+- **`dispatch.rs` pipeline** — cross-Layer `ClearDeepStage` (deep
+  Hold-to-repeat on both Layers, held into the active-Layer band): after the
+  clear + a further held-Depth report + a `Repeat`, no phantom deep output.
+
+## Docs
+
+- **`stage.rs`** — `stop_stage` doc's "Residual (accepted)" paragraph is
+  rewritten: the accepted residual is *only* the one-frame `release_deep_slot`
+  drop **for a deep Toggle**; the `feed`/`deep_repeat` and `primary_handed_off`
+  gaps are real bugs closed here, not residuals.
+- **`KeyRuntime::just_reset`** doc — note that the re-adoption now also
+  reconstructs `primary_handed_off` (if option 2 is taken).
+- **`edit.rs`** — `Effect::StopStage` doc gains the `Layer` argument note (if
+  option 1 is taken); `SetAxisAssignment` variant doc unchanged in substance.
+- **No ADR / no `CONTEXT.md`.**
+- **`.scratch/README.md`** — extend the `post-release-development` line.
+
+## Facts dug from the code (not asked of the user)
+
+- `trigger::Slots::force_release` (`trigger.rs:585`) releases but **keeps** the
+  firing entry; `trigger::Slots::stop_firing` (`trigger.rs`, added by ticket
+  22) releases **and removes** it.
+- `trigger::decide` `(HoldToRepeat, Repeat)` (`trigger.rs:239`): `RepeatKey`
+  for `Some(FiringUnfinished | FiringFinished)` (un-`guarded`),
+  `guarded(HoldKeyDown)` for `None`.
+- `Engine::update` `just_reset` branch: `stage.rs:552`. `primary_handed_off`
+  writes: `stage.rs:593`–`602`. `feed` `Repeat` / `primary_handed_off` /
+  `deep_repeat`: `stage.rs:789`–`800`, `stage.rs:1007`, `stage.rs:1027`.
+- `stop_stage`: `stage.rs:1221`. Its doc already flags the `Layer`-threading
+  follow-up (`stage.rs:1214`–`1220`).
+
+**Blocked by:** None. `stage.rs`-local plus (option 1) one `Effect::StopStage`
+signature change touched in `edit.rs` + `dispatch::run_effects`.
+
+**Status:** open — filed 2026-09-10 from ticket 22's `/code-review`; not
+started.
+
+## Comments
+
+**2026-09-10** — Filed from ticket 22's `/code-review`. Ticket 23's B12
+reset-and-keep fixed the `Engine::update` mechanical-replay re-fire but the
+`Engine::feed` (`rx_events` `Repeat`) path was never brought in step: a
+still-valid Hold-to-repeat deep stage re-fires via `deep_repeat` →
+`RepeatKey`, and a handed-off Hold-to-repeat primary machine-guns because the
+`just_reset` re-adoption drops `primary_handed_off`. Both traced through the
+code; ticket 23's tests miss them (deep Toggle instead of Hold-to-repeat;
+`repeat_analog` with no interleaved `push_depth`; Fire-once primary only).
+Ticket 22's `SetAxisAssignment` → `cascade_orphaned_deep_stage` push reaches
+the same `stop_stage` in the cross-Layer / deep-on-both-Layers shape but is
+not the main trigger — `SetStagingMode` and cross-Layer `ClearDeepStage` are.
