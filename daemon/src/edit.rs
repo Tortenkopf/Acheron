@@ -44,14 +44,22 @@ pub enum Edit {
     /// paired with a non-fire-once trigger, `analog_repeat` on a non-Grid
     /// Input, an existing Axis assignment for `(layer, input)`). Assigning a
     /// `Step` Action silently steals that `(stepper, direction)` off its old
-    /// Input or Chord (ticket 03/40).
+    /// Input or Chord (ticket 03/40). A *replacement* that changes the
+    /// trigger or Action pushes `Effect::StopToggle(input)`
+    /// (`cascade_replaced_toggle`, ticket 22 B10) so a live individual Toggle
+    /// on that key is released now rather than on its next press; a fresh
+    /// bind or a byte-identical GUI re-Save pushes nothing.
     SetBinding {
         input: Input,
         layer: Layer,
         binding: Binding,
     },
     /// Removes a Binding (ordinary passthrough resumes). Fails `NotFound` if
-    /// `input` has no Binding on `layer`.
+    /// `input` has no Binding on `layer`. Pushes `Effect::StopToggle(input)`
+    /// (`cascade_replaced_toggle`, ticket 22 — consistency with
+    /// `SetBinding`-replace) and, via `cascade_orphaned_deep_stage`, any
+    /// `Effect::StopStage(input)` for a deep stage the removed primary
+    /// carried.
     ClearBinding { input: Input, layer: Layer },
     /// Flips the active Profile's `mode_key_role` (ticket 18). Never fails on
     /// its own account — the active Profile always exists — but `plan` still
@@ -201,14 +209,23 @@ pub enum Edit {
     /// if `inputs`' member set is a subset or superset of an existing
     /// Chord's on the same Layer (ticket 01's amended Answer) — editing the
     /// exact same member set back (same `inputs`) is not a conflict with
-    /// itself.
+    /// itself. A *replacement* that changes the trigger or Action pushes
+    /// `Effect::StopChord(key)` (ticket 22 B11) so a live Chord Toggle /
+    /// firing on that key — otherwise permanently unstoppable once its old
+    /// binding is gone — is force-released now; a byte-identical GUI re-Save
+    /// pushes nothing.
     SetChordBinding {
         inputs: std::collections::BTreeSet<Input>,
         layer: Layer,
         binding: Binding,
     },
     /// Removes a Chord Binding by its exact member set. Fails `NotFound` if
-    /// no Chord with exactly that member set exists on `layer`.
+    /// no Chord with exactly that member set exists on `layer`. Pushes
+    /// `Effect::StopChord(key)` unconditionally after a successful remove
+    /// (ticket 22 B11, mirroring `ClearDeepStage` → `StopStage`): a live
+    /// Chord Toggle or Hold-to-repeat firing on that key is orphaned the
+    /// moment its key leaves `chords(layer)` — `chord::feed` can no longer
+    /// route a stop to it.
     ClearChordBinding {
         inputs: std::collections::BTreeSet<Input>,
         layer: Layer,
@@ -220,7 +237,13 @@ pub enum Edit {
     /// atomically alongside the insert (ticket 59 §2's mutual exclusion —
     /// unlike `SetBinding`/`SetChordBinding`, which reject rather than
     /// overwrite an existing Axis assignment there). Fails `InvalidRequest`
-    /// if `input` isn't a `Grid` variant.
+    /// if `input` isn't a `Grid` variant. Beyond `Effect::RecomputeAxes`,
+    /// pushes the teardown effect for any live runtime state the clear
+    /// orphaned (ticket 22 B9): `Effect::StopToggle(input)` if a primary
+    /// Binding was removed (`cascade_replaced_toggle`),
+    /// `Effect::StopStage(input)` for a deep stage that primary carried
+    /// (`cascade_orphaned_deep_stage` — an axis key can't legally keep one),
+    /// and `Effect::StopChord(key)` for every Chord membership cleared.
     SetAxisAssignment {
         input: Input,
         layer: Layer,
@@ -384,6 +407,23 @@ pub(crate) enum Effect {
     /// Binding or mode backing it, and can't wait for a next Up that may
     /// never come.
     StopStage(Input),
+    /// Force-stop the running Chord Toggle *and* force-release any live Chord
+    /// Hold-to-repeat firing on `key` — `dispatch`'s `chord_slots.stop_toggle`
+    /// then `chord_slots.stop_firing`. `post-release-development` ticket 22
+    /// (cases B9 / B11), the Chord-keyspace sibling of `StopStage`. Three
+    /// sources: `ClearChordBinding` (unconditional, after a successful
+    /// `remove` — mirrors `ClearDeepStage` → `StopStage`); a `SetChordBinding`
+    /// that *replaces* an existing Chord Binding with one that differs in
+    /// trigger or Action (a pure GUI re-Save of an identical binding pushes
+    /// nothing); and `SetAxisAssignment` for every Chord membership it clears
+    /// for `(layer, input)`. Once a Chord's key leaves `chords(layer)` a live
+    /// Chord Toggle is permanently unstoppable — it stops only via a fresh
+    /// full-member completion routed through `chord::feed`, whose `stopping`
+    /// filter iterates `chords.keys()` — and a live Chord firing is stranded
+    /// the same way (the completed member's `Up` that would
+    /// `ReleaseChordFiring` can't reach it). `run_effects` no-ops when neither
+    /// a Toggle nor a firing is present, matching `StopStage`'s contract.
+    StopChord(ChordKey),
     /// Reconcile the given Stepper's Daemon-side runtime cursor against the
     /// just-committed `Config` — its list definition changed
     /// (`DeleteStepper` removes it, `SetStepperItems` reshapes it).
@@ -452,9 +492,9 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
                 );
                 take_stepper_direction_elsewhere_from_chords(&mut next, stepper, *direction, None);
             }
-            active_profile_mut(&mut next)
+            let replaced = active_profile_mut(&mut next)
                 .layer_mut(layer)
-                .insert(input, binding);
+                .insert(input, binding.clone());
             // No deep-stage cascade here: *overwriting* a primary Binding
             // leaves a primary in place, so the deep stage stays valid and
             // is deliberately kept (the GUI edits either stage and Saves
@@ -463,6 +503,16 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             // see `ClearBinding` below. A replacement primary that would
             // make the deep stage illegal (`analog_repeat`, a Chord member)
             // is already rejected by the trailing `config::validate(&next)`.
+            //
+            // A replacement that changes the trigger or Action *does*
+            // release a live individual Toggle pinned to this key (ticket 22
+            // B10) — chosen over the keybinder `spec.md`'s "stops on the next
+            // press" model for consistency with B9 / B11. A pure GUI re-Save
+            // of a byte-identical binding must not drop a live Toggle, and a
+            // fresh bind (`replaced == None`) has no live slot to orphan.
+            if replaced.is_some_and(|old| old != binding) {
+                cascade_replaced_toggle(input, &mut effects);
+            }
         }
         Edit::ClearBinding { input, layer } => {
             if active_profile_mut(&mut next)
@@ -472,6 +522,13 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             {
                 return Err(CommandError::NotFound);
             }
+            // One rule across the four arms that remove or replace a primary
+            // Binding (ticket 22): release a live individual Toggle on the
+            // cleared key now, rather than leaving it to `dispatch.rs`'s
+            // stop-toggle-on-`Down` to catch on the key's next physical
+            // press. Keeps `ClearBinding` uniform with `SetBinding`-replace
+            // and `SetAxisAssignment`.
+            cascade_replaced_toggle(input, &mut effects);
             cascade_orphaned_deep_stage(&mut next, layer, input, &mut effects);
         }
         Edit::SetModeKeyRole { role } => {
@@ -706,9 +763,19 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
                     Some((&active_profile, layer, &key)),
                 );
             }
-            active_profile_mut(&mut next)
+            let replaced = active_profile_mut(&mut next)
                 .chords_mut(layer)
-                .insert(key, binding);
+                .insert(key.clone(), binding.clone());
+            // A replacement that changes the trigger or Action orphans a live
+            // Chord Toggle / firing on this key: once the old binding is gone
+            // it can only ever be stopped through `chord::feed`, which now
+            // routes against the *new* binding (ticket 22 B11). A pure GUI
+            // re-Save of an identical member set + binding must not drop a
+            // live Toggle; a brand-new Chord (`replaced == None`) has no live
+            // slot to orphan.
+            if replaced.is_some_and(|old| old != binding) {
+                effects.push(Effect::StopChord(key));
+            }
         }
         Edit::ClearChordBinding { inputs, layer } => {
             let key = ChordKey::new(inputs);
@@ -719,6 +786,12 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             {
                 return Err(CommandError::NotFound);
             }
+            // Unconditional after a successful `remove`, mirroring
+            // `ClearDeepStage` → `StopStage`: a live Chord Toggle or
+            // Hold-to-repeat firing on this key is now orphaned — the key is
+            // gone from `chords(layer)`, so `chord::feed` can never route a
+            // stop to it (ticket 22 B11).
+            effects.push(Effect::StopChord(key));
         }
         Edit::SetAxisAssignment {
             input,
@@ -727,10 +800,25 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
         } => {
             // Ticket 59 §2's mutual exclusion: atomically clear any existing
             // Binding *and* any Chord membership for (layer, input) alongside
-            // the insert.
-            active_profile_mut(&mut next)
+            // the insert. `config::validate` rejects the *illegal* end
+            // states, but a live individual Toggle, a live deep stage, or a
+            // live Chord firing/Toggle on this key is not illegal — the axis
+            // reassignment orphans each one with no release edge, so push the
+            // matching teardown effect for whatever was actually removed
+            // (ticket 22 B9), mirroring `ClearBinding`'s own cascade.
+            if active_profile_mut(&mut next)
                 .layer_mut(layer)
-                .remove(&input);
+                .remove(&input)
+                .is_some()
+            {
+                cascade_replaced_toggle(input, &mut effects);
+            }
+            // An axis key can't carry a deep stage (`config::validate` would
+            // reject the end state), so a deep Binding the removed primary
+            // carried must be cascaded away here exactly as `ClearBinding`
+            // does — `SetAxisAssignment`'s `layer_mut(layer).remove` does not
+            // trigger the deep cascade on its own.
+            cascade_orphaned_deep_stage(&mut next, layer, input, &mut effects);
             let chords = active_profile_mut(&mut next).chords_mut(layer);
             let member_keys: Vec<ChordKey> = chords
                 .keys()
@@ -739,6 +827,7 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
                 .collect();
             for key in member_keys {
                 chords.remove(&key);
+                effects.push(Effect::StopChord(key));
             }
             active_profile_mut(&mut next)
                 .axis_layer_mut(layer)
@@ -874,6 +963,25 @@ fn cascade_orphaned_deep_stage(
     {
         effects.push(Effect::StopStage(input));
     }
+}
+
+/// A `SetBinding` / `ClearBinding` / `SetAxisAssignment` that removes or
+/// replaces `input`'s primary Binding on `layer` pushes
+/// `Effect::StopToggle(input)` so a live individual Toggle pinned to that key
+/// is released on commit rather than lingering with a stale Action until the
+/// key's next physical press (`post-release-development` ticket 22, cases
+/// B9 / B10). `dispatch.rs`'s unconditional stop-toggle-on-`Down` still
+/// catches such a Toggle eventually, but only on that next press — ticket 20
+/// decided the release should happen now, for one rule across every `edit`
+/// arm that removes or replaces a primary Binding. `edit::plan` is pure — it
+/// cannot see `individual` liveness — so the push is unconditional at the
+/// call site's own "there was a Binding here" gate, and `run_effects`'
+/// `stop_toggle` no-ops when absent, matching `Effect::StopStage`'s contract.
+/// A one-liner rather than an inline `effects.push` so the four arms read
+/// uniformly and the rule has one name (sibling of
+/// `cascade_orphaned_deep_stage`).
+fn cascade_replaced_toggle(input: Input, effects: &mut Vec<Effect>) {
+    effects.push(Effect::StopToggle(input));
 }
 
 /// The `Default` Profile always exists — `load_or_seed` refuses to start a
@@ -1173,9 +1281,12 @@ mod tests {
                 .contains_key(&Input::Grid(1, 1)),
             "the deep Binding must survive an overwrite of its primary"
         );
-        assert!(
-            outcome.effects.is_empty(),
-            "no teardown on a mere overwrite"
+        // The deep stage is *kept* (no `StopStage`), but the changed primary
+        // still releases a live individual Toggle on the key (ticket 22 B10).
+        assert_eq!(
+            outcome.effects,
+            vec![Effect::StopToggle(Input::Grid(1, 1))],
+            "a changed overwrite releases the individual Toggle but keeps the deep stage"
         );
     }
 
@@ -1322,7 +1433,15 @@ mod tests {
             "the orphaned deep Binding must be cascaded away"
         );
         assert!(!next.profiles[DEFAULT_PROFILE_NAME].deep_stages.is_empty());
-        assert_eq!(outcome.effects, vec![Effect::StopStage(Input::Grid(1, 1))]);
+        // `StopToggle` (ticket 22 — one rule across every primary-removing
+        // arm) then the deep-stage cascade's `StopStage`.
+        assert_eq!(
+            outcome.effects,
+            vec![
+                Effect::StopToggle(Input::Grid(1, 1)),
+                Effect::StopStage(Input::Grid(1, 1)),
+            ]
+        );
     }
 
     #[test]
@@ -1731,6 +1850,170 @@ mod tests {
         );
     }
 
+    fn toggle_keypress(key: KeyCode) -> Binding {
+        Binding {
+            trigger: TriggerMode::Toggle,
+            action: Action::Keypress {
+                modifiers: Modifiers::default(),
+                key,
+            },
+        }
+    }
+
+    #[test]
+    fn clear_chord_binding_pushes_stop_chord_after_a_successful_remove() {
+        // Ticket 22 B11: a live Chord Toggle / firing on this key becomes
+        // unstoppable the moment its key leaves `chords(layer)` — the remove
+        // must push the force-release, unconditionally (mirroring
+        // `ClearDeepStage` → `StopStage`).
+        let members = [Input::Grid(1, 1), Input::Grid(1, 2)];
+        let mut config = seed();
+        active(&mut config)
+            .chords_base
+            .insert(ChordKey::new(chord(members)), keypress());
+        let key = ChordKey::new(chord(members));
+
+        let (_, outcome) = plan_ok(
+            &config,
+            Edit::ClearChordBinding {
+                inputs: chord(members),
+                layer: Layer::Base,
+            },
+        );
+        assert_eq!(outcome.effects, vec![Effect::StopChord(key)]);
+    }
+
+    #[test]
+    fn set_chord_binding_replacing_a_differing_binding_pushes_stop_chord_an_identical_re_save_does_not()
+     {
+        let members = [Input::Grid(1, 1), Input::Grid(1, 2)];
+        let key = ChordKey::new(chord(members));
+        let mut config = seed();
+        active(&mut config)
+            .chords_base
+            .insert(key.clone(), keypress());
+
+        // A replacement that changes the Action → `StopChord`.
+        let (_, outcome) = plan_ok(
+            &config,
+            Edit::SetChordBinding {
+                inputs: chord(members),
+                layer: Layer::Base,
+                binding: toggle_keypress(KeyCode::KEY_B),
+            },
+        );
+        assert_eq!(outcome.effects, vec![Effect::StopChord(key)]);
+
+        // A byte-identical re-Save (the GUI does this) → nothing.
+        let (_, outcome) = plan_ok(
+            &config,
+            Edit::SetChordBinding {
+                inputs: chord(members),
+                layer: Layer::Base,
+                binding: keypress(),
+            },
+        );
+        assert!(
+            outcome.effects.is_empty(),
+            "an identical re-Save must not drop a live Chord Toggle"
+        );
+    }
+
+    #[test]
+    fn set_binding_replacing_a_differing_binding_pushes_stop_toggle_a_fresh_bind_or_re_save_does_not() {
+        let mut config = seed();
+        active(&mut config).base.insert(Input::Grid(1, 1), keypress());
+
+        // A replacement that changes the Action → `StopToggle` (ticket 22 B10).
+        let (_, outcome) = plan_ok(
+            &config,
+            Edit::SetBinding {
+                input: Input::Grid(1, 1),
+                layer: Layer::Base,
+                binding: toggle_keypress(KeyCode::KEY_B),
+            },
+        );
+        assert_eq!(outcome.effects, vec![Effect::StopToggle(Input::Grid(1, 1))]);
+
+        // A byte-identical re-Save → nothing.
+        let (_, outcome) = plan_ok(
+            &config,
+            Edit::SetBinding {
+                input: Input::Grid(1, 1),
+                layer: Layer::Base,
+                binding: keypress(),
+            },
+        );
+        assert!(outcome.effects.is_empty(), "an identical re-Save is a no-op");
+
+        // A fresh bind (nothing there before) → nothing.
+        let (_, outcome) = plan_ok(
+            &seed(),
+            Edit::SetBinding {
+                input: Input::Grid(2, 2),
+                layer: Layer::Base,
+                binding: keypress(),
+            },
+        );
+        assert!(
+            outcome.effects.is_empty(),
+            "a fresh bind has no live slot to orphan"
+        );
+    }
+
+    #[test]
+    fn set_axis_assignment_over_a_key_that_had_binding_chord_membership_and_a_deep_stage() {
+        // Ticket 22 B9: the axis reassignment atomically clears the primary
+        // Binding, the deep stage it carried, and every Chord membership —
+        // each orphaning live runtime state `config::validate` won't flag.
+        // `plan` pushes the matching teardown effect for all three, then the
+        // recompute. (The starting state — a Chord member that also carries a
+        // deep stage — isn't edit-reachable, but `plan` never validates its
+        // *input*, only the result.)
+        let members = [Input::Grid(1, 1), Input::Grid(1, 2)];
+        let key = ChordKey::new(chord(members));
+        let mut config = seed();
+        active(&mut config).base.insert(Input::Grid(1, 1), keypress());
+        active(&mut config)
+            .deep_base
+            .insert(Input::Grid(1, 1), keypress());
+        active(&mut config).deep_stages.insert(
+            Input::Grid(1, 1),
+            crate::config::DeepStageConfig {
+                actuation: ActuationPoint {
+                    actuation: 220,
+                    release: 200,
+                },
+                mode: StagingMode::Handoff,
+            },
+        );
+        active(&mut config)
+            .chords_base
+            .insert(key.clone(), keypress());
+
+        let (next, outcome) = plan_ok(
+            &config,
+            Edit::SetAxisAssignment {
+                input: Input::Grid(1, 1),
+                layer: Layer::Base,
+                target: AxisTarget::LeftTrigger,
+            },
+        );
+        let profile = &next.profiles[DEFAULT_PROFILE_NAME];
+        assert!(!profile.base.contains_key(&Input::Grid(1, 1)));
+        assert!(!profile.deep_base.contains_key(&Input::Grid(1, 1)));
+        assert!(profile.chords_base.is_empty());
+        assert_eq!(
+            outcome.effects,
+            vec![
+                Effect::StopToggle(Input::Grid(1, 1)),
+                Effect::StopStage(Input::Grid(1, 1)),
+                Effect::StopChord(key),
+                Effect::RecomputeAxes { layer: Layer::Base },
+            ]
+        );
+    }
+
     #[test]
     fn set_axis_assignment_clears_a_colliding_binding_and_asks_for_a_recompute() {
         let mut config = seed();
@@ -1752,9 +2035,14 @@ mod tests {
             profile.axis_base[&Input::Grid(1, 1)],
             AxisTarget::LeftTrigger
         );
+        // The removed primary Binding also releases a live individual Toggle
+        // on the key (ticket 22 B9), ahead of the recompute.
         assert_eq!(
             outcome.effects,
-            vec![Effect::RecomputeAxes { layer: Layer::Base }]
+            vec![
+                Effect::StopToggle(Input::Grid(1, 1)),
+                Effect::RecomputeAxes { layer: Layer::Base },
+            ]
         );
     }
 

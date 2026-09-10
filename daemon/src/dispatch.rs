@@ -747,6 +747,16 @@ impl DispatchState {
                 edit::Effect::StopStage(input) => {
                     self.stage.stop_stage(input, &self.injector).await;
                 }
+                edit::Effect::StopChord(key) => {
+                    // The Chord-keyspace sibling of `StopStage` (ticket 22):
+                    // an `edit` arm removed or changed the Chord backing this
+                    // key, so force-stop a live Chord Toggle *and* force-
+                    // release a live Chord Hold-to-repeat firing — neither can
+                    // reach its own stop edge once the key has left
+                    // `chords(layer)`. Both calls no-op when nothing is live.
+                    self.chord_slots.stop_toggle(&key).await;
+                    self.chord_slots.stop_firing(&key, &self.injector).await;
+                }
                 edit::Effect::ReconcileStepperCursor(stepper_id) => {
                     // Against the just-committed `Config`: `id` gone → drop
                     // the cursor, list shorter → clamp, list empty → drop.
@@ -3174,6 +3184,34 @@ mod tests {
                 inputs: inputs.into_iter().collect(),
                 layer,
                 binding,
+            })
+            .await
+            .map(|_| ())
+        }
+
+        async fn clear_chord_binding(
+            &self,
+            inputs: impl IntoIterator<Item = Input>,
+            layer: Layer,
+        ) -> Result<(), CommandError> {
+            self.apply(edit::Edit::ClearChordBinding {
+                inputs: inputs.into_iter().collect(),
+                layer,
+            })
+            .await
+            .map(|_| ())
+        }
+
+        async fn set_axis_assignment(
+            &self,
+            input: Input,
+            layer: Layer,
+            target: AxisTarget,
+        ) -> Result<(), CommandError> {
+            self.apply(edit::Edit::SetAxisAssignment {
+                input,
+                layer,
+                target,
             })
             .await
             .map(|_| ())
@@ -6007,6 +6045,148 @@ mod tests {
         assert!(
             released.contains(&(evdev::KeyCode::KEY_C, 0)),
             "the Profile switch drained the Chord Toggle, releasing KEY_C: {released:?}"
+        );
+
+        harness.shut_down().await;
+    }
+
+    // ── ticket 22: the integration net — a config edit that orphans a live
+    //    individual Toggle or Chord firing/Toggle now pushes the teardown ──
+
+    #[tokio::test(start_paused = true)]
+    async fn clearing_a_chord_binding_force_releases_its_live_chord_toggle() {
+        // B11: a `ClearChordBinding` while a Chord Toggle is live leaves the
+        // Toggle with nothing to stop it — its key is gone from
+        // `chords(layer)`, so no fresh full-member completion can route a
+        // stop through `chord::feed`. `Effect::StopChord` force-releases it
+        // on commit.
+        let mut profile = Profile::default();
+        let members = [Input::Grid(1, 1), Input::Grid(1, 2)];
+        profile.chords_base.insert(
+            ChordKey::new(BTreeSet::from(members)),
+            toggle_binding(evdev::KeyCode::KEY_C),
+        );
+        let harness = CommandHarness::spawn(config_with_profile(profile));
+
+        harness.press(Input::Grid(1, 1)).await;
+        harness.press(Input::Grid(1, 2)).await;
+        settle().await;
+        let mark = harness.sink.batches().len();
+        assert!(
+            (0..mark)
+                .map(|i| key_and_value(harness.sink.batches()[i][0]))
+                .any(|kv| kv == (evdev::KeyCode::KEY_C, 1)),
+            "the Chord Toggle turned KEY_C on"
+        );
+
+        harness
+            .clear_chord_binding(members, Layer::Base)
+            .await
+            .expect("ClearChordBinding must succeed");
+        settle().await;
+
+        let released: Vec<_> = harness.sink.batches()[mark..]
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect();
+        assert!(
+            released.contains(&(evdev::KeyCode::KEY_C, 0)),
+            "the clear released the Chord Toggle's key: {released:?}"
+        );
+
+        let after = harness.sink.batches().len();
+        tokio::time::advance(Duration::from_millis(500)).await;
+        settle().await;
+        assert_eq!(
+            harness.sink.batches().len(),
+            after,
+            "no further output — the Chord Toggle is genuinely stopped, not paused"
+        );
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replacing_a_live_individual_toggles_binding_releases_the_old_action_immediately() {
+        // B10: overwriting an individual Toggle's Binding with a different
+        // Action used to leave the old Action running until the key's next
+        // press (`dispatch.rs`'s stop-toggle-on-`Down`). `Effect::StopToggle`
+        // now releases it on commit.
+        let harness = CommandHarness::spawn(config_with_bindings(HashMap::from([(
+            Input::Grid(1, 1),
+            toggle_binding(evdev::KeyCode::KEY_C),
+        )])));
+
+        harness.press(Input::Grid(1, 1)).await;
+        settle().await;
+        let mark = harness.sink.batches().len();
+        assert!(
+            (0..mark)
+                .map(|i| key_and_value(harness.sink.batches()[i][0]))
+                .any(|kv| kv == (evdev::KeyCode::KEY_C, 1)),
+            "the individual Toggle turned KEY_C on"
+        );
+
+        harness
+            .set_binding(
+                Input::Grid(1, 1),
+                Layer::Base,
+                toggle_binding(evdev::KeyCode::KEY_D),
+            )
+            .await
+            .expect("SetBinding must succeed");
+        settle().await;
+
+        let released: Vec<_> = harness.sink.batches()[mark..]
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect();
+        assert!(
+            released.contains(&(evdev::KeyCode::KEY_C, 0)),
+            "the replace released the stale Toggle's KEY_C without a second press: {released:?}"
+        );
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn assigning_an_axis_to_a_chord_member_drains_the_live_chord_firing() {
+        // B9: `SetAxisAssignment` atomically removes the Chord membership for
+        // the key; a live Chord Hold-to-repeat firing on that Chord then has
+        // no member `Up` left to end it. `Effect::StopChord` (one per removed
+        // membership) force-releases it.
+        let mut profile = Profile::default();
+        let members = [Input::Grid(1, 1), Input::Grid(1, 2)];
+        profile.chords_base.insert(
+            ChordKey::new(BTreeSet::from(members)),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_C),
+        );
+        let harness = CommandHarness::spawn(config_with_profile(profile));
+
+        harness.press(Input::Grid(1, 1)).await;
+        harness.press(Input::Grid(1, 2)).await;
+        settle().await;
+        let mark = harness.sink.batches().len();
+        assert!(
+            (0..mark)
+                .map(|i| key_and_value(harness.sink.batches()[i][0]))
+                .any(|kv| kv == (evdev::KeyCode::KEY_C, 1)),
+            "the Chord Hold-to-repeat is holding KEY_C down"
+        );
+
+        harness
+            .set_axis_assignment(Input::Grid(1, 1), Layer::Base, AxisTarget::LeftTrigger)
+            .await
+            .expect("SetAxisAssignment must succeed");
+        settle().await;
+
+        let released: Vec<_> = harness.sink.batches()[mark..]
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect();
+        assert!(
+            released.contains(&(evdev::KeyCode::KEY_C, 0)),
+            "the axis assignment drained the Chord firing, releasing KEY_C: {released:?}"
         );
 
         harness.shut_down().await;
