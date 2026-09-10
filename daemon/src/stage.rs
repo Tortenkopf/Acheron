@@ -342,6 +342,14 @@ struct KeyRuntime {
     /// observed tick is a real, tested scenario (the mechanical-replay
     /// tables' own `(Up, Up)` rows), not a reset artifact, so it still gets
     /// `advance`'s ordinary full-replay treatment.
+    ///
+    /// After a `stop_stage` reset (only — not `stop_all`'s), the same
+    /// re-adoption also re-confirms the `primary_handed_off` that
+    /// `stop_stage` carried across the reset (correcting it if the deep band
+    /// was left in the meantime) and holds `deep_repeat_suppressed` until
+    /// the deep band lifts, so the `Engine::feed` path stays in step with
+    /// the reset rather than machine-gunning off the slots `release_deep_slot`
+    /// left behind (ticket 24) — see `deep_repeat_suppressed`.
     just_reset: bool,
     /// The stage machine currently holds this key's primary *released* — a
     /// `ReleasePrimary` op not yet followed by `FirePrimary`/`RepressPrimary`
@@ -356,6 +364,25 @@ struct KeyRuntime {
     /// no mode leaves the primary autorepeating alongside a live deep stage
     /// (the Additive mode that did was removed — ADR-0009).
     primary_handed_off: bool,
+    /// `stop_stage` force-released this key's deep stage and wiped the
+    /// entry (a `SetStagingMode` mode flip, or a cross-Layer deep-stage
+    /// clear landing on a key held into the deep band on the *other*,
+    /// still-valid Layer) — but `release_deep_slot`'s `force_release`
+    /// *keeps* the deep firing entry (`Slot::FiringFinished`), so once an
+    /// `update` tick has re-adopted `deep = Down`, `feed`'s next primary
+    /// `Repeat` would drive `deep_repeat` → `trigger::decide((HoldToRepeat,
+    /// Repeat), Some(FiringFinished))` → `RepeatKey` and machine-gun a
+    /// stage `stop_stage` logically released. This flag makes `deep_repeat`
+    /// a no-op until the deep band is *physically* released (`update` sees
+    /// `deep` go `Up` and clears it); a genuine re-crossing then re-fires
+    /// the deep stage cleanly. Set only by `stop_stage` — `stop_all` (a
+    /// Layer/Profile switch) genuinely re-establishes on the new Layer, and
+    /// `decide`'s own "`Repeat` with no firing re-presses first" rule
+    /// covers it. Also marks the entry as `stop_stage`-reset (not
+    /// `stop_all`-reset), which is what scopes the `just_reset` re-adoption's
+    /// `primary_handed_off` re-confirmation to the `stop_stage` path
+    /// (ticket 24).
+    deep_repeat_suppressed: bool,
 }
 
 /// `dispatch_individual_down`'s exact Down-side logic — get, short-circuit
@@ -553,12 +580,34 @@ impl Engine {
                 rt.primary = new_primary;
                 rt.deep = new_deep;
                 rt.just_reset = false;
+                if rt.deep_repeat_suppressed {
+                    // Re-confirm the hand-off `stop_stage` carried across its
+                    // reset (a `SetStagingMode` mode flip, or a cross-Layer
+                    // deep-stage clear) against the bands we just re-adopted:
+                    // under Handoff / No-Return a key sitting in the deep
+                    // band has its primary handed to the deep stage — and if
+                    // the deep band was left in the gap before this tick, the
+                    // primary is no longer handed off (ticket 24).
+                    rt.primary_handed_off = matches!(
+                        deep_cfg.mode,
+                        StagingMode::Handoff | StagingMode::NoReturn
+                    ) && new_primary == KeyState::Down
+                        && new_deep == KeyState::Down;
+                    if new_deep == KeyState::Up {
+                        rt.deep_repeat_suppressed = false;
+                    }
+                }
                 continue;
             }
             let prev = (to_band(rt.primary), to_band(rt.deep));
             let next = (to_band(new_primary), to_band(new_deep));
             rt.primary = new_primary;
             rt.deep = new_deep;
+            // The deep band lifted — any `stop_stage` deep-repeat suppression
+            // has served its purpose; a fresh crossing re-fires cleanly.
+            if new_deep == KeyState::Up {
+                rt.deep_repeat_suppressed = false;
+            }
             if prev == next {
                 continue;
             }
@@ -717,6 +766,14 @@ impl Engine {
     /// | Quick-Skip `Up` / `Repeat` once `Late` | runs the general rows (plain Handoff) |
     /// | any mode, `Repeat`, primary handed off to deep | drive deep repeat, `Handled(vec![])` |
     /// | any mode, `Repeat`, primary **not** handed off | drive deep repeat, `NotMine { true }` |
+    ///
+    /// "drive deep repeat" is itself a no-op while `deep_repeat_suppressed`
+    /// (a `stop_stage` reset that hasn't been cleared by a physical deep
+    /// re-crossing); the hand-off column is decided by `primary_handed_off`,
+    /// which `stop_stage` carries across its reset (re-confirmed by the
+    /// `update` re-adoption) — so both `Repeat` rows stay correct from the
+    /// instant the reset lands, without waiting on an `update` tick
+    /// (ticket 24).
     pub(crate) async fn feed(
         &mut self,
         deps: EngineDeps<'_>,
@@ -1037,8 +1094,12 @@ impl Engine {
         if !self
             .runtime
             .get(&input)
-            .is_some_and(|rt| rt.deep == KeyState::Down)
+            .is_some_and(|rt| rt.deep == KeyState::Down && !rt.deep_repeat_suppressed)
         {
+            // `deep_repeat_suppressed`: `stop_stage` force-released this deep
+            // stage while the band stayed held — stay silent rather than
+            // resurrect it off the `Slot::FiringFinished` `force_release`
+            // kept, until a physical re-crossing re-fires it (ticket 24).
             return Ok(());
         }
         let profile = config
@@ -1211,18 +1272,53 @@ impl Engine {
     /// the inert `just_reset` entry is simply never ticked again — a harmless
     /// `HashMap` entry bounded by grid size, identical to `stop_all`'s.
     ///
+    /// The `just_reset` re-adoption alone only quiesces the `Engine::update`
+    /// path — but the symptom it targets fires from `Engine::feed`, and the
+    /// two are driven by independent channels (`rx_depth` vs `rx_events`)
+    /// with no ordering guarantee, and `update` may not run at all while a
+    /// steady hold produces no fresh depth reports (`capture::analog`
+    /// synthesizes `Repeat`s off a wall clock regardless — see its
+    /// `relay_grid_blocking`). So the two `feed`-visible pieces of the
+    /// hand-off are handled at `stop_stage` time, not deferred:
+    ///
+    /// - **`primary_handed_off` is carried across the reset, not cleared.**
+    ///   `stop_stage` force-releases the *deep* slot and resets band
+    ///   tracking; it never re-presses the primary, so a primary the stage
+    ///   machine had handed to the deep stage is *still* released — clearing
+    ///   the flag was a plain bug (a handed-off Hold-to-repeat primary then
+    ///   machine-guns on the next `feed` `Repeat`). The `just_reset`
+    ///   re-adoption re-confirms it from the re-adopted bands once `update`
+    ///   next runs (and corrects it to `false` if the deep band was left in
+    ///   the meantime).
+    /// - **`deep_repeat_suppressed` is set.** `release_deep_slot`'s
+    ///   `force_release` *keeps* the deep firing entry
+    ///   (`Slot::FiringFinished`), so `deep_repeat` →
+    ///   `trigger::decide((HoldToRepeat, Repeat), Some(FiringFinished))` →
+    ///   `RepeatKey` would resurrect a still-valid Hold-to-repeat deep stage
+    ///   `stop_stage` logically released. The flag makes `deep_repeat` inert
+    ///   until the deep band is physically re-crossed (`update` clears it on
+    ///   `deep == Up`). Between the reset and the first re-adopting `update`
+    ///   tick the band-tracking reset to `Up` already blocks `deep_repeat`.
+    ///
     /// Residual (accepted): `release_deep_slot` still runs unconditionally,
     /// so a cross-Layer held deep stage *is* briefly force-released for one
-    /// frame before `update` re-adopts it. Removing that too needs the
-    /// cleared `Layer` threaded through the effect so `release_deep_slot` can
-    /// be skipped when it isn't the active Layer — flagged in ticket 23, not
-    /// required; the `just_reset` change removes the user-visible
-    /// double-actuation (the re-fire).
+    /// frame (a deep Toggle's `value=0`, or a deep Hold-to-repeat's) before
+    /// `update` re-adopts it and `deep_repeat_suppressed` keeps it quiet.
+    /// Removing that one frame too needs the cleared `Layer` threaded
+    /// through the effect so `release_deep_slot` can be skipped when it
+    /// isn't the active Layer — flagged in ticket 23, not required.
     pub(crate) async fn stop_stage(&mut self, input: Input, injector: &Injector) {
         self.release_deep_slot(input, injector).await;
         if let Some(rt) = self.runtime.get_mut(&input) {
+            // Carry `primary_handed_off` — `stop_stage` doesn't re-press the
+            // primary, so a handed-off primary stays handed off, and `feed`
+            // must keep swallowing its `Repeat`s without waiting for the
+            // next `rx_depth`-driven `update` tick (ticket 24).
+            let primary_handed_off = rt.primary_handed_off;
             *rt = KeyRuntime {
                 just_reset: true,
+                deep_repeat_suppressed: true,
+                primary_handed_off,
                 ..KeyRuntime::default()
             };
         }
@@ -1542,6 +1638,7 @@ mod tests {
     /// `update` / `tick` call needs — no dispatch task, no D-Bus.
     struct StageFixture {
         inj: Injector,
+        sink: RecordingSink,
         individual: Slots<Input>,
         cursors: stepper::Cursors,
     }
@@ -1552,6 +1649,7 @@ mod tests {
             let (inj, _handle) = injector::spawn(sink.clone(), sink.clone());
             StageFixture {
                 inj,
+                sink,
                 individual: Slots::default(),
                 cursors: stepper::Cursors::default(),
             }
@@ -1575,6 +1673,20 @@ mod tests {
             input: KEY,
             state,
             depth,
+        }
+    }
+
+    fn key_and_value(event: evdev::InputEvent) -> (evdev::KeyCode, i32) {
+        match event.destructure() {
+            evdev::EventSummary::Key(_, code, value) => (code, value),
+            other => panic!("expected a key event, got {other:?}"),
+        }
+    }
+
+    /// Lets a spawned firing task land its writes in the `RecordingSink`.
+    async fn settle() {
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
         }
     }
 
@@ -2062,6 +2174,203 @@ mod tests {
         assert!(
             engine.slots.slot(&StageKey(KEY)).is_none(),
             "the live deep slot is force-released"
+        );
+    }
+
+    // ── `post-release-development` ticket 24: `stop_stage` + the `feed` path ──
+    //
+    // Ticket 23's reset-and-keep quiesced `Engine::update`'s mechanical
+    // replay but not `Engine::feed`'s `Repeat` path: `release_deep_slot`'s
+    // `force_release` keeps the deep firing entry (`Slot::FiringFinished`),
+    // and `stop_stage` drops `primary_handed_off`. Once an `update` tick
+    // re-adopts `deep = Down`, the next primary `Repeat` would resurrect the
+    // released stage — a phantom `value=2` deep autorepeat, or a handed-off
+    // Hold-to-repeat primary machine-gunning. `deep_repeat_suppressed` + the
+    // re-adoption's `primary_handed_off` rebuild close both.
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_stage_then_re_adopt_does_not_resurrect_a_held_deep_hold_to_repeat() {
+        let config = dual_stage_cfg(
+            StagingMode::Handoff,
+            TriggerMode::FireOnce,
+            TriggerMode::HoldToRepeat,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+
+        // Into the deep band — the deep Hold-to-repeat latches its `value=1`.
+        engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 250u8)]))
+            .await
+            .unwrap();
+        settle().await;
+        assert!(
+            matches!(
+                engine.slots.slot(&StageKey(KEY)),
+                Some(trigger::Slot::FiringFinished | trigger::Slot::FiringUnfinished)
+            ),
+            "the deep Hold-to-repeat holds a firing before the clear"
+        );
+
+        // `SetStagingMode` / cross-Layer clear force-releases it and resets.
+        engine.stop_stage(KEY, &fx.inj).await;
+        settle().await;
+        assert!(
+            matches!(
+                engine.slots.slot(&StageKey(KEY)),
+                Some(trigger::Slot::FiringFinished)
+            ),
+            "`force_release` keeps the entry — the trap the suppression flag guards"
+        );
+
+        // The ordering ticket 23's B7 test omits: an `update` tick at the
+        // same held Depth consumes `just_reset` and re-adopts `deep = Down`.
+        engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 250u8)]))
+            .await
+            .unwrap();
+
+        let before = fx.sink.batches().len();
+        let out = engine
+            .feed(fx.deps(&config), edge(EventState::Repeat, Some(250)))
+            .await
+            .unwrap();
+        settle().await;
+
+        assert_eq!(out, StageOutcome::Handled(Vec::new()));
+        assert_eq!(
+            fx.sink.batches().len(),
+            before,
+            "a released deep Hold-to-repeat must not re-fire off its leftover slot"
+        );
+
+        // A physical re-crossing (out of the deep band, then back in) clears
+        // the suppression and re-fires the deep stage cleanly.
+        engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 150u8)]))
+            .await
+            .unwrap();
+        engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 250u8)]))
+            .await
+            .unwrap();
+        settle().await;
+        let deep_b: Vec<_> = fx
+            .sink
+            .batches()
+            .iter()
+            .flatten()
+            .map(|e| key_and_value(*e))
+            .filter(|(c, _)| *c == evdev::KeyCode::KEY_B)
+            .collect();
+        assert_eq!(
+            deep_b.last(),
+            Some(&(evdev::KeyCode::KEY_B, 1)),
+            "a fresh crossing re-fires the deep stage: {deep_b:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_stage_carries_primary_handed_off_across_the_reset_no_update_tick_needed() {
+        let config = dual_stage_cfg(
+            StagingMode::Handoff,
+            TriggerMode::HoldToRepeat,
+            TriggerMode::FireOnce,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+
+        // Primary band, then hand off into the deep band.
+        engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 150u8)]))
+            .await
+            .unwrap();
+        engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 250u8)]))
+            .await
+            .unwrap();
+        settle().await;
+        assert!(
+            engine.primary_handed_off(KEY),
+            "the primary is handed off before the clear"
+        );
+
+        engine.stop_stage(KEY, &fx.inj).await;
+        settle().await;
+        assert!(
+            engine.primary_handed_off(KEY),
+            "carried across the reset — `stop_stage` never re-presses the primary"
+        );
+
+        // No intervening `update` tick (the `rx_depth` snapshot could be
+        // reordered behind the `rx_events` `Repeat`, or a steady hold could
+        // stop producing depth reports entirely). `feed` must still swallow.
+        let before = fx.sink.batches().len();
+        let out = engine
+            .feed(fx.deps(&config), edge(EventState::Repeat, Some(250)))
+            .await
+            .unwrap();
+        settle().await;
+        assert_eq!(
+            out,
+            StageOutcome::Handled(Vec::new()),
+            "the handed-off primary's `Repeat` pulse is swallowed with no `update` tick"
+        );
+        assert_eq!(
+            fx.sink.batches().len(),
+            before,
+            "no phantom primary autorepeat under the deep stage"
+        );
+
+        // A held-Depth `update` tick re-confirms it; a later exit hands back.
+        engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 250u8)]))
+            .await
+            .unwrap();
+        assert!(engine.primary_handed_off(KEY), "re-confirmed by the re-adoption");
+        engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 150u8)]))
+            .await
+            .unwrap();
+        assert!(
+            !engine.primary_handed_off(KEY),
+            "the primary is handed back once the deep band releases"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_stage_re_adopt_corrects_primary_handed_off_when_the_deep_band_was_left() {
+        // The other side of the carry: if the finger leaves the deep band in
+        // the gap before the re-adopting `update` tick, the carried
+        // `primary_handed_off` must be corrected to `false`.
+        let config = dual_stage_cfg(
+            StagingMode::Handoff,
+            TriggerMode::HoldToRepeat,
+            TriggerMode::FireOnce,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+
+        engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 150u8)]))
+            .await
+            .unwrap();
+        engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 250u8)]))
+            .await
+            .unwrap();
+        settle().await;
+        engine.stop_stage(KEY, &fx.inj).await;
+        assert!(engine.primary_handed_off(KEY), "carried");
+
+        // Re-adopt with the key now back in the primary band only.
+        engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 150u8)]))
+            .await
+            .unwrap();
+        assert!(
+            !engine.primary_handed_off(KEY),
+            "the re-adoption corrects the carried flag — the deep band was left"
         );
     }
 }

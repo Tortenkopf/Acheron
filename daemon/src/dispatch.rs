@@ -7975,6 +7975,247 @@ mod tests {
         harness.shut_down().await;
     }
 
+    // ── `post-release-development` ticket 24: `stop_stage` + the `feed` path ──
+
+    #[tokio::test]
+    async fn dual_stage_set_staging_mode_mid_press_stays_silent_after_a_held_depth_report() {
+        // Ticket 24: ticket 23's B7 test drove `repeat_analog` straight after
+        // `SetStagingMode` with no interleaved `push_depth`, so `just_reset`
+        // was never consumed and `rt.deep` stayed `Up` — `deep_repeat`'s
+        // `rt.deep == Down` guard masked the bug. Production's `capture::
+        // analog` sends a fresh Depth snapshot *and* `Repeat` pulses per
+        // report: the snapshot re-adopts `rt.deep = Down`, and the next pulse
+        // would reach `deep_repeat` → `RepeatKey` off the `FiringFinished`
+        // slot `release_deep_slot` left behind.
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        harness.repeat_analog(Input::Grid(1, 1), 250).await;
+        settle().await;
+        let deep_b = |h: &CommandHarness| {
+            h.sink
+                .batches()
+                .iter()
+                .map(|b| key_and_value(b[0]))
+                .filter(|(c, _)| *c == evdev::KeyCode::KEY_B)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            deep_b(&harness),
+            vec![(evdev::KeyCode::KEY_B, 1), (evdev::KeyCode::KEY_B, 2)],
+            "the deep Hold-to-repeat fired and repeated once before the mode flip"
+        );
+
+        harness
+            .apply(edit::Edit::SetStagingMode {
+                input: Input::Grid(1, 1),
+                mode: StagingMode::NoReturn,
+            })
+            .await
+            .unwrap();
+        settle().await;
+        assert_eq!(
+            deep_b(&harness).last(),
+            Some(&(evdev::KeyCode::KEY_B, 0)),
+            "SetStagingMode force-releases the held deep value=1"
+        );
+        let quiesced = deep_b(&harness);
+
+        // The full production ordering: a fresh held-Depth snapshot (consumes
+        // `just_reset`, re-adopts `rt.deep = Down`) then a run of `Repeat`s.
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        for _ in 0..4 {
+            harness.repeat_analog(Input::Grid(1, 1), 250).await;
+            settle().await;
+        }
+        assert_eq!(
+            deep_b(&harness),
+            quiesced,
+            "a released deep Hold-to-repeat must not resume off its leftover slot"
+        );
+
+        // A genuine re-crossing re-fires it under the new mode.
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        assert_eq!(
+            deep_b(&harness).last(),
+            Some(&(evdev::KeyCode::KEY_B, 1)),
+            "a fresh deep crossing re-fires the deep stage"
+        );
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn dual_stage_set_staging_mode_mid_press_keeps_a_handed_off_primary_silent() {
+        // Ticket 24 failure 2: a handed-off Hold-to-repeat *primary*. `update`
+        // did `ReleasePrimary` + set `primary_handed_off`; `stop_stage`
+        // carries that flag across its reset, so `feed` keeps swallowing the
+        // primary's `Repeat`s — with *or without* an interleaved `push_depth`
+        // (the `rx_depth` snapshot can be reordered behind the `rx_events`
+        // pulse, or a steady hold can stop producing depth reports entirely,
+        // which `capture::analog`'s wall-clock `Repeat` synthesis tolerates).
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.repeat_analog(Input::Grid(1, 1), 150).await;
+        settle().await;
+        let key_a_taps = |h: &CommandHarness| {
+            h.sink
+                .batches()
+                .iter()
+                .map(|b| key_and_value(b[0]))
+                .filter(|(c, _)| *c == evdev::KeyCode::KEY_A)
+                .count()
+        };
+        assert!(key_a_taps(&harness) > 0, "the primary taps before the hand-off");
+
+        // Hand off into the deep band.
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+
+        harness
+            .apply(edit::Edit::SetStagingMode {
+                input: Input::Grid(1, 1),
+                mode: StagingMode::NoReturn,
+            })
+            .await
+            .unwrap();
+        settle().await;
+
+        // No interleaved `push_depth` — the primary `Repeat`s arrive with
+        // `Engine::update` never having ticked since the reset.
+        let taps_after_reset = key_a_taps(&harness);
+        for _ in 0..3 {
+            harness.repeat_analog(Input::Grid(1, 1), 250).await;
+            settle().await;
+        }
+        assert_eq!(
+            key_a_taps(&harness),
+            taps_after_reset,
+            "swallowed with no `update` tick between the mode flip and the pulses"
+        );
+
+        // Now the held-Depth snapshot lands and more pulses follow — still
+        // swallowed (re-confirmed by the re-adoption).
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        for _ in 0..3 {
+            harness.repeat_analog(Input::Grid(1, 1), 250).await;
+            settle().await;
+        }
+        assert_eq!(
+            key_a_taps(&harness),
+            taps_after_reset,
+            "the handed-off Hold-to-repeat primary must stay silent under the deep stage after a mode flip"
+        );
+
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn dual_stage_cross_layer_clear_leaves_the_held_deep_hold_to_repeat_silent_on_repeat() {
+        // Ticket 24 failure 1 at the pipeline level: ticket 23's B12 test
+        // stopped at a `push_depth` after the cross-Layer clear and never
+        // sent a `Repeat`. With the deep band re-adopted `Down` and the deep
+        // slot left `FiringFinished` by `release_deep_slot`, the next
+        // synthesized primary `Repeat` would drive `deep_repeat` →
+        // `RepeatKey` — phantom `value=2` for the whole remaining hold.
+        let mut config = dual_stage_config(
+            StagingMode::Handoff,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_C),
+        );
+        {
+            let profile = config.active_profile_mut().expect("seed profile");
+            profile
+                .held
+                .insert(Input::Grid(1, 1), keypress_binding(evdev::KeyCode::KEY_A));
+            profile.deep_held.insert(
+                Input::Grid(1, 1),
+                hold_to_repeat_binding(evdev::KeyCode::KEY_B),
+            );
+        }
+        let harness = CommandHarness::spawn(config);
+
+        harness.press(Input::ModeKey).await;
+        settle().await;
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        harness.repeat_analog(Input::Grid(1, 1), 250).await;
+        settle().await;
+
+        let deep_b = |h: &CommandHarness| {
+            h.sink
+                .batches()
+                .iter()
+                .map(|b| key_and_value(b[0]))
+                .filter(|(c, _)| *c == evdev::KeyCode::KEY_B)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            deep_b(&harness),
+            vec![(evdev::KeyCode::KEY_B, 1), (evdev::KeyCode::KEY_B, 2)],
+            "the Held deep Hold-to-repeat fired and repeated once before the clear"
+        );
+
+        // Clear the *Base* deep Binding while the key is held deep on Held —
+        // the active-Layer (`Held`) `deep_layer` guard stays true.
+        harness
+            .clear_deep_stage(Input::Grid(1, 1), Layer::Base)
+            .await
+            .unwrap();
+        settle().await;
+        assert_eq!(
+            deep_b(&harness).last(),
+            Some(&(evdev::KeyCode::KEY_B, 0)),
+            "the accepted one-frame `release_deep_slot` residual"
+        );
+        let quiesced = deep_b(&harness);
+
+        // A further held-Depth report re-adopts `rt.deep = Down`; the pulses
+        // that follow must not resurrect the released deep stage.
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        for _ in 0..4 {
+            harness.repeat_analog(Input::Grid(1, 1), 250).await;
+            settle().await;
+        }
+        assert_eq!(
+            deep_b(&harness),
+            quiesced,
+            "no phantom deep output after a cross-Layer clear of the other Layer"
+        );
+
+        harness.release(Input::ModeKey).await;
+        harness.shut_down().await;
+    }
+
     // Overwriting (not removing) a primary Binding no longer tears its deep
     // stage down — covered as a `plan` unit test
     // (`edit::tests::set_binding_overwriting_a_primary_keeps_its_live_deep_binding`),

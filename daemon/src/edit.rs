@@ -389,8 +389,10 @@ pub(crate) enum Effect {
     /// / `AssertStatusLeds` / `AnnounceProfileChange` stay separate effects.
     TearDown(TeardownReason),
     /// Force-release the given Input's live dual-stage deep slot immediately
-    /// (`stage::Engine::stop_stage`, which resets-and-keeps the runtime entry
-    /// — post-release ticket 23). Three sources: `ClearBinding`'s cascade
+    /// (`stage::Engine::stop_stage`, which resets-and-keeps the runtime
+    /// entry, suppresses `deep_repeat`, and carries `primary_handed_off`
+    /// across the reset so the `feed` path stays in step — post-release
+    /// tickets 23, 24). Three sources: `ClearBinding`'s cascade
     /// (ticket 06's "Cascade-delete" — removing a primary Binding orphans the
     /// `deep_base`/`deep_held` entry it carried, via
     /// `cascade_orphaned_deep_stage`); `ClearDeepStage` directly (ticket 18);

@@ -196,8 +196,84 @@ likely the smallest sound fix.
 **Blocked by:** None. `stage.rs`-local plus (option 1) one `Effect::StopStage`
 signature change touched in `edit.rs` + `dispatch::run_effects`.
 
-**Status:** open — filed 2026-09-10 from ticket 22's `/code-review`; not
-started.
+**Status:** done — 2026-09-10.
+
+## Resolution
+
+**Fix taken: option 2 only** (self-contained in `stage.rs`; option 1's
+`Effect::StopStage(Input, Layer)` threading was declined — it churns four
+`edit` arms + `run_effects` and still can't cover `SetStagingMode`, which
+has no single Layer). One mechanism covers both trigger families.
+
+- **New `KeyRuntime::deep_repeat_suppressed`** — set (alongside
+  `just_reset`) *only* by `stop_stage`, never `stop_all` (a Layer/Profile
+  switch genuinely re-establishes on the new Layer, and `decide`'s
+  "`Repeat` with no firing re-presses first" rule covers it). While set,
+  `deep_repeat` is a no-op, so a still-valid Hold-to-repeat deep stage
+  can't resurrect off the `Slot::FiringFinished` entry `release_deep_slot`
+  keeps. Cleared by `Engine::update` the moment it observes the deep band
+  physically lift (`new_deep == Up`) — a genuine re-crossing then re-fires
+  the stage cleanly.
+- **`primary_handed_off` is carried across the `stop_stage` reset, not
+  cleared** (`/code-review` finding). `stop_stage` force-releases the
+  *deep* slot and resets band tracking — it never re-presses the primary,
+  so a primary the machine handed to the deep stage is *still* released;
+  clearing the flag was a plain bug. The `feed` swallow now works the
+  instant `stop_stage` returns, with no dependence on `rx_depth` /
+  `Engine::update` timing — which matters because the two channels have no
+  ordering guarantee and `update` may not tick at all during a steady hold
+  that stops producing depth reports (`capture::analog` synthesizes
+  `Repeat`s off a wall clock regardless).
+- **The `just_reset` re-adoption re-confirms `primary_handed_off`** — gated
+  on `deep_repeat_suppressed` (scopes it to the `stop_stage` path):
+  `matches!(mode, Handoff | NoReturn) && new_primary == Down && new_deep ==
+  Down`. This *corrects* the carried flag to `false` if the finger left the
+  deep band before the first `update` tick after the reset.
+- The ticket's option-2 sketch ("skip `deep_repeat` on the tick(s)
+  immediately after a reset" / a `just_reset` check in `feed`) was
+  under-specified — `just_reset` is already consumed by the time the
+  `Repeat` pulses arrive, so suppression has to persist until the physical
+  re-cross. That's what `deep_repeat_suppressed` does.
+- Bands (`rt.primary` / `rt.deep`) are *not* also carried — the
+  `deep_repeat` re-fire is already blocked in the pre-`update` window by
+  the band-tracking reset to `Up`, and after the re-adopt by
+  `deep_repeat_suppressed`, so carrying them would only risk perturbing
+  ticket 23's silent-re-adopt contract for no gain.
+
+**Tests added** (`daemon` 578, clippy clean):
+
+- `stage.rs` — `stop_stage_then_re_adopt_does_not_resurrect_a_held_deep_hold_to_repeat`
+  (deep Hold-to-repeat: `stop_stage` → `update` re-adopt `deep = Down` →
+  `feed(Repeat)` emits nothing; a fresh crossing re-fires),
+  `stop_stage_carries_primary_handed_off_across_the_reset_no_update_tick_needed`
+  (Handoff, Hold-to-repeat primary handed off: `feed(Repeat)` swallowed
+  with *no* intervening `update` tick, re-confirmed on the held-Depth
+  re-adopt, handed back on deep-band exit),
+  `stop_stage_re_adopt_corrects_primary_handed_off_when_the_deep_band_was_left`
+  (the carried flag corrected to `false` when the re-adopt sees the finger
+  back in the primary band). `StageFixture` gained a `sink` handle + a
+  `settle()` helper so stage-level tests can assert on injected output.
+- `dispatch.rs` pipeline —
+  `dual_stage_set_staging_mode_mid_press_stays_silent_after_a_held_depth_report`
+  (the ticket-23 B7 sequence *with* the interleaved `push_depth` it
+  omitted, deep Hold-to-repeat),
+  `dual_stage_set_staging_mode_mid_press_keeps_a_handed_off_primary_silent`
+  (Hold-to-repeat primary variant),
+  `dual_stage_cross_layer_clear_leaves_the_held_deep_hold_to_repeat_silent_on_repeat`
+  (deep Hold-to-repeat on both Layers, held into the active band, Base
+  cleared, then held-Depth report + `Repeat` run). All three reproduce the
+  phantom `value=2` / machine-gun with the fix reverted.
+- All prior `dual_stage_*` / `stage.rs` tests unchanged and green;
+  ticket 23's `dual_stage_set_staging_mode_mid_press_releases_the_live_deep_stage`
+  (the no-interleaved-`push_depth` ordering) still passes as-is.
+
+**Docs:** `stop_stage` doc's "Residual (accepted)" paragraph rewritten
+(the accepted residual is now *only* the one-frame `release_deep_slot`
+drop; the `feed`/`deep_repeat` and `primary_handed_off` gaps are closed,
+not residuals); `KeyRuntime::just_reset` + new `deep_repeat_suppressed`
+docs; `Engine::feed` routing-matrix doc notes the suppression; `edit.rs`
+`Effect::StopStage` doc gains the ticket-24 note (no `Layer` argument —
+option 1 not taken). No ADR, no `CONTEXT.md`.
 
 ## Comments
 
