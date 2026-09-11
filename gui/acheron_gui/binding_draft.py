@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
-from .inputs import default_key_code_for
+from .inputs import default_key_code_for, default_trigger_for
 
 
 class BindingDraft:
@@ -64,11 +64,21 @@ class BindingDraft:
         `build_action_and_trigger_fields`'s old seed dict exactly, including
         for a `starting["type"]` this module doesn't itself know how to
         render (`unsupported_kind`, handled entirely by the caller — every
-        sub-state below just falls through to its default, same as today)."""
+        sub-state below just falls through to its default, same as today).
+
+        `starting.get("trigger", ...)` rather than `starting["trigger"]`
+        (ticket 28): an Axis-kind `starting` — this class's own `to_wire()`
+        output, round-tripped back in as `starting` by the dual-stage panel's
+        `stage_starting` after an unsaved Axis edit survives a stage swap —
+        carries no `"trigger"` key at all (Axis assignment isn't a `Binding`,
+        ticket 59 §2). `self.trigger` is inert for Axis either way (locked/
+        hidden in the UI, dropped by `to_wire()`), so any in-range default
+        does; `default_trigger_for(inp)` matches the synthetic-primary/
+        fresh-deep-stage seeds elsewhere in this module's caller."""
         kind = starting["type"]
         return cls(
             kind=kind,
-            trigger=starting["trigger"],
+            trigger=starting.get("trigger", default_trigger_for(inp)),
             keypress=(
                 {"key": starting.get("key", "KEY_A"), "modifiers": list(starting.get("modifiers", []))}
                 if kind == "keypress"

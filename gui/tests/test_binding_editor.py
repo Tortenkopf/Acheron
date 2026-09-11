@@ -1761,6 +1761,29 @@ def test_deep_stage_action_menu_offers_the_full_binding_menu_minus_axis():
     assert "Axis" not in labels
 
 
+def test_an_unsaved_axis_edit_on_the_primary_stage_survives_a_stage_swap_without_crashing():
+    # Ticket 28: picking Axis on the primary stage and assigning a target
+    # without hitting Save/Apply stores `{"type": "axis", "target": ...}` —
+    # no "trigger" key at all — as the primary's captured draft. Adding a
+    # deep stage (or any other structural edit) swaps the mounted stage to
+    # Deep and back to Primary, feeding that dict straight back in as
+    # `starting` — this must not KeyError.
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+
+    action_dd = _dropdown_labeled(editor, "Action")
+    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("axis"))
+    _click_axis_target(editor, "Left Trigger")
+
+    _add_deep_stage(editor)  # captures the primary's Axis draft, lands on Deep
+    _toggles_startswith(editor, "Primary")[0].set_active(True)  # re-seeds from that draft
+
+    action_dd = _dropdown_labeled(editor, "Action")
+    assert action_dd.get_model().get_string(action_dd.get_selected()) == "Axis"
+    trigger_dd = _dropdown_labeled(editor, "Trigger mode")
+    assert not trigger_dd.get_sensitive()
+
+
 def test_dragging_the_primary_actuation_marker_is_clamped_below_the_deep_band():
     stub = DaemonStub()
     editor = _dual_stage_editor(stub)

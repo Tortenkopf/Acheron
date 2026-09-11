@@ -39,17 +39,28 @@ against the real widget tree.
 
 ## Acceptance criteria
 
-- [ ] Picking Axis on an unbound-elsewhere Grid key's primary stage, assigning
+- [x] Picking Axis on an unbound-elsewhere Grid key's primary stage, assigning
       a target, then toggling to the deep-stage swap and back no longer
       crashes.
-- [ ] A `dispatch`/`binding_editor` test reproduces the crash on `dev` before
+- [x] A `dispatch`/`binding_editor` test reproduces the crash on `dev` before
       the fix and passes after.
-- [ ] Decide and document which side owns the invariant: either `starting`
+- [x] Decide and document which side owns the invariant: either `starting`
       dicts are never assumed to carry `"trigger"` when `type == "axis"`, or
       the dual-stage panel's own draft capture normalizes/rejects an
       Axis-kind primary draft before it can round-trip back in as `starting`.
-- [ ] GUI suite green.
+- [x] GUI suite green.
 
 ## Comments
 
 **2026-09-11** — Filed from ticket 26's `/code-review` (BindingDraft carve).
+
+**2026-09-12** — Fixed on the `BindingDraft.from_wire`/`build_action_and_
+trigger_fields` side: `starting["trigger"]` → `starting.get("trigger",
+default_trigger_for(inp))` at both read sites (`binding_draft.py`,
+`binding_editor.py`). `to_wire()`'s no-`"trigger"`-key Axis shape is already
+a documented, load-bearing invariant of the wire format (`binding_draft.py`'s
+own module docstring) — the consumer side owns tolerating it, not the
+dual-stage panel's draft capture. `self.trigger` is inert for Axis regardless
+(locked/hidden in the UI, dropped again by `to_wire()`), so any in-range
+default works. Regression tests added in `test_binding_draft.py` and
+`test_binding_editor.py`; full GUI suite green (538 passed).

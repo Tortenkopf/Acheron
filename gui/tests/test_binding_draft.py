@@ -55,6 +55,26 @@ def test_from_wire_seeds_axis_from_starting():
     assert draft.axis == {"target": "left_trigger"}
 
 
+def test_from_wire_tolerates_an_axis_starting_dict_with_no_trigger_key():
+    # Ticket 28: an Axis-kind `starting` is this class's own `to_wire()`
+    # output round-tripped back in (the dual-stage panel's `stage_starting`,
+    # after an unsaved Axis edit survives a stage swap) — and `to_wire()`
+    # never puts a "trigger" key on an Axis dict at all. Must not KeyError.
+    starting = {"type": "axis", "target": "left_trigger"}
+    draft = BindingDraft.from_wire(starting, inp="grid_r1c1", profile="Default")
+    assert draft.kind == "axis"
+    assert draft.axis == {"target": "left_trigger"}
+    assert draft.trigger == "hold_to_repeat"
+
+
+def test_from_wire_defaults_the_missing_trigger_per_input_same_as_a_fresh_binding():
+    # The scroll-wheel directions default Fire-once everywhere else
+    # (`default_trigger_for`) — the same fallback applies here.
+    starting = {"type": "axis", "target": None}
+    draft = BindingDraft.from_wire(starting, inp="wheel_scroll_up", profile="Default")
+    assert draft.trigger == "fire_once"
+
+
 # --- from_wire: default-seeding every kind that isn't the active one ---
 
 

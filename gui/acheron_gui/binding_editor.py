@@ -543,7 +543,12 @@ def build_action_and_trigger_fields(
     trigger_options = base_trigger_options
     trigger_keys = [k for k, _ in trigger_options]
     trigger_dd = Gtk.DropDown(model=Gtk.StringList.new([lbl for _, lbl in trigger_options]))
-    trigger_dd.set_selected(trigger_keys.index(starting["trigger"]))
+    # `starting.get("trigger", ...)`, not `starting["trigger"]` (ticket 28):
+    # an Axis-kind `starting` has no `"trigger"` key at all — see
+    # `BindingDraft.from_wire`'s docstring for why. The dropdown itself gets
+    # disabled/hidden below once `kind == "axis"` is known, so this initial
+    # selection is inert for that case; it just has to be in-range.
+    trigger_dd.set_selected(trigger_keys.index(starting.get("trigger", default_trigger_for(inp))))
     trigger_row = labeled_row("Trigger mode", trigger_dd)
     fields.append(trigger_row)
 
