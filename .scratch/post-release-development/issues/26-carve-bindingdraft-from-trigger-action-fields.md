@@ -117,12 +117,12 @@ discarded the moment a real kind is picked.
 
 ## Acceptance criteria
 
-- [ ] `gui/acheron_gui/binding_draft.py` exists, is importable with no `gi`/`Gtk` dependency, and `BindingDraft` covers all six Action kinds per the shape above.
-- [ ] `gui/tests/test_binding_draft.py` is a pure test file (no `Gtk` import) covering construction from `from_wire` for every kind (including the `inp=None` Chord case and default-seeding an unbound Input), every setter, `is_valid()` transitions, and `to_wire()` output per kind including the axis special case.
-- [ ] `build_action_and_trigger_fields`'s `draft` dict and `get_binding()` are gone, replaced by a `BindingDraft` instance; behavior is unchanged for the non-grid Binding editor and the Chord binding dialog.
-- [ ] `gui/tests/test_binding_editor.py` sheds the widget-tree tests that were only exercising per-kind field logic now covered directly by `test_binding_draft.py`, and keeps the ones asserting real GTK wiring (which picker mounts per kind, Save-button sensitivity, dropdown rebuild on kind change, the Analog-repeat hint).
-- [ ] `build_dual_stage_panel` is untouched (still uses its own `draft` dict via `build_action_and_trigger_fields` internally) — ticket 27's job.
-- [ ] Daemon and GUI test suites both green; `gui` linting/formatting clean.
+- [x] `gui/acheron_gui/binding_draft.py` exists, is importable with no `gi`/`Gtk` dependency, and `BindingDraft` covers all six Action kinds per the shape above.
+- [x] `gui/tests/test_binding_draft.py` is a pure test file (no `Gtk` import) covering construction from `from_wire` for every kind (including the `inp=None` Chord case and default-seeding an unbound Input), every setter, `is_valid()` transitions, and `to_wire()` output per kind including the axis special case.
+- [x] `build_action_and_trigger_fields`'s `draft` dict and `get_binding()` are gone, replaced by a `BindingDraft` instance; behavior is unchanged for the non-grid Binding editor and the Chord binding dialog.
+- [x] `gui/tests/test_binding_editor.py` sheds the widget-tree tests that were only exercising per-kind field logic now covered directly by `test_binding_draft.py`, and keeps the ones asserting real GTK wiring (which picker mounts per kind, Save-button sensitivity, dropdown rebuild on kind change, the Analog-repeat hint). — audited every test in the non-grid/Chord range; none qualified (see Comments).
+- [x] `build_dual_stage_panel` is untouched (still uses its own `draft` dict via `build_action_and_trigger_fields` internally) — ticket 27's job.
+- [x] Daemon and GUI test suites both green; `gui` linting/formatting clean (no lint/format tooling is configured in this repo to run).
 
 ## Comments
 
@@ -133,3 +133,47 @@ GUI binding editor had never had a deepening pass. Split into two tickets
 (26/27) at the grilling's Q4 boundary: land the shared Trigger/Action
 editor first (covers two of four call sites, lower risk), then fold the
 harder dual-stage-panel composition in separately.
+
+**2026-09-11** — Implemented on `dev`. `binding_draft.py`'s `BindingDraft`
+matches the Shape section exactly: `kind`/`trigger` plus one dict per Action
+kind, `from_wire`/`to_wire`/`is_valid()` and the nine named setters.
+`build_action_and_trigger_fields` now does `draft.set_kind(kind)` at the top
+of `render_action_editor` and `draft.set_<field>(...)` from each GTK
+callback instead of mutating a bare dict; the per-branch manual
+`save_btn.set_sensitive(...)` calls collapsed into one
+`save_btn.set_sensitive(draft.is_valid())` after the kind `if`/`elif` chain
+(axis's live `on_axis_changed` keeps its own call, for the interactive
+re-arm). `get_binding()` is now two lines: sync the live Trigger-mode
+selection onto the draft, then `return draft.to_wire()`. 31 new pure tests in
+`test_binding_draft.py`; the existing 120 `test_binding_editor.py` tests and
+the rest of the GUI suite (535 total) pass unmodified — TDD'd the pure module
+first, then refactored the GTK call sites against the already-green pure
+suite, then confirmed the full suite was still green with no test changes
+needed there.
+
+On the "sheds widget-tree tests" bullet: read every test in the non-grid/
+Chord range (roughly line 57–1350) and classified each one against
+`test_binding_draft.py`'s new coverage. None qualified for removal — every
+test in that range carries at least one assertion `test_binding_draft.py`
+structurally cannot express (a dropdown's live model/selection, a picker's
+own click-driven callback wiring, `+ New Macro`/`+ New Stepper` popover
+flows, `on_axis_changed` re-arming Save on a live click, Chord dialog's
+kind-exclusion list, `on_saved`/`on_clear` callback wiring, Daemon-rejection
+error rendering). The file was already lean — one Save-through-the-real-
+widget-tree test per kind plus a set of GTK-specific behavior tests, not a
+pile of per-kind field-value permutations — so the bullet's intent (don't
+keep duplicate coverage) was already satisfied without removing anything.
+
+`/code-review` (Standards + Spec) returned four findings. Two actioned: (1)
+`set_keypress_modifiers` was missing its parameter type annotation, unlike
+every other setter — added `Iterable[str]`. (2) the "sheds tests" bullet
+above, addressed by the audit rather than a code change. One dismissed:
+`set_stepper(stepper_id, direction)` taking both fields together (forcing
+call sites that change one to read back the other) is exactly the signature
+this ticket's own Shape section specifies — not a defect to fix under this
+ticket. One filed separately rather than fixed here, since it's a real bug
+but predates this ticket and sits inside `build_dual_stage_panel`, which is
+explicitly out of scope (ticket 27's job): an Axis-kind stage's captured
+draft has no `"trigger"` key and crashes `BindingDraft.from_wire` (and,
+identically, the old dict code before it) if it round-trips back in as
+`starting` on the next panel rebuild — **ticket 28**.
