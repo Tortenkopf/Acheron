@@ -487,7 +487,7 @@ def build_action_and_trigger_fields(
     inp: str | None = None,
     layer: str | None = None,
     picker_css_class: str | None = None,
-) -> tuple[Gtk.Widget, Gtk.DropDown, Callable[[], dict]]:
+) -> tuple[Gtk.Widget, Gtk.DropDown, Callable[[], BindingDraft]]:
     """The Trigger-mode/Action editor core — everything below a Binding's
     own heading, shared verbatim by `build_binding_editor`'s per-Input
     popover and `build_chord_binding_dialog`'s small modal (ticket 01/40:
@@ -504,15 +504,18 @@ def build_action_and_trigger_fields(
     tolerated" standard (e.g. `SetChordBinding`'s subset/superset rule
     itself).
 
-    Returns `(fields, trigger_dd, get_binding)`: `fields` is the widget to
+    Returns `(fields, trigger_dd, get_draft)`: `fields` is the widget to
     append into the caller's own box; `trigger_dd` is exposed so a caller
     that also validates Trigger-mode-specific rules (none currently do, but
     `build_binding_editor` did historically) can still reach it directly;
-    `get_binding()` reads the current widget state into the same flat
-    Binding dict every caller sends to the Daemon. `save_btn` is the
-    caller's own Save button — this function only ever toggles its
-    `set_sensitive`, never builds or places it, so each caller keeps full
-    control of its own button row.
+    `get_draft()` reads the current widget state into the live `BindingDraft`
+    (syncing the Trigger-mode selection onto it first) and hands the draft
+    itself back — a caller that just wants the flat Binding dict every
+    caller sends to the Daemon calls `get_draft().to_wire()`; the dual-stage
+    panel (ticket 27) instead holds onto the draft itself across a rebuild.
+    `save_btn` is the caller's own Save button — this function only ever
+    toggles its `set_sensitive`, never builds or places it, so each caller
+    keeps full control of its own button row.
 
     `picker_css_class` (tartarus-dual-stage-keys ticket 07) is added to the
     Key / Controller-button picker widget when set — the dual-stage editor
@@ -878,15 +881,14 @@ def build_action_and_trigger_fields(
             )
         )
 
-    def get_binding() -> dict:
+    def get_draft() -> BindingDraft:
         # The live Trigger-mode selection isn't tracked on `draft` as the
         # user changes it (unlike every per-kind field) — it's simplest read
-        # straight off `trigger_dd` right before serializing, same as
-        # `get_binding()` always did.
+        # straight off `trigger_dd` right before handing the draft back.
         draft.set_trigger(trigger_options[trigger_dd.get_selected()][0])
-        return draft.to_wire()
+        return draft
 
-    return fields, trigger_dd, get_binding
+    return fields, trigger_dd, get_draft
 
 
 # --- Dual-stage grid keys (tartarus-dual-stage-keys ticket 07) -----------
@@ -1050,9 +1052,12 @@ def build_dual_stage_panel(
     # The currently-mounted stage's fields are captured here whenever the
     # panel rebuilds (a stage swap, + Add deep stage, …) so an unsaved edit
     # to one stage survives switching to the other, and Save then commits
-    # *both* stages at once regardless of which is on screen.
-    drafts: dict = {"primary": None, "deep": None}
-    slot: dict = {"get_binding": None, "stage": None}
+    # *both* stages at once regardless of which is on screen. Ticket 27:
+    # holds the actual `BindingDraft` each stage's field editor built, not a
+    # frozen wire dict — `to_wire()` is only called where a wire dict is
+    # actually needed (`stage_starting`, `commit_stages`).
+    drafts: dict[str, BindingDraft | None] = {"primary": None, "deep": None}
+    slot: dict = {"get_draft": None, "stage": None}
 
     panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
     panel.add_css_class("actuation-section")
@@ -1079,16 +1084,18 @@ def build_dual_stage_panel(
 
     def stage_starting(stage: str) -> dict | None:
         # The dict the editor slot builds from: this stage's live draft if
-        # it has one, else the snapshot.
-        return drafts[stage] if drafts[stage] is not None else stage_snapshot(stage)
+        # it has one, flattened back to wire shape (the field editor calls
+        # `BindingDraft.from_wire` on whatever this returns), else the
+        # snapshot.
+        return drafts[stage].to_wire() if drafts[stage] is not None else stage_snapshot(stage)
 
     def capture_draft() -> None:
-        # Fold the currently-mounted stage's fields into `drafts` before the
-        # widgets are torn down. Skipped while Save is disabled (an
-        # unsupported Action kind, an empty Macro library) — those states
-        # can't be saved anyway, so there's nothing worth preserving.
-        if slot["get_binding"] is not None and save_btn.get_sensitive():
-            drafts[slot["stage"]] = slot["get_binding"]()
+        # Fold the currently-mounted stage's `BindingDraft` into `drafts`
+        # before the widgets are torn down. Skipped while Save is disabled
+        # (an unsupported Action kind, an empty Macro library) — those
+        # states can't be saved anyway, so there's nothing worth preserving.
+        if slot["get_draft"] is not None and save_btn.get_sensitive():
+            drafts[slot["stage"]] = slot["get_draft"]()
 
     def default_deep_cfg() -> dict:
         # A fresh `deep_stages` entry, mode Handoff, with a band disjoint from
@@ -1198,8 +1205,8 @@ def build_dual_stage_panel(
         # (whether or not anything actually needed pushing); False when a
         # rejection was surfaced (Save then stays open).
         capture_draft()
-        primary_target = drafts["primary"] if drafts["primary"] is not None else primary_binding()
-        deep_target = drafts["deep"] if drafts["deep"] is not None else deep_binding()
+        primary_target = drafts["primary"].to_wire() if drafts["primary"] is not None else primary_binding()
+        deep_target = drafts["deep"].to_wire() if drafts["deep"] is not None else deep_binding()
         try:
             # With no primary Binding yet the stage is synthetic — commit it
             # unconditionally (matching the old plain editor's "Save always
@@ -1536,17 +1543,17 @@ def build_dual_stage_panel(
                         css_classes=["dim"],
                     )
                 )
-            fields, _td, get_binding = build_action_and_trigger_fields(
+            fields, _td, get_draft = build_action_and_trigger_fields(
                 client, config, profile, stage_starting("deep"), save_btn,
                 _deep_action_types(available_action_types), inp, layer,
                 picker_css_class="deep-picker",
             )
         else:
-            fields, _td, get_binding = build_action_and_trigger_fields(
+            fields, _td, get_draft = build_action_and_trigger_fields(
                 client, config, profile, stage_starting("primary"), save_btn,
                 available_action_types, inp, layer,
             )
-        slot["get_binding"], slot["stage"] = get_binding, editing
+        slot["get_draft"], slot["stage"] = get_draft, editing
         panel.append(fields)
 
         # 5. Primary-actuation profile-default controls.
@@ -1717,7 +1724,7 @@ def build_binding_editor(
         box.append(btn_row)
         return box
 
-    fields, _trigger_dd, get_binding = build_action_and_trigger_fields(
+    fields, _trigger_dd, get_draft = build_action_and_trigger_fields(
         client, config, profile, starting, save_btn, available_action_types, inp, layer
     )
     box.append(fields)
@@ -1726,7 +1733,7 @@ def build_binding_editor(
     btn_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
 
     def on_save(b):
-        binding = get_binding()
+        binding = get_draft().to_wire()
         try:
             if binding["type"] == "axis":
                 client.set_axis_assignment(inp, layer, binding["target"])
@@ -1865,13 +1872,13 @@ def build_chord_binding_dialog(
     save_btn = Gtk.Button(label="Save Chord")
     save_btn.add_css_class("suggested-action")
 
-    fields, _trigger_dd, get_binding = build_action_and_trigger_fields(
+    fields, _trigger_dd, get_draft = build_action_and_trigger_fields(
         client, config, profile, starting, save_btn, chord_action_types
     )
     outer.append(fields)
 
     def on_save(b):
-        binding = get_binding()
+        binding = get_draft().to_wire()
         try:
             # Compared as sets, not by re-deriving what the wire key
             # "should" look like — this stub/GUI must never assume its own
