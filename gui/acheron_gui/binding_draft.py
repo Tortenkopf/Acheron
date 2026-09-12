@@ -24,11 +24,19 @@ value can never reach a draft in the first place.
 
 No `__eq__` — a caller that needs to diff a draft against a snapshot compares
 `to_wire()` output as a plain dict (as `commit_stages` already does).
+
+`on_change` (post-release ticket 31) is a plain `Callable[[], None]`,
+defaulting to a no-op, fired at the end of every setter. It carries no `Gtk`
+dependency itself — a caller that wants to resync some UI state (e.g.
+`build_action_and_trigger_fields`'s `save_btn.set_sensitive(draft.is_valid())`)
+assigns it as a plain attribute after construction. Every other caller
+(`build_dual_stage_panel`, `test_binding_draft.py`) never sets it, so it stays
+inert for them — the same as it was before this hook existed.
 """
 
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .inputs import default_key_code_for, default_trigger_for
 
@@ -54,6 +62,7 @@ class BindingDraft:
         self.profile_switch = profile_switch
         self.controller_button = controller_button
         self.axis = axis
+        self.on_change: Callable[[], None] = lambda: None
 
     @classmethod
     def from_wire(cls, starting: dict | None, *, inp: str | None, profile: str) -> "BindingDraft":
@@ -156,28 +165,37 @@ class BindingDraft:
 
     def set_kind(self, kind: str) -> None:
         self.kind = kind
+        self.on_change()
 
     def set_trigger(self, trigger: str) -> None:
         self.trigger = trigger
+        self.on_change()
 
     def set_keypress_key(self, code: str) -> None:
         self.keypress["key"] = code
+        self.on_change()
 
     def set_keypress_modifiers(self, modifiers: Iterable[str]) -> None:
         self.keypress["modifiers"] = sorted(modifiers)
+        self.on_change()
 
     def set_macro_id(self, macro_id: str | None) -> None:
         self.macro["macro_id"] = macro_id
+        self.on_change()
 
     def set_stepper(self, stepper_id: str | None, direction: str) -> None:
         self.step["stepper_id"] = stepper_id
         self.step["direction"] = direction
+        self.on_change()
 
     def set_profile_switch_target(self, target: str) -> None:
         self.profile_switch["target"] = target
+        self.on_change()
 
     def set_controller_button(self, button: str) -> None:
         self.controller_button["button"] = button
+        self.on_change()
 
     def set_axis_target(self, target: str | None) -> None:
         self.axis["target"] = target
+        self.on_change()

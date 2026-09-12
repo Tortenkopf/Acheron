@@ -318,3 +318,47 @@ def test_set_kind():
     draft = BindingDraft.from_wire(_keypress(), inp="grid_r1c1", profile="Default")
     draft.set_kind("macro")
     assert draft.kind == "macro"
+
+
+# --- on_change (post-release ticket 31) ---
+
+
+def test_on_change_defaults_to_a_noop():
+    # Every setter must be callable with the default hook in place — this is
+    # exactly what every caller except `build_action_and_trigger_fields` does.
+    draft = BindingDraft.from_wire(_keypress(), inp="grid_r1c1", profile="Default")
+    draft.set_keypress_key("KEY_Z")
+    assert draft.keypress["key"] == "KEY_Z"
+
+
+def test_on_change_fires_at_the_end_of_every_setter():
+    draft = BindingDraft.from_wire(_keypress(), inp="grid_r1c1", profile="Default")
+    calls = []
+    draft.on_change = lambda: calls.append(1)
+
+    draft.set_kind("macro")
+    draft.set_trigger("toggle")
+    draft.set_keypress_key("KEY_Z")
+    draft.set_keypress_modifiers({"ctrl"})
+    draft.set_macro_id("m1")
+    draft.set_stepper("s1", "backward")
+    draft.set_profile_switch_target("Gaming")
+    draft.set_controller_button("BTN_EAST")
+    draft.set_axis_target("left_trigger")
+
+    assert len(calls) == 9
+
+
+def test_on_change_sees_the_field_already_updated():
+    # The hook fires *after* the field write, not before — a caller that
+    # reads the draft from inside it (e.g. `save_btn.set_sensitive(draft.
+    # is_valid())`) must see the new value.
+    draft = BindingDraft.from_wire(
+        {"trigger": "fire_once", "type": "macro", "macro_id": None}, inp="grid_r1c1", profile="Default"
+    )
+    seen = []
+    draft.on_change = lambda: seen.append(draft.is_valid())
+
+    draft.set_macro_id("m1")
+
+    assert seen == [True]

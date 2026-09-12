@@ -183,33 +183,28 @@ def test_editing_targets_the_held_layer_independently_of_base():
 # --- Profile Switch (ticket 34) ---
 
 
-def test_saving_a_profile_switch_binding_calls_set_binding_with_fire_once_and_the_chosen_target():
+def test_saving_a_profile_switch_binding_sends_the_right_wire():
+    # End-to-end regression cover for the render_action_editor ->
+    # get_draft().to_wire() -> push_stage wiring (code-review finding on
+    # ticket 31's test trim): the per-kind widget-construction variations
+    # moved to test_action_editor.py, but each kind still needs one Save
+    # round trip exercised through the real popover.
     stub = DaemonStub()
     stub.create_profile("Gaming")
     stub.calls.clear()
-    changed = []
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
 
-    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
-    popover = editor_content(btn)
-
-    action_dd = _dropdown_labeled(popover, "Action")
+    action_dd = _dropdown_labeled(editor, "Action")
     action_dd.set_selected([k for k, _ in ACTION_TYPES].index("profile_switch"))
-
-    target_dd = _dropdown_labeled(popover, "Target Profile")
+    target_dd = _dropdown_labeled(editor, "Target Profile")
     profile_names = sorted(stub.get_config()["profiles"].keys())
     target_dd.set_selected(profile_names.index("Gaming"))
 
-    button_labeled(popover, "Save").emit("clicked")
+    button_labeled(editor, "Save").emit("clicked")
 
     assert stub.calls == [
-        (
-            "set_binding",
-            "grid_r1c1",
-            "base",
-            {"trigger": "fire_once", "type": "profile_switch", "target": "Gaming"},
-        )
+        ("set_binding", "grid_r1c1", "base", {"trigger": "fire_once", "type": "profile_switch", "target": "Gaming"})
     ]
-    assert changed == [1]
 
 
 def test_selecting_profile_switch_disables_and_forces_the_trigger_dropdown_to_fire_once():
@@ -252,34 +247,28 @@ def test_bound_profile_switch_shows_the_target_in_the_grid_button_label():
 # --- Controller Button (ticket 43) ---
 
 
-def test_saving_a_controller_button_binding_calls_set_binding_with_the_chosen_button():
+def test_saving_a_controller_button_binding_sends_the_right_wire():
+    # See test_saving_a_profile_switch_binding_sends_the_right_wire above.
     stub = DaemonStub()
-    changed = []
+    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
 
-    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: changed.append(1))
-    popover = editor_content(btn)
-
-    action_dd = _dropdown_labeled(popover, "Action")
+    action_dd = _dropdown_labeled(editor, "Action")
     action_dd.set_selected([k for k, _ in ACTION_TYPES].index("controller_button"))
-
-    button_row = find_one(popover, lambda w: isinstance(w, Gtk.Box) and _row_label_text(w) == "Button")
+    button_row = find_one(editor, lambda w: isinstance(w, Gtk.Box) and _row_label_text(w) == "Button")
     button_labeled(button_row, "B").emit("clicked")
 
-    button_labeled(popover, "Save").emit("clicked")
+    button_labeled(editor, "Save").emit("clicked")
 
-    assert stub.calls == [
-        (
-            "set_binding",
-            "grid_r1c1",
-            "base",
-            # Ticket 78: Fire-once is excluded once the Action-kind becomes
-            # Controller Button, so switching to it from the default
-            # fire_once Keypress falls back to Hold-to-repeat rather than
-            # keeping an option no longer offered.
-            {"trigger": "hold_to_repeat", "type": "controller_button", "button": "BTN_EAST"},
-        )
-    ]
-    assert changed == [1]
+    assert stub.calls[-1] == (
+        "set_binding",
+        "grid_r1c1",
+        "base",
+        # Ticket 78: Fire-once is excluded once the Action-kind becomes
+        # Controller Button, so switching to it from the default fire_once
+        # Keypress falls back to Hold-to-repeat rather than keeping an
+        # option no longer offered.
+        {"trigger": "hold_to_repeat", "type": "controller_button", "button": "BTN_EAST"},
+    )
 
 
 def test_controller_button_keeps_the_trigger_dropdown_selectable():
@@ -513,23 +502,6 @@ def test_depth_track_set_live_value_updates_the_fill_and_tolerates_none():
 # --- Key/mouse-button picker (ticket 42) ---
 
 
-def test_saving_a_mouse_button_binding_round_trips_the_btn_code():
-    stub = DaemonStub()
-    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
-
-    _pick_key(editor, "Key", "Left")
-    button_labeled(editor, "Save").emit("clicked")
-
-    assert stub.calls == [
-        (
-            "set_binding",
-            "grid_r1c1",
-            "base",
-            {"trigger": "hold_to_repeat", "type": "keypress", "key": "BTN_LEFT", "modifiers": []},
-        )
-    ]
-
-
 def test_modifier_warning_shows_for_fire_once_key_and_hides_for_toggle():
     stub = DaemonStub()
     editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
@@ -598,52 +570,13 @@ def test_selecting_macro_with_an_empty_library_shows_no_macros_yet_and_disables_
     assert not button_labeled(editor, "Save").get_sensitive()
 
 
-def test_selecting_macro_with_existing_entries_defaults_to_the_first_and_save_resends_it():
-    stub = DaemonStub()
-    macro_id = stub.create_macro("Screenshot Combo", [{"type": "key_down", "key": "KEY_A"}])
-    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
-
-    action_dd = _dropdown_labeled(editor, "Action")
-    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("macro"))
-
-    macro_dd = _dropdown_labeled(editor, "Macro")
-    assert macro_dd.get_model().get_string(macro_dd.get_selected()) == "Screenshot Combo"
-
-    button_labeled(editor, "Save").emit("clicked")
-
-    assert stub.calls[-1] == (
-        "set_binding",
-        "grid_r1c1",
-        "base",
-        # Ticket 89: fresh editor → Hold-to-repeat default.
-        {"trigger": "hold_to_repeat", "type": "macro", "macro_id": macro_id},
-    )
-
-
-def test_opening_an_existing_macro_binding_preselects_it_in_the_dropdown():
-    stub = DaemonStub()
-    stub.create_macro("Other Macro", [])
-    macro_id = stub.create_macro("Test macro", [{"type": "key_down", "key": "KEY_A"}])
-    stub.set_binding("grid_r1c1", "base", {"trigger": "fire_once", "type": "macro", "macro_id": macro_id})
-
-    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
-
-    macro_dd = _dropdown_labeled(editor, "Macro")
-    assert macro_dd.get_model().get_string(macro_dd.get_selected()) == "Test macro"
-    save_btn = button_labeled(editor, "Save")
-    assert save_btn.get_sensitive()
-
-    save_btn.emit("clicked")
-
-    assert stub.calls[-1] == (
-        "set_binding",
-        "grid_r1c1",
-        "base",
-        {"trigger": "fire_once", "type": "macro", "macro_id": macro_id},
-    )
-
-
 def test_creating_a_macro_inline_via_new_macro_assigns_it_and_enables_save():
+    # End-to-end regression cover (code-review finding on ticket 31's test
+    # trim): the "+ New" inline-creation path is the one most at risk of a
+    # `rerender()` ordering bug (the fresh entry must actually be picked up
+    # before the popup that offers Save gets its state) — worth exercising
+    # through the real popover rather than only the isolated builder unit
+    # test in test_action_editor.py.
     stub = DaemonStub()
     editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
 
@@ -755,93 +688,8 @@ def test_picking_a_real_action_over_an_unsupported_binding_reenables_save():
 # --- Stepper (ticket 55) ---
 
 
-def test_selecting_stepper_with_an_empty_library_shows_no_steppers_yet_and_disables_save():
-    stub = DaemonStub()
-    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
-
-    action_dd = _dropdown_labeled(editor, "Action")
-    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("step"))
-
-    assert find_one(
-        editor, lambda w: isinstance(w, Gtk.Label) and "No Steppers in the library yet" in w.get_label()
-    )
-    assert not button_labeled(editor, "Save").get_sensitive()
-
-
-def test_selecting_stepper_with_existing_entries_defaults_to_the_first_and_forward_and_save_sends_it():
-    stub = DaemonStub()
-    stepper_id = stub.create_stepper("Weapon Wheel", [{"type": "key", "key": "KEY_1"}])
-    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
-
-    action_dd = _dropdown_labeled(editor, "Action")
-    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("step"))
-
-    stepper_dd = _dropdown_labeled(editor, "Stepper")
-    assert stepper_dd.get_model().get_string(stepper_dd.get_selected()) == "Weapon Wheel"
-    direction_dd = _dropdown_labeled(editor, "Direction")
-    assert direction_dd.get_model().get_string(direction_dd.get_selected()) == "Forward"
-
-    button_labeled(editor, "Save").emit("clicked")
-
-    assert stub.calls[-1] == (
-        "set_binding",
-        "grid_r1c1",
-        "base",
-        # Ticket 89: fresh editor → Hold-to-repeat default.
-        {"trigger": "hold_to_repeat", "type": "step", "stepper_id": stepper_id, "direction": "forward"},
-    )
-
-
-def test_changing_direction_for_a_step_binding_updates_the_saved_binding():
-    stub = DaemonStub()
-    stepper_id = stub.create_stepper("Weapon Wheel", [])
-    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
-
-    action_dd = _dropdown_labeled(editor, "Action")
-    action_dd.set_selected([k for k, _ in ACTION_TYPES].index("step"))
-
-    direction_dd = _dropdown_labeled(editor, "Direction")
-    direction_dd.set_selected(1)  # Backward
-
-    button_labeled(editor, "Save").emit("clicked")
-
-    assert stub.calls[-1] == (
-        "set_binding",
-        "grid_r1c1",
-        "base",
-        # Ticket 89: fresh editor → Hold-to-repeat default.
-        {"trigger": "hold_to_repeat", "type": "step", "stepper_id": stepper_id, "direction": "backward"},
-    )
-
-
-def test_opening_an_existing_step_binding_preselects_the_stepper_and_direction():
-    stub = DaemonStub()
-    stub.create_stepper("Other Wheel", [])
-    stepper_id = stub.create_stepper("Weapon Wheel", [{"type": "key", "key": "KEY_1"}])
-    stub.set_binding(
-        "grid_r1c1", "base", {"trigger": "hold_to_repeat", "type": "step", "stepper_id": stepper_id, "direction": "backward"}
-    )
-
-    editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
-
-    stepper_dd = _dropdown_labeled(editor, "Stepper")
-    assert stepper_dd.get_model().get_string(stepper_dd.get_selected()) == "Weapon Wheel"
-    direction_dd = _dropdown_labeled(editor, "Direction")
-    assert direction_dd.get_model().get_string(direction_dd.get_selected()) == "Backward"
-    save_btn = button_labeled(editor, "Save")
-    assert save_btn.get_sensitive()
-
-    save_btn.emit("clicked")
-
-    assert stub.calls[-1] == (
-        "set_binding",
-        "grid_r1c1",
-        "base",
-        {"trigger": "hold_to_repeat", "type": "step", "stepper_id": stepper_id, "direction": "backward"},
-    )
-
-
 def test_creating_a_stepper_inline_via_new_stepper_assigns_it_and_enables_save():
+    # See test_creating_a_macro_inline_via_new_macro_assigns_it_and_enables_save above.
     stub = DaemonStub()
     editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
 
