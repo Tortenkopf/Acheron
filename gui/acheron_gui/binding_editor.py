@@ -25,6 +25,7 @@ from gi.repository import Gdk, Gtk, GLib
 from . import rules
 from .binding_draft import BindingDraft
 from .daemon_client import DaemonError
+from .dual_stage_plan import DualStagePlan
 from .gtk_utils import build_name_prompt_popover, clear_children
 from .inputs import (
     ACTION_TYPES,
@@ -1050,15 +1051,14 @@ def build_dual_stage_panel(
 
     ui = {"stage": "primary"}
     track_holder: dict = {"track": None, "live": None}
-    # Per-stage editor drafts. `None` means "not edited — read the snapshot".
-    # The currently-mounted stage's fields are captured here whenever the
-    # panel rebuilds (a stage swap, + Add deep stage, …) so an unsaved edit
-    # to one stage survives switching to the other, and Save then commits
-    # *both* stages at once regardless of which is on screen. Ticket 27:
-    # holds the actual `BindingDraft` each stage's field editor built, not a
-    # frozen wire dict — `to_wire()` is only called where a wire dict is
-    # actually needed (`stage_starting`, `commit_stages`).
-    drafts: dict[str, BindingDraft | None] = {"primary": None, "deep": None}
+    # Per-stage editor drafts, plus the diff/commit-ordering policy over them
+    # — carved into `DualStagePlan` (ticket 30) the same way ticket 26 carved
+    # `BindingDraft` out of `build_action_and_trigger_fields`. An unsaved
+    # edit to one stage survives switching to the other because
+    # `capture_draft()` folds the mounted stage's draft into `plan` before
+    # every rebuild; Save/Apply then push whichever stages `plan.diff(...)`
+    # says actually changed, primary before deep.
+    plan = DualStagePlan()
     slot: dict = {"get_draft": None, "stage": None}
 
     panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -1089,15 +1089,15 @@ def build_dual_stage_panel(
         # it has one, flattened back to wire shape (the field editor calls
         # `BindingDraft.from_wire` on whatever this returns), else the
         # snapshot.
-        return drafts[stage].to_wire() if drafts[stage] is not None else stage_snapshot(stage)
+        return plan.stage_starting(stage, stage_snapshot(stage))
 
     def capture_draft() -> None:
-        # Fold the currently-mounted stage's `BindingDraft` into `drafts`
+        # Fold the currently-mounted stage's `BindingDraft` into `plan`
         # before the widgets are torn down. Skipped while Save is disabled
         # (an unsupported Action kind, an empty Macro library) — those
         # states can't be saved anyway, so there's nothing worth preserving.
         if slot["get_draft"] is not None and save_btn.get_sensitive():
-            drafts[slot["stage"]] = slot["get_draft"]()
+            plan.capture(slot["stage"], slot["get_draft"]())
 
     def default_deep_cfg() -> dict:
         # A fresh `deep_stages` entry, mode Handoff, with a band disjoint from
@@ -1159,7 +1159,7 @@ def build_dual_stage_panel(
             rebuild()
             return
         deep_map()[inp] = default_deep
-        drafts["deep"] = None
+        plan.mark_committed("deep")
         ui["stage"] = "deep"
         rebuild()
 
@@ -1171,7 +1171,7 @@ def build_dual_stage_panel(
             return
         deep_map().pop(inp, None)
         on_commit()
-        drafts["deep"] = None
+        plan.mark_committed("deep")
         ui["stage"] = "primary"
         rebuild()
 
@@ -1188,44 +1188,38 @@ def build_dual_stage_panel(
     def commit_stages() -> bool:
         # The shared commit path behind both Save and Apply: push *both*
         # stages, not just the one on screen — whichever stage the user was
-        # last editing is folded in by `capture_draft`, and each stage is
-        # pushed only if its draft actually differs from the snapshot (an
-        # unedited stage is left alone). Primary first: a replacement primary
-        # the Daemon rejects (`analog_repeat`, a Chord member) must fail
-        # before the deep push, and never leaves a half-applied pair the user
-        # didn't ask for.
+        # last editing is folded in by `capture_draft`, and `plan.diff(...)`
+        # decides which stages actually differ from the snapshot (an
+        # unedited stage is left alone) and returns them primary-first: a
+        # replacement primary the Daemon rejects (`analog_repeat`, a Chord
+        # member) must fail before the deep push, and never leaves a
+        # half-applied pair the user didn't ask for.
         #
         # Every landed push also mutates the in-memory `config` snapshot (the
-        # "+ New Macro" precedent) and clears that stage's draft, so a local
-        # rebuild — Apply's, or a later structural edit's — reflects the
-        # freshly-committed stage straight from the snapshot. `on_commit()`
-        # is fired the first time any push lands (idempotent — it just arms
-        # the caller's deferred rebuild).
+        # "+ New Macro" precedent) and clears that stage's draft
+        # (`plan.mark_committed`), so a local rebuild — Apply's, or a later
+        # structural edit's — reflects the freshly-committed stage straight
+        # from the snapshot. `on_commit()` is fired the first time any push
+        # lands (idempotent — it just arms the caller's deferred rebuild).
         #
         # Returns True when the commit completed with no Daemon rejection
         # (whether or not anything actually needed pushing); False when a
         # rejection was surfaced (Save then stays open).
         capture_draft()
-        primary_target = drafts["primary"].to_wire() if drafts["primary"] is not None else primary_binding()
-        deep_target = drafts["deep"].to_wire() if drafts["deep"] is not None else deep_binding()
+        steps = plan.diff(primary_snapshot(), deep_binding())
         try:
-            # With no primary Binding yet the stage is synthetic — commit it
-            # unconditionally (matching the old plain editor's "Save always
-            # calls set_binding" behaviour); otherwise push only a real edit.
-            if not has_primary() or primary_target != primary_binding():
-                if primary_target.get("type") == "axis":
-                    client.set_axis_assignment(inp, layer, primary_target["target"])
-                    profile_dict[f"axis_{layer}"][inp] = primary_target["target"]
+            for stage, wire in steps:
+                if stage == "primary" and wire.get("type") == "axis":
+                    client.set_axis_assignment(inp, layer, wire["target"])
+                    profile_dict[f"axis_{layer}"][inp] = wire["target"]
                     profile_dict[layer].pop(inp, None)
+                elif stage == "primary":
+                    client.set_binding(inp, layer, wire)
+                    profile_dict[layer][inp] = wire
                 else:
-                    client.set_binding(inp, layer, primary_target)
-                    profile_dict[layer][inp] = primary_target
-                drafts["primary"] = None
-                on_commit()
-            if has_deep() and deep_target is not None and deep_target != deep_binding():
-                client.set_deep_stage(inp, layer, deep_target)
-                deep_map()[inp] = deep_target
-                drafts["deep"] = None
+                    client.set_deep_stage(inp, layer, wire)
+                    deep_map()[inp] = wire
+                plan.mark_committed(stage)
                 on_commit()
         except DaemonError as exc:
             show_error(exc)
@@ -1581,7 +1575,7 @@ def build_dual_stage_panel(
         panel.append(force_digital_check)
 
     # Save/Apply/Clear are wired once — `on_save_stage`/`on_apply_stage` read
-    # `drafts`/`slot` and `on_clear_stage` reads `ui["stage"]` at click time,
+    # `plan`/`slot` and `on_clear_stage` reads `ui["stage"]` at click time,
     # so none depend on the current rebuild's closures.
     save_btn.connect("clicked", lambda _b: on_save_stage())
     apply_btn.connect("clicked", lambda _b: on_apply_stage())
