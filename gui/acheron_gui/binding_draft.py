@@ -56,7 +56,7 @@ class BindingDraft:
         self.axis = axis
 
     @classmethod
-    def from_wire(cls, starting: dict, *, inp: str | None, profile: str) -> "BindingDraft":
+    def from_wire(cls, starting: dict | None, *, inp: str | None, profile: str) -> "BindingDraft":
         """Seeds each kind's sub-state from `starting` if it matches
         `starting["type"]`, else a default — `default_key_code_for(inp)`
         (already pure, already handles `inp is None` for the Chord case) for
@@ -66,6 +66,19 @@ class BindingDraft:
         render (`unsupported_kind`, handled entirely by the caller — every
         sub-state below just falls through to its default, same as today).
 
+        `starting=None` (post-release ticket 29) means "no Binding at all
+        yet" — a fresh, unbound Keypress: `kind` defaults to `"keypress"`,
+        seeded the same way the *inactive* Keypress slot always has been
+        (`default_key_code_for(inp)` / `default_trigger_for(inp)`), not the
+        dead-code `"KEY_A"` fallback the *active*-Keypress branch below keeps
+        for a real (malformed) `starting` dict missing its `"key"`. This is
+        now the single place every "what does an unbound Binding look like"
+        call site asks — `BindingDraft.from_wire(None, inp=inp,
+        profile=profile).to_wire()` replaces what used to be four separately
+        hand-built dict literals (the dual-stage panel's synthetic primary
+        stage and fresh deep stage, the plain editor's fresh-binding
+        fallback, the Chord dialog's fresh-binding fallback).
+
         `starting.get("trigger", ...)` rather than `starting["trigger"]`
         (ticket 28): an Axis-kind `starting` — this class's own `to_wire()`
         output, round-tripped back in as `starting` by the dual-stage panel's
@@ -73,15 +86,15 @@ class BindingDraft:
         carries no `"trigger"` key at all (Axis assignment isn't a `Binding`,
         ticket 59 §2). `self.trigger` is inert for Axis either way (locked/
         hidden in the UI, dropped by `to_wire()`), so any in-range default
-        does; `default_trigger_for(inp)` matches the synthetic-primary/
-        fresh-deep-stage seeds elsewhere in this module's caller."""
-        kind = starting["type"]
+        does; `default_trigger_for(inp)` matches the fresh-Binding seed
+        above."""
+        kind = starting["type"] if starting is not None else "keypress"
         return cls(
             kind=kind,
-            trigger=starting.get("trigger", default_trigger_for(inp)),
+            trigger=(starting or {}).get("trigger", default_trigger_for(inp)),
             keypress=(
                 {"key": starting.get("key", "KEY_A"), "modifiers": list(starting.get("modifiers", []))}
-                if kind == "keypress"
+                if starting is not None and kind == "keypress"
                 else {"key": default_key_code_for(inp), "modifiers": []}
             ),
             macro={"macro_id": starting.get("macro_id")} if kind == "macro" else {"macro_id": None},

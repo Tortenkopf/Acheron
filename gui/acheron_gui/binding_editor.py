@@ -31,7 +31,6 @@ from .inputs import (
     INPUT_DEFAULT_LABEL,
     TRIGGER_OPTIONS,
     TRIGGER_SHORT,
-    default_key_code_for,
     default_trigger_for,
     input_label,
     is_grid_input,
@@ -1032,15 +1031,13 @@ def build_dual_stage_panel(
     # mode with a `KEY_A` placeholder Action. The `Primary — …` toggle shows
     # `action_summary(None, …)` — the passthrough-default label — instead,
     # matching what the key actually does while unbound.
-    synthetic_primary = {
-        "trigger": default_trigger_for(inp),
-        "type": "keypress",
-        # The Input's own passthrough default, not a fixed `KEY_A` — so the
-        # key-picker highlight on an as-yet-unbound key matches what the key
-        # already does (grid_r1c1 → "1", the Mode key → Alt, …).
-        "key": default_key_code_for(inp),
-        "modifiers": [],
-    }
+    #
+    # `BindingDraft.from_wire(None, ...)` (ticket 29) is the single place
+    # "what does an unbound Binding look like" is decided — the Input's own
+    # passthrough default, not a fixed `KEY_A` — so the key-picker highlight
+    # on an as-yet-unbound key matches what the key already does (grid_r1c1
+    # → "1", the Mode key → Alt, …).
+    synthetic_primary = BindingDraft.from_wire(None, inp=inp, profile=profile).to_wire()
 
     def primary_snapshot() -> dict | None:
         return profile_dict[layer].get(inp)
@@ -1139,12 +1136,11 @@ def build_dual_stage_panel(
         cfg = default_deep_cfg()
         d_act = cfg["actuation"]["actuation"]
         d_rel = cfg["actuation"]["release"]
-        default_deep = {
-            "trigger": default_trigger_for(inp),
-            "type": "keypress",
-            "key": "KEY_A",
-            "modifiers": [],
-        }
+        # Ticket 29: a fresh deep stage's default Keypress goes through the
+        # same "unbound Binding" seed as the primary's own synthetic stage —
+        # the Input's own passthrough default, not a fixed `KEY_A` — rather
+        # than a second, separately-hand-built placeholder.
+        default_deep = BindingDraft.from_wire(None, inp=inp, profile=profile).to_wire()
         try:
             client.set_deep_actuation(inp, d_act, d_rel)
         except DaemonError as exc:
@@ -1644,16 +1640,11 @@ def build_binding_editor(
     else:
         # Ticket 89: a freshly-created Binding defaults to Hold-to-repeat
         # (Fire-once for the scroll wheel — see `default_trigger_for`), not
-        # Fire-once everywhere.
-        starting = existing or {
-            "trigger": default_trigger_for(inp),
-            "type": "keypress",
-            # The Input's own passthrough default (ticket 11 follow-up) — a
-            # freshly-opened unbound editor highlights the key the Input
-            # already produces, not a fixed `KEY_A`.
-            "key": default_key_code_for(inp),
-            "modifiers": [],
-        }
+        # Fire-once everywhere. `BindingDraft.from_wire(None, ...)` (ticket
+        # 29) seeds the Input's own passthrough default (ticket 11
+        # follow-up) — a freshly-opened unbound editor highlights the key
+        # the Input already produces, not a fixed `KEY_A`.
+        starting = existing or BindingDraft.from_wire(None, inp=inp, profile=profile).to_wire()
     # "Axis" is offered only for grid keys (ticket 60's Answer) — non-grid
     # Inputs (Mode key, thumbstick, wheel) never see the option at all,
     # rather than seeing it disabled. Filtered through the `rules` mirror of
@@ -1836,12 +1827,9 @@ def build_chord_binding_dialog(
     """
     # Ticket 89: a Chord's own Binding has no single Input, so it takes the
     # plain Hold-to-repeat default (`default_trigger_for(None)`).
-    starting = existing or {
-        "trigger": default_trigger_for(None),
-        "type": "keypress",
-        "key": "KEY_A",
-        "modifiers": [],
-    }
+    # `BindingDraft.from_wire(None, inp=None, ...)` (ticket 29) is the same
+    # "unbound Binding" seed every other fresh-Binding call site now uses.
+    starting = existing or BindingDraft.from_wire(None, inp=None, profile=profile).to_wire()
     # Neither Profile Switch nor Axis has anywhere coherent to run from a
     # Chord's own Binding — Profile Switch because `fire_chord` has no
     # `&mut Config` to run a switch through, Axis because it isn't a Binding

@@ -1428,6 +1428,20 @@ def test_unbound_grid_key_shows_the_unified_panel_with_a_synthetic_primary_stage
     assert TRIGGER_OPTIONS[trigger_dd.get_selected()][0] == "hold_to_repeat"
 
 
+def test_add_deep_stage_seeds_the_deep_binding_from_the_keys_own_passthrough_default():
+    # Ticket 29: on_add_deep's fresh deep Keypress goes through the same
+    # "unbound Binding" seed as the primary's own synthetic stage — the
+    # Input's own passthrough default (grid_r1c1 -> KEY_1), not a fixed
+    # "KEY_A" — regardless of what the primary itself is bound to.
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub, key="KEY_F1")
+
+    _add_deep_stage(editor)
+
+    deep = stub.get_config()["profiles"]["Default"]["deep_base"]["grid_r1c1"]
+    assert deep["key"] == "KEY_1"
+
+
 def test_unbound_grid_key_add_deep_stage_is_inert_while_disabled():
     # The disabled `+ Add deep stage` must not reach the Daemon even if its
     # "clicked" is emitted directly (a deep stage structurally requires a

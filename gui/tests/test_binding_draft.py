@@ -114,6 +114,49 @@ def test_from_wire_default_seeds_profile_switch_target_to_the_current_profile():
     assert draft.profile_switch == {"target": "Gaming"}
 
 
+# --- from_wire: starting=None (a fresh, unbound Binding) ---
+#
+# Ticket 29: the single seed every "what does an unbound Binding look like"
+# call site now asks for — the dual-stage panel's synthetic primary stage and
+# fresh deep stage, the plain editor's fresh-binding fallback, and the Chord
+# dialog's fresh-binding fallback.
+
+
+def test_from_wire_with_no_starting_seeds_a_fresh_keypress_on_a_grid_key():
+    # grid_r1c1's passthrough default is KEY_1 (see inputs.INPUT_DEFAULT_KEY_CODE)
+    # — not a hardcoded "KEY_A".
+    draft = BindingDraft.from_wire(None, inp="grid_r1c1", profile="Default")
+    assert draft.kind == "keypress"
+    assert draft.trigger == "hold_to_repeat"
+    assert draft.keypress == {"key": "KEY_1", "modifiers": []}
+
+
+def test_from_wire_with_no_starting_falls_back_to_key_a_for_the_scroll_wheel():
+    # wheel_scroll_up has no discrete default keycode, and is Fire-once
+    # rather than Hold-to-repeat (`default_trigger_for`).
+    draft = BindingDraft.from_wire(None, inp="wheel_scroll_up", profile="Default")
+    assert draft.trigger == "fire_once"
+    assert draft.keypress == {"key": "KEY_A", "modifiers": []}
+
+
+def test_from_wire_with_no_starting_falls_back_to_key_a_for_the_chord_case():
+    # A Chord's own Binding has no single Input to take a passthrough
+    # default from.
+    draft = BindingDraft.from_wire(None, inp=None, profile="Default")
+    assert draft.kind == "keypress"
+    assert draft.trigger == "hold_to_repeat"
+    assert draft.keypress == {"key": "KEY_A", "modifiers": []}
+
+
+def test_from_wire_with_no_starting_seeds_every_inactive_kind_too():
+    draft = BindingDraft.from_wire(None, inp="grid_r1c1", profile="Gaming")
+    assert draft.macro == {"macro_id": None}
+    assert draft.step == {"stepper_id": None, "direction": "forward"}
+    assert draft.profile_switch == {"target": "Gaming"}
+    assert draft.controller_button == {"button": "BTN_SOUTH"}
+    assert draft.axis == {"target": None}
+
+
 # --- to_wire: per-kind wire shape, byte-for-byte ---
 
 
