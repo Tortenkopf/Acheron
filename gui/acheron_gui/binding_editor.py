@@ -40,6 +40,7 @@ from .axis_picker import AXIS_LABEL_BY_TARGET, build_inline_axis_picker
 from .controller_picker import LABEL_BY_CODE as CONTROLLER_LABEL_BY_CODE
 from .controller_picker import build_inline_controller_picker
 from .key_picker import LABEL_BY_CODE, build_inline_key_picker
+from .stage_push import push_stage
 
 
 # Output-safety spec §4 (effort `.scratch/output-safety-guidance/`, ticket
@@ -1209,15 +1210,13 @@ def build_dual_stage_panel(
         steps = plan.diff(primary_snapshot(), deep_binding())
         try:
             for stage, wire in steps:
+                push_stage(client, stage, inp, layer, wire)
                 if stage == "primary" and wire.get("type") == "axis":
-                    client.set_axis_assignment(inp, layer, wire["target"])
                     profile_dict[f"axis_{layer}"][inp] = wire["target"]
                     profile_dict[layer].pop(inp, None)
                 elif stage == "primary":
-                    client.set_binding(inp, layer, wire)
                     profile_dict[layer][inp] = wire
                 else:
-                    client.set_deep_stage(inp, layer, wire)
                     deep_map()[inp] = wire
                 plan.mark_committed(stage)
                 on_commit()
@@ -1725,10 +1724,7 @@ def build_binding_editor(
     def on_save(b):
         binding = get_draft().to_wire()
         try:
-            if binding["type"] == "axis":
-                client.set_axis_assignment(inp, layer, binding["target"])
-            else:
-                client.set_binding(inp, layer, binding)
+            push_stage(client, "primary", inp, layer, binding)
         except DaemonError as exc:
             show_error(exc)
             return
