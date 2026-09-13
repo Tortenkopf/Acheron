@@ -23,14 +23,15 @@ from typing import Callable
 from gi.repository import Gdk, Gtk, GLib
 
 from . import rules
+from .binding_draft import BindingDraft
 from .daemon_client import DaemonError
+from .dual_stage_plan import DualStagePlan
 from .gtk_utils import build_name_prompt_popover, clear_children
 from .inputs import (
     ACTION_TYPES,
     INPUT_DEFAULT_LABEL,
     TRIGGER_OPTIONS,
     TRIGGER_SHORT,
-    default_key_code_for,
     default_trigger_for,
     input_label,
     is_grid_input,
@@ -39,6 +40,7 @@ from .axis_picker import AXIS_LABEL_BY_TARGET, build_inline_axis_picker
 from .controller_picker import LABEL_BY_CODE as CONTROLLER_LABEL_BY_CODE
 from .controller_picker import build_inline_controller_picker
 from .key_picker import LABEL_BY_CODE, build_inline_key_picker
+from .stage_push import push_stage
 
 
 # Output-safety spec §4 (effort `.scratch/output-safety-guidance/`, ticket
@@ -476,6 +478,289 @@ def build_actuation_section(
     return box
 
 
+ActionEditorFn = Callable[
+    [
+        object,
+        dict,
+        str,
+        str | None,
+        str | None,
+        BindingDraft,
+        Gtk.DropDown,
+        list[tuple[str, str]],
+        str | None,
+        Callable[[Callable[[], None]], None],
+        Callable[[], None],
+    ],
+    Gtk.Widget,
+]
+# (client, config, profile, layer, inp, draft, trigger_dd, trigger_options,
+#  picker_css_class, set_trigger_listener, rerender) -> Widget
+#
+# One builder per Action kind (post-release ticket 31), replacing the
+# 240-line `if kind == "keypress": … elif …` chain `render_action_editor`
+# used to hold. Each returns one composed `Gtk.Widget` — the caller appends
+# it once to `editor_slot` rather than the old multi-append-per-branch shape
+# — taking its inputs as explicit params rather than a bundled context
+# object, mirroring `library_view.LibraryKind`'s own callables (even though
+# most of these ignore several of them, same as `LibraryKind.build_middle_
+# slot`'s shared signature across Macro/Stepper). `trigger_dd`/`trigger_
+# options`/`set_trigger_listener` exist only for Keypress's Trigger-mode-
+# dependent modifier warning — `set_trigger_listener` registers a callback
+# on `trigger_dd`'s "notify::selected" the same disconnect-tracked way
+# `render_action_editor` always has, so cycling Action kinds can't
+# accumulate stale handlers (ticket 42). `rerender` is `render_action_
+# editor` itself, used by Macro/Stepper's "+ New" inline-creation to pick up
+# the entry it just created. This table has exactly one consumer — a new
+# sibling module would be a seam with no second caller.
+
+
+def _build_new_library_entry_button(
+    client,
+    label: str,
+    prompt_title: str,
+    create: Callable[[object, str], str],
+    on_created: Callable[[str], None],
+) -> Gtk.MenuButton:
+    """Shared by `_build_macro_editor` and `_build_step_editor` (post-release
+    ticket 31) — the two "+ New …" inline-creation blocks were already
+    near-identical duplicates of each other. `create(client, name)` calls the
+    Daemon and returns the fresh entry's id; `on_created(entry_id)` is the
+    caller's own follow-up (assign the fresh id to the draft, then rerender
+    so the newly-created entry shows up in the dropdown)."""
+    btn = Gtk.MenuButton(label=label)
+
+    def on_submitted(name: str) -> None:
+        on_created(create(client, name))
+
+    btn.set_popover(build_name_prompt_popover(prompt_title, "", "Create", on_submitted))
+    return btn
+
+
+def _build_keypress_editor(
+    client, config, profile, layer, inp, draft, trigger_dd, trigger_options,
+    picker_css_class, set_trigger_listener, rerender,
+) -> Gtk.Widget:
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+
+    def on_key_changed(code: str) -> None:
+        draft.set_keypress_key(code)
+
+    def key_warn_predicate() -> bool:
+        return trigger_options[trigger_dd.get_selected()][0] != "toggle"
+
+    key_picker, refresh_key_warning = build_inline_key_picker(
+        draft.keypress["key"], on_key_changed, key_warn_predicate
+    )
+    if picker_css_class:
+        key_picker.add_css_class(picker_css_class)
+    box.append(labeled_row("Key", key_picker))
+    # Ticket 42: the modifier warning also depends on Trigger mode, which the
+    # key picker can't see on its own — registered through the caller's
+    # disconnect-tracked slot rather than connected directly here, so cycling
+    # Action kinds never piles up stale listeners on `trigger_dd` (which
+    # outlives every rebuild, unlike this widget).
+    set_trigger_listener(refresh_key_warning)
+
+    mod_box = Gtk.Box(spacing=8)
+    mods = set(draft.keypress["modifiers"])
+    for m in ("ctrl", "shift", "alt", "super"):
+        cb = Gtk.CheckButton(label=m)
+        cb.set_active(m in mods)
+
+        def on_mod(c, m=m):
+            cur = set(draft.keypress["modifiers"])
+            if c.get_active():
+                cur.add(m)
+            else:
+                cur.discard(m)
+            draft.set_keypress_modifiers(cur)
+
+        cb.connect("toggled", on_mod)
+        mod_box.append(cb)
+    box.append(mod_box)
+    return box
+
+
+def _build_profile_switch_editor(
+    client, config, profile, layer, inp, draft, trigger_dd, trigger_options,
+    picker_css_class, set_trigger_listener, rerender,
+) -> Gtk.Widget:
+    profile_names = sorted(config["profiles"].keys())
+    target_dd = Gtk.DropDown(model=Gtk.StringList.new(profile_names))
+    current_target = draft.profile_switch["target"]
+    if current_target not in profile_names:
+        current_target = profile_names[0]
+    draft.set_profile_switch_target(current_target)
+    target_dd.set_selected(profile_names.index(current_target))
+
+    def on_target_changed(dd, *_):
+        draft.set_profile_switch_target(profile_names[dd.get_selected()])
+
+    target_dd.connect("notify::selected", on_target_changed)
+    return labeled_row("Target Profile", target_dd)
+
+
+def _build_controller_button_editor(
+    client, config, profile, layer, inp, draft, trigger_dd, trigger_options,
+    picker_css_class, set_trigger_listener, rerender,
+) -> Gtk.Widget:
+    def on_button_changed(code: str) -> None:
+        draft.set_controller_button(code)
+
+    controller_picker = build_inline_controller_picker(draft.controller_button["button"], on_button_changed)
+    if picker_css_class:
+        controller_picker.add_css_class(picker_css_class)
+    return labeled_row("Button", controller_picker)
+
+
+def _build_axis_editor(
+    client, config, profile, layer, inp, draft, trigger_dd, trigger_options,
+    picker_css_class, set_trigger_listener, rerender,
+) -> Gtk.Widget:
+    def on_axis_changed(target: str) -> None:
+        # `BindingDraft.on_change` (post-release ticket 31) resyncs
+        # `save_btn`'s sensitivity generically now — this used to be the one
+        # kind that called `save_btn.set_sensitive(...)` inline here.
+        draft.set_axis_target(target)
+
+    # Ticket 60's cross-key toast: which other key (if any) already claims
+    # each target on this same Layer — `inp`/`layer` are `None` for
+    # `build_chord_binding_dialog`'s call (which excludes "axis" from its own
+    # `available_action_types`, so this branch never actually runs there; the
+    # `or {}` just keeps this defensive rather than reaching for a missing
+    # config key).
+    axis_map = config["profiles"][profile][f"axis_{layer}"] if layer else {}
+    claimed_by = {target: input_label(other) for other, target in axis_map.items() if other != inp}
+    axis_picker = build_inline_axis_picker(draft.axis["target"], on_axis_changed, claimed_by)
+    return labeled_row("Target", axis_picker)
+
+
+def _build_step_editor(
+    client, config, profile, layer, inp, draft, trigger_dd, trigger_options,
+    picker_css_class, set_trigger_listener, rerender,
+) -> Gtk.Widget:
+    # Ticket 55: a dropdown of existing library entries (by display name)
+    # plus "+ New Stepper" to create one inline and assign it right away.
+    # Unlike Macro, Action::Step carries a second field (`direction`), so a
+    # Forward/Backward dropdown sits alongside the Stepper dropdown; full
+    # item authoring and the Forward/Backward *Input*-pair assignment both
+    # live in the Library screen (`library_view.build_editor_columns`), not
+    # here — this builder only ever assigns `stepper_id`/`direction` to the
+    # Binding on this one Input, exactly like every other builder here only
+    # assigns its own field(s).
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    steppers = config.get("steppers", {})
+    stepper_ids = sorted(steppers, key=lambda sid: steppers[sid]["name"].lower())
+    current_stepper_id = draft.step["stepper_id"]
+
+    if stepper_ids:
+        stepper_dd = Gtk.DropDown(model=Gtk.StringList.new([steppers[sid]["name"] for sid in stepper_ids]))
+        if current_stepper_id in stepper_ids:
+            stepper_dd.set_selected(stepper_ids.index(current_stepper_id))
+        else:
+            stepper_dd.set_selected(0)
+            draft.set_stepper(stepper_ids[0], draft.step["direction"])
+
+        def on_stepper_changed(dd, *_):
+            draft.set_stepper(stepper_ids[dd.get_selected()], draft.step["direction"])
+
+        stepper_dd.connect("notify::selected", on_stepper_changed)
+        box.append(labeled_row("Stepper", stepper_dd))
+    else:
+        box.append(Gtk.Label(label="No Steppers in the library yet — create one below.", xalign=0, wrap=True))
+
+    direction_options = [("forward", "Forward"), ("backward", "Backward")]
+    direction_dd = Gtk.DropDown(model=Gtk.StringList.new([lbl for _, lbl in direction_options]))
+    current_direction = draft.step["direction"]
+    direction_dd.set_selected([k for k, _ in direction_options].index(current_direction))
+
+    def on_direction_changed(dd, *_):
+        draft.set_stepper(draft.step["stepper_id"], direction_options[dd.get_selected()][0])
+
+    direction_dd.connect("notify::selected", on_direction_changed)
+    box.append(labeled_row("Direction", direction_dd))
+
+    def create_stepper(client, name: str) -> str:
+        stepper_id = client.create_stepper(name, [])
+        # `config` is a snapshot fetched before this popover opened (per the
+        # module docstring) — mutated in place here so the rerender below
+        # sees the entry it just created.
+        config.setdefault("steppers", {})[stepper_id] = {"name": name, "items": []}
+        return stepper_id
+
+    def on_new_stepper_created(stepper_id: str) -> None:
+        draft.set_stepper(stepper_id, draft.step["direction"])
+        rerender()
+
+    box.append(
+        _build_new_library_entry_button(
+            client, "+ New Stepper", "Creating a Stepper", create_stepper, on_new_stepper_created
+        )
+    )
+    return box
+
+
+def _build_macro_editor(
+    client, config, profile, layer, inp, draft, trigger_dd, trigger_options,
+    picker_css_class, set_trigger_listener, rerender,
+) -> Gtk.Widget:
+    # Ticket 52: a dropdown of existing library entries (by display name,
+    # `macro_id` stays internal) plus "+ New Macro" to create one inline and
+    # assign it right away. Full step authoring lives in the Library screen
+    # (`library_view.build_editor_columns`), not here — this builder only
+    # ever assigns a `macro_id` to the Binding, exactly like the Controller-
+    # button/Profile-switch builders only ever assign their own single field.
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    macros = config.get("macros", {})
+    macro_ids = sorted(macros, key=lambda mid: macros[mid]["name"].lower())
+    current_macro_id = draft.macro["macro_id"]
+
+    if macro_ids:
+        macro_dd = Gtk.DropDown(model=Gtk.StringList.new([macros[mid]["name"] for mid in macro_ids]))
+        if current_macro_id in macro_ids:
+            macro_dd.set_selected(macro_ids.index(current_macro_id))
+        else:
+            macro_dd.set_selected(0)
+            draft.set_macro_id(macro_ids[0])
+
+        def on_macro_changed(dd, *_):
+            draft.set_macro_id(macro_ids[dd.get_selected()])
+
+        macro_dd.connect("notify::selected", on_macro_changed)
+        box.append(labeled_row("Macro", macro_dd))
+    else:
+        box.append(Gtk.Label(label="No Macros in the library yet — create one below.", xalign=0, wrap=True))
+
+    def create_macro(client, name: str) -> str:
+        macro_id = client.create_macro(name, [])
+        # `config` is a snapshot fetched before this popover opened (per the
+        # module docstring) — mutated in place here so the rerender below
+        # sees the entry it just created, rather than picking up the (stale)
+        # `macro_ids` list that doesn't have the fresh id yet.
+        config.setdefault("macros", {})[macro_id] = {"name": name, "steps": []}
+        return macro_id
+
+    def on_new_macro_created(macro_id: str) -> None:
+        draft.set_macro_id(macro_id)
+        rerender()
+
+    box.append(
+        _build_new_library_entry_button(client, "+ New Macro", "Creating a Macro", create_macro, on_new_macro_created)
+    )
+    return box
+
+
+_ACTION_EDITORS: dict[str, ActionEditorFn] = {
+    "keypress": _build_keypress_editor,
+    "profile_switch": _build_profile_switch_editor,
+    "controller_button": _build_controller_button_editor,
+    "axis": _build_axis_editor,
+    "step": _build_step_editor,
+    "macro": _build_macro_editor,
+}
+
+
 def build_action_and_trigger_fields(
     client,
     config: dict,
@@ -486,7 +771,7 @@ def build_action_and_trigger_fields(
     inp: str | None = None,
     layer: str | None = None,
     picker_css_class: str | None = None,
-) -> tuple[Gtk.Widget, Gtk.DropDown, Callable[[], dict]]:
+) -> tuple[Gtk.Widget, Gtk.DropDown, Callable[[], BindingDraft]]:
     """The Trigger-mode/Action editor core — everything below a Binding's
     own heading, shared verbatim by `build_binding_editor`'s per-Input
     popover and `build_chord_binding_dialog`'s small modal (ticket 01/40:
@@ -503,15 +788,18 @@ def build_action_and_trigger_fields(
     tolerated" standard (e.g. `SetChordBinding`'s subset/superset rule
     itself).
 
-    Returns `(fields, trigger_dd, get_binding)`: `fields` is the widget to
+    Returns `(fields, trigger_dd, get_draft)`: `fields` is the widget to
     append into the caller's own box; `trigger_dd` is exposed so a caller
     that also validates Trigger-mode-specific rules (none currently do, but
     `build_binding_editor` did historically) can still reach it directly;
-    `get_binding()` reads the current widget state into the same flat
-    Binding dict every caller sends to the Daemon. `save_btn` is the
-    caller's own Save button — this function only ever toggles its
-    `set_sensitive`, never builds or places it, so each caller keeps full
-    control of its own button row.
+    `get_draft()` reads the current widget state into the live `BindingDraft`
+    (syncing the Trigger-mode selection onto it first) and hands the draft
+    itself back — a caller that just wants the flat Binding dict every
+    caller sends to the Daemon calls `get_draft().to_wire()`; the dual-stage
+    panel (ticket 27) instead holds onto the draft itself across a rebuild.
+    `save_btn` is the caller's own Save button — this function only ever
+    toggles its `set_sensitive`, never builds or places it, so each caller
+    keeps full control of its own button row.
 
     `picker_css_class` (tartarus-dual-stage-keys ticket 07) is added to the
     Key / Controller-button picker widget when set — the dual-stage editor
@@ -539,7 +827,12 @@ def build_action_and_trigger_fields(
     trigger_options = base_trigger_options
     trigger_keys = [k for k, _ in trigger_options]
     trigger_dd = Gtk.DropDown(model=Gtk.StringList.new([lbl for _, lbl in trigger_options]))
-    trigger_dd.set_selected(trigger_keys.index(starting["trigger"]))
+    # `starting.get("trigger", ...)`, not `starting["trigger"]` (ticket 28):
+    # an Axis-kind `starting` has no `"trigger"` key at all — see
+    # `BindingDraft.from_wire`'s docstring for why. The dropdown itself gets
+    # disabled/hidden below once `kind == "axis"` is known, so this initial
+    # selection is inert for that case; it just has to be in-range.
+    trigger_dd.set_selected(trigger_keys.index(starting.get("trigger", default_trigger_for(inp))))
     trigger_row = labeled_row("Trigger mode", trigger_dd)
     fields.append(trigger_row)
 
@@ -587,36 +880,30 @@ def build_action_and_trigger_fields(
     editor_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
     fields.append(editor_slot)
 
-    # `save_btn` is the caller's own button (see this function's docstring)
-    # — the Macro/Step branches below gate its sensitivity directly,
-    # mirroring how trigger_dd's sensitivity is already gated for
-    # profile_switch.
-    draft = {
-        "keypress": {"key": starting.get("key", "KEY_A"), "modifiers": list(starting.get("modifiers", []))}
-        if starting["type"] == "keypress"
-        else {"key": default_key_code_for(inp), "modifiers": []},
-        "macro": {"macro_id": starting.get("macro_id")} if starting["type"] == "macro" else {"macro_id": None},
-        "step": {
-            "stepper_id": starting.get("stepper_id"),
-            "direction": starting.get("direction", "forward"),
-        }
-        if starting["type"] == "step"
-        else {"stepper_id": None, "direction": "forward"},
-        "profile_switch": {"target": starting.get("target", profile)}
-        if starting["type"] == "profile_switch"
-        else {"target": profile},
-        "controller_button": {"button": starting.get("button", "BTN_SOUTH")}
-        if starting["type"] == "controller_button"
-        else {"button": "BTN_SOUTH"},
-        "axis": {"target": starting.get("target")} if starting["type"] == "axis" else {"target": None},
-    }
+    # `save_btn` is the caller's own button (see this function's docstring).
+    # Ticket 26: `draft` is a `BindingDraft` (see `binding_draft.py`) rather
+    # than a bare dict of closures — it already covers every Action kind's
+    # fields simultaneously, tagged with which kind is active, exactly as the
+    # old seed dict here did. Ticket 31: `draft.on_change` resyncs Save's
+    # sensitivity generically, on every setter call regardless of kind —
+    # replacing the explicit `save_btn.set_sensitive(draft.is_valid())` calls
+    # that used to be sprinkled through the per-kind branches (Axis alone
+    # needed one mid-render, since it's the one kind whose completeness can
+    # flip after the widget is already built).
+    draft = BindingDraft.from_wire(starting, inp=inp, profile=profile)
+    draft.on_change = lambda: save_btn.set_sensitive(draft.is_valid())
 
     # Ticket 42: the keypress Key field's modifier warning also depends on
     # Trigger mode, which the picker component can't see on its own — a
     # single current handler on trigger_dd (which outlives every
     # render_action_editor() rebuild, unlike editor_slot's own children)
-    # avoids piling up one stale listener per rebuild.
+    # avoids piling up one stale listener per rebuild. `set_trigger_listener`
+    # (passed to whichever `_ACTION_EDITORS[kind]` builder wants it) is the
+    # registration side of this same slot.
     _trigger_handler: dict = {"id": None}
+
+    def set_trigger_listener(callback: Callable[[], None]) -> None:
+        _trigger_handler["id"] = trigger_dd.connect("notify::selected", lambda *_: callback())
 
     def render_action_editor():
         nonlocal trigger_options, trigger_keys
@@ -626,10 +913,7 @@ def build_action_and_trigger_fields(
             _trigger_handler["id"] = None
 
         kind = available_action_types[action_dd.get_selected()][0]
-        # Reset here, unconditionally — only the Macro branch below ever
-        # disables it (no picker yet to assign a fresh macro_id), and every
-        # other kind must not stay disabled from a previous render.
-        save_btn.set_sensitive(True)
+        draft.set_kind(kind)
 
         # Two Action kinds drop one entry from an otherwise-normal trigger
         # list: Controller Button loses Fire-once (ticket 78 — Hold-to-repeat's
@@ -680,194 +964,20 @@ def build_action_and_trigger_fields(
         elif kind == "axis":
             trigger_dd.set_tooltip_text("Axis output has no Trigger mode")
 
-        if kind == "keypress":
-            def on_key_changed(code: str) -> None:
-                draft["keypress"]["key"] = code
-
-            def key_warn_predicate() -> bool:
-                return trigger_options[trigger_dd.get_selected()][0] != "toggle"
-
-            key_picker, refresh_key_warning = build_inline_key_picker(
-                draft["keypress"].get("key", "KEY_A"), on_key_changed, key_warn_predicate
+        editor_slot.append(
+            _ACTION_EDITORS[kind](
+                client, config, profile, layer, inp, draft, trigger_dd, trigger_options,
+                picker_css_class, set_trigger_listener, render_action_editor,
             )
-            if picker_css_class:
-                key_picker.add_css_class(picker_css_class)
-            editor_slot.append(labeled_row("Key", key_picker))
-            _trigger_handler["id"] = trigger_dd.connect("notify::selected", lambda *_: refresh_key_warning())
+        )
 
-            mod_box = Gtk.Box(spacing=8)
-            mods = set(draft["keypress"].get("modifiers", []))
-            for m in ("ctrl", "shift", "alt", "super"):
-                cb = Gtk.CheckButton(label=m)
-                cb.set_active(m in mods)
-
-                def on_mod(c, m=m):
-                    cur = set(draft["keypress"].get("modifiers", []))
-                    if c.get_active():
-                        cur.add(m)
-                    else:
-                        cur.discard(m)
-                    draft["keypress"]["modifiers"] = sorted(cur)
-
-                cb.connect("toggled", on_mod)
-                mod_box.append(cb)
-            editor_slot.append(mod_box)
-        elif kind == "profile_switch":
-            profile_names = sorted(config["profiles"].keys())
-            target_dd = Gtk.DropDown(model=Gtk.StringList.new(profile_names))
-            current_target = draft["profile_switch"].get("target", profile)
-            if current_target not in profile_names:
-                current_target = profile_names[0]
-            draft["profile_switch"]["target"] = current_target
-            target_dd.set_selected(profile_names.index(current_target))
-
-            def on_target_changed(dd, *_):
-                draft["profile_switch"]["target"] = profile_names[dd.get_selected()]
-
-            target_dd.connect("notify::selected", on_target_changed)
-            editor_slot.append(labeled_row("Target Profile", target_dd))
-        elif kind == "controller_button":
-            def on_button_changed(code: str) -> None:
-                draft["controller_button"]["button"] = code
-
-            controller_picker = build_inline_controller_picker(
-                draft["controller_button"].get("button", "BTN_SOUTH"), on_button_changed
-            )
-            if picker_css_class:
-                controller_picker.add_css_class(picker_css_class)
-            editor_slot.append(labeled_row("Button", controller_picker))
-        elif kind == "axis":
-            def on_axis_changed(target: str) -> None:
-                draft["axis"]["target"] = target
-                save_btn.set_sensitive(target is not None)
-
-            # Ticket 60's cross-key toast: which other key (if any) already
-            # claims each target on this same Layer — `inp`/`layer` are
-            # `None` for `build_chord_binding_dialog`'s call (which excludes
-            # "axis" from its own `available_action_types`, so this branch
-            # never actually runs there; the `or {}` just keeps this
-            # defensive rather than reaching for a missing config key).
-            axis_map = config["profiles"][profile][f"axis_{layer}"] if layer else {}
-            claimed_by = {target: input_label(other) for other, target in axis_map.items() if other != inp}
-            axis_picker = build_inline_axis_picker(
-                draft["axis"].get("target"), on_axis_changed, claimed_by
-            )
-            editor_slot.append(labeled_row("Target", axis_picker))
-            save_btn.set_sensitive(draft["axis"].get("target") is not None)
-        elif kind == "step":
-            # Ticket 55: the real assignment flow, mirroring the Macro
-            # branch below almost exactly — a dropdown of existing library
-            # entries (by display name) plus "+ New Stepper" to create one
-            # inline and assign it right away. Unlike Macro, Action::Step
-            # carries a second field (`direction`), so a Forward/Backward
-            # dropdown sits alongside the Stepper dropdown; full item
-            # authoring and the Forward/Backward *Input*-pair assignment
-            # both live in the Library screen
-            # (`library_view.build_editor_columns`), not here — this
-            # popover only ever assigns `stepper_id`/`direction` to the
-            # Binding on this one Input, exactly like every other branch
-            # here only assigns its own field(s).
-            steppers = config.get("steppers", {})
-            stepper_ids = sorted(steppers, key=lambda sid: steppers[sid]["name"].lower())
-            current_stepper_id = draft["step"].get("stepper_id")
-
-            if stepper_ids:
-                stepper_dd = Gtk.DropDown(model=Gtk.StringList.new([steppers[sid]["name"] for sid in stepper_ids]))
-                if current_stepper_id in stepper_ids:
-                    stepper_dd.set_selected(stepper_ids.index(current_stepper_id))
-                else:
-                    stepper_dd.set_selected(0)
-                    draft["step"]["stepper_id"] = stepper_ids[0]
-
-                def on_stepper_changed(dd, *_):
-                    draft["step"]["stepper_id"] = stepper_ids[dd.get_selected()]
-
-                stepper_dd.connect("notify::selected", on_stepper_changed)
-                editor_slot.append(labeled_row("Stepper", stepper_dd))
-            else:
-                editor_slot.append(
-                    Gtk.Label(label="No Steppers in the library yet — create one below.", xalign=0, wrap=True)
-                )
-
-            direction_options = [("forward", "Forward"), ("backward", "Backward")]
-            direction_dd = Gtk.DropDown(model=Gtk.StringList.new([lbl for _, lbl in direction_options]))
-            current_direction = draft["step"].get("direction", "forward")
-            direction_dd.set_selected([k for k, _ in direction_options].index(current_direction))
-
-            def on_direction_changed(dd, *_):
-                draft["step"]["direction"] = direction_options[dd.get_selected()][0]
-
-            direction_dd.connect("notify::selected", on_direction_changed)
-            editor_slot.append(labeled_row("Direction", direction_dd))
-
-            new_stepper_btn = Gtk.MenuButton(label="+ New Stepper")
-
-            def on_new_stepper_submitted(name: str):
-                stepper_id = client.create_stepper(name, [])
-                # Same reasoning as "+ New Macro" below: mutate the snapshot
-                # in place so the rebuild sees the entry it just created.
-                config.setdefault("steppers", {})[stepper_id] = {"name": name, "items": []}
-                draft["step"]["stepper_id"] = stepper_id
-                render_action_editor()
-
-            new_stepper_btn.set_popover(
-                build_name_prompt_popover("Creating a Stepper", "", "Create", on_new_stepper_submitted)
-            )
-            editor_slot.append(new_stepper_btn)
-
-            save_btn.set_sensitive(draft["step"].get("stepper_id") is not None)
-        else:
-            # Ticket 52: the real assignment flow — a dropdown of existing
-            # library entries (by display name, ticket 51's macro_id stays
-            # internal) plus "+ New Macro" to create one inline and assign it
-            # right away, replacing ticket 51's temporary read-only stub.
-            # Full step authoring lives in the Library screen
-            # (`library_view.build_editor_columns`), not here — this popover
-            # only ever assigns a `macro_id` to the Binding, exactly like the
-            # Controller-button/Profile-switch branches only ever assign
-            # their own single field.
-            macros = config.get("macros", {})
-            macro_ids = sorted(macros, key=lambda mid: macros[mid]["name"].lower())
-            current_macro_id = draft["macro"].get("macro_id")
-
-            if macro_ids:
-                macro_dd = Gtk.DropDown(model=Gtk.StringList.new([macros[mid]["name"] for mid in macro_ids]))
-                if current_macro_id in macro_ids:
-                    macro_dd.set_selected(macro_ids.index(current_macro_id))
-                else:
-                    macro_dd.set_selected(0)
-                    draft["macro"]["macro_id"] = macro_ids[0]
-
-                def on_macro_changed(dd, *_):
-                    draft["macro"]["macro_id"] = macro_ids[dd.get_selected()]
-
-                macro_dd.connect("notify::selected", on_macro_changed)
-                editor_slot.append(labeled_row("Macro", macro_dd))
-            else:
-                editor_slot.append(
-                    Gtk.Label(label="No Macros in the library yet — create one below.", xalign=0, wrap=True)
-                )
-
-            new_macro_btn = Gtk.MenuButton(label="+ New Macro")
-
-            def on_new_macro_submitted(name: str):
-                macro_id = client.create_macro(name, [])
-                # `config` is a snapshot fetched before this popover opened
-                # (per the module docstring) — mutated in place here so the
-                # rebuild below sees the entry it just created, rather than
-                # `render_action_editor` immediately overwriting `macro_id`
-                # with `macro_ids[0]` because the fresh id isn't in its
-                # (stale) `macro_ids` list yet.
-                config.setdefault("macros", {})[macro_id] = {"name": name, "steps": []}
-                draft["macro"]["macro_id"] = macro_id
-                render_action_editor()
-
-            new_macro_btn.set_popover(
-                build_name_prompt_popover("Creating a Macro", "", "Create", on_new_macro_submitted)
-            )
-            editor_slot.append(new_macro_btn)
-
-            save_btn.set_sensitive(draft["macro"].get("macro_id") is not None)
+        # Narrow completeness only (`BindingDraft.is_valid()`) — never
+        # re-derives Trigger/Action legality, since the dropdowns above
+        # structurally can't offer an illegal option. Also handled generically
+        # by `draft.on_change` now, but kept here as the settled-state check
+        # once the kind's whole editor (and any of its own default-seeding
+        # setter calls) has finished building.
+        save_btn.set_sensitive(draft.is_valid())
 
         # An Action-kind change can rebuild the Trigger-mode model and pull
         # `analog_repeat` out of it (Profile Switch, Axis) or shift the
@@ -895,50 +1005,14 @@ def build_action_and_trigger_fields(
             )
         )
 
-    def get_binding() -> dict:
-        kind = available_action_types[action_dd.get_selected()][0]
-        if kind == "axis":
-            # Not a Binding at all (ticket 59 §2 — Axis assignment is a
-            # parallel, structurally independent concept, no Trigger mode/
-            # Action). The caller (`build_binding_editor`'s `on_save`) must
-            # branch on this `"type"` and call `client.set_axis_assignment`
-            # instead of `client.set_binding`.
-            return {"type": "axis", "target": draft["axis"].get("target")}
-        if kind == "keypress":
-            return {
-                "trigger": trigger_options[trigger_dd.get_selected()][0],
-                "type": "keypress",
-                "key": draft["keypress"].get("key", "KEY_A"),
-                "modifiers": draft["keypress"].get("modifiers", []),
-            }
-        if kind == "profile_switch":
-            return {
-                # Always Fire-once regardless of the (disabled) dropdown's
-                # own selection — the Daemon rejects anything else anyway.
-                "trigger": "fire_once",
-                "type": "profile_switch",
-                "target": draft["profile_switch"].get("target", profile),
-            }
-        if kind == "controller_button":
-            return {
-                "trigger": trigger_options[trigger_dd.get_selected()][0],
-                "type": "controller_button",
-                "button": draft["controller_button"].get("button", "BTN_SOUTH"),
-            }
-        if kind == "step":
-            return {
-                "trigger": trigger_options[trigger_dd.get_selected()][0],
-                "type": "step",
-                "stepper_id": draft["step"]["stepper_id"],
-                "direction": draft["step"].get("direction", "forward"),
-            }
-        return {
-            "trigger": trigger_options[trigger_dd.get_selected()][0],
-            "type": "macro",
-            "macro_id": draft["macro"]["macro_id"],
-        }
+    def get_draft() -> BindingDraft:
+        # The live Trigger-mode selection isn't tracked on `draft` as the
+        # user changes it (unlike every per-kind field) — it's simplest read
+        # straight off `trigger_dd` right before handing the draft back.
+        draft.set_trigger(trigger_options[trigger_dd.get_selected()][0])
+        return draft
 
-    return fields, trigger_dd, get_binding
+    return fields, trigger_dd, get_draft
 
 
 # --- Dual-stage grid keys (tartarus-dual-stage-keys ticket 07) -----------
@@ -1077,15 +1151,13 @@ def build_dual_stage_panel(
     # mode with a `KEY_A` placeholder Action. The `Primary — …` toggle shows
     # `action_summary(None, …)` — the passthrough-default label — instead,
     # matching what the key actually does while unbound.
-    synthetic_primary = {
-        "trigger": default_trigger_for(inp),
-        "type": "keypress",
-        # The Input's own passthrough default, not a fixed `KEY_A` — so the
-        # key-picker highlight on an as-yet-unbound key matches what the key
-        # already does (grid_r1c1 → "1", the Mode key → Alt, …).
-        "key": default_key_code_for(inp),
-        "modifiers": [],
-    }
+    #
+    # `BindingDraft.from_wire(None, ...)` (ticket 29) is the single place
+    # "what does an unbound Binding look like" is decided — the Input's own
+    # passthrough default, not a fixed `KEY_A` — so the key-picker highlight
+    # on an as-yet-unbound key matches what the key already does (grid_r1c1
+    # → "1", the Mode key → Alt, …).
+    synthetic_primary = BindingDraft.from_wire(None, inp=inp, profile=profile).to_wire()
 
     def primary_snapshot() -> dict | None:
         return profile_dict[layer].get(inp)
@@ -1098,13 +1170,15 @@ def build_dual_stage_panel(
 
     ui = {"stage": "primary"}
     track_holder: dict = {"track": None, "live": None}
-    # Per-stage editor drafts. `None` means "not edited — read the snapshot".
-    # The currently-mounted stage's fields are captured here whenever the
-    # panel rebuilds (a stage swap, + Add deep stage, …) so an unsaved edit
-    # to one stage survives switching to the other, and Save then commits
-    # *both* stages at once regardless of which is on screen.
-    drafts: dict = {"primary": None, "deep": None}
-    slot: dict = {"get_binding": None, "stage": None}
+    # Per-stage editor drafts, plus the diff/commit-ordering policy over them
+    # — carved into `DualStagePlan` (ticket 30) the same way ticket 26 carved
+    # `BindingDraft` out of `build_action_and_trigger_fields`. An unsaved
+    # edit to one stage survives switching to the other because
+    # `capture_draft()` folds the mounted stage's draft into `plan` before
+    # every rebuild; Save/Apply then push whichever stages `plan.diff(...)`
+    # says actually changed, primary before deep.
+    plan = DualStagePlan()
+    slot: dict = {"get_draft": None, "stage": None}
 
     panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
     panel.add_css_class("actuation-section")
@@ -1131,16 +1205,18 @@ def build_dual_stage_panel(
 
     def stage_starting(stage: str) -> dict | None:
         # The dict the editor slot builds from: this stage's live draft if
-        # it has one, else the snapshot.
-        return drafts[stage] if drafts[stage] is not None else stage_snapshot(stage)
+        # it has one, flattened back to wire shape (the field editor calls
+        # `BindingDraft.from_wire` on whatever this returns), else the
+        # snapshot.
+        return plan.stage_starting(stage, stage_snapshot(stage))
 
     def capture_draft() -> None:
-        # Fold the currently-mounted stage's fields into `drafts` before the
-        # widgets are torn down. Skipped while Save is disabled (an
-        # unsupported Action kind, an empty Macro library) — those states
-        # can't be saved anyway, so there's nothing worth preserving.
-        if slot["get_binding"] is not None and save_btn.get_sensitive():
-            drafts[slot["stage"]] = slot["get_binding"]()
+        # Fold the currently-mounted stage's `BindingDraft` into `plan`
+        # before the widgets are torn down. Skipped while Save is disabled
+        # (an unsupported Action kind, an empty Macro library) — those
+        # states can't be saved anyway, so there's nothing worth preserving.
+        if slot["get_draft"] is not None and save_btn.get_sensitive():
+            plan.capture(slot["stage"], slot["get_draft"]())
 
     def default_deep_cfg() -> dict:
         # A fresh `deep_stages` entry, mode Handoff, with a band disjoint from
@@ -1179,12 +1255,11 @@ def build_dual_stage_panel(
         cfg = default_deep_cfg()
         d_act = cfg["actuation"]["actuation"]
         d_rel = cfg["actuation"]["release"]
-        default_deep = {
-            "trigger": default_trigger_for(inp),
-            "type": "keypress",
-            "key": "KEY_A",
-            "modifiers": [],
-        }
+        # Ticket 29: a fresh deep stage's default Keypress goes through the
+        # same "unbound Binding" seed as the primary's own synthetic stage —
+        # the Input's own passthrough default, not a fixed `KEY_A` — rather
+        # than a second, separately-hand-built placeholder.
+        default_deep = BindingDraft.from_wire(None, inp=inp, profile=profile).to_wire()
         try:
             client.set_deep_actuation(inp, d_act, d_rel)
         except DaemonError as exc:
@@ -1203,7 +1278,7 @@ def build_dual_stage_panel(
             rebuild()
             return
         deep_map()[inp] = default_deep
-        drafts["deep"] = None
+        plan.mark_committed("deep")
         ui["stage"] = "deep"
         rebuild()
 
@@ -1215,7 +1290,7 @@ def build_dual_stage_panel(
             return
         deep_map().pop(inp, None)
         on_commit()
-        drafts["deep"] = None
+        plan.mark_committed("deep")
         ui["stage"] = "primary"
         rebuild()
 
@@ -1232,44 +1307,36 @@ def build_dual_stage_panel(
     def commit_stages() -> bool:
         # The shared commit path behind both Save and Apply: push *both*
         # stages, not just the one on screen — whichever stage the user was
-        # last editing is folded in by `capture_draft`, and each stage is
-        # pushed only if its draft actually differs from the snapshot (an
-        # unedited stage is left alone). Primary first: a replacement primary
-        # the Daemon rejects (`analog_repeat`, a Chord member) must fail
-        # before the deep push, and never leaves a half-applied pair the user
-        # didn't ask for.
+        # last editing is folded in by `capture_draft`, and `plan.diff(...)`
+        # decides which stages actually differ from the snapshot (an
+        # unedited stage is left alone) and returns them primary-first: a
+        # replacement primary the Daemon rejects (`analog_repeat`, a Chord
+        # member) must fail before the deep push, and never leaves a
+        # half-applied pair the user didn't ask for.
         #
         # Every landed push also mutates the in-memory `config` snapshot (the
-        # "+ New Macro" precedent) and clears that stage's draft, so a local
-        # rebuild — Apply's, or a later structural edit's — reflects the
-        # freshly-committed stage straight from the snapshot. `on_commit()`
-        # is fired the first time any push lands (idempotent — it just arms
-        # the caller's deferred rebuild).
+        # "+ New Macro" precedent) and clears that stage's draft
+        # (`plan.mark_committed`), so a local rebuild — Apply's, or a later
+        # structural edit's — reflects the freshly-committed stage straight
+        # from the snapshot. `on_commit()` is fired the first time any push
+        # lands (idempotent — it just arms the caller's deferred rebuild).
         #
         # Returns True when the commit completed with no Daemon rejection
         # (whether or not anything actually needed pushing); False when a
         # rejection was surfaced (Save then stays open).
         capture_draft()
-        primary_target = drafts["primary"] if drafts["primary"] is not None else primary_binding()
-        deep_target = drafts["deep"] if drafts["deep"] is not None else deep_binding()
+        steps = plan.diff(primary_snapshot(), deep_binding())
         try:
-            # With no primary Binding yet the stage is synthetic — commit it
-            # unconditionally (matching the old plain editor's "Save always
-            # calls set_binding" behaviour); otherwise push only a real edit.
-            if not has_primary() or primary_target != primary_binding():
-                if primary_target.get("type") == "axis":
-                    client.set_axis_assignment(inp, layer, primary_target["target"])
-                    profile_dict[f"axis_{layer}"][inp] = primary_target["target"]
+            for stage, wire in steps:
+                push_stage(client, stage, inp, layer, wire)
+                if stage == "primary" and wire.get("type") == "axis":
+                    profile_dict[f"axis_{layer}"][inp] = wire["target"]
                     profile_dict[layer].pop(inp, None)
+                elif stage == "primary":
+                    profile_dict[layer][inp] = wire
                 else:
-                    client.set_binding(inp, layer, primary_target)
-                    profile_dict[layer][inp] = primary_target
-                drafts["primary"] = None
-                on_commit()
-            if has_deep() and deep_target is not None and deep_target != deep_binding():
-                client.set_deep_stage(inp, layer, deep_target)
-                deep_map()[inp] = deep_target
-                drafts["deep"] = None
+                    deep_map()[inp] = wire
+                plan.mark_committed(stage)
                 on_commit()
         except DaemonError as exc:
             show_error(exc)
@@ -1588,17 +1655,17 @@ def build_dual_stage_panel(
                         css_classes=["dim"],
                     )
                 )
-            fields, _td, get_binding = build_action_and_trigger_fields(
+            fields, _td, get_draft = build_action_and_trigger_fields(
                 client, config, profile, stage_starting("deep"), save_btn,
                 _deep_action_types(available_action_types), inp, layer,
                 picker_css_class="deep-picker",
             )
         else:
-            fields, _td, get_binding = build_action_and_trigger_fields(
+            fields, _td, get_draft = build_action_and_trigger_fields(
                 client, config, profile, stage_starting("primary"), save_btn,
                 available_action_types, inp, layer,
             )
-        slot["get_binding"], slot["stage"] = get_binding, editing
+        slot["get_draft"], slot["stage"] = get_draft, editing
         panel.append(fields)
 
         # 5. Primary-actuation profile-default controls.
@@ -1625,7 +1692,7 @@ def build_dual_stage_panel(
         panel.append(force_digital_check)
 
     # Save/Apply/Clear are wired once — `on_save_stage`/`on_apply_stage` read
-    # `drafts`/`slot` and `on_clear_stage` reads `ui["stage"]` at click time,
+    # `plan`/`slot` and `on_clear_stage` reads `ui["stage"]` at click time,
     # so none depend on the current rebuild's closures.
     save_btn.connect("clicked", lambda _b: on_save_stage())
     apply_btn.connect("clicked", lambda _b: on_apply_stage())
@@ -1684,16 +1751,11 @@ def build_binding_editor(
     else:
         # Ticket 89: a freshly-created Binding defaults to Hold-to-repeat
         # (Fire-once for the scroll wheel — see `default_trigger_for`), not
-        # Fire-once everywhere.
-        starting = existing or {
-            "trigger": default_trigger_for(inp),
-            "type": "keypress",
-            # The Input's own passthrough default (ticket 11 follow-up) — a
-            # freshly-opened unbound editor highlights the key the Input
-            # already produces, not a fixed `KEY_A`.
-            "key": default_key_code_for(inp),
-            "modifiers": [],
-        }
+        # Fire-once everywhere. `BindingDraft.from_wire(None, ...)` (ticket
+        # 29) seeds the Input's own passthrough default (ticket 11
+        # follow-up) — a freshly-opened unbound editor highlights the key
+        # the Input already produces, not a fixed `KEY_A`.
+        starting = existing or BindingDraft.from_wire(None, inp=inp, profile=profile).to_wire()
     # "Axis" is offered only for grid keys (ticket 60's Answer) — non-grid
     # Inputs (Mode key, thumbstick, wheel) never see the option at all,
     # rather than seeing it disabled. Filtered through the `rules` mirror of
@@ -1769,7 +1831,7 @@ def build_binding_editor(
         box.append(btn_row)
         return box
 
-    fields, _trigger_dd, get_binding = build_action_and_trigger_fields(
+    fields, _trigger_dd, get_draft = build_action_and_trigger_fields(
         client, config, profile, starting, save_btn, available_action_types, inp, layer
     )
     box.append(fields)
@@ -1778,12 +1840,9 @@ def build_binding_editor(
     btn_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
 
     def on_save(b):
-        binding = get_binding()
+        binding = get_draft().to_wire()
         try:
-            if binding["type"] == "axis":
-                client.set_axis_assignment(inp, layer, binding["target"])
-            else:
-                client.set_binding(inp, layer, binding)
+            push_stage(client, "primary", inp, layer, binding)
         except DaemonError as exc:
             show_error(exc)
             return
@@ -1876,12 +1935,9 @@ def build_chord_binding_dialog(
     """
     # Ticket 89: a Chord's own Binding has no single Input, so it takes the
     # plain Hold-to-repeat default (`default_trigger_for(None)`).
-    starting = existing or {
-        "trigger": default_trigger_for(None),
-        "type": "keypress",
-        "key": "KEY_A",
-        "modifiers": [],
-    }
+    # `BindingDraft.from_wire(None, inp=None, ...)` (ticket 29) is the same
+    # "unbound Binding" seed every other fresh-Binding call site now uses.
+    starting = existing or BindingDraft.from_wire(None, inp=None, profile=profile).to_wire()
     # Neither Profile Switch nor Axis has anywhere coherent to run from a
     # Chord's own Binding — Profile Switch because `fire_chord` has no
     # `&mut Config` to run a switch through, Axis because it isn't a Binding
@@ -1917,13 +1973,13 @@ def build_chord_binding_dialog(
     save_btn = Gtk.Button(label="Save Chord")
     save_btn.add_css_class("suggested-action")
 
-    fields, _trigger_dd, get_binding = build_action_and_trigger_fields(
+    fields, _trigger_dd, get_draft = build_action_and_trigger_fields(
         client, config, profile, starting, save_btn, chord_action_types
     )
     outer.append(fields)
 
     def on_save(b):
-        binding = get_binding()
+        binding = get_draft().to_wire()
         try:
             # Compared as sets, not by re-deriving what the wire key
             # "should" look like — this stub/GUI must never assume its own

@@ -603,6 +603,23 @@ impl<K: Eq + Hash + Clone> Slots<K> {
         }
     }
 
+    /// Force-releases **and removes** `key`'s live firing — the single-key
+    /// counterpart of `drain_firings`, for a targeted teardown that discards
+    /// one key's binding rather than the whole map. `Effect::StopChord`
+    /// (`post-release-development` ticket 22) pushes it: a `ClearChordBinding`
+    /// / changed `SetChordBinding` replace / `SetAxisAssignment` removes the
+    /// Chord from `Config`, and a live Chord Hold-to-repeat firing on that key
+    /// then has no completion edge left to end it — `chord::feed`'s `stopping`
+    /// filter iterates `chords.keys()`, and the key is gone. The entry is
+    /// removed, not just released (`force_release`'s job): the binding it
+    /// compiled against is being discarded, matching `drain_firings`' own
+    /// contract. A no-op when no firing is present.
+    pub(crate) async fn stop_firing(&mut self, key: &K, injector: &Injector) {
+        if let Some(firing) = self.firings.remove(key) {
+            firing.force_release_stuck(injector).await;
+        }
+    }
+
     /// Drains and stops every Toggle — `SwitchProfile`'s `StopAllToggles`
     /// effect and the `StopAllToggles` command (ticket 25). The old free
     /// `dispatch::stop_all_toggles`, verbatim.

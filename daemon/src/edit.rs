@@ -44,19 +44,27 @@ pub enum Edit {
     /// paired with a non-fire-once trigger, `analog_repeat` on a non-Grid
     /// Input, an existing Axis assignment for `(layer, input)`). Assigning a
     /// `Step` Action silently steals that `(stepper, direction)` off its old
-    /// Input or Chord (ticket 03/40).
+    /// Input or Chord (ticket 03/40). Teardown effects: see
+    /// `reconcile_teardowns` (a *replacement* that changes the trigger or
+    /// Action releases a live individual Toggle on that key; a fresh bind or a
+    /// byte-identical GUI re-Save orphans nothing).
     SetBinding {
         input: Input,
         layer: Layer,
         binding: Binding,
     },
     /// Removes a Binding (ordinary passthrough resumes). Fails `NotFound` if
-    /// `input` has no Binding on `layer`.
+    /// `input` has no Binding on `layer`. Drops any deep Binding the removed
+    /// primary carried on `layer` (`drop_orphaned_deep_binding` — a deep
+    /// Binding can't outlive its primary). Teardown effects (`StopToggle` for
+    /// a live individual Toggle, `StopStage` for the orphaned deep slot): see
+    /// `reconcile_teardowns`.
     ClearBinding { input: Input, layer: Layer },
     /// Flips the active Profile's `mode_key_role` (ticket 18). Never fails on
     /// its own account — the active Profile always exists — but `plan` still
     /// returns a `Result` for symmetry with the other mutating `Edit`s and
-    /// room for a future validation rule.
+    /// room for a future validation rule. Teardown effect (`StopToggle(ModeKey)`
+    /// on the `Bound → LayerSwitch` transition): see `reconcile_teardowns`.
     SetModeKeyRole { role: ModeKeyRole },
     /// Creates a new, empty Profile (ticket 19) — both Layers present with
     /// empty Binding maps, `mode_key_role` defaulting to `LayerSwitch`, same
@@ -201,14 +209,21 @@ pub enum Edit {
     /// if `inputs`' member set is a subset or superset of an existing
     /// Chord's on the same Layer (ticket 01's amended Answer) — editing the
     /// exact same member set back (same `inputs`) is not a conflict with
-    /// itself.
+    /// itself. Teardown effect: see `reconcile_teardowns` (a *replacement*
+    /// that changes the trigger or Action force-releases a live Chord Toggle /
+    /// firing on that key — otherwise permanently unstoppable once its old
+    /// binding is gone; a byte-identical GUI re-Save orphans nothing).
     SetChordBinding {
         inputs: std::collections::BTreeSet<Input>,
         layer: Layer,
         binding: Binding,
     },
     /// Removes a Chord Binding by its exact member set. Fails `NotFound` if
-    /// no Chord with exactly that member set exists on `layer`.
+    /// no Chord with exactly that member set exists on `layer`. Teardown
+    /// effect (`StopChord(key)` for a live Chord Toggle or Hold-to-repeat
+    /// firing this remove orphans — the moment its key leaves `chords(layer)`,
+    /// `chord::feed` can no longer route a stop to it): see
+    /// `reconcile_teardowns`.
     ClearChordBinding {
         inputs: std::collections::BTreeSet<Input>,
         layer: Layer,
@@ -220,7 +235,12 @@ pub enum Edit {
     /// atomically alongside the insert (ticket 59 §2's mutual exclusion —
     /// unlike `SetBinding`/`SetChordBinding`, which reject rather than
     /// overwrite an existing Axis assignment there). Fails `InvalidRequest`
-    /// if `input` isn't a `Grid` variant.
+    /// if `input` isn't a `Grid` variant. Its only operation-specific effect
+    /// is `Effect::RecomputeAxes { layer }`; the teardown effects for the live
+    /// runtime slots the clear orphans (`StopToggle` for a primary Binding,
+    /// `StopStage` for a deep stage it carried, `StopChord` for every Chord
+    /// membership) all fall out of the maps it mutates, via
+    /// `reconcile_teardowns`.
     SetAxisAssignment {
         input: Input,
         layer: Layer,
@@ -249,34 +269,87 @@ pub enum Edit {
     /// — sequencing across the primary Binding, the deep Binding, and the
     /// `deep_stages` config is the caller's job, the same way
     /// `SetAxisAssignment` leaves "was there already a Binding here" to
-    /// `validate`'s reachable states.
+    /// `validate`'s reachable states. Teardown effect (`StopStage(input)` when
+    /// this insert *replaces* a differing deep Binding under a live deep slot —
+    /// ticket 25 delta 1, matching `SetBinding`-replace → `StopToggle`): see
+    /// `reconcile_teardowns`.
     SetDeepStage {
         input: Input,
         layer: Layer,
         binding: Binding,
     },
     /// Removes the deep Binding on `layer`. Fails `NotFound` if `input` has
-    /// no deep Binding there. Does **not** cascade-clear `deep_stages` or
-    /// force-release a live slot — ticket 06's runtime-teardown sweep covers
-    /// only a *primary* Binding's removal cascading the deep one away
-    /// (`SetBinding`/`ClearBinding` below); editing the deep Binding directly
-    /// isn't one of spec.md's five listed transitions, so this stays as-is.
+    /// no deep Binding there. Leaves `deep_stages` (the Actuation/mode config)
+    /// untouched — legal and inert with no matching `deep_base`/`deep_held`
+    /// entry, same as the primary-removal cascade. Teardown effect
+    /// (`StopStage(input)` for a live deep firing this remove orphans — a
+    /// Toggle, or a single-key Hold-to-repeat in `value=1` autorepeat — which
+    /// would otherwise wait for a next Up that may never come): see
+    /// `reconcile_teardowns`.
     ClearDeepStage { input: Input, layer: Layer },
     /// Sets a grid key's deep Actuation/Release point pair on the active
     /// Profile, `.entry(input).or_default()`-creating a fresh
     /// `DeepStageConfig` (mode defaulting to `StagingMode::Handoff`) if none
     /// exists yet. **No `Effect`** — unlike `SetActuationPoint`, nothing
     /// needs a live snapshot pushed to it: `stage::Engine` lives in dispatch
-    /// and reads `Config` directly each tick.
+    /// and reads `Config` directly each tick. Safe to move the point under a
+    /// key that is *currently* holding a live deep slot (post-release ticket
+    /// 20 case B8, decided keep): the next `Engine::update` tick re-thresholds
+    /// `rt.deep` against the new point exactly as `SetActuationPoint` does
+    /// under a held primary, and a band the point now excludes emits a clean
+    /// `ReleaseDeep` + `RepressPrimary` — no orphan is reachable.
     SetDeepActuation {
         input: Input,
         actuation: u8,
         release: u8,
     },
     /// Sets a grid key's Staging mode on the active Profile, the same
-    /// `.or_default()`-creation as `SetDeepActuation`. No `Effect`, same
-    /// reasoning.
+    /// `.or_default()`-creation as `SetDeepActuation`. Teardown effect
+    /// (`Effect::StopStage(input)` whenever the `.mode` field actually
+    /// changes — post-release ticket 23 case B7): a mode change, unlike an
+    /// Actuation-point change, can strand Quick-Skip's own per-press phase
+    /// machine (`rt.quick_skip`), since the next `advance` would run the *new*
+    /// mode's transition table against a phase value the *old* mode wrote.
+    /// There is no clean "the next tick reconciles" guarantee here (there is
+    /// for `SetDeepActuation`, where `analog::observe` just re-thresholds).
+    /// Force-releasing the live deep slot lets the new mode start from a known
+    /// state — the next `Engine::update` tick re-adopts at the current Depth
+    /// under the new mode with a clean `quick_skip = None`. Only sound because
+    /// ticket 23 also makes `stage::Engine::stop_stage` reset-and-keep the
+    /// runtime entry: a `SetStagingMode` on the active Layer with the key held
+    /// would otherwise hit the same re-fire bug B12 fixes (the deep Binding is
+    /// untouched, so the `deep_layer` guard stays true). The effect itself is
+    /// derived by `reconcile_teardowns` (ticket 25), not pushed here.
     SetStagingMode { input: Input, mode: StagingMode },
+}
+
+/// Why `DispatchState::tear_down` is running — the one place the "what
+/// ephemeral runtime state gets released on a Layer switch / Profile switch /
+/// disconnect / Digital-mode flip" matrix lives (`post-release-development`
+/// ticket 19, ADR-0010). Each variant's `tear_down` arm names every
+/// participant — `axis`, `analog_repeat`, `stage`, `individual` (firings and
+/// toggles separately), `chord_machine`, `chord_slots` — with an explicit
+/// `//` line for each participant it deliberately leaves alone. Behaviour is
+/// exactly today's, transcribed from the four former call sites; turning one
+/// of the `//`-marked skips into a real call is ticket 20's job.
+///
+/// A plain `Copy` data enum, it lives here next to `Effect` (and
+/// `CommandError`) so `edit` stays a leaf module — `dispatch` already
+/// imports `edit`, not the reverse, and `Effect::TearDown` needs the type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TeardownReason {
+    /// Mode key edge under `ModeKeyRole::LayerSwitch` — `active_layer`
+    /// flipped. Individual Toggles deliberately survive (a Toggle held
+    /// across a Layer switch keeps running — CONTEXT.md Toggle).
+    LayerSwitch,
+    /// `Edit::SwitchProfile` committed. Strongest sweep: individual
+    /// Toggles drain too. Chord Toggles still survive (an active Chord
+    /// Toggle survives a Profile switch today — see `SwitchProfile` below).
+    ProfileSwitch,
+    /// Device reported disconnected.
+    Disconnect,
+    /// Capture mode flipped to Digital (no Depth).
+    CaptureModeToDigital,
 }
 
 /// A post-commit effect the caller must run — described here by `plan`,
@@ -297,35 +370,60 @@ pub(crate) enum Effect {
     /// Tell the capture supervisor to swap the live capture source (ticket
     /// 23) — `SetForceDigital`'s only side effect.
     SignalCaptureMode(bool),
-    /// Force-stop the running Toggle on the given Input, if any.
+    /// Force-stop the running Toggle on the given Input, if any. `plan`'s sole
+    /// source for this is `reconcile_teardowns` (ADR-0011) — a committed edit
+    /// that removes or changes a primary `Binding` under a live individual
+    /// Toggle, or flips `mode_key_role` `Bound → LayerSwitch`. `run_effects`'
+    /// `stop_toggle` no-ops when nothing is live.
     StopToggle(Input),
-    /// Force-stop every running Toggle.
-    StopAllToggles,
-    /// Force-stop every running Analog-repeat task.
-    StopAllAnalogRepeats,
-    /// Force-release every live dual-stage deep slot and reset `stage::
-    /// Engine`'s per-key runtime state (`stage::Engine::stop_all()`) —
-    /// `SwitchProfile`'s own share of `tartarus-dual-stage-keys` ticket 06's
-    /// runtime teardown, alongside `StopAllToggles`/`StopAllAnalogRepeats`.
-    StopAllStages,
-    /// Force-release and drop every live individual firing
-    /// (`trigger::Slots::drain_firings`), leaving individual Toggles running —
-    /// `SwitchProfile`'s share of `spec-kernel-shaped-repeat.md` §7: a
-    /// single-key Hold-to-repeat holds a bare unbalanced `KeyDown` for the
-    /// life of the press (ticket 04), and the new Profile's binding for that
-    /// key may not release it (unbound / Toggle-bound ⇒ `decide`'s `Up` arm
-    /// is inert). Alongside `StopAllStages`, which does the same for the deep
-    /// slots.
-    ReleaseAllHolds,
+    /// Run the dispatch task's one lifecycle-teardown matrix
+    /// (`DispatchState::tear_down`) for the given reason — the
+    /// Config-commit entry point into it (ticket 19, ADR-0010). Pushed only
+    /// by `SwitchProfile` (`TeardownReason::ProfileSwitch`): a Profile switch
+    /// mutates `Config`, so its ephemeral teardown — drain individual Toggles
+    /// and firings, reset axes, stop Analog-repeats, release deep stages —
+    /// must run from `run_effects`, the sole commit point, rather than as a
+    /// direct call the way the three momentary-state situations (Layer
+    /// switch, disconnect, Digital flip) reach `tear_down`. Replaced the five
+    /// separate `StopAllToggles` / `ReleaseAllHolds` / `ResetAxisOutputs` /
+    /// `StopAllAnalogRepeats` / `StopAllStages` variants, whose fan-out order
+    /// now lives in the `ProfileSwitch` arm of the match. `RepublishActuation`
+    /// / `AssertStatusLeds` / `AnnounceProfileChange` stay separate effects.
+    TearDown(TeardownReason),
     /// Force-release the given Input's live dual-stage deep slot immediately
-    /// (`stage::Engine::stop_stage`) — pushed by `SetBinding`/`ClearBinding`
-    /// when the edit cascades away an orphaned `deep_base`/`deep_held` entry
-    /// (ticket 06's "Cascade-delete": a live deep stage must not survive its
-    /// primary Binding's removal, and can't wait for a next Up that may
-    /// never come).
+    /// (`stage::Engine::stop_stage`, which resets-and-keeps the runtime
+    /// entry, suppresses `deep_repeat`, and carries `primary_handed_off`
+    /// across the reset so the `feed` path stays in step — post-release
+    /// tickets 23, 24). `plan`'s sole source for this is `reconcile_teardowns`
+    /// (ADR-0011), which derives it by diffing the active Profile: a
+    /// `deep_base`/`deep_held` entry removed (`ClearDeepStage`, or
+    /// `ClearBinding` / `SetAxisAssignment` dropping the primary the deep
+    /// Binding hung off, via `drop_orphaned_deep_binding`) or *changed*
+    /// (`SetDeepStage`-replace — ticket 25 delta 1); or `deep_stages[input]
+    /// .mode` changed (`SetStagingMode` — ticket 23 B7, a mid-press mode flip
+    /// can strand Quick-Skip's phase machine). An actuation-only
+    /// `DeepStageConfig` change (`SetDeepActuation`) re-thresholds cleanly on
+    /// the next tick and orphans nothing (ticket 20 B8). Where it is emitted,
+    /// a live deep slot must not linger past the Binding or mode backing it,
+    /// and can't wait for a next Up that may never come.
     StopStage(Input),
-    /// Center every live axis output and clear the axis engine's state.
-    ResetAxisOutputs,
+    /// Force-stop the running Chord Toggle *and* force-release any live Chord
+    /// Hold-to-repeat firing on `key` — `dispatch`'s `chord_slots.stop_toggle`
+    /// then `chord_slots.stop_firing`. `post-release-development` ticket 22
+    /// (cases B9 / B11), the Chord-keyspace sibling of `StopStage`. `plan`'s
+    /// sole source for this is `reconcile_teardowns` (ADR-0011), which derives
+    /// it by diffing the active Profile's `chords_base`/`chords_held`: a Chord
+    /// Binding removed (`ClearChordBinding`, or `SetAxisAssignment` clearing a
+    /// membership for `(layer, input)`) or changed in trigger or Action
+    /// (`SetChordBinding`-replace — a byte-identical GUI re-Save orphans
+    /// nothing). Once a Chord's key leaves `chords(layer)` a live
+    /// Chord Toggle is permanently unstoppable — it stops only via a fresh
+    /// full-member completion routed through `chord::feed`, whose `stopping`
+    /// filter iterates `chords.keys()` — and a live Chord firing is stranded
+    /// the same way (the completed member's `Up` that would
+    /// `ReleaseChordFiring` can't reach it). `run_effects` no-ops when neither
+    /// a Toggle nor a firing is present, matching `StopStage`'s contract.
+    StopChord(ChordKey),
     /// Reconcile the given Stepper's Daemon-side runtime cursor against the
     /// just-committed `Config` — its list definition changed
     /// (`DeleteStepper` removes it, `SetStepperItems` reshapes it).
@@ -369,9 +467,14 @@ pub(crate) struct Outcome {
 /// name) are explicit early-return `Err` in each arm, with their existing
 /// messages preserved verbatim. Structural invariants of the resulting
 /// `Config` stay in `config::validate`, run once here at the end.
+///
+/// Each arm collects only its operation-specific effects into `arm_effects`;
+/// the teardown `Effect`s a committed edit orphans (`StopToggle` / `StopStage`
+/// / `StopChord`) are derived once by `reconcile_teardowns` diffing `config`
+/// vs. the result, and lead the returned vec (ADR-0011).
 pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), CommandError> {
     let mut next = config.clone();
-    let mut effects = Vec::new();
+    let mut arm_effects = Vec::new();
     let mut created = None;
 
     match edit {
@@ -405,6 +508,10 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             // see `ClearBinding` below. A replacement primary that would
             // make the deep stage illegal (`analog_repeat`, a Chord member)
             // is already rejected by the trailing `config::validate(&next)`.
+            //
+            // Teardown effects (a `StopToggle` on a replacement that changes
+            // the binding under a live individual Toggle): see
+            // `reconcile_teardowns`.
         }
         Edit::ClearBinding { input, layer } => {
             if active_profile_mut(&mut next)
@@ -414,18 +521,21 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             {
                 return Err(CommandError::NotFound);
             }
-            cascade_orphaned_deep_stage(&mut next, layer, input, &mut effects);
+            // Removing the primary Binding orphans any deep Binding it carried
+            // on this Layer — a deep Binding can never exist without a matching
+            // primary (`ConfigError::DeepStageWithoutPrimary`), so drop it from
+            // `next` now or the trailing `config::validate` rejects the whole
+            // edit. Teardown effects (`StopToggle` for a live individual
+            // Toggle, `StopStage` for the orphaned deep slot): see
+            // `reconcile_teardowns`.
+            drop_orphaned_deep_binding(&mut next, layer, input);
         }
         Edit::SetModeKeyRole { role } => {
             active_profile_mut(&mut next).mode_key_role = role;
-            if role == ModeKeyRole::LayerSwitch {
-                // Leaving `Bound`: a Toggle can only ever have been started
-                // on the Mode key while `Bound`. Once `LayerSwitch` takes
-                // over, `handle_event` intercepts every `Input::ModeKey`
-                // press before the stop-toggle check, so a still-running one
-                // would become permanently unstoppable via that key.
-                effects.push(Effect::StopToggle(Input::ModeKey));
-            }
+            // Teardown effect (`StopToggle(ModeKey)` on the `Bound →
+            // LayerSwitch` transition — once `LayerSwitch` takes over,
+            // `handle_event` intercepts every `Input::ModeKey` press before
+            // the stop-toggle check): see `reconcile_teardowns`.
         }
         Edit::CreateProfile { name } => {
             if next.profiles.contains_key(&name) {
@@ -470,45 +580,40 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
                 return Err(CommandError::NotFound);
             }
             next.active_profile = name.clone();
-            // Ordering matters: Toggles and Analog-repeats stop, the new
-            // Profile's Actuation snapshot goes out, axes reset, then the
-            // signal fires — all after the D-Bus reply, uniformly, which is
-            // what deletes `SwitchProfile`'s old bespoke reply-before-signal
-            // reasoning (the hazard it dodged is now the default shape).
-            //
-            // `StopAllToggles` drains only the individual `Slots<Input>`
-            // (`dispatch`'s `individual` field), never the `ChordKey`-keyed
-            // `chord_slots` — an active Chord Toggle survives a Profile switch
-            // today. That is
-            // pre-existing behaviour, preserved unchanged by post-release
-            // ticket 07's mechanical carve; whether a Chord Toggle *should*
-            // outlive a Profile switch is an open question for the domain
-            // owner, not something to settle here.
-            effects.push(Effect::StopAllToggles);
-            // `spec-kernel-shaped-repeat.md` §7: a single-key Hold-to-repeat
-            // holds a bare unbalanced `KeyDown` for the life of the press
-            // (ticket 04); the incoming Profile's binding for that key may
-            // never release it, so drain every live individual firing here —
-            // same reasoning as `StopAllToggles` / `StopAllStages`. Individual
-            // Toggles deliberately survive the switch (see above).
-            effects.push(Effect::ReleaseAllHolds);
-            effects.push(Effect::RepublishActuation);
-            effects.push(Effect::ResetAxisOutputs);
-            effects.push(Effect::StopAllAnalogRepeats);
-            // Ticket 06: a live dual-stage deep press must not survive a
-            // Profile switch either — same reasoning as the Toggle/Analog-
-            // repeat stops just above. Safe to run after this firing's own
-            // `Edit::SwitchProfile` was already produced: `update_stages`/
-            // `stage::Engine::feed` fully complete (and this `Edit` is returned)
-            // before `commit_input_edits` ever reaches `edit::apply`, so the
-            // triggering firing itself is never interrupted by its own
-            // consequence.
-            effects.push(Effect::StopAllStages);
+            // The whole ephemeral teardown — drain individual Toggles and
+            // firings, reset axes, stop Analog-repeats, release deep stages,
+            // in that order — is the `ProfileSwitch` arm of dispatch's one
+            // lifecycle-teardown matrix (`DispatchState::tear_down`, ticket
+            // 19 / ADR-0010). A Profile switch mutates `Config`, so it reaches
+            // that matrix as an `Effect` through `run_effects` (the sole
+            // commit point), where the three momentary-state situations
+            // (Layer switch, disconnect, Digital flip) reach it by direct
+            // call. The matrix records the load-bearing survival rules that
+            // used to live in this comment: individual Toggles drain on a
+            // Profile switch (the strongest sweep) but Chord Toggles survive
+            // (`StopAllToggles` only ever drained the individual
+            // `Slots<Input>`), and a single-key Hold-to-repeat's bare
+            // unbalanced `KeyDown` (`spec-kernel-shaped-repeat.md` §7) is
+            // drained here because the incoming Profile's binding for that
+            // key may never release it. Safe to run after this firing's own
+            // `Edit::SwitchProfile` was already produced: `update_stages` /
+            // `stage::Engine::feed` fully complete (and this `Edit` is
+            // returned) before `commit_input_edits` ever reaches
+            // `edit::apply`, so the triggering firing is never interrupted by
+            // its own consequence.
+            arm_effects.push(Effect::TearDown(TeardownReason::ProfileSwitch));
+            // The new Profile's resolved Actuation snapshot goes out after
+            // the teardown — `publish_actuation_snapshot` only re-pushes the
+            // actuation watch-channel snapshot to the capture grid task,
+            // independent of axis centering and hold draining, so its move
+            // from between `ReleaseAllHolds` and `ResetAxisOutputs` to here
+            // is behaviour-neutral (ticket 19).
+            arm_effects.push(Effect::RepublishActuation);
             // The physical indicator follows the active Profile deterministically
             // (`tartarus-status-leds` ticket 03). Order is irrelevant — the LEDs
             // are independent of Toggles / axes / Analog-repeat.
-            effects.push(Effect::AssertStatusLeds);
-            effects.push(Effect::AnnounceProfileChange(name));
+            arm_effects.push(Effect::AssertStatusLeds);
+            arm_effects.push(Effect::AnnounceProfileChange(name));
         }
         Edit::SetActuationPoint {
             input,
@@ -518,17 +623,17 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             active_profile_mut(&mut next)
                 .actuation_overrides
                 .insert(input, ActuationPoint { actuation, release });
-            effects.push(Effect::RepublishActuation);
+            arm_effects.push(Effect::RepublishActuation);
         }
         Edit::ClearActuationPoint { input } => {
             active_profile_mut(&mut next)
                 .actuation_overrides
                 .remove(&input);
-            effects.push(Effect::RepublishActuation);
+            arm_effects.push(Effect::RepublishActuation);
         }
         Edit::SetDefaultActuation { actuation, release } => {
             active_profile_mut(&mut next).default_actuation = ActuationPoint { actuation, release };
-            effects.push(Effect::RepublishActuation);
+            arm_effects.push(Effect::RepublishActuation);
         }
         Edit::SetDefaultDeepActuation { actuation, release } => {
             active_profile_mut(&mut next).default_deep_actuation =
@@ -536,11 +641,11 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
         }
         Edit::ResetActuationPoints => {
             active_profile_mut(&mut next).actuation_overrides.clear();
-            effects.push(Effect::RepublishActuation);
+            arm_effects.push(Effect::RepublishActuation);
         }
         Edit::SetForceDigital { force } => {
             next.force_digital = force;
-            effects.push(Effect::SignalCaptureMode(force));
+            arm_effects.push(Effect::SignalCaptureMode(force));
         }
         Edit::CreateMacro { name, steps } => {
             if name.trim().is_empty() {
@@ -622,7 +727,7 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             // gone, so the cursor is dropped) so a later `CreateStepper`
             // landing on the same freed slug starts at the list's first item
             // rather than inheriting a stale position.
-            effects.push(Effect::ReconcileStepperCursor(stepper_id));
+            arm_effects.push(Effect::ReconcileStepperCursor(stepper_id));
         }
         Edit::SetStepperItems { stepper_id, items } => {
             let def = next
@@ -635,7 +740,7 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             // list (clamp on a shrink, drop when empty). `plan` just names
             // the list that moved; the drop-vs-clamp rule lives in
             // `stepper::Cursors`.
-            effects.push(Effect::ReconcileStepperCursor(stepper_id));
+            arm_effects.push(Effect::ReconcileStepperCursor(stepper_id));
         }
         Edit::SetChordBinding {
             inputs,
@@ -656,6 +761,10 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             active_profile_mut(&mut next)
                 .chords_mut(layer)
                 .insert(key, binding);
+            // Teardown effect (`StopChord` on a replacement that changes the
+            // Chord Binding under a live Chord Toggle / firing — otherwise
+            // permanently unstoppable once the old binding is gone): see
+            // `reconcile_teardowns`.
         }
         Edit::ClearChordBinding { inputs, layer } => {
             let key = ChordKey::new(inputs);
@@ -666,6 +775,10 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             {
                 return Err(CommandError::NotFound);
             }
+            // Teardown effect (`StopChord` for a live Chord Toggle or
+            // Hold-to-repeat firing this remove orphans — the key is gone from
+            // `chords(layer)`, so `chord::feed` can never route a stop to it):
+            // see `reconcile_teardowns`.
         }
         Edit::SetAxisAssignment {
             input,
@@ -674,10 +787,21 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
         } => {
             // Ticket 59 §2's mutual exclusion: atomically clear any existing
             // Binding *and* any Chord membership for (layer, input) alongside
-            // the insert.
+            // the insert. `config::validate` rejects the *illegal* end states;
+            // the teardown effects for the live runtime slots this clear
+            // orphans — `StopToggle` for a primary Binding, `StopStage` for a
+            // deep stage that primary carried, `StopChord` for every Chord
+            // membership — all fall out of the maps it mutates here, via
+            // `reconcile_teardowns`.
             active_profile_mut(&mut next)
                 .layer_mut(layer)
                 .remove(&input);
+            // An axis key can't carry a deep stage (`config::validate` would
+            // reject the end state), so a deep Binding the removed primary
+            // carried is dropped here exactly as `ClearBinding` does —
+            // `SetAxisAssignment`'s `layer_mut(layer).remove` does not trigger
+            // the deep drop on its own.
+            drop_orphaned_deep_binding(&mut next, layer, input);
             let chords = active_profile_mut(&mut next).chords_mut(layer);
             let member_keys: Vec<ChordKey> = chords
                 .keys()
@@ -690,7 +814,7 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             active_profile_mut(&mut next)
                 .axis_layer_mut(layer)
                 .insert(input, target);
-            effects.push(Effect::RecomputeAxes { layer });
+            arm_effects.push(Effect::RecomputeAxes { layer });
         }
         Edit::ClearAxisAssignment { input, layer } => {
             if active_profile_mut(&mut next)
@@ -700,8 +824,8 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             {
                 return Err(CommandError::NotFound);
             }
-            effects.push(Effect::ForgetAxisContribution(input));
-            effects.push(Effect::RecomputeAxes { layer });
+            arm_effects.push(Effect::ForgetAxisContribution(input));
+            arm_effects.push(Effect::RecomputeAxes { layer });
         }
         Edit::SetStatusLeds {
             orange,
@@ -713,7 +837,7 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
                 green,
                 blue,
             };
-            effects.push(Effect::AssertStatusLeds);
+            arm_effects.push(Effect::AssertStatusLeds);
         }
         Edit::SetDeepStage {
             input,
@@ -723,6 +847,9 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             active_profile_mut(&mut next)
                 .deep_layer_mut(layer)
                 .insert(input, binding);
+            // Teardown effect (`StopStage` when this insert replaces a
+            // differing deep Binding under a live deep slot — delta 1): see
+            // `reconcile_teardowns`.
         }
         Edit::ClearDeepStage { input, layer } => {
             if active_profile_mut(&mut next)
@@ -732,6 +859,10 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             {
                 return Err(CommandError::NotFound);
             }
+            // Teardown effect (`StopStage` for a live deep firing this remove
+            // orphans — the `deep_layer` entry is gone, so
+            // `stage::Engine::update`'s `deep_layer(active_layer).contains_key`
+            // guard skips the Input for good): see `reconcile_teardowns`.
         }
         Edit::SetDeepActuation {
             input,
@@ -745,6 +876,12 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
                 .actuation = ActuationPoint { actuation, release };
         }
         Edit::SetStagingMode { input, mode } => {
+            // Teardown effect (`StopStage` when the `.mode` field actually
+            // changes under a live deep firing — a mid-press mode flip can
+            // strand Quick-Skip's per-press phase machine, so the live deep
+            // slot is force-released to start the new mode from a known state;
+            // an actuation-only or idempotent re-apply pushes nothing): see
+            // `reconcile_teardowns`.
             active_profile_mut(&mut next)
                 .deep_stages
                 .entry(input)
@@ -753,8 +890,134 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
         }
     }
 
+    // Every teardown `Effect` the committed edit implies — derived once by
+    // diffing the active Profile's runtime-bearing maps before vs. after,
+    // rather than pushed arm by arm (ADR-0011). Prepended so a live key is
+    // released before the arm's own `RecomputeAxes` / `AssertStatusLeds` /
+    // `RepublishActuation` re-asserts state on it.
+    let mut effects = reconcile_teardowns(config, &next);
+    effects.extend(arm_effects);
     config::validate(&next)?;
     Ok((next, Outcome { effects, created }))
+}
+
+/// Every teardown `Effect` a committed edit implies, derived by diffing the
+/// active Profile's runtime-bearing maps before vs. after. `plan` calls this
+/// once, just before `config::validate(&next)?`; its output is prepended to
+/// the arm's own operation-specific effects. Pure and liveness-blind by the
+/// same contract the arms had — `run_effects`' `stop_*` handlers no-op when
+/// nothing is live (`Effect::StopToggle` / `StopStage` / `StopChord` docs) —
+/// so it emits unconditionally on a config diff and lets dispatch sort out
+/// what is actually running. The config-edit axis of ADR-0010's lifecycle
+/// consolidation (`dispatch::tear_down`).
+///
+/// Active-Profile only: every binding / Chord / deep / axis / mode edit goes
+/// through `active_profile_mut`, and the D-Bus surface has no Profile arg.
+/// Returns empty when `before.active_profile != after.active_profile` — the
+/// only edit that changes it is `SwitchProfile`, which owns
+/// `Effect::TearDown(TeardownReason::ProfileSwitch)`; an active-Profile
+/// rename leaves the maps byte-identical.
+///
+/// Inspects `base`, `held`, `chords_base`, `chords_held`, `deep_base`,
+/// `deep_held`, `deep_stages` (the `.mode` field only), and `mode_key_role`.
+/// Ignores `axis_base` / `axis_held`, `actuation_overrides`,
+/// `default_actuation`, `status_leds`, `macros`, `steppers`.
+///
+/// | before → after (active Profile) | emit |
+/// |---|---|
+/// | `base` / `held`[input] removed, or `Binding` differs | `StopToggle(input)` |
+/// | `deep_base` / `deep_held`[input] removed, or `Binding` differs *(delta 1)* | `StopStage(input)` |
+/// | `chords_base` / `chords_held`[key] removed, or `Binding` differs | `StopChord(key)` |
+/// | `deep_stages`[input]`.mode` differs (actuation-only change → nothing) | `StopStage(input)` |
+/// | `mode_key_role` `Bound → LayerSwitch` *(delta 2)* | `StopToggle(Input::ModeKey)` |
+///
+/// Output contract: fixed effect-type order `StopToggle` → `StopStage` →
+/// `StopChord`; keys sorted (and de-duplicated) within each type; fully
+/// deterministic regardless of `HashMap` iteration order.
+pub(crate) fn reconcile_teardowns(before: &Config, after: &Config) -> Vec<Effect> {
+    // `SwitchProfile` owns `Effect::TearDown(ProfileSwitch)`; an active-Profile
+    // rename leaves the maps byte-identical. Either way this diff has nothing
+    // to say — and without the bail it would see the entire active layer
+    // "change".
+    if before.active_profile != after.active_profile {
+        return Vec::new();
+    }
+    let (Some(was), Some(now)) = (before.active_profile(), after.active_profile()) else {
+        return Vec::new();
+    };
+
+    let mut toggles: Vec<Input> = Vec::new();
+    let mut stages: Vec<Input> = Vec::new();
+    let mut chords: Vec<ChordKey> = Vec::new();
+
+    // Primary Bindings: a removed or changed `Binding` orphans a live
+    // individual Toggle pinned to that key.
+    toggles.extend(removed_or_changed(&was.base, &now.base).copied());
+    toggles.extend(removed_or_changed(&was.held, &now.held).copied());
+
+    // Mode key: `Bound → LayerSwitch` — a Toggle can only ever have been
+    // started on the Mode key while `Bound`, and once `LayerSwitch` takes over
+    // `handle_event` intercepts every `Input::ModeKey` press before the
+    // stop-toggle check, so a still-running one becomes unstoppable (delta 2 —
+    // a `LayerSwitch → LayerSwitch` re-apply now pushes nothing).
+    if was.mode_key_role == ModeKeyRole::Bound && now.mode_key_role == ModeKeyRole::LayerSwitch {
+        toggles.push(Input::ModeKey);
+    }
+
+    // Deep Bindings: a removed or changed deep `Binding` orphans a live deep
+    // slot — `stage::Engine::update`'s `deep_layer(active_layer).contains_key`
+    // guard would otherwise skip the Input for good (delta 1 covers the
+    // *changed* case, matching `SetBinding`-replace → `StopToggle`).
+    stages.extend(removed_or_changed(&was.deep_base, &now.deep_base).copied());
+    stages.extend(removed_or_changed(&was.deep_held, &now.deep_held).copied());
+
+    // Staging mode: a `.mode` change under a live deep firing can strand
+    // Quick-Skip's per-press phase machine. An actuation-only `DeepStageConfig`
+    // change is inert (the next tick re-thresholds cleanly — ticket 20 B8). An
+    // absent `deep_stages` entry reads as the default mode, so `SetStagingMode`
+    // `.or_default()`-creating a fresh entry with a non-default mode counts as
+    // a change (matching the old `entry.mode != mode` guard).
+    for input in was.deep_stages.keys().chain(now.deep_stages.keys()) {
+        let mode = |p: &Profile| p.deep_stages.get(input).map(|c| c.mode).unwrap_or_default();
+        if mode(was) != mode(now) {
+            stages.push(*input);
+        }
+    }
+
+    // Chord Bindings: a removed or changed Chord `Binding` orphans a live
+    // Chord Toggle / firing — once the key has left `chords(layer)`,
+    // `chord::feed` can never route a stop to it.
+    chords.extend(removed_or_changed(&was.chords_base, &now.chords_base).cloned());
+    chords.extend(removed_or_changed(&was.chords_held, &now.chords_held).cloned());
+
+    toggles.sort_unstable();
+    toggles.dedup();
+    stages.sort_unstable();
+    stages.dedup();
+    chords.sort_unstable_by(|a, b| a.members().cmp(b.members()));
+    chords.dedup();
+
+    let mut effects = Vec::with_capacity(toggles.len() + stages.len() + chords.len());
+    effects.extend(toggles.into_iter().map(Effect::StopToggle));
+    effects.extend(stages.into_iter().map(Effect::StopStage));
+    effects.extend(chords.into_iter().map(Effect::StopChord));
+    effects
+}
+
+/// The keys present in `was` that `now` has either dropped outright or rebound
+/// to a different value — the one diff shape `reconcile_teardowns` runs
+/// against each of its three `(base, held)` map pairs.
+fn removed_or_changed<'a, K, V>(
+    was: &'a std::collections::HashMap<K, V>,
+    now: &'a std::collections::HashMap<K, V>,
+) -> impl Iterator<Item = &'a K>
+where
+    K: Eq + std::hash::Hash,
+    V: PartialEq,
+{
+    was.iter()
+        .filter(move |(key, value)| now.get(key).is_none_or(|current| current != *value))
+        .map(|(key, _)| key)
 }
 
 /// The thin async wrapper: `plan`, then `config::persist` the planned
@@ -773,28 +1036,20 @@ pub(crate) async fn apply(
     Ok(outcome)
 }
 
-/// `tartarus-dual-stage-keys` ticket 06's "Cascade-delete": `ClearBinding`
-/// removing `input`'s primary Binding on `layer` orphans any deep Binding it
-/// carried there — a deep Binding can never exist without a matching primary
-/// (`ConfigError::DeepStageWithoutPrimary`), so the removal would otherwise
-/// be rejected outright by the trailing `config::validate`. Drops the deep
-/// Binding and pushes `Effect::StopStage(input)` so a live slot
-/// force-releases immediately rather than waiting for a next Up that may
-/// never come. `deep_stages` (the Actuation/mode config) is left untouched —
-/// legal and inert with no matching `deep_base`/`deep_held` entry.
-fn cascade_orphaned_deep_stage(
-    next: &mut Config,
-    layer: Layer,
-    input: Input,
-    effects: &mut Vec<Effect>,
-) {
-    if active_profile_mut(next)
+/// `tartarus-dual-stage-keys` ticket 06's "Cascade-delete": `ClearBinding` /
+/// `SetAxisAssignment` removing `input`'s primary Binding on `layer` orphans
+/// any deep Binding it carried there — a deep Binding can never exist without
+/// a matching primary (`ConfigError::DeepStageWithoutPrimary`), so the removal
+/// would otherwise be rejected outright by the trailing `config::validate`.
+/// Drops the deep Binding from `next` and nothing else — the
+/// `Effect::StopStage(input)` for a live deep slot the drop orphans falls out
+/// of the `deep_*` diff in `reconcile_teardowns` (ADR-0011). `deep_stages`
+/// (the Actuation/mode config) is left untouched — legal and inert with no
+/// matching `deep_base`/`deep_held` entry.
+fn drop_orphaned_deep_binding(next: &mut Config, layer: Layer, input: Input) {
+    active_profile_mut(next)
         .deep_layer_mut(layer)
-        .remove(&input)
-        .is_some()
-    {
-        effects.push(Effect::StopStage(input));
-    }
+        .remove(&input);
 }
 
 /// The `Default` Profile always exists — `load_or_seed` refuses to start a
@@ -1094,9 +1349,12 @@ mod tests {
                 .contains_key(&Input::Grid(1, 1)),
             "the deep Binding must survive an overwrite of its primary"
         );
-        assert!(
-            outcome.effects.is_empty(),
-            "no teardown on a mere overwrite"
+        // The deep stage is *kept* (no `StopStage`), but the changed primary
+        // still releases a live individual Toggle on the key (ticket 22 B10).
+        assert_eq!(
+            outcome.effects,
+            vec![Effect::StopToggle(Input::Grid(1, 1))],
+            "a changed overwrite releases the individual Toggle but keeps the deep stage"
         );
     }
 
@@ -1108,7 +1366,7 @@ mod tests {
             .base
             .insert(Input::Grid(1, 1), step("wep", StepDirection::Forward));
 
-        let (next, _) = plan_ok(
+        let (next, outcome) = plan_ok(
             &config,
             Edit::SetBinding {
                 input: Input::Grid(2, 2),
@@ -1119,6 +1377,11 @@ mod tests {
         let base = &next.profiles[DEFAULT_PROFILE_NAME].base;
         assert!(!base.contains_key(&Input::Grid(1, 1)), "old owner cleared");
         assert!(base.contains_key(&Input::Grid(2, 2)), "new owner set");
+        // The steal drops the old owner's `base` entry, so `reconcile_teardowns`
+        // emits a `StopToggle` for it (ADR-0011: a structural consequence of the
+        // map mutation — inert, since a `Step` Action is `FireOnce` and can hold
+        // no live Toggle).
+        assert_eq!(outcome.effects, vec![Effect::StopToggle(Input::Grid(1, 1))]);
     }
 
     #[test]
@@ -1243,7 +1506,15 @@ mod tests {
             "the orphaned deep Binding must be cascaded away"
         );
         assert!(!next.profiles[DEFAULT_PROFILE_NAME].deep_stages.is_empty());
-        assert_eq!(outcome.effects, vec![Effect::StopStage(Input::Grid(1, 1))]);
+        // `StopToggle` (ticket 22 — one rule across every primary-removing
+        // arm) then the deep-stage cascade's `StopStage`.
+        assert_eq!(
+            outcome.effects,
+            vec![
+                Effect::StopToggle(Input::Grid(1, 1)),
+                Effect::StopStage(Input::Grid(1, 1)),
+            ]
+        );
     }
 
     #[test]
@@ -1292,7 +1563,7 @@ mod tests {
     }
 
     #[test]
-    fn set_mode_key_role_flips_the_field_and_emits_stop_toggle_only_for_layer_switch() {
+    fn set_mode_key_role_flips_the_field_and_emits_stop_toggle_only_on_bound_to_layer_switch() {
         let mut config = seed();
         active(&mut config).mode_key_role = crate::config::ModeKeyRole::Bound;
         // A Held-layer binding retained while `Bound` makes it unreachable
@@ -1319,6 +1590,7 @@ mod tests {
         );
         assert_eq!(outcome.effects, vec![Effect::StopToggle(Input::ModeKey)]);
 
+        // `LayerSwitch → Bound` pushes nothing.
         let (_, outcome) = plan_ok(
             &seed(),
             Edit::SetModeKeyRole {
@@ -1326,6 +1598,20 @@ mod tests {
             },
         );
         assert!(outcome.effects.is_empty());
+
+        // Delta 2 (ticket 25): a `LayerSwitch → LayerSwitch` re-apply is a
+        // config no-op and now pushes nothing — the old per-arm `if role ==
+        // LayerSwitch` guard pushed a harmless `StopToggle(ModeKey)` here.
+        let (_, outcome) = plan_ok(
+            &seed(),
+            Edit::SetModeKeyRole {
+                role: crate::config::ModeKeyRole::LayerSwitch,
+            },
+        );
+        assert!(
+            outcome.effects.is_empty(),
+            "a LayerSwitch → LayerSwitch re-apply orphans nothing"
+        );
     }
 
     #[test]
@@ -1410,15 +1696,16 @@ mod tests {
             },
         );
         assert_eq!(next.active_profile, "Gaming");
+        // The five former teardown effects collapsed into one
+        // `TearDown(ProfileSwitch)` (ticket 19); its fan-out order is asserted
+        // in `dispatch`'s `tear_down` matrix tests. `RepublishActuation` now
+        // trails the teardown rather than sitting mid-chain — a
+        // behaviour-neutral move.
         assert_eq!(
             outcome.effects,
             vec![
-                Effect::StopAllToggles,
-                Effect::ReleaseAllHolds,
+                Effect::TearDown(TeardownReason::ProfileSwitch),
                 Effect::RepublishActuation,
-                Effect::ResetAxisOutputs,
-                Effect::StopAllAnalogRepeats,
-                Effect::StopAllStages,
                 Effect::AssertStatusLeds,
                 Effect::AnnounceProfileChange("Gaming".to_string()),
             ]
@@ -1651,6 +1938,178 @@ mod tests {
         );
     }
 
+    fn toggle_keypress(key: KeyCode) -> Binding {
+        Binding {
+            trigger: TriggerMode::Toggle,
+            action: Action::Keypress {
+                modifiers: Modifiers::default(),
+                key,
+            },
+        }
+    }
+
+    #[test]
+    fn clear_chord_binding_pushes_stop_chord_after_a_successful_remove() {
+        // Ticket 22 B11: a live Chord Toggle / firing on this key becomes
+        // unstoppable the moment its key leaves `chords(layer)` — the remove
+        // must push the force-release, unconditionally (mirroring
+        // `ClearDeepStage` → `StopStage`).
+        let members = [Input::Grid(1, 1), Input::Grid(1, 2)];
+        let mut config = seed();
+        active(&mut config)
+            .chords_base
+            .insert(ChordKey::new(chord(members)), keypress());
+        let key = ChordKey::new(chord(members));
+
+        let (_, outcome) = plan_ok(
+            &config,
+            Edit::ClearChordBinding {
+                inputs: chord(members),
+                layer: Layer::Base,
+            },
+        );
+        assert_eq!(outcome.effects, vec![Effect::StopChord(key)]);
+    }
+
+    #[test]
+    fn set_chord_binding_replacing_a_differing_binding_pushes_stop_chord_an_identical_re_save_does_not()
+     {
+        let members = [Input::Grid(1, 1), Input::Grid(1, 2)];
+        let key = ChordKey::new(chord(members));
+        let mut config = seed();
+        active(&mut config)
+            .chords_base
+            .insert(key.clone(), keypress());
+
+        // A replacement that changes the Action → `StopChord`.
+        let (_, outcome) = plan_ok(
+            &config,
+            Edit::SetChordBinding {
+                inputs: chord(members),
+                layer: Layer::Base,
+                binding: toggle_keypress(KeyCode::KEY_B),
+            },
+        );
+        assert_eq!(outcome.effects, vec![Effect::StopChord(key)]);
+
+        // A byte-identical re-Save (the GUI does this) → nothing.
+        let (_, outcome) = plan_ok(
+            &config,
+            Edit::SetChordBinding {
+                inputs: chord(members),
+                layer: Layer::Base,
+                binding: keypress(),
+            },
+        );
+        assert!(
+            outcome.effects.is_empty(),
+            "an identical re-Save must not drop a live Chord Toggle"
+        );
+    }
+
+    #[test]
+    fn set_binding_replacing_a_differing_binding_pushes_stop_toggle_a_fresh_bind_or_re_save_does_not()
+     {
+        let mut config = seed();
+        active(&mut config)
+            .base
+            .insert(Input::Grid(1, 1), keypress());
+
+        // A replacement that changes the Action → `StopToggle` (ticket 22 B10).
+        let (_, outcome) = plan_ok(
+            &config,
+            Edit::SetBinding {
+                input: Input::Grid(1, 1),
+                layer: Layer::Base,
+                binding: toggle_keypress(KeyCode::KEY_B),
+            },
+        );
+        assert_eq!(outcome.effects, vec![Effect::StopToggle(Input::Grid(1, 1))]);
+
+        // A byte-identical re-Save → nothing.
+        let (_, outcome) = plan_ok(
+            &config,
+            Edit::SetBinding {
+                input: Input::Grid(1, 1),
+                layer: Layer::Base,
+                binding: keypress(),
+            },
+        );
+        assert!(
+            outcome.effects.is_empty(),
+            "an identical re-Save is a no-op"
+        );
+
+        // A fresh bind (nothing there before) → nothing.
+        let (_, outcome) = plan_ok(
+            &seed(),
+            Edit::SetBinding {
+                input: Input::Grid(2, 2),
+                layer: Layer::Base,
+                binding: keypress(),
+            },
+        );
+        assert!(
+            outcome.effects.is_empty(),
+            "a fresh bind has no live slot to orphan"
+        );
+    }
+
+    #[test]
+    fn set_axis_assignment_over_a_key_that_had_binding_chord_membership_and_a_deep_stage() {
+        // Ticket 22 B9: the axis reassignment atomically clears the primary
+        // Binding, the deep stage it carried, and every Chord membership —
+        // each orphaning live runtime state `config::validate` won't flag.
+        // `plan` pushes the matching teardown effect for all three, then the
+        // recompute. (The starting state — a Chord member that also carries a
+        // deep stage — isn't edit-reachable, but `plan` never validates its
+        // *input*, only the result.)
+        let members = [Input::Grid(1, 1), Input::Grid(1, 2)];
+        let key = ChordKey::new(chord(members));
+        let mut config = seed();
+        active(&mut config)
+            .base
+            .insert(Input::Grid(1, 1), keypress());
+        active(&mut config)
+            .deep_base
+            .insert(Input::Grid(1, 1), keypress());
+        active(&mut config).deep_stages.insert(
+            Input::Grid(1, 1),
+            crate::config::DeepStageConfig {
+                actuation: ActuationPoint {
+                    actuation: 220,
+                    release: 200,
+                },
+                mode: StagingMode::Handoff,
+            },
+        );
+        active(&mut config)
+            .chords_base
+            .insert(key.clone(), keypress());
+
+        let (next, outcome) = plan_ok(
+            &config,
+            Edit::SetAxisAssignment {
+                input: Input::Grid(1, 1),
+                layer: Layer::Base,
+                target: AxisTarget::LeftTrigger,
+            },
+        );
+        let profile = &next.profiles[DEFAULT_PROFILE_NAME];
+        assert!(!profile.base.contains_key(&Input::Grid(1, 1)));
+        assert!(!profile.deep_base.contains_key(&Input::Grid(1, 1)));
+        assert!(profile.chords_base.is_empty());
+        assert_eq!(
+            outcome.effects,
+            vec![
+                Effect::StopToggle(Input::Grid(1, 1)),
+                Effect::StopStage(Input::Grid(1, 1)),
+                Effect::StopChord(key),
+                Effect::RecomputeAxes { layer: Layer::Base },
+            ]
+        );
+    }
+
     #[test]
     fn set_axis_assignment_clears_a_colliding_binding_and_asks_for_a_recompute() {
         let mut config = seed();
@@ -1672,9 +2131,14 @@ mod tests {
             profile.axis_base[&Input::Grid(1, 1)],
             AxisTarget::LeftTrigger
         );
+        // The removed primary Binding also releases a live individual Toggle
+        // on the key (ticket 22 B9), ahead of the recompute.
         assert_eq!(
             outcome.effects,
-            vec![Effect::RecomputeAxes { layer: Layer::Base }]
+            vec![
+                Effect::StopToggle(Input::Grid(1, 1)),
+                Effect::RecomputeAxes { layer: Layer::Base },
+            ]
         );
     }
 
@@ -1746,7 +2210,42 @@ mod tests {
             next.profiles[DEFAULT_PROFILE_NAME].deep_base[&Input::Grid(1, 1)],
             keypress()
         );
-        assert!(outcome.effects.is_empty());
+        assert!(
+            outcome.effects.is_empty(),
+            "a fresh deep bind has no live slot to orphan"
+        );
+
+        // Delta 1 (ticket 25): replacing an *existing* deep Binding with one
+        // that differs force-releases a live deep slot on that key — matching
+        // `SetBinding`-replace → `StopToggle` and `SetChordBinding`-replace →
+        // `StopChord`. The old bare `.insert` arm pushed nothing.
+        let mut with_deep = with_primary_and_deep_stage(Input::Grid(1, 1));
+        active(&mut with_deep)
+            .deep_base
+            .insert(Input::Grid(1, 1), keypress());
+        let (_, outcome) = plan_ok(
+            &with_deep,
+            Edit::SetDeepStage {
+                input: Input::Grid(1, 1),
+                layer: Layer::Base,
+                binding: toggle_keypress(KeyCode::KEY_B),
+            },
+        );
+        assert_eq!(outcome.effects, vec![Effect::StopStage(Input::Grid(1, 1))]);
+
+        // A byte-identical re-Save of the same deep Binding → nothing.
+        let (_, outcome) = plan_ok(
+            &with_deep,
+            Edit::SetDeepStage {
+                input: Input::Grid(1, 1),
+                layer: Layer::Base,
+                binding: keypress(),
+            },
+        );
+        assert!(
+            outcome.effects.is_empty(),
+            "an identical deep re-Save must not drop a live deep slot"
+        );
 
         // No inline "needs a primary" check in `plan` itself — `validate`
         // alone rejects this (`DeepStageWithoutPrimary`/`DeepStageMissingConfig`).
@@ -1789,6 +2288,30 @@ mod tests {
             ),
             CommandError::NotFound
         ));
+    }
+
+    #[test]
+    fn clear_deep_stage_pushes_stop_stage_to_force_release_a_live_deep_slot() {
+        // Ticket 18: mirrors `clear_binding_removing_a_primary_with_a_live_
+        // deep_binding_cascades_it_away` — removing the deep Binding directly
+        // orphans a live deep firing the same way the primary cascade does, so
+        // it must force-release the slot rather than leave it stuck.
+        let mut config = with_primary_and_deep_stage(Input::Grid(1, 1));
+        active(&mut config)
+            .deep_base
+            .insert(Input::Grid(1, 1), keypress());
+
+        let (next, outcome) = plan_ok(
+            &config,
+            Edit::ClearDeepStage {
+                input: Input::Grid(1, 1),
+                layer: Layer::Base,
+            },
+        );
+        assert!(next.profiles[DEFAULT_PROFILE_NAME].deep_base.is_empty());
+        // `deep_stages` (Actuation/mode config) is left behind, inert.
+        assert!(!next.profiles[DEFAULT_PROFILE_NAME].deep_stages.is_empty());
+        assert_eq!(outcome.effects, vec![Effect::StopStage(Input::Grid(1, 1))]);
     }
 
     #[test]
@@ -1873,7 +2396,321 @@ mod tests {
             next.profiles[DEFAULT_PROFILE_NAME].deep_stages[&Input::Grid(1, 1)].mode,
             StagingMode::QuickSkip
         );
-        assert!(outcome.effects.is_empty());
+        // Ticket 23 B7: a mode flip can strand Quick-Skip's phase machine, so
+        // `SetStagingMode` force-releases the live deep slot.
+        assert_eq!(outcome.effects, vec![Effect::StopStage(Input::Grid(1, 1))]);
+    }
+
+    #[test]
+    fn set_staging_mode_pushes_stop_stage_even_on_an_existing_entry() {
+        // Ticket 23 B7: the force-release is unconditional — pushed whether or
+        // not a `DeepStageConfig` already existed, mirroring `ClearDeepStage`.
+        let mut config = seed();
+        active(&mut config).deep_stages.insert(
+            Input::Grid(1, 1),
+            crate::config::DeepStageConfig {
+                actuation: ActuationPoint {
+                    actuation: 220,
+                    release: 200,
+                },
+                mode: StagingMode::Handoff,
+            },
+        );
+
+        let (next, outcome) = plan_ok(
+            &config,
+            Edit::SetStagingMode {
+                input: Input::Grid(1, 1),
+                mode: StagingMode::QuickSkip,
+            },
+        );
+        assert_eq!(
+            next.profiles[DEFAULT_PROFILE_NAME].deep_stages[&Input::Grid(1, 1)].mode,
+            StagingMode::QuickSkip
+        );
+        assert_eq!(outcome.effects, vec![Effect::StopStage(Input::Grid(1, 1))]);
+    }
+
+    #[test]
+    fn set_staging_mode_to_the_same_mode_pushes_no_effect() {
+        // Ticket 23 `/code-review`: an idempotent re-apply is a config no-op
+        // and must not force-release a deep firing the user is holding.
+        let mut config = seed();
+        active(&mut config).deep_stages.insert(
+            Input::Grid(1, 1),
+            crate::config::DeepStageConfig {
+                actuation: ActuationPoint {
+                    actuation: 220,
+                    release: 200,
+                },
+                mode: StagingMode::NoReturn,
+            },
+        );
+
+        let (_next, outcome) = plan_ok(
+            &config,
+            Edit::SetStagingMode {
+                input: Input::Grid(1, 1),
+                mode: StagingMode::NoReturn,
+            },
+        );
+        assert!(
+            outcome.effects.is_empty(),
+            "same-mode re-apply is a no-op — no StopStage"
+        );
+    }
+
+    // --- `reconcile_teardowns` truth table (ticket 25 / ADR-0011) ------------
+
+    #[test]
+    fn reconcile_teardowns_covers_every_matrix_row_both_deltas_and_the_negatives() {
+        use crate::config::{DeepStageConfig, ModeKeyRole};
+
+        let g11 = Input::Grid(1, 1);
+        let g22 = Input::Grid(2, 2);
+        let ckey = || ChordKey::new(chord([Input::Grid(1, 1), Input::Grid(1, 2)]));
+        let deep = |mode| DeepStageConfig {
+            actuation: ActuationPoint {
+                actuation: 220,
+                release: 200,
+            },
+            mode,
+        };
+
+        // Each row: seed the "before" active Profile, then mutate a clone for
+        // "after"; `reconcile_teardowns` must derive exactly `expect`.
+        let check = |name: &str,
+                     before: &dyn Fn(&mut Profile),
+                     after: &dyn Fn(&mut Profile),
+                     expect: Vec<Effect>| {
+            let mut b = seed();
+            before(active(&mut b));
+            let mut a = b.clone();
+            after(active(&mut a));
+            assert_eq!(reconcile_teardowns(&b, &a), expect, "{name}");
+        };
+
+        // base / held primary Binding → StopToggle
+        check(
+            "base binding removed",
+            &|p| {
+                p.base.insert(g11, keypress());
+            },
+            &|p| {
+                p.base.remove(&g11);
+            },
+            vec![Effect::StopToggle(g11)],
+        );
+        check(
+            "base binding changed",
+            &|p| {
+                p.base.insert(g11, keypress());
+            },
+            &|p| {
+                p.base.insert(g11, toggle_keypress(KeyCode::KEY_B));
+            },
+            vec![Effect::StopToggle(g11)],
+        );
+        check(
+            "base binding present and byte-equal → nothing",
+            &|p| {
+                p.base.insert(g11, keypress());
+            },
+            &|_| {},
+            vec![],
+        );
+        check(
+            "held binding removed",
+            &|p| {
+                p.held.insert(g11, keypress());
+            },
+            &|p| {
+                p.held.remove(&g11);
+            },
+            vec![Effect::StopToggle(g11)],
+        );
+        check(
+            "fresh base bind orphans nothing",
+            &|_| {},
+            &|p| {
+                p.base.insert(g11, keypress());
+            },
+            vec![],
+        );
+
+        // deep_base / deep_held deep Binding → StopStage (delta 1: "or differs")
+        check(
+            "deep binding removed",
+            &|p| {
+                p.base.insert(g11, keypress());
+                p.deep_base.insert(g11, keypress());
+                p.deep_stages.insert(g11, deep(StagingMode::Handoff));
+            },
+            &|p| {
+                p.deep_base.remove(&g11);
+            },
+            vec![Effect::StopStage(g11)],
+        );
+        check(
+            "deep binding changed (delta 1)",
+            &|p| {
+                p.base.insert(g11, keypress());
+                p.deep_base.insert(g11, keypress());
+                p.deep_stages.insert(g11, deep(StagingMode::Handoff));
+            },
+            &|p| {
+                p.deep_base.insert(g11, toggle_keypress(KeyCode::KEY_B));
+            },
+            vec![Effect::StopStage(g11)],
+        );
+        check(
+            "deep binding byte-equal → nothing",
+            &|p| {
+                p.base.insert(g11, keypress());
+                p.deep_base.insert(g11, keypress());
+                p.deep_stages.insert(g11, deep(StagingMode::Handoff));
+            },
+            &|_| {},
+            vec![],
+        );
+
+        // chords_base / chords_held Chord Binding → StopChord
+        check(
+            "chord binding removed",
+            &|p| {
+                p.chords_base.insert(ckey(), keypress());
+            },
+            &|p| {
+                p.chords_base.remove(&ckey());
+            },
+            vec![Effect::StopChord(ckey())],
+        );
+        check(
+            "chord binding changed",
+            &|p| {
+                p.chords_base.insert(ckey(), keypress());
+            },
+            &|p| {
+                p.chords_base
+                    .insert(ckey(), toggle_keypress(KeyCode::KEY_B));
+            },
+            vec![Effect::StopChord(ckey())],
+        );
+        check(
+            "chord binding byte-equal → nothing",
+            &|p| {
+                p.chords_base.insert(ckey(), keypress());
+            },
+            &|_| {},
+            vec![],
+        );
+
+        // deep_stages.mode → StopStage; actuation-only → nothing
+        check(
+            "staging mode changed",
+            &|p| {
+                p.deep_stages.insert(g11, deep(StagingMode::Handoff));
+            },
+            &|p| {
+                p.deep_stages.insert(g11, deep(StagingMode::QuickSkip));
+            },
+            vec![Effect::StopStage(g11)],
+        );
+        check(
+            "deep_stages actuation-only change → nothing",
+            &|p| {
+                p.deep_stages.insert(g11, deep(StagingMode::Handoff));
+            },
+            &|p| {
+                p.deep_stages.insert(
+                    g11,
+                    DeepStageConfig {
+                        actuation: ActuationPoint {
+                            actuation: 210,
+                            release: 190,
+                        },
+                        mode: StagingMode::Handoff,
+                    },
+                );
+            },
+            vec![],
+        );
+        check(
+            "fresh deep_stages entry with a non-default mode counts as a change",
+            &|_| {},
+            &|p| {
+                p.deep_stages.insert(g11, deep(StagingMode::QuickSkip));
+            },
+            vec![Effect::StopStage(g11)],
+        );
+
+        // mode_key_role → StopToggle(ModeKey), only Bound → LayerSwitch (delta 2)
+        check(
+            "mode_key_role Bound → LayerSwitch",
+            &|p| p.mode_key_role = ModeKeyRole::Bound,
+            &|p| p.mode_key_role = ModeKeyRole::LayerSwitch,
+            vec![Effect::StopToggle(Input::ModeKey)],
+        );
+        check(
+            "mode_key_role LayerSwitch → LayerSwitch → nothing (delta 2)",
+            &|p| p.mode_key_role = ModeKeyRole::LayerSwitch,
+            &|_| {},
+            vec![],
+        );
+        check(
+            "mode_key_role LayerSwitch → Bound → nothing",
+            &|p| p.mode_key_role = ModeKeyRole::LayerSwitch,
+            &|p| p.mode_key_role = ModeKeyRole::Bound,
+            vec![],
+        );
+
+        // Output contract: fixed type order, keys sorted within a type.
+        check(
+            "type order StopToggle → StopStage → StopChord, keys sorted",
+            &|p| {
+                p.base.insert(g22, keypress());
+                p.base.insert(g11, keypress());
+                p.deep_base.insert(g11, keypress());
+                p.deep_stages.insert(g11, deep(StagingMode::Handoff));
+                p.chords_base.insert(ckey(), keypress());
+                p.mode_key_role = ModeKeyRole::Bound;
+            },
+            &|p| {
+                p.base.remove(&g11);
+                p.base.remove(&g22);
+                p.deep_base.remove(&g11);
+                p.chords_base.remove(&ckey());
+                p.mode_key_role = ModeKeyRole::LayerSwitch;
+            },
+            vec![
+                Effect::StopToggle(Input::ModeKey),
+                Effect::StopToggle(g11),
+                Effect::StopToggle(g22),
+                Effect::StopStage(g11),
+                Effect::StopChord(ckey()),
+            ],
+        );
+
+        // Negatives that need a whole-Config diff, not a Profile one.
+        let mut two = seed();
+        two.profiles
+            .insert("Gaming".to_string(), Profile::default());
+        active(&mut two).base.insert(g11, keypress());
+        let mut switched = two.clone();
+        switched.active_profile = "Gaming".to_string();
+        assert!(
+            reconcile_teardowns(&two, &switched).is_empty(),
+            "an active-Profile change bails — SwitchProfile owns TearDown(ProfileSwitch)"
+        );
+
+        let mut renamed = two.clone();
+        let p = renamed.profiles.remove(DEFAULT_PROFILE_NAME).unwrap();
+        renamed.profiles.insert("Renamed".to_string(), p);
+        renamed.active_profile = "Renamed".to_string();
+        assert!(
+            reconcile_teardowns(&two, &renamed).is_empty(),
+            "an active-Profile rename bails too"
+        );
     }
 
     // --- preconditions and invariants, one row each ---------------------------

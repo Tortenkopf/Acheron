@@ -46,7 +46,10 @@ struct ChordWindow {
 }
 
 /// The Chord-detection state machine's own state — pure bookkeeping only.
-/// Reset fresh on every dispatch task start, same as the old `ChordState`.
+/// Reset fresh on every dispatch task start, same as the old `ChordState`,
+/// and on every lifecycle transition (Layer / Profile switch, disconnect,
+/// Digital flip) via `reset()` — the lifecycle-teardown entry point
+/// (`post-release-development` ticket 21, `DispatchState::tear_down`).
 /// The `ChordKey`-keyed firing/toggle *handles* are NOT here — they live in
 /// `DispatchState`'s `chord_slots: trigger::Slots<ChordKey>` and their liveness
 /// is passed into every `feed` call as a `trigger::Slot` snapshot
@@ -63,6 +66,19 @@ pub(crate) struct ChordMachine {
     /// don't fall back to their individual Bindings until they're released
     /// and re-pressed fresh").
     claimed: HashSet<Input>,
+}
+
+impl ChordMachine {
+    /// Drops any open simultaneity window and every claimed Input — a
+    /// lifecycle transition (Layer / Profile switch, disconnect, Digital
+    /// flip) is a clean-slate event, same as every other engine's teardown
+    /// (`DispatchState::tear_down`, `post-release-development` ticket 21).
+    /// Pending members do NOT retroactively fire the way a window timeout
+    /// (`tick`) makes them: the press context they belonged to is gone.
+    pub(crate) fn reset(&mut self) {
+        self.window = None;
+        self.claimed.clear();
+    }
 }
 
 /// A post-decision effect the `dispatch` executor must perform. Ordering
@@ -426,6 +442,37 @@ mod tests {
         let effects = handled(feed(&mut machine, &chords, &HashMap::new(), down(G11)));
         assert!(effects.is_empty());
         assert!(next_deadline(&machine).is_some());
+    }
+
+    #[test]
+    fn reset_drops_an_open_window_and_every_claimed_member() {
+        // Two members of a three-member Chord down: window open, both
+        // claimed, nothing fired — the shape a lifecycle switch can catch
+        // mid-simultaneity-window (post-release-development ticket 21, A4).
+        let mut machine = ChordMachine::default();
+        let chords = HashMap::from([(chord([G11, G12, G13]), fire_once(KeyCode::KEY_C))]);
+        handled(feed(&mut machine, &chords, &HashMap::new(), down(G11)));
+        handled(feed(&mut machine, &chords, &HashMap::new(), down(G12)));
+        assert!(
+            next_deadline(&machine).is_some(),
+            "window open before reset"
+        );
+
+        machine.reset();
+
+        assert_eq!(
+            next_deadline(&machine),
+            None,
+            "reset drops the window — no deadline for the `run` loop to arm on"
+        );
+        // A formerly-claimed member's later Up is no longer the machine's —
+        // it falls through to ordinary Binding lookup, and the pending
+        // member does NOT retroactively fire its individual Binding the way
+        // a window timeout (`tick`) would.
+        assert_eq!(
+            feed(&mut machine, &chords, &HashMap::new(), up(G11)),
+            ChordOutcome::NotMine
+        );
     }
 
     #[test]

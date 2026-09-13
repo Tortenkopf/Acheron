@@ -27,7 +27,7 @@ An assignment from one Input to an Action, scoped to a specific Profile and Laye
 _Avoid_: mapping, keybind (as a bare synonym — "keybind" refers to a Binding whose Action is a Keypress)
 
 **Action**:
-What a Binding produces when triggered — a Keypress, a Macro, a Stepper step, a Switch Profile, or a Controller button press.
+What a Binding produces when triggered — a Keypress, a Macro, a Stepper step, a Switch Profile, or a Controller button press. The GUI builds each kind's Trigger/Action editor fields through a per-kind widget-builder table, `binding_editor._ACTION_EDITORS` (post-release ticket 31), the same locus-of-per-variant-behavior shape the Library entry's own `LibraryKind` already names.
 _Avoid_: output, effect
 
 **Keypress**:
