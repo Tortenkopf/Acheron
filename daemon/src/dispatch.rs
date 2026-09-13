@@ -5736,7 +5736,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tear_down_disconnect_centres_axis_stops_analog_drains_every_firing_and_keeps_toggles() {
+    async fn tear_down_disconnect_centres_axis_stops_analog_drains_every_firing_and_keeps_toggles()
+    {
         let (_depth_tx, depth_rx) = watch::channel(HashMap::new());
         let mut seam = Seam::new(matrix_config());
         seed_every_teardown_participant(&mut seam, &depth_rx).await;
@@ -8087,7 +8088,10 @@ mod tests {
                 .filter(|(c, _)| *c == evdev::KeyCode::KEY_A)
                 .count()
         };
-        assert!(key_a_taps(&harness) > 0, "the primary taps before the hand-off");
+        assert!(
+            key_a_taps(&harness) > 0,
+            "the primary taps before the hand-off"
+        );
 
         // Hand off into the deep band.
         harness.push_depth([(Input::Grid(1, 1), 250)]);

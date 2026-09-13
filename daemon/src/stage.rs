@@ -588,11 +588,10 @@ impl Engine {
                     // band has its primary handed to the deep stage — and if
                     // the deep band was left in the gap before this tick, the
                     // primary is no longer handed off (ticket 24).
-                    rt.primary_handed_off = matches!(
-                        deep_cfg.mode,
-                        StagingMode::Handoff | StagingMode::NoReturn
-                    ) && new_primary == KeyState::Down
-                        && new_deep == KeyState::Down;
+                    rt.primary_handed_off =
+                        matches!(deep_cfg.mode, StagingMode::Handoff | StagingMode::NoReturn)
+                            && new_primary == KeyState::Down
+                            && new_deep == KeyState::Down;
                     if new_deep == KeyState::Up {
                         rt.deep_repeat_suppressed = false;
                     }
@@ -2327,7 +2326,10 @@ mod tests {
             .update(fx.deps(&config), &HashMap::from([(KEY, 250u8)]))
             .await
             .unwrap();
-        assert!(engine.primary_handed_off(KEY), "re-confirmed by the re-adoption");
+        assert!(
+            engine.primary_handed_off(KEY),
+            "re-confirmed by the re-adoption"
+        );
         engine
             .update(fx.deps(&config), &HashMap::from([(KEY, 150u8)]))
             .await

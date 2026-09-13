@@ -453,7 +453,10 @@ mod tests {
         let chords = HashMap::from([(chord([G11, G12, G13]), fire_once(KeyCode::KEY_C))]);
         handled(feed(&mut machine, &chords, &HashMap::new(), down(G11)));
         handled(feed(&mut machine, &chords, &HashMap::new(), down(G12)));
-        assert!(next_deadline(&machine).is_some(), "window open before reset");
+        assert!(
+            next_deadline(&machine).is_some(),
+            "window open before reset"
+        );
 
         machine.reset();
 

@@ -2008,9 +2008,12 @@ mod tests {
     }
 
     #[test]
-    fn set_binding_replacing_a_differing_binding_pushes_stop_toggle_a_fresh_bind_or_re_save_does_not() {
+    fn set_binding_replacing_a_differing_binding_pushes_stop_toggle_a_fresh_bind_or_re_save_does_not()
+     {
         let mut config = seed();
-        active(&mut config).base.insert(Input::Grid(1, 1), keypress());
+        active(&mut config)
+            .base
+            .insert(Input::Grid(1, 1), keypress());
 
         // A replacement that changes the Action → `StopToggle` (ticket 22 B10).
         let (_, outcome) = plan_ok(
@@ -2032,7 +2035,10 @@ mod tests {
                 binding: keypress(),
             },
         );
-        assert!(outcome.effects.is_empty(), "an identical re-Save is a no-op");
+        assert!(
+            outcome.effects.is_empty(),
+            "an identical re-Save is a no-op"
+        );
 
         // A fresh bind (nothing there before) → nothing.
         let (_, outcome) = plan_ok(
@@ -2061,7 +2067,9 @@ mod tests {
         let members = [Input::Grid(1, 1), Input::Grid(1, 2)];
         let key = ChordKey::new(chord(members));
         let mut config = seed();
-        active(&mut config).base.insert(Input::Grid(1, 1), keypress());
+        active(&mut config)
+            .base
+            .insert(Input::Grid(1, 1), keypress());
         active(&mut config)
             .deep_base
             .insert(Input::Grid(1, 1), keypress());
