@@ -39,7 +39,7 @@ pub(crate) enum BindingSite {
 ///
 ///   1. action-payload — `ControllerButton { button }` must be a gamepad code
 ///   2. trigger legality — ProfileSwitch⇒FireOnce, ControllerButton≠FireOnce,
-///      Step≠Toggle
+///      Step≠Toggle/AnalogRepeat
 ///   3. site-shape — AnalogRepeat needs `Individual(Grid)` and cannot wrap a
 ///      Macro Action; a `Chord` Binding may be neither ProfileSwitch nor
 ///      analog-repeat
@@ -59,7 +59,12 @@ pub(crate) fn check_binding(site: BindingSite, binding: &Binding) -> Result<(), 
         Action::ControllerButton { .. } if binding.trigger == TriggerMode::FireOnce => {
             return Err(ConfigError::InvalidControllerButtonTrigger);
         }
-        Action::Step { .. } if binding.trigger == TriggerMode::Toggle => {
+        Action::Step { .. }
+            if matches!(
+                binding.trigger,
+                TriggerMode::Toggle | TriggerMode::AnalogRepeat
+            ) =>
+        {
             return Err(ConfigError::InvalidStepTrigger);
         }
         _ => {}
@@ -184,7 +189,7 @@ mod tests {
         if kind == "controller_button" && trigger == TriggerMode::FireOnce {
             return Some(ConfigError::InvalidControllerButtonTrigger);
         }
-        if kind == "step" && trigger == TriggerMode::Toggle {
+        if kind == "step" && matches!(trigger, TriggerMode::Toggle | TriggerMode::AnalogRepeat) {
             return Some(ConfigError::InvalidStepTrigger);
         }
         // 3. site-shape

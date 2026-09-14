@@ -679,8 +679,12 @@ pub enum Action {
     /// rather than carrying item content directly, same reference-not-inline
     /// shape as `Action::Macro`. Validated (`SetBinding` and `load_or_seed`,
     /// via `parse`'s `UnknownStepper`/`InvalidStepTrigger` checks) to name a
-    /// real `StepperId` and to never pair with `TriggerMode::Toggle` — a
-    /// cursor advance has no coherent continuously-running state.
+    /// real `StepperId` and to never pair with `TriggerMode::Toggle` (a
+    /// cursor advance has no coherent continuously-running state) or
+    /// `TriggerMode::AnalogRepeat` (`analog_repeat::Engine` replays one fixed
+    /// pre-compiled firing at the Depth-driven tick rate rather than
+    /// re-running `compile_action` per tick, so it can't re-consume the
+    /// runtime cursor each step).
     Step {
         stepper: StepperId,
         direction: StepDirection,
@@ -943,6 +947,18 @@ pub enum ConfigError {
     InvalidControllerButtonStepperItem(String),
     UnknownMacro(String),
     UnknownStepper(String),
+    /// A Step Binding carrying Toggle (no coherent continuously-running state
+    /// for a cursor advance the way there is for a held Keypress or a looping
+    /// Macro) or Analog-repeat. Analog-repeat hands `analog_repeat::Engine` one
+    /// fixed pre-compiled `Vec<MacroStep>` up front and replays it unchanged at
+    /// the Depth-driven tick rate (`analog_repeat.rs`'s module doc: "`dispatch`
+    /// calls `trigger::compile_action` and hands the engine pre-compiled
+    /// steps") — fine for a stateless Keypress/ControllerButton, but a Stepper
+    /// needs `compile_action` re-run per tick to re-consume the runtime
+    /// cursor, so it would just repeat whichever single item was next at the
+    /// first tick rather than actually stepping. Refused outright rather than
+    /// given (broken) semantics, the same call `AnalogRepeatMacro` made for a
+    /// multi-step Macro.
     InvalidStepTrigger,
     /// A Chord Binding (`chords_base`/`chords_held`) whose Action is
     /// `ProfileSwitch` (ticket 40) — refused because `executor::compile`
@@ -1119,7 +1135,9 @@ impl fmt::Display for ConfigError {
                 f,
                 "a Step Binding references stepper {stepper_id:?}, which is not in [steppers]"
             ),
-            ConfigError::InvalidStepTrigger => write!(f, "a Step Binding must not use toggle"),
+            ConfigError::InvalidStepTrigger => {
+                write!(f, "a Step Binding must not use toggle or analog_repeat")
+            }
             ConfigError::InvalidChordProfileSwitch => {
                 write!(f, "a Chord Binding's Action cannot be profile_switch")
             }
@@ -2559,6 +2577,35 @@ action = { type = "step", stepper = "weapon-wheel", direction = "forward" }
         fs::write(&path, original).unwrap();
 
         let err = load_or_seed(&path).expect_err("a Toggle Step Binding must refuse to start");
+        assert!(matches!(err, ConfigError::InvalidStepTrigger));
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    /// `analog_repeat::Engine` replays one fixed pre-compiled firing at the
+    /// Depth-driven tick rate rather than re-running `compile_action` per
+    /// tick, so an Analog-repeat Step Binding can't re-consume the runtime
+    /// cursor each step — it would just repeat whichever item was next at the
+    /// first tick. Refused outright, same as Toggle above.
+    #[test]
+    fn refuses_to_start_when_a_step_binding_is_analog_repeat() {
+        let (_dir, path) = temp_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"schema_version = 1
+active_profile = "Default"
+
+[steppers.weapon-wheel]
+name = "Weapon Wheel"
+items = [{ type = "key", key = "KEY_1" }]
+
+[profiles.Default.base.grid_r1c1]
+trigger = "analog_repeat"
+action = { type = "step", stepper = "weapon-wheel", direction = "forward" }
+"#;
+        fs::write(&path, original).unwrap();
+
+        let err =
+            load_or_seed(&path).expect_err("an Analog-repeat Step Binding must refuse to start");
         assert!(matches!(err, ConfigError::InvalidStepTrigger));
 
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
