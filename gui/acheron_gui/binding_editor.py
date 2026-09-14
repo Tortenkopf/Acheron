@@ -547,7 +547,7 @@ def _build_keypress_editor(
         draft.set_keypress_key(code)
 
     def key_warn_predicate() -> bool:
-        return trigger_options[trigger_dd.get_selected()][0] != "toggle"
+        return trigger_options[trigger_dd.get_selected()][0] not in ("toggle", "hold_to_repeat")
 
     key_picker, refresh_key_warning = build_inline_key_picker(
         draft.keypress["key"], on_key_changed, key_warn_predicate

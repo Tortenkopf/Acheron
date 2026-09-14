@@ -4507,14 +4507,16 @@ mod tests {
             .await
             .unwrap();
 
+        // Post-release ticket 12 follow-up: a single-key Stepper `Key` step
+        // under Hold-to-repeat now also splices `FIRE_ONCE_KEY_DWELL` between
+        // its edges (it's the one Hold-to-repeat shape that reaches
+        // `D::SpawnFireOnce` rather than the kernel-autorepeat arms), so the
+        // Down and the Repeat must be spaced past the dwell or the second one
+        // is dropped by `decide`'s ordinary same-key overlap guard.
         harness.press(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::sleep(executor::FIRE_ONCE_KEY_DWELL + Duration::from_millis(20)).await;
         harness.repeat(Input::Grid(1, 1)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::sleep(executor::FIRE_ONCE_KEY_DWELL + Duration::from_millis(20)).await;
 
         let state = harness.get_state().await;
         harness.shut_down().await;

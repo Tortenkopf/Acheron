@@ -502,12 +502,16 @@ def test_depth_track_set_live_value_updates_the_fill_and_tolerates_none():
 # --- Key/mouse-button picker (ticket 42) ---
 
 
-def test_modifier_warning_shows_for_fire_once_key_and_hides_for_toggle():
+def test_modifier_warning_shows_only_for_fire_once_and_analog_repeat():
+    # Hold-to-repeat and Toggle both compile a bare modifier to a genuine
+    # sustained hold (HoldKeyDown/RepeatKey and StartToggleAutorepeat
+    # respectively); only Fire-once/Analog-repeat collapse it to a single
+    # pulse, so only those two should carry the warning.
     stub = DaemonStub()
     editor = build_binding_editor(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
 
     _pick_first_modifier(editor, "Key")
-    assert _has_warning(editor)
+    assert not _has_warning(editor)  # default trigger is Hold-to-repeat
 
     trigger_dd = _dropdown_labeled(editor, "Trigger mode")
     trigger_dd.set_selected([k for k, _ in TRIGGER_OPTIONS].index("toggle"))
@@ -515,6 +519,12 @@ def test_modifier_warning_shows_for_fire_once_key_and_hides_for_toggle():
 
     trigger_dd.set_selected([k for k, _ in TRIGGER_OPTIONS].index("fire_once"))
     assert _has_warning(editor)
+
+    trigger_dd.set_selected([k for k, _ in TRIGGER_OPTIONS].index("analog_repeat"))
+    assert _has_warning(editor)
+
+    trigger_dd.set_selected([k for k, _ in TRIGGER_OPTIONS].index("hold_to_repeat"))
+    assert not _has_warning(editor)
 
 
 def test_trigger_mode_warning_wiring_survives_repeated_action_kind_switching():
@@ -532,6 +542,8 @@ def test_trigger_mode_warning_wiring_survives_repeated_action_kind_switching():
         action_dd.set_selected([k for k, _ in ACTION_TYPES].index("keypress"))
 
     _pick_first_modifier(editor, "Key")
+    trigger_dd = _dropdown_labeled(editor, "Trigger mode")
+    trigger_dd.set_selected([k for k, _ in TRIGGER_OPTIONS].index("fire_once"))
     assert _has_warning(editor)
 
     trigger_dd = _dropdown_labeled(editor, "Trigger mode")

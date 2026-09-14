@@ -464,12 +464,10 @@ def test_adding_an_item_with_a_modifier_checked_round_trips_through_on_add_and_t
 
 
 def test_picking_a_bare_modifier_for_a_new_item_shows_no_modifier_warning():
-    # A Stepper item always fires as a bare KeyDown/KeyUp pair (never a
-    # Macro step) and Toggle is disallowed outright for a Stepper Binding,
-    # so the picker's usual "use Toggle with a KeyDown-only Macro step"
-    # warning would point at a workflow this construct can't support —
-    # suppressed the same way the Macro editor already suppresses it for
-    # its own KeyDown-only steps, just for a different reason.
+    # A Stepper item has no Trigger mode of its own (it always compiles to
+    # a bare KeyDown/KeyUp pair) for the picker's Fire-once/Analog-repeat
+    # modifier warning to key off of — suppressed the same way the Macro
+    # editor already suppresses it for its own KeyDown-only steps.
     stub = DaemonStub()
     stub.create_stepper("Weapon Wheel", [])
 

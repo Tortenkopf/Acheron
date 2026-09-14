@@ -502,13 +502,27 @@ impl<K: Eq + Hash + Clone> Slots<K> {
                 // steps are a single held key (`single_held_key`, the same
                 // bright line the `value=2` work uses — plain / modifier
                 // Keypress, single-key Macro, single-key Stepper `Key` step,
-                // single-key Chord), Fire-once only. `AnalogRepeat` — including
-                // the Digital-Capture fallback that also lands on
-                // `D::SpawnFireOnce` — keeps its already-audited tap cadence;
-                // a multi-step Macro's `single_held_key` is `None`, so the Macro
-                // exception holds by shape.
+                // single-key Chord), Fire-once always, and Hold-to-repeat only
+                // for a Stepper (post-release ticket 12 follow-up): `Action::Step`
+                // is the only action whose `hold_repeat_kind` is `None` (a
+                // Stepper cursor has no "held key" of its own), so it's the only
+                // shape that reaches `D::SpawnFireOnce` under Hold-to-repeat with
+                // `single_held_key` still `Some` — a plain Keypress/Macro takes
+                // the kernel-autorepeat arms instead and never reaches here.
+                // `AnalogRepeat` — including the Digital-Capture fallback that
+                // also lands on `D::SpawnFireOnce` — keeps its already-audited
+                // tap cadence; a multi-step Macro's `single_held_key` is `None`,
+                // so the Macro exception holds by shape. `Action::Step` can no
+                // longer even pair with `AnalogRepeat` at all
+                // (`config::binding::check_binding`'s `InvalidStepTrigger`) —
+                // `analog_repeat::Engine` replays one fixed pre-compiled firing
+                // rather than re-running `compile_action` per tick, so it never
+                // reaches this arm for a Stepper.
+                let dwell_eligible_trigger = binding.trigger == TriggerMode::FireOnce
+                    || (binding.trigger == TriggerMode::HoldToRepeat
+                        && matches!(binding.action, Action::Step { .. }));
                 if deps.fire_once_key_dwell
-                    && binding.trigger == TriggerMode::FireOnce
+                    && dwell_eligible_trigger
                     && let Some((mods, code)) = executor::single_held_key(&steps)
                 {
                     steps = executor::fire_once_key_steps(mods, code);
@@ -1736,6 +1750,58 @@ mod slots {
             fx.key_events(),
             vec![(KeyCode::KEY_A, 1), (KeyCode::KEY_A, 0)],
             "Stepper `Key` step: the Up lands exactly one dwell later"
+        );
+    }
+
+    /// Post-release ticket 12 follow-up: a Hold-to-repeat Stepper is the one
+    /// Hold-to-repeat shape that reaches `D::SpawnFireOnce` with a single held
+    /// key (`hold_repeat_kind`'s `Action::Step` arm is `None`, so it can't ride
+    /// the kernel-autorepeat arms a Keypress/Macro would) — it gets the same
+    /// `FIRE_ONCE_KEY_DWELL` splice a Fire-once Stepper does.
+    #[tokio::test(start_paused = true)]
+    async fn perform_hold_to_repeat_single_key_stepper_step_holds_the_key_for_the_spliced_dwell() {
+        let mut fx = Fixture::new();
+        fx.steppers.insert(
+            StepperId::from("s"),
+            StepperDef {
+                name: "s".to_string(),
+                items: vec![crate::config::StepperItem::Key {
+                    key: KeyCode::KEY_A,
+                    modifiers: Modifiers::default(),
+                }],
+            },
+        );
+        let binding = Binding {
+            trigger: TriggerMode::HoldToRepeat,
+            action: Action::Step {
+                stepper: StepperId::from("s"),
+                direction: crate::config::StepDirection::Forward,
+            },
+        };
+        let mut slots: Slots<Key> = Slots::default();
+
+        tokio::task::yield_now().await;
+        slots
+            .perform(TriggerDecision::SpawnFireOnce, K, &binding, fx.deps())
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fx.key_events(),
+            vec![(KeyCode::KEY_A, 1)],
+            "Hold-to-repeat Stepper `Key` step: only the Down until the spliced dwell elapses"
+        );
+
+        tokio::time::advance(executor::FIRE_ONCE_KEY_DWELL).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fx.key_events(),
+            vec![(KeyCode::KEY_A, 1), (KeyCode::KEY_A, 0)],
+            "Hold-to-repeat Stepper `Key` step: the Up lands exactly one dwell later"
         );
     }
 
