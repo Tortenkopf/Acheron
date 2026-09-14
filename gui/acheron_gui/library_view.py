@@ -783,9 +783,10 @@ def _build_macro_add_controls(
             def on_value_key_changed(code: str) -> None:
                 new_step_value["key"] = code
 
-            # No modifier warning here, same reasoning as the pre-ticket-51
-            # editor this was ported from: a KeyDown-only step *is* that
-            # warning's own recommended workaround, not a case it applies to.
+            # No modifier warning here: a Macro step has no Trigger mode of
+            # its own for the warning to key off of (Fire-once/Analog-repeat
+            # vs. Hold-to-repeat is a Binding-level concept), so it doesn't
+            # apply to an individual step's key value.
             value_picker, _refresh = build_inline_key_picker(
                 new_step_value["key"], on_value_key_changed, warn_predicate=lambda: False
             )
@@ -911,12 +912,10 @@ def _build_stepper_add_controls(
             def on_value_key_changed(code: str) -> None:
                 new_item_value["key"] = code
 
-            # The modifier warning is suppressed for a different reason than
-            # the Macro editor's own KeyDown-only step: there the workaround
-            # (Toggle + a KeyDown-only Macro step) *is* a KeyDown-only step;
-            # here it's simply unreachable — a Stepper item always compiles
-            # to a bare KeyDown/KeyUp pair (ticket 03/54) and Toggle is
-            # disallowed for a Stepper Binding.
+            # Same reasoning as the Macro editor's own KeyDown-only step
+            # above: a Stepper item has no Trigger mode of its own (it always
+            # compiles to a bare KeyDown/KeyUp pair, ticket 03/54), so the
+            # warning doesn't apply here either.
             value_picker, _refresh = build_inline_key_picker(
                 new_item_value["key"], on_value_key_changed, warn_predicate=lambda: False
             )

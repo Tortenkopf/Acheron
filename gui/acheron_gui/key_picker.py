@@ -120,9 +120,8 @@ def build_modifier_warning() -> Gtk.Widget:
     # once anything upstream propagates natural width.
     return Gtk.Label(
         label=(
-            "⚠ A bare modifier as a Fire-once/Hold-to-repeat main key fires a near-instant "
-            "pulse, not a sustained hold. Use Toggle with a single KeyDown-only Macro step "
-            "to hold a modifier down."
+            "⚠ A bare modifier as a Fire-once/Analog-repeat main key fires a near-instant "
+            "pulse, not a sustained hold. Use Hold-to-repeat to hold a modifier down."
         ),
         xalign=0,
         wrap=True,
