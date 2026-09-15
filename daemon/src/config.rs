@@ -584,6 +584,22 @@ pub struct Colour {
     pub b: u8,
 }
 
+/// CONTEXT.md: Lighting assignment. One assertable snapshot of a Profile's
+/// whole Lighting state — the assignment plus the brightness byte that
+/// applies regardless of which assignment is active (`tartarus-backlight`
+/// ticket 02; spec.md's "Daemon architecture" `LightingState { assignment,
+/// brightness }`). Not `Serialize`/`Deserialize`: `Profile` stores its
+/// `lighting`/`brightness` fields separately in `config.toml`; this just
+/// bundles them for the one call (`capture::analog::assert_lighting`) that
+/// needs a whole snapshot at once — mirrors `StatusLeds` living beside
+/// `LightingAssignment` here rather than in the hardware-writer module that
+/// consumes it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LightingState {
+    pub assignment: LightingAssignment,
+    pub brightness: u8,
+}
+
 /// CONTEXT.md: Axis assignment. One of the 17 targets ticket 59 §3 settled —
 /// 5 unsigned single-key axes (raw Depth 0-255, no polar opposite) and 6
 /// signed axes split into two independently-assignable +/- halves each (12

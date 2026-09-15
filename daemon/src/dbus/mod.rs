@@ -1072,6 +1072,7 @@ mod tests {
                 depth_rx,
                 tokio::sync::mpsc::channel::<Option<crate::capture::analog::DeviceInfo>>(8).1,
                 tokio::sync::watch::channel::<Option<crate::config::StatusLeds>>(None).0,
+                tokio::sync::watch::channel::<Option<crate::config::LightingState>>(None).0,
             ));
 
             TestServer {
@@ -2603,6 +2604,7 @@ mod tests {
             depth_rx,
             tokio::sync::mpsc::channel::<Option<crate::capture::analog::DeviceInfo>>(8).1,
             tokio::sync::watch::channel::<Option<crate::config::StatusLeds>>(None).0,
+            tokio::sync::watch::channel::<Option<crate::config::LightingState>>(None).0,
         ));
 
         {

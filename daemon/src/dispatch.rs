@@ -39,7 +39,8 @@ use crate::capture::{CaptureMode, EventState, PhysicalEvent};
 use crate::chord;
 use crate::command::{Command, State};
 use crate::config::{
-    self, Action, ActuationPoint, ChordKey, Config, Layer, ModeKeyRole, StatusLeds, TriggerMode,
+    self, Action, ActuationPoint, ChordKey, Config, Layer, LightingState, ModeKeyRole, StatusLeds,
+    TriggerMode,
 };
 use crate::dbus::Daemon;
 use crate::edit::{self, TeardownReason};
@@ -106,6 +107,13 @@ struct DispatchState {
     /// ticket 03 on — Profile switch. `Config` is the sole authoritative
     /// triple; there is no cached `led_state` here.
     led_tx: watch::Sender<Option<StatusLeds>>,
+    /// The `led` task's second `watch::Sender` (`tartarus-backlight` ticket
+    /// 02 / ADR-0012), alongside `led_tx` — same task, independent channel.
+    /// `push_lighting` sends the active Profile's whole `LightingState` on
+    /// it on device (re)connect and Daemon startup (Profile switch /
+    /// `SetLighting` follow in a later ticket). `Config` stays the sole
+    /// authoritative source; there is no cached `lighting_state` here.
+    lighting_tx: watch::Sender<Option<LightingState>>,
 }
 
 impl DispatchState {
@@ -113,6 +121,7 @@ impl DispatchState {
     /// the five owned collaborators come from `run`'s startup parameters (and
     /// from stub channels in the test seam). `run` calls this once and then
     /// only drives the `select!` loop.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         injector: Injector,
         signal_emitter: Option<SignalEmitter<'static>>,
@@ -121,6 +130,7 @@ impl DispatchState {
         toggle_lap_target: Duration,
         toggle_autorepeat_schedule: RepeatSchedule,
         led_tx: watch::Sender<Option<StatusLeds>>,
+        lighting_tx: watch::Sender<Option<LightingState>>,
     ) -> Self {
         DispatchState {
             individual: trigger::Slots::default(),
@@ -141,6 +151,7 @@ impl DispatchState {
             toggle_lap_target,
             toggle_autorepeat_schedule,
             led_tx,
+            lighting_tx,
         }
     }
 
@@ -161,6 +172,25 @@ impl DispatchState {
             .expect("load_or_seed validates active_profile names a real profile")
             .status_leds;
         self.led_tx.send_replace(Some(leds));
+    }
+
+    /// Sends the active Profile's whole Lighting state on the `led` task's
+    /// second watch channel (`tartarus-backlight` ticket 02 — CONTEXT.md:
+    /// Lighting assignment; ADR-0012). Reads `lighting`/`brightness` straight
+    /// from the just-committed `Config` — the sole authoritative source, no
+    /// cached `LightingState` in `DispatchState` — the same discipline
+    /// `push_status_leds` follows. This ticket's only call site is the
+    /// `rx_connection` arm (connect/startup); Profile switch and
+    /// `SetLighting` gain their own call sites in a later ticket, mirroring
+    /// `push_status_leds`'s own history.
+    fn push_lighting(&self, config: &Config) {
+        let profile = config
+            .active_profile()
+            .expect("load_or_seed validates active_profile names a real profile");
+        self.lighting_tx.send_replace(Some(LightingState {
+            assignment: profile.lighting.clone(),
+            brightness: profile.brightness,
+        }));
     }
 
     /// Resolves one `PhysicalEvent` against the active Profile/Layer. Returns
@@ -929,6 +959,12 @@ pub async fn run(
     // switch). The `led` task drives it to the hardware; a write failure
     // there never reaches this task.
     led_tx: watch::Sender<Option<StatusLeds>>,
+    // `tartarus-backlight` ticket 02 / ADR-0012: the same `led` task's
+    // second `watch::Sender`, created in `main.rs` alongside `led_tx`. Held
+    // on `DispatchState` and written by `push_lighting` — the active
+    // Profile's whole `LightingState` pushed on every device (re)connect
+    // (Profile switch and `SetLighting` follow in a later ticket).
+    lighting_tx: watch::Sender<Option<LightingState>>,
 ) -> io::Result<()> {
     // Published once up front so the analog capture source's grid task
     // (ticket 22/23) has a correct snapshot to threshold against from the
@@ -951,6 +987,7 @@ pub async fn run(
         toggle_lap_target,
         toggle_autorepeat_schedule,
         led_tx,
+        lighting_tx,
     );
     // Pure `select!`-loop plumbing — the `rx_*` receivers stay `run` locals
     // (so no `select!` branch expression borrows `state`) and these liveness
@@ -1019,6 +1056,12 @@ pub async fn run(
                         // hardware; a redundant `true` costs one ioctl.
                         if connected {
                             state.push_status_leds(&config);
+                            // `tartarus-backlight` ticket 02 / ADR-0012:
+                            // same trigger and reasoning as Status LEDs —
+                            // re-assert the active Profile's Lighting on
+                            // every `connected == true`, not just the
+                            // transition (covers present-at-startup too).
+                            state.push_lighting(&config);
                         }
                     }
                     None => connection_open = false,
@@ -1169,9 +1212,9 @@ mod tests {
     use super::*;
     use crate::capture::EventState;
     use crate::config::{
-        Action, ActuationPoint, AxisTarget, Binding, DEFAULT_PROFILE_NAME, DeepStageConfig,
-        MacroDef, MacroId, MacroStepDto, Modifiers, Profile, StagingMode, StatusLeds,
-        StepDirection, StepperDef, StepperId, StepperItem,
+        Action, ActuationPoint, AxisTarget, Binding, Colour, DEFAULT_PROFILE_NAME, DeepStageConfig,
+        FixedEffect, LightingAssignment, MacroDef, MacroId, MacroStepDto, Modifiers, Profile,
+        StagingMode, StatusLeds, StepDirection, StepperDef, StepperId, StepperItem,
     };
     use crate::edit::{CommandError, CreatedId};
     use crate::executor;
@@ -1324,6 +1367,13 @@ mod tests {
         watch::channel(None).0
     }
 
+    /// `led_channel`'s Lighting sibling (`tartarus-backlight` ticket 02) —
+    /// a fresh `LightingState` `Sender` for tests that don't assert on what
+    /// dispatch pushes. `CommandHarness` keeps its own paired `Receiver`.
+    fn lighting_channel() -> watch::Sender<Option<LightingState>> {
+        watch::channel(None).0
+    }
+
     /// The direct `DispatchState` seam (ticket 09): a `RecordingSink` injector
     /// plus an in-memory `Config`, no channels and no tempfile. Feed
     /// `PhysicalEvent`s (and `Command`s) straight into the handler methods and
@@ -1355,6 +1405,7 @@ mod tests {
                 executor::MIN_TOGGLE_LAP,
                 RepeatSchedule::new(250, 33),
                 led_channel(),
+                lighting_channel(),
             );
             Seam {
                 state,
@@ -2399,6 +2450,7 @@ mod tests {
             depth_channel(),
             device_info_channel(),
             led_channel(),
+            lighting_channel(),
         ));
 
         for state in [EventState::Down, EventState::Repeat, EventState::Up] {
@@ -2458,6 +2510,7 @@ mod tests {
             depth_rx,
             device_info_channel(),
             led_channel(),
+            lighting_channel(),
         ));
 
         // A mid-travel Depth, comfortably between the deadzone and the
@@ -2564,6 +2617,7 @@ mod tests {
             depth_rx,
             device_info_channel(),
             led_channel(),
+            lighting_channel(),
         ));
 
         let depth: u8 = 100;
@@ -2644,6 +2698,7 @@ mod tests {
             depth_rx,
             device_info_channel(),
             led_channel(),
+            lighting_channel(),
         ));
 
         depth_tx.send_replace(HashMap::from([(Input::Grid(1, 1), u8::MAX)]));
@@ -2757,6 +2812,7 @@ mod tests {
             depth_rx,
             device_info_channel(),
             led_channel(),
+            lighting_channel(),
         ));
 
         // Advance ~`ms` of paused time in 5ms steps so the clock drives each
@@ -2896,6 +2952,7 @@ mod tests {
             depth_channel(),
             device_info_channel(),
             led_channel(),
+            lighting_channel(),
         ));
 
         // Down starts a firing that immediately sends KeyDown, then sleeps
@@ -3064,6 +3121,9 @@ mod tests {
         /// real `led` task's `watch::Receiver`, read directly instead of
         /// running the hardware-touching task.
         led_rx: watch::Receiver<Option<StatusLeds>>,
+        /// The `led`-task seam's Lighting sibling (`tartarus-backlight`
+        /// ticket 02): what dispatch pushes on device connect/startup.
+        lighting_rx: watch::Receiver<Option<LightingState>>,
         sink: RecordingSink,
         gamepad_sink: RecordingSink,
         dispatch_handle: tokio::task::JoinHandle<io::Result<()>>,
@@ -3099,6 +3159,7 @@ mod tests {
             let (depth_tx, depth_rx) = watch::channel(HashMap::new());
             let (device_info_tx, device_info_rx) = mpsc::channel(8);
             let (led_tx, led_rx) = watch::channel(None);
+            let (lighting_tx, lighting_rx) = watch::channel(None);
             let dispatch_handle = tokio::spawn(run(
                 event_rx,
                 conn_rx,
@@ -3115,6 +3176,7 @@ mod tests {
                 depth_rx,
                 device_info_rx,
                 led_tx,
+                lighting_tx,
             ));
 
             CommandHarness {
@@ -3126,6 +3188,7 @@ mod tests {
                 depth_tx,
                 device_info_tx,
                 led_rx,
+                lighting_rx,
                 conn_tx,
                 sink,
                 gamepad_sink,
@@ -3364,6 +3427,23 @@ mod tests {
         /// re-asserts.
         fn status_leds_re_pushed(&self) -> bool {
             self.led_rx.has_changed().unwrap_or(false)
+        }
+
+        /// The latest `LightingState` dispatch has pushed on the `led`
+        /// task's second watch channel (`tartarus-backlight` ticket 02),
+        /// marking it seen — `None` until the first connect edge asserts
+        /// one. A burst coalesces here exactly as it would for the real
+        /// `led` task.
+        fn take_lighting_pushed(&mut self) -> Option<LightingState> {
+            self.lighting_rx.borrow_and_update().clone()
+        }
+
+        /// Whether dispatch has pushed a fresh value on the Lighting channel
+        /// since the last `take_lighting_pushed` — true even for an
+        /// unchanged state, so a test can assert every `connected == true`
+        /// re-asserts.
+        fn lighting_re_pushed(&self) -> bool {
+            self.lighting_rx.has_changed().unwrap_or(false)
         }
 
         async fn press(&self, input: Input) {
@@ -4016,6 +4096,109 @@ mod tests {
 
         assert!(!harness.status_leds_re_pushed());
         assert_eq!(harness.take_status_leds_pushed(), None);
+        harness.shut_down().await;
+    }
+
+    // -- Lighting: dispatch pushes the active Profile's whole `LightingState`
+    // on the `led` task's second watch channel on every device connect and
+    // on Daemon startup (`tartarus-backlight` ticket 02). No Profile-switch
+    // or `SetLighting` re-assertion yet — that lands in a later ticket. The
+    // `HIDIOCSFEATURE` write and the `led` task's own consume/coalesce
+    // behaviour are covered in `capture::analog` / `crate::led`. ------------
+
+    fn config_with_lighting(assignment: LightingAssignment, brightness: u8) -> Config {
+        config_with_profile(Profile {
+            lighting: assignment,
+            brightness,
+            ..Default::default()
+        })
+    }
+
+    fn sample_fixed_effect() -> LightingAssignment {
+        LightingAssignment::FixedEffect {
+            effect: FixedEffect::Static {
+                colour: Colour {
+                    r: 0x10,
+                    g: 0x20,
+                    b: 0x30,
+                },
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_device_connect_pushes_the_active_profiles_lighting() {
+        let assignment = sample_fixed_effect();
+        let mut harness = CommandHarness::spawn(config_with_lighting(assignment.clone(), 0x80));
+
+        // No pre-loop assert — nothing on the channel until the connect edge.
+        assert_eq!(harness.take_lighting_pushed(), None);
+
+        harness.set_device_connected(true).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            harness.take_lighting_pushed(),
+            Some(LightingState {
+                assignment,
+                brightness: 0x80,
+            })
+        );
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn every_connected_true_re_pushes_the_lighting_even_without_a_transition() {
+        let assignment = LightingAssignment::Off;
+        let mut harness = CommandHarness::spawn(config_with_lighting(assignment.clone(), 0x00));
+
+        harness.set_device_connected(true).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            harness.take_lighting_pushed(),
+            Some(LightingState {
+                assignment: assignment.clone(),
+                brightness: 0x00,
+            })
+        );
+
+        // A second `true` with no intervening `false`: `handle_connection_
+        // change` early-returns on the unchanged bool, but the Lighting
+        // assert must still re-fire — the same reasoning Status LEDs'
+        // equivalent test documents, applied here for consistency even
+        // though VARSTORE means the firmware itself doesn't reset Lighting
+        // on enumeration (ADR-0012's re-assertion-discipline argument).
+        harness.set_device_connected(true).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert!(harness.lighting_re_pushed());
+        assert_eq!(
+            harness.take_lighting_pushed(),
+            Some(LightingState {
+                assignment,
+                brightness: 0x00,
+            })
+        );
+
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn a_reported_disconnect_pushes_no_lighting() {
+        let mut harness = CommandHarness::spawn(config_with_lighting(sample_fixed_effect(), 0x40));
+
+        harness.set_device_connected(false).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(!harness.lighting_re_pushed());
+        assert_eq!(harness.take_lighting_pushed(), None);
         harness.shut_down().await;
     }
 
@@ -7171,6 +7354,7 @@ mod tests {
             depth_rx,
             device_info_channel(),
             led_channel(),
+            lighting_channel(),
         ));
 
         capture_mode_tx.send(CaptureMode::Analog).await.unwrap();
@@ -7391,6 +7575,7 @@ mod tests {
             depth_rx,
             device_info_channel(),
             led_channel(),
+            lighting_channel(),
         ));
 
         // `DispatchState::new` starts `capture_mode` at `Digital` — flip to

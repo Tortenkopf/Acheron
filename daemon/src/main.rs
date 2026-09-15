@@ -6,7 +6,7 @@ use std::io;
 use std::time::Duration;
 
 use acheron_daemon::capture::supervisor;
-use acheron_daemon::config::{self, StatusLeds};
+use acheron_daemon::config::{self, LightingState, StatusLeds};
 use acheron_daemon::dbus::Daemon;
 use acheron_daemon::{dispatch, injector, led};
 use tokio::task::JoinError;
@@ -107,7 +107,17 @@ async fn main() -> io::Result<()> {
     // `tokio::select!` below — an LED write failure must never exit the
     // process.
     let (led_tx, led_rx) = tokio::sync::watch::channel::<Option<StatusLeds>>(None);
-    let _led_handle = led::spawn(led_rx);
+    // The Lighting seam (`tartarus-backlight` ticket 02 / ADR-0012): a
+    // second, independent channel alongside `led_tx`/`led_rx` — dispatch
+    // pushes the active Profile's whole `LightingState` on Daemon startup
+    // and every device (re)connect; the same `led` task below drives it to
+    // the hardware over its own short-lived Interface-2 hidraw fd, never
+    // interleaved with a Status-LED write (both channels share the one
+    // task). Two channels rather than one combined type: a Status-LED-only
+    // push must not have to resupply the current Lighting value, or vice
+    // versa (ADR-0012).
+    let (lighting_tx, lighting_rx) = tokio::sync::watch::channel::<Option<LightingState>>(None);
+    let _led_handle = led::spawn(led_rx, lighting_rx);
 
     // Built before the dispatch task so a real `SignalEmitter` (ticket 18's
     // `ActiveLayerChanged`, pushed directly from the dispatch task on every
@@ -162,6 +172,7 @@ async fn main() -> io::Result<()> {
         depth_rx,
         device_info_rx,
         led_tx,
+        lighting_tx,
     ));
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
