@@ -682,6 +682,34 @@ impl Daemon {
         .await
     }
 
+    /// Sets the active Profile's whole Lighting assignment and brightness in
+    /// one call (CONTEXT.md: Lighting assignment; `tartarus-backlight`
+    /// ticket 03) — mirroring `set_status_leds`'s whole-state shape: no
+    /// partial-update bookkeeping, `Config` stays authoritative. Persisted
+    /// to `config.toml` and driven to the hardware immediately; a Profile
+    /// switch re-asserts the newly active Profile's Lighting, so the
+    /// backlight always follows the active Profile. Profile-unscoped like
+    /// every mutating method — `plan` applies it to the active Profile.
+    /// Errors `InvalidBinding` if `assignment` doesn't decode (an unknown
+    /// `"type"` tag, a missing field, or a `CustomLayout` whose `"colours"`
+    /// isn't exactly 21 entries); never fails on validation grounds
+    /// otherwise (every `LightingAssignment`/`u8` is structurally valid) —
+    /// can still surface `IoError` if the `config.toml` rewrite fails.
+    async fn set_lighting(
+        &self,
+        assignment: HashMap<String, OwnedValue>,
+        brightness: u8,
+    ) -> Result<(), DaemonError> {
+        let assignment = wire::lighting_assignment_from_dict(&assignment)
+            .map_err(DaemonError::InvalidBinding)?;
+
+        self.apply(Edit::SetLighting {
+            assignment,
+            brightness,
+        })
+        .await
+    }
+
     /// Creates or edits the deep Binding on `layer` for a dual-stage grid
     /// key (tartarus-dual-stage-keys ticket 05 — CONTEXT.md: Actuation
     /// stage) — atomic/immediately-applied/immediately-persisted, mirroring
@@ -952,6 +980,11 @@ mod tests {
         fn reset_actuation_points(&self) -> zbus::Result<()>;
         fn set_force_digital(&self, force: bool) -> zbus::Result<()>;
         fn set_status_leds(&self, orange: bool, green: bool, blue: bool) -> zbus::Result<()>;
+        fn set_lighting(
+            &self,
+            assignment: HashMap<String, OwnedValue>,
+            brightness: u8,
+        ) -> zbus::Result<()>;
         fn set_deep_stage(
             &self,
             input: &str,
@@ -2918,6 +2951,88 @@ mod tests {
 
         assert!(on_disk.contains("[profiles.Default.status_leds]"));
         assert!(on_disk.contains("orange = true"));
+    }
+
+    /// `tartarus-backlight` ticket 03's core requirement: `SetLighting`
+    /// persists the active Profile's whole Lighting assignment and
+    /// brightness, and it's visible via `GetConfig` — mirroring
+    /// `set_status_leds_over_real_dbus_persists_the_triple_and_surfaces_it_via_get_config`.
+    /// The request's `Colour` rides as a `(yyy)` byte-triple
+    /// (`wire::colour_from_field`'s decode convention); `GetConfig`'s reply
+    /// still encodes it as `colour_to_dict`'s existing `a{sv}` dict — this
+    /// test is the one place that asymmetry is exercised end-to-end.
+    #[tokio::test]
+    async fn set_lighting_over_real_dbus_persists_the_assignment_and_surfaces_it_via_get_config() {
+        use zbus::zvariant::Value;
+
+        let server = TestServer::start().await;
+
+        let mut effect = HashMap::new();
+        effect.insert(
+            "type".to_string(),
+            OwnedValue::try_from(Value::new("reactive".to_string())).unwrap(),
+        );
+        effect.insert(
+            "colour".to_string(),
+            OwnedValue::try_from(Value::new((255u8, 128u8, 0u8))).unwrap(),
+        );
+        effect.insert(
+            "speed".to_string(),
+            OwnedValue::try_from(Value::new(3u8)).unwrap(),
+        );
+        let mut assignment = HashMap::new();
+        assignment.insert(
+            "type".to_string(),
+            OwnedValue::try_from(Value::new("fixed_effect".to_string())).unwrap(),
+        );
+        assignment.insert(
+            "effect".to_string(),
+            OwnedValue::try_from(Value::new(effect)).unwrap(),
+        );
+
+        server
+            .proxy
+            .set_lighting(assignment, 0x80)
+            .await
+            .expect("SetLighting over D-Bus must succeed");
+
+        let config = server.proxy.get_config().await.unwrap();
+        let profiles: wire::Dict = config.get("profiles").unwrap().clone().try_into().unwrap();
+        let default_profile: wire::Dict = profiles
+            .get(DEFAULT_PROFILE_NAME)
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        let lighting: wire::Dict = default_profile
+            .get("lighting")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            <&str>::try_from(lighting.get("type").unwrap()).unwrap(),
+            "fixed_effect"
+        );
+        let effect: wire::Dict = lighting.get("effect").unwrap().clone().try_into().unwrap();
+        assert_eq!(
+            <&str>::try_from(effect.get("type").unwrap()).unwrap(),
+            "reactive"
+        );
+        assert_eq!(u8::try_from(effect.get("speed").unwrap()).unwrap(), 3);
+        let colour: wire::Dict = effect.get("colour").unwrap().clone().try_into().unwrap();
+        assert_eq!(u8::try_from(colour.get("r").unwrap()).unwrap(), 255);
+        assert_eq!(u8::try_from(colour.get("g").unwrap()).unwrap(), 128);
+        assert_eq!(u8::try_from(colour.get("b").unwrap()).unwrap(), 0);
+        assert_eq!(
+            u8::try_from(default_profile.get("brightness").unwrap()).unwrap(),
+            0x80
+        );
+
+        let on_disk = std::fs::read_to_string(&server.config_path).unwrap();
+        server.shut_down().await;
+
+        assert!(on_disk.contains("brightness = 128"));
     }
 
     /// tartarus-dual-stage-keys ticket 05's core requirement: `SetDeepStage`/

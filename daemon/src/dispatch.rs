@@ -110,9 +110,9 @@ struct DispatchState {
     /// The `led` task's second `watch::Sender` (`tartarus-backlight` ticket
     /// 02 / ADR-0012), alongside `led_tx` — same task, independent channel.
     /// `push_lighting` sends the active Profile's whole `LightingState` on
-    /// it on device (re)connect and Daemon startup (Profile switch /
-    /// `SetLighting` follow in a later ticket). `Config` stays the sole
-    /// authoritative source; there is no cached `lighting_state` here.
+    /// it on device (re)connect, Daemon startup, Profile switch, and
+    /// `SetLighting` (ticket 03). `Config` stays the sole authoritative
+    /// source; there is no cached `lighting_state` here.
     lighting_tx: watch::Sender<Option<LightingState>>,
 }
 
@@ -179,10 +179,10 @@ impl DispatchState {
     /// Lighting assignment; ADR-0012). Reads `lighting`/`brightness` straight
     /// from the just-committed `Config` — the sole authoritative source, no
     /// cached `LightingState` in `DispatchState` — the same discipline
-    /// `push_status_leds` follows. This ticket's only call site is the
-    /// `rx_connection` arm (connect/startup); Profile switch and
-    /// `SetLighting` gain their own call sites in a later ticket, mirroring
-    /// `push_status_leds`'s own history.
+    /// `push_status_leds` follows. Two call sites of this one helper: the
+    /// `rx_connection` arm (connect/startup) and — from ticket 03 —
+    /// `run_effects` (`Effect::AssertLighting`, Profile switch /
+    /// `SetLighting`), mirroring `push_status_leds`'s own two call sites.
     fn push_lighting(&self, config: &Config) {
         let profile = config
             .active_profile()
@@ -802,6 +802,13 @@ impl DispatchState {
                     // active Profile's triple — same helper the `rx_connection`
                     // arm calls on connect, reading the just-committed `config`.
                     self.push_status_leds(config);
+                }
+                edit::Effect::AssertLighting => {
+                    // A `SetLighting` edit or a Profile switch re-asserts the
+                    // active Profile's whole Lighting state — same helper the
+                    // `rx_connection` arm calls on connect, reading the
+                    // just-committed `config` (`tartarus-backlight` ticket 03).
+                    self.push_lighting(config);
                 }
             }
         }
@@ -3394,6 +3401,19 @@ mod tests {
             .map(|_| ())
         }
 
+        async fn set_lighting(
+            &self,
+            assignment: LightingAssignment,
+            brightness: u8,
+        ) -> Result<(), CommandError> {
+            self.apply(edit::Edit::SetLighting {
+                assignment,
+                brightness,
+            })
+            .await
+            .map(|_| ())
+        }
+
         async fn get_config(&self) -> Config {
             let (reply, rx) = oneshot::channel();
             self.cmd_tx.send(Command::GetConfig(reply)).await.unwrap();
@@ -4101,10 +4121,9 @@ mod tests {
 
     // -- Lighting: dispatch pushes the active Profile's whole `LightingState`
     // on the `led` task's second watch channel on every device connect and
-    // on Daemon startup (`tartarus-backlight` ticket 02). No Profile-switch
-    // or `SetLighting` re-assertion yet — that lands in a later ticket. The
-    // `HIDIOCSFEATURE` write and the `led` task's own consume/coalesce
-    // behaviour are covered in `capture::analog` / `crate::led`. ------------
+    // on Daemon startup (`tartarus-backlight` ticket 02). The `HIDIOCSFEATURE`
+    // write and the `led` task's own consume/coalesce behaviour are covered
+    // in `capture::analog` / `crate::led`. ----------------------------------
 
     fn config_with_lighting(assignment: LightingAssignment, brightness: u8) -> Config {
         config_with_profile(Profile {
@@ -4304,6 +4323,111 @@ mod tests {
         }
 
         assert_eq!(harness.take_status_leds_pushed(), Some(a));
+        harness.shut_down().await;
+    }
+
+    // -- Lighting: a `SetLighting` D-Bus edit and a Profile switch both
+    // re-assert the active Profile's whole Lighting state on the `led`
+    // task's second channel (`tartarus-backlight` ticket 03, via
+    // `edit::Effect::AssertLighting` → `push_lighting`), mirroring Status
+    // LEDs' own trio of tests above exactly. ------------------------------
+
+    #[tokio::test]
+    async fn a_set_lighting_edit_persists_the_assignment_and_pushes_it() {
+        let want = sample_fixed_effect();
+        let mut harness = CommandHarness::spawn(config_with_lighting(LightingAssignment::Off, 0));
+
+        harness
+            .set_lighting(want.clone(), 0x55)
+            .await
+            .expect("SetLighting must succeed");
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            harness.take_lighting_pushed(),
+            Some(LightingState {
+                assignment: want.clone(),
+                brightness: 0x55,
+            })
+        );
+        let config = harness.get_config().await;
+        let profile = config.active_profile().unwrap();
+        assert_eq!(profile.lighting, want);
+        assert_eq!(profile.brightness, 0x55);
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn switching_profile_re_asserts_the_newly_active_profiles_lighting() {
+        let gaming = sample_fixed_effect();
+        let mut config = config_with_lighting(LightingAssignment::Off, 0);
+        config.profiles.insert(
+            "Gaming".to_string(),
+            Profile {
+                lighting: gaming.clone(),
+                brightness: 0xAA,
+                ..Default::default()
+            },
+        );
+        let mut harness = CommandHarness::spawn(config);
+
+        harness
+            .switch_profile("Gaming")
+            .await
+            .expect("SwitchProfile must succeed");
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            harness.take_lighting_pushed(),
+            Some(LightingState {
+                assignment: gaming,
+                brightness: 0xAA,
+            })
+        );
+        harness.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_switches_coalesces_to_the_final_profiles_lighting() {
+        let a = LightingAssignment::Off;
+        let b = sample_fixed_effect();
+        let mut config = config_with_lighting(LightingAssignment::Off, 0);
+        config.profiles.insert(
+            "A".to_string(),
+            Profile {
+                lighting: a.clone(),
+                brightness: 0x11,
+                ..Default::default()
+            },
+        );
+        config.profiles.insert(
+            "B".to_string(),
+            Profile {
+                lighting: b,
+                brightness: 0x22,
+                ..Default::default()
+            },
+        );
+        let mut harness = CommandHarness::spawn(config);
+
+        harness.switch_profile("A").await.unwrap();
+        harness.switch_profile("B").await.unwrap();
+        harness.switch_profile("A").await.unwrap();
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            harness.take_lighting_pushed(),
+            Some(LightingState {
+                assignment: a,
+                brightness: 0x11,
+            })
+        );
         harness.shut_down().await;
     }
 

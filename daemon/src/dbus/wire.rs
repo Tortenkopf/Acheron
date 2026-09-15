@@ -58,6 +58,18 @@ fn get_u64(dict: &Dict, key: &str) -> Result<u64, String> {
     u64::try_from(get(dict, key)?).map_err(|_| format!("field {key:?} is not an integer"))
 }
 
+fn get_u8(dict: &Dict, key: &str) -> Result<u8, String> {
+    u8::try_from(get(dict, key)?).map_err(|_| format!("field {key:?} is not a byte"))
+}
+
+/// Extracts a nested `a{sv}` dict from `dict[key]` — `SetLighting`'s decode
+/// direction is the first caller in this module that needs a *nested* dict
+/// field rather than a flat scalar one (`LightingAssignment::FixedEffect`'s
+/// `"effect"` field, `FixedEffect::Breath`/`Starlight`'s `"style"` field).
+fn get_dict(dict: &Dict, key: &str) -> Result<Dict, String> {
+    Dict::try_from(get(dict, key)?.clone()).map_err(|_| format!("field {key:?} is not a dict"))
+}
+
 fn key_to_string(key: KeyCode) -> String {
     format!("{key:?}")
 }
@@ -477,6 +489,102 @@ fn lighting_assignment_to_dict(assignment: &LightingAssignment) -> Dict {
         }
     }
     dict
+}
+
+/// Decodes a `Colour` field carried on `SetLighting`'s incoming `a{sv}`
+/// payload — a nested `(yyy)` byte-triple, not the `a{sv}` dict
+/// `colour_to_dict` emits for `GetConfig`'s encode direction. This is the
+/// first RGB value ever *accepted* on this project's D-Bus surface
+/// (`tartarus-backlight` ticket 03's own deliberate, minimal choice for a
+/// fresh decode path — `GetConfig`'s existing encode convention is
+/// untouched).
+fn colour_from_field(dict: &Dict, key: &str) -> Result<Colour, String> {
+    let (r, g, b) = <(u8, u8, u8)>::try_from(get(dict, key)?.clone())
+        .map_err(|_| format!("field {key:?} is not a (yyy) byte-triple"))?;
+    Ok(Colour { r, g, b })
+}
+
+fn wave_direction_from_str(s: &str) -> Result<WaveDirection, String> {
+    match s {
+        "left" => Ok(WaveDirection::Left),
+        "right" => Ok(WaveDirection::Right),
+        other => Err(format!("{other:?} is not a valid WaveDirection")),
+    }
+}
+
+/// The decode counterpart of `breath_style_to_dict` — `Colour` fields decode
+/// via `colour_from_field`'s `(yyy)` convention (see its doc comment), same
+/// asymmetry as `FixedEffect`'s own `"colour"` fields.
+fn breath_style_from_dict(dict: &Dict) -> Result<BreathStyle, String> {
+    match get_str(dict, "style")? {
+        "random" => Ok(BreathStyle::Random),
+        "single" => Ok(BreathStyle::Single {
+            colour: colour_from_field(dict, "colour")?,
+        }),
+        "dual" => Ok(BreathStyle::Dual {
+            first: colour_from_field(dict, "first")?,
+            second: colour_from_field(dict, "second")?,
+        }),
+        other => Err(format!("{other:?} is not a valid BreathStyle")),
+    }
+}
+
+/// The decode counterpart of `fixed_effect_to_dict`.
+fn fixed_effect_from_dict(dict: &Dict) -> Result<FixedEffect, String> {
+    match get_str(dict, "type")? {
+        "static" => Ok(FixedEffect::Static {
+            colour: colour_from_field(dict, "colour")?,
+        }),
+        "spectrum" => Ok(FixedEffect::Spectrum),
+        "reactive" => Ok(FixedEffect::Reactive {
+            colour: colour_from_field(dict, "colour")?,
+            speed: get_u8(dict, "speed")?,
+        }),
+        "wave" => Ok(FixedEffect::Wave {
+            direction: wave_direction_from_str(get_str(dict, "direction")?)?,
+        }),
+        "breath" => Ok(FixedEffect::Breath {
+            style: breath_style_from_dict(&get_dict(dict, "style")?)?,
+        }),
+        "starlight" => Ok(FixedEffect::Starlight {
+            style: breath_style_from_dict(&get_dict(dict, "style")?)?,
+            speed: get_u8(dict, "speed")?,
+        }),
+        other => Err(format!("{other:?} is not a valid FixedEffect type")),
+    }
+}
+
+/// Decodes `"colours"` — a `CustomLayout`'s 21-entry array of `(yyy)`
+/// byte-triples (`colour_from_field`'s same convention, one level up).
+/// Errors if the array isn't exactly 21 entries — `[Colour; 21]`'s own
+/// fixed-size contract.
+fn colours_from_value(value: &OwnedValue) -> Result<[Colour; 21], String> {
+    let raw: Vec<(u8, u8, u8)> = Vec::try_from(value.clone())
+        .map_err(|_| "field \"colours\" is not an array of (yyy) byte-triples".to_string())?;
+    let colours: Vec<Colour> = raw
+        .into_iter()
+        .map(|(r, g, b)| Colour { r, g, b })
+        .collect();
+    let len = colours.len();
+    colours
+        .try_into()
+        .map_err(|_| format!("field \"colours\" must have exactly 21 entries, got {len}"))
+}
+
+/// The decode counterpart of `lighting_assignment_to_dict` — `SetLighting`'s
+/// whole-assignment payload, `action_from_dict`'s existing tagged-dict
+/// convention extended to Lighting (`tartarus-backlight` ticket 03).
+pub fn lighting_assignment_from_dict(dict: &Dict) -> Result<LightingAssignment, String> {
+    match get_str(dict, "type")? {
+        "off" => Ok(LightingAssignment::Off),
+        "fixed_effect" => Ok(LightingAssignment::FixedEffect {
+            effect: fixed_effect_from_dict(&get_dict(dict, "effect")?)?,
+        }),
+        "custom_layout" => Ok(LightingAssignment::CustomLayout {
+            colours: colours_from_value(get(dict, "colours")?)?,
+        }),
+        other => Err(format!("{other:?} is not a valid LightingAssignment type")),
+    }
 }
 
 fn actuation_overrides_to_dict(overrides: &HashMap<crate::input::Input, ActuationPoint>) -> Dict {
@@ -1398,6 +1506,96 @@ mod tests {
             u8::try_from(get(&default_profile, "brightness").unwrap()).unwrap(),
             128
         );
+    }
+
+    /// `tartarus-backlight` ticket 03: `SetLighting`'s decode direction —
+    /// `lighting_assignment_from_dict` — one profile per `LightingAssignment`
+    /// variant, mirroring the encode-side test above. `Colour` fields ride as
+    /// `(yyy)` byte-triples on this decode path (`colour_from_field`'s doc
+    /// comment), not `colour_to_dict`'s `a{sv}` shape, so these dicts are
+    /// built by hand rather than round-tripped through the encode helpers.
+    #[test]
+    fn lighting_assignment_from_dict_decodes_every_variant() {
+        let mut off = Dict::new();
+        off.insert("type".to_string(), scalar("off".to_string()));
+        assert_eq!(
+            lighting_assignment_from_dict(&off).unwrap(),
+            LightingAssignment::Off
+        );
+
+        let mut colour = Dict::new();
+        colour.insert("colour".to_string(), scalar((255u8, 128u8, 0u8)));
+        colour.insert("speed".to_string(), scalar(3u8));
+        colour.insert("type".to_string(), scalar("reactive".to_string()));
+        let mut fixed_effect = Dict::new();
+        fixed_effect.insert("type".to_string(), scalar("fixed_effect".to_string()));
+        fixed_effect.insert("effect".to_string(), scalar(colour));
+        assert_eq!(
+            lighting_assignment_from_dict(&fixed_effect).unwrap(),
+            LightingAssignment::FixedEffect {
+                effect: FixedEffect::Reactive {
+                    colour: Colour {
+                        r: 255,
+                        g: 128,
+                        b: 0,
+                    },
+                    speed: 3,
+                },
+            }
+        );
+
+        let mut breath = Dict::new();
+        breath.insert("style".to_string(), scalar("dual".to_string()));
+        breath.insert("first".to_string(), scalar((1u8, 2u8, 3u8)));
+        breath.insert("second".to_string(), scalar((4u8, 5u8, 6u8)));
+        let mut breath_effect = Dict::new();
+        breath_effect.insert("type".to_string(), scalar("breath".to_string()));
+        breath_effect.insert("style".to_string(), scalar(breath));
+        let mut breath_assignment = Dict::new();
+        breath_assignment.insert("type".to_string(), scalar("fixed_effect".to_string()));
+        breath_assignment.insert("effect".to_string(), scalar(breath_effect));
+        assert_eq!(
+            lighting_assignment_from_dict(&breath_assignment).unwrap(),
+            LightingAssignment::FixedEffect {
+                effect: FixedEffect::Breath {
+                    style: BreathStyle::Dual {
+                        first: Colour { r: 1, g: 2, b: 3 },
+                        second: Colour { r: 4, g: 5, b: 6 },
+                    },
+                },
+            }
+        );
+
+        let colours: Vec<(u8, u8, u8)> = (0..21).map(|i| (i, i, i)).collect();
+        let mut custom = Dict::new();
+        custom.insert("type".to_string(), scalar("custom_layout".to_string()));
+        custom.insert("colours".to_string(), scalar(colours));
+        let want_colours: [Colour; 21] = (0..21)
+            .map(|i| Colour { r: i, g: i, b: i })
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            lighting_assignment_from_dict(&custom).unwrap(),
+            LightingAssignment::CustomLayout {
+                colours: want_colours,
+            }
+        );
+    }
+
+    #[test]
+    fn lighting_assignment_from_dict_rejects_an_unknown_type_tag() {
+        let mut dict = Dict::new();
+        dict.insert("type".to_string(), scalar("bogus".to_string()));
+        assert!(lighting_assignment_from_dict(&dict).is_err());
+    }
+
+    #[test]
+    fn lighting_assignment_from_dict_rejects_a_custom_layout_with_the_wrong_colour_count() {
+        let mut dict = Dict::new();
+        dict.insert("type".to_string(), scalar("custom_layout".to_string()));
+        dict.insert("colours".to_string(), scalar(vec![(1u8, 2u8, 3u8)]));
+        assert!(lighting_assignment_from_dict(&dict).is_err());
     }
 
     /// tartarus-dual-stage-keys ticket 01: `config_to_dict` must serialize a

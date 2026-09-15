@@ -24,8 +24,8 @@
 use std::path::Path;
 
 use crate::config::{
-    self, Action, ActuationPoint, AxisTarget, Binding, ChordKey, Config, Layer, MacroId,
-    MacroStepDto, ModeKeyRole, Profile, StagingMode, StatusLeds, StepDirection, StepperId,
+    self, Action, ActuationPoint, AxisTarget, Binding, ChordKey, Config, Layer, LightingAssignment,
+    MacroId, MacroStepDto, ModeKeyRole, Profile, StagingMode, StatusLeds, StepDirection, StepperId,
     StepperItem,
 };
 use crate::input::Input;
@@ -261,6 +261,20 @@ pub enum Edit {
         green: bool,
         blue: bool,
     },
+    /// Sets the active Profile's whole Lighting assignment and brightness in
+    /// one call (CONTEXT.md: Lighting assignment; `tartarus-backlight`
+    /// ticket 03) — the whole state in one hardware frame, mirroring
+    /// `SetStatusLeds` exactly: no partial-update bookkeeping, `Config`
+    /// stays authoritative. Pushes `Effect::AssertLighting` unconditionally
+    /// — no `target == active` gate, since every mutating D-Bus method is
+    /// Profile-unscoped and the GUI always edits the active Profile. Never
+    /// fails on its own account (every `LightingAssignment`/`u8` is
+    /// structurally valid); the `Result` is the shared
+    /// `config.toml`-write-failure case.
+    SetLighting {
+        assignment: LightingAssignment,
+        brightness: u8,
+    },
     /// Creates or edits the deep Binding on the active Profile's `layer`
     /// for a dual-stage grid key (tartarus-dual-stage-keys ticket 05 —
     /// CONTEXT.md: Actuation stage). Mirrors `SetBinding` one level deeper.
@@ -437,6 +451,12 @@ pub(crate) enum Effect {
     /// to dispatch's `push_status_leds(&config)` — the same helper the connect
     /// edge uses. Pushed by `SetStatusLeds` and by `SwitchProfile`.
     AssertStatusLeds,
+    /// Re-assert the active Profile's whole Lighting state on the hardware
+    /// (CONTEXT.md: Lighting assignment; ADR-0012). `run_effects` routes it
+    /// to dispatch's `push_lighting(&config)` — the same helper the connect
+    /// edge uses. Pushed by `SetLighting` and by `SwitchProfile`, mirroring
+    /// `AssertStatusLeds` exactly (`tartarus-backlight` ticket 03).
+    AssertLighting,
 }
 
 /// The freshly-minted id a `CreateMacro` / `CreateStepper` mints — the D-Bus
@@ -613,6 +633,11 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
             // (`tartarus-status-leds` ticket 03). Order is irrelevant — the LEDs
             // are independent of Toggles / axes / Analog-repeat.
             arm_effects.push(Effect::AssertStatusLeds);
+            // The backlight follows the active Profile deterministically too
+            // (`tartarus-backlight` ticket 03). Order against `AssertStatusLeds`
+            // is irrelevant — independent devices/writes serialised by the
+            // shared `led` task, not by ordering here.
+            arm_effects.push(Effect::AssertLighting);
             arm_effects.push(Effect::AnnounceProfileChange(name));
         }
         Edit::SetActuationPoint {
@@ -838,6 +863,15 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
                 blue,
             };
             arm_effects.push(Effect::AssertStatusLeds);
+        }
+        Edit::SetLighting {
+            assignment,
+            brightness,
+        } => {
+            let profile = active_profile_mut(&mut next);
+            profile.lighting = assignment;
+            profile.brightness = brightness;
+            arm_effects.push(Effect::AssertLighting);
         }
         Edit::SetDeepStage {
             input,
@@ -1219,8 +1253,9 @@ impl From<crate::config::ConfigError> for CommandError {
 mod tests {
     use super::*;
     use crate::config::{
-        Action, AxisTarget, Binding, DEFAULT_PROFILE_NAME, MacroDef, MacroStepDto, Modifiers,
-        Profile, StepDirection, StepperDef, StepperItem, TriggerMode,
+        Action, AxisTarget, Binding, Colour, DEFAULT_PROFILE_NAME, FixedEffect, LightingAssignment,
+        MacroDef, MacroStepDto, Modifiers, Profile, StepDirection, StepperDef, StepperItem,
+        TriggerMode,
     };
     use evdev::KeyCode;
     use std::collections::BTreeSet;
@@ -1708,6 +1743,7 @@ mod tests {
                 Effect::TearDown(TeardownReason::ProfileSwitch),
                 Effect::RepublishActuation,
                 Effect::AssertStatusLeds,
+                Effect::AssertLighting,
                 Effect::AnnounceProfileChange("Gaming".to_string()),
             ]
         );
@@ -1732,6 +1768,29 @@ mod tests {
             }
         );
         assert_eq!(outcome.effects, vec![Effect::AssertStatusLeds]);
+    }
+
+    #[test]
+    fn set_lighting_writes_the_active_profiles_assignment_and_asks_for_an_assert() {
+        let assignment = LightingAssignment::FixedEffect {
+            effect: FixedEffect::Static {
+                colour: Colour {
+                    r: 0x10,
+                    g: 0x20,
+                    b: 0x30,
+                },
+            },
+        };
+        let (next, outcome) = plan_ok(
+            &seed(),
+            Edit::SetLighting {
+                assignment: assignment.clone(),
+                brightness: 0x80,
+            },
+        );
+        assert_eq!(next.profiles[DEFAULT_PROFILE_NAME].lighting, assignment);
+        assert_eq!(next.profiles[DEFAULT_PROFILE_NAME].brightness, 0x80);
+        assert_eq!(outcome.effects, vec![Effect::AssertLighting]);
     }
 
     #[test]

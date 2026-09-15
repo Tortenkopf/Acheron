@@ -639,6 +639,16 @@ class DaemonStub:
         }
         self.calls.append(("set_status_leds", orange, green, blue))
 
+    def set_lighting(self, assignment: dict, brightness: int) -> None:
+        # `tartarus-backlight` ticket 03: the whole assignment + brightness in
+        # one call, mirroring `set_status_leds` exactly — always an edit to
+        # the active Profile. Mirrors what a real `GetConfig` would return
+        # after the call so stub-backed GUI code rebuilding from config sees
+        # it.
+        self._profiles[self._active_profile]["lighting"] = copy.deepcopy(assignment)
+        self._profiles[self._active_profile]["brightness"] = brightness
+        self.calls.append(("set_lighting", copy.deepcopy(assignment), brightness))
+
     # --- tartarus-dual-stage-keys ticket 05: deep-stage D-Bus surface -------
     #
     # Mirrors `daemon/src/edit.rs`'s `SetDeepStage`/`ClearDeepStage`/

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright © 2026 Justin Milatz
 
+import pytest
+
 from acheron_gui import wire
 
 
@@ -104,3 +106,80 @@ def test_controller_button_stepper_item_round_trips_through_a_variant():
 
     assert unpacked == item
     assert "modifiers" not in variant_dict
+
+
+# --- `tartarus-backlight` ticket 03: `lighting_assignment_to_variant` ------
+#
+# `Colour` rides as a `(yyy)` byte-triple on this wire encoding (matching the
+# daemon's `colour_from_field` decode convention), not the `{"r","g","b"}`
+# dict `GetConfig()` hands back — these tests unpack through that boundary
+# rather than asserting dict equality against the input.
+
+
+def test_off_lighting_assignment_round_trips_through_a_variant():
+    variant_dict = wire.lighting_assignment_to_variant({"type": "off"})
+
+    assert {k: v.unpack() for k, v in variant_dict.items()} == {"type": "off"}
+
+
+def test_fixed_effect_reactive_lighting_assignment_encodes_its_colour_as_a_byte_triple():
+    assignment = {
+        "type": "fixed_effect",
+        "effect": {
+            "type": "reactive",
+            "colour": {"r": 255, "g": 128, "b": 0},
+            "speed": 3,
+        },
+    }
+
+    variant_dict = wire.lighting_assignment_to_variant(assignment)
+    unpacked = {k: v.unpack() for k, v in variant_dict.items()}
+
+    assert unpacked == {
+        "type": "fixed_effect",
+        "effect": {
+            "type": "reactive",
+            "colour": (255, 128, 0),
+            "speed": 3,
+        },
+    }
+
+
+def test_fixed_effect_breath_dual_lighting_assignment_encodes_both_colours():
+    assignment = {
+        "type": "fixed_effect",
+        "effect": {
+            "type": "breath",
+            "style": {
+                "style": "dual",
+                "first": {"r": 1, "g": 2, "b": 3},
+                "second": {"r": 4, "g": 5, "b": 6},
+            },
+        },
+    }
+
+    variant_dict = wire.lighting_assignment_to_variant(assignment)
+    unpacked = {k: v.unpack() for k, v in variant_dict.items()}
+
+    assert unpacked == {
+        "type": "fixed_effect",
+        "effect": {
+            "type": "breath",
+            "style": {"style": "dual", "first": (1, 2, 3), "second": (4, 5, 6)},
+        },
+    }
+
+
+def test_custom_layout_lighting_assignment_encodes_21_colours_as_an_array_of_byte_triples():
+    colours = [{"r": i, "g": i, "b": i} for i in range(21)]
+
+    variant_dict = wire.lighting_assignment_to_variant({"type": "custom_layout", "colours": colours})
+    unpacked = {k: v.unpack() for k, v in variant_dict.items()}
+
+    assert unpacked["type"] == "custom_layout"
+    assert unpacked["colours"] == [(i, i, i) for i in range(21)]
+
+
+def test_lighting_assignment_to_variant_rejects_an_unknown_type():
+    with pytest.raises(ValueError):
+        wire.lighting_assignment_to_variant({"type": "bogus"})

@@ -811,6 +811,21 @@ def test_set_status_leds_updates_the_active_profile_and_records_the_call():
     assert stub.calls == [("set_status_leds", True, False, True)]
 
 
+def test_set_lighting_updates_the_active_profile_and_records_the_call():
+    # `tartarus-backlight` ticket 03: the whole assignment + brightness in
+    # one call, always an edit to the active Profile. `get_config` reflects
+    # it the way a real `GetConfig` would after `SetLighting`.
+    stub = DaemonStub()
+    assignment = {"type": "fixed_effect", "effect": {"type": "spectrum"}}
+
+    stub.set_lighting(assignment, 128)
+
+    profile = stub.get_config()["profiles"]["Default"]
+    assert profile["lighting"] == assignment
+    assert profile["brightness"] == 128
+    assert stub.calls == [("set_lighting", assignment, 128)]
+
+
 # --- tartarus-dual-stage-keys ticket 05: deep-stage D-Bus surface -----------
 
 
