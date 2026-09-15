@@ -23,9 +23,10 @@ use zbus::zvariant::{OwnedValue, Value};
 
 use crate::command::State;
 use crate::config::{
-    Action, ActuationPoint, AxisTarget, Binding, ChordKey, Config, DeepStageConfig, Layer,
-    MacroDef, MacroId, MacroStepDto, ModeKeyRole, Modifiers, Profile, StagingMode, StatusLeds,
-    StepDirection, StepperDef, StepperId, StepperItem, TriggerMode,
+    Action, ActuationPoint, AxisTarget, Binding, BreathStyle, ChordKey, Colour, Config,
+    DeepStageConfig, FixedEffect, Layer, LightingAssignment, MacroDef, MacroId, MacroStepDto,
+    ModeKeyRole, Modifiers, Profile, StagingMode, StatusLeds, StepDirection, StepperDef, StepperId,
+    StepperItem, TriggerMode, WaveDirection,
 };
 
 /// The `a{sv}` shape every `Action`/`MacroStep`/`Binding`/`Config` entity
@@ -374,6 +375,110 @@ fn status_leds_to_dict(leds: StatusLeds) -> Dict {
     dict
 }
 
+/// `Colour` marshals as a flat three-field `a{sv}` of bytes (`tartarus-
+/// backlight` ticket 01), following `actuation_point_to_dict`'s
+/// bundle-related-scalars convention.
+fn colour_to_dict(colour: Colour) -> Dict {
+    let mut dict = Dict::new();
+    dict.insert("r".to_string(), scalar(colour.r));
+    dict.insert("g".to_string(), scalar(colour.g));
+    dict.insert("b".to_string(), scalar(colour.b));
+    dict
+}
+
+fn wave_direction_str(direction: WaveDirection) -> &'static str {
+    match direction {
+        WaveDirection::Left => "left",
+        WaveDirection::Right => "right",
+    }
+}
+
+/// `BreathStyle` marshals as its own `"style"`-tagged dict — `FixedEffect`'s
+/// `Breath`/`Starlight` variants nest this under their own `style` field, so
+/// the tag key repeats at two nesting levels by design, mirroring
+/// `config::BreathStyle`'s own `#[serde(tag = "style", ...)]` shape exactly.
+fn breath_style_to_dict(style: &BreathStyle) -> Dict {
+    let mut dict = Dict::new();
+    match style {
+        BreathStyle::Random => {
+            dict.insert("style".to_string(), scalar("random".to_string()));
+        }
+        BreathStyle::Single { colour } => {
+            dict.insert("style".to_string(), scalar("single".to_string()));
+            dict.insert("colour".to_string(), scalar(colour_to_dict(*colour)));
+        }
+        BreathStyle::Dual { first, second } => {
+            dict.insert("style".to_string(), scalar("dual".to_string()));
+            dict.insert("first".to_string(), scalar(colour_to_dict(*first)));
+            dict.insert("second".to_string(), scalar(colour_to_dict(*second)));
+        }
+    }
+    dict
+}
+
+/// `FixedEffect` marshals as a `"type"`-tagged dict, `Action`'s existing
+/// tagged-dict convention for sum types extended to Lighting (`tartarus-
+/// backlight` ticket 01).
+fn fixed_effect_to_dict(effect: &FixedEffect) -> Dict {
+    let mut dict = Dict::new();
+    match effect {
+        FixedEffect::Static { colour } => {
+            dict.insert("type".to_string(), scalar("static".to_string()));
+            dict.insert("colour".to_string(), scalar(colour_to_dict(*colour)));
+        }
+        FixedEffect::Spectrum => {
+            dict.insert("type".to_string(), scalar("spectrum".to_string()));
+        }
+        FixedEffect::Reactive { colour, speed } => {
+            dict.insert("type".to_string(), scalar("reactive".to_string()));
+            dict.insert("colour".to_string(), scalar(colour_to_dict(*colour)));
+            dict.insert("speed".to_string(), scalar(*speed));
+        }
+        FixedEffect::Wave { direction } => {
+            dict.insert("type".to_string(), scalar("wave".to_string()));
+            dict.insert(
+                "direction".to_string(),
+                scalar(wave_direction_str(*direction).to_string()),
+            );
+        }
+        FixedEffect::Breath { style } => {
+            dict.insert("type".to_string(), scalar("breath".to_string()));
+            dict.insert("style".to_string(), scalar(breath_style_to_dict(style)));
+        }
+        FixedEffect::Starlight { style, speed } => {
+            dict.insert("type".to_string(), scalar("starlight".to_string()));
+            dict.insert("style".to_string(), scalar(breath_style_to_dict(style)));
+            dict.insert("speed".to_string(), scalar(*speed));
+        }
+    }
+    dict
+}
+
+/// A Profile's `LightingAssignment` marshals as a `"type"`-tagged dict,
+/// `action_to_dict`'s existing convention now extended to Lighting
+/// (`tartarus-backlight` ticket 01).
+fn lighting_assignment_to_dict(assignment: &LightingAssignment) -> Dict {
+    let mut dict = Dict::new();
+    match assignment {
+        LightingAssignment::Off => {
+            dict.insert("type".to_string(), scalar("off".to_string()));
+        }
+        LightingAssignment::FixedEffect { effect } => {
+            dict.insert("type".to_string(), scalar("fixed_effect".to_string()));
+            dict.insert("effect".to_string(), scalar(fixed_effect_to_dict(effect)));
+        }
+        LightingAssignment::CustomLayout { colours } => {
+            dict.insert("type".to_string(), scalar("custom_layout".to_string()));
+            let colours: Vec<Dict> = colours
+                .iter()
+                .map(|colour| colour_to_dict(*colour))
+                .collect();
+            dict.insert("colours".to_string(), scalar(colours));
+        }
+    }
+    dict
+}
+
 fn actuation_overrides_to_dict(overrides: &HashMap<crate::input::Input, ActuationPoint>) -> Dict {
     overrides
         .iter()
@@ -481,6 +586,11 @@ fn profile_to_dict(profile: &Profile) -> Dict {
         "status_leds".to_string(),
         scalar(status_leds_to_dict(profile.status_leds)),
     );
+    dict.insert(
+        "lighting".to_string(),
+        scalar(lighting_assignment_to_dict(&profile.lighting)),
+    );
+    dict.insert("brightness".to_string(), scalar(profile.brightness));
     dict.insert(
         "deep_base".to_string(),
         scalar(bindings_to_dict(&profile.deep_base)),
@@ -1178,6 +1288,116 @@ mod tests {
         assert!(bool::try_from(get(&status_leds, "orange").unwrap()).unwrap());
         assert!(!bool::try_from(get(&status_leds, "green").unwrap()).unwrap());
         assert!(bool::try_from(get(&status_leds, "blue").unwrap()).unwrap());
+    }
+
+    /// `tartarus-backlight` ticket 01: `config_to_dict` must serialize a
+    /// Profile's `lighting` (a `"type"`-tagged dict, `action_to_dict`'s
+    /// convention extended to `LightingAssignment`/`FixedEffect`) and
+    /// `brightness` (a plain byte) — one profile per `LightingAssignment`
+    /// variant, mirroring `config_to_dict_serializes_status_leds` above.
+    #[test]
+    fn config_to_dict_serializes_lighting_and_brightness_for_every_variant() {
+        use std::collections::HashMap as StdHashMap;
+
+        fn dict_for(assignment: LightingAssignment, brightness: u8) -> Dict {
+            let mut profiles = StdHashMap::new();
+            profiles.insert(
+                "Default".to_string(),
+                Profile {
+                    lighting: assignment,
+                    brightness,
+                    ..Default::default()
+                },
+            );
+            let config = Config {
+                schema_version: 1,
+                active_profile: "Default".to_string(),
+                profiles,
+                force_digital: false,
+                macros: StdHashMap::new(),
+                steppers: StdHashMap::new(),
+            };
+            let dict = config_to_dict(&config);
+            let profiles_dict: Dict = get(&dict, "profiles").unwrap().clone().try_into().unwrap();
+            profiles_dict
+                .get("Default")
+                .unwrap()
+                .clone()
+                .try_into()
+                .unwrap()
+        }
+
+        // Off
+        let default_profile = dict_for(LightingAssignment::Off, 0);
+        let lighting: Dict = get(&default_profile, "lighting")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(dict_get_string(&lighting, "type"), "off");
+        assert_eq!(
+            u8::try_from(get(&default_profile, "brightness").unwrap()).unwrap(),
+            0
+        );
+
+        // FixedEffect (Reactive, to exercise both a nested colour and a speed byte)
+        let default_profile = dict_for(
+            LightingAssignment::FixedEffect {
+                effect: FixedEffect::Reactive {
+                    colour: Colour {
+                        r: 255,
+                        g: 128,
+                        b: 0,
+                    },
+                    speed: 3,
+                },
+            },
+            200,
+        );
+        let lighting: Dict = get(&default_profile, "lighting")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(dict_get_string(&lighting, "type"), "fixed_effect");
+        let effect: Dict = get(&lighting, "effect")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(dict_get_string(&effect, "type"), "reactive");
+        assert_eq!(u8::try_from(get(&effect, "speed").unwrap()).unwrap(), 3);
+        let colour: Dict = get(&effect, "colour").unwrap().clone().try_into().unwrap();
+        assert_eq!(u8::try_from(get(&colour, "r").unwrap()).unwrap(), 255);
+        assert_eq!(u8::try_from(get(&colour, "g").unwrap()).unwrap(), 128);
+        assert_eq!(u8::try_from(get(&colour, "b").unwrap()).unwrap(), 0);
+        assert_eq!(
+            u8::try_from(get(&default_profile, "brightness").unwrap()).unwrap(),
+            200
+        );
+
+        // CustomLayout (21 colours)
+        let colours = [Colour {
+            r: 10,
+            g: 20,
+            b: 30,
+        }; 21];
+        let default_profile = dict_for(LightingAssignment::CustomLayout { colours }, 128);
+        let lighting: Dict = get(&default_profile, "lighting")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(dict_get_string(&lighting, "type"), "custom_layout");
+        let colours_vec: Vec<OwnedValue> =
+            Vec::try_from(get(&lighting, "colours").unwrap().clone()).unwrap();
+        assert_eq!(colours_vec.len(), 21);
+        let first_colour: Dict = colours_vec[0].clone().try_into().unwrap();
+        assert_eq!(u8::try_from(get(&first_colour, "r").unwrap()).unwrap(), 10);
+        assert_eq!(
+            u8::try_from(get(&default_profile, "brightness").unwrap()).unwrap(),
+            128
+        );
     }
 
     /// tartarus-dual-stage-keys ticket 01: `config_to_dict` must serialize a

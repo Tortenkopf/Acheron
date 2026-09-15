@@ -921,7 +921,8 @@ pub(crate) fn plan(config: &Config, edit: Edit) -> Result<(Config, Outcome), Com
 /// Inspects `base`, `held`, `chords_base`, `chords_held`, `deep_base`,
 /// `deep_held`, `deep_stages` (the `.mode` field only), and `mode_key_role`.
 /// Ignores `axis_base` / `axis_held`, `actuation_overrides`,
-/// `default_actuation`, `status_leds`, `macros`, `steppers`.
+/// `default_actuation`, `status_leds`, `lighting`, `brightness`, `macros`,
+/// `steppers`.
 ///
 /// | before → after (active Profile) | emit |
 /// |---|---|

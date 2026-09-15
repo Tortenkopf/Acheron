@@ -167,6 +167,26 @@ pub struct Profile {
     /// serde default *is* the migration, exactly as every prior added field.
     #[serde(default)]
     pub status_leds: StatusLeds,
+    /// The Lighting assignment for this Profile (`tartarus-backlight` ticket
+    /// 01 — CONTEXT.md: Lighting assignment). `#[serde(default)]`
+    /// **without** `skip_serializing_if` — always written back in full, like
+    /// `default_actuation`/`status_leds`, so `toml::to_string_pretty` renders
+    /// a `[profiles.<name>.lighting]` sub-table. A pre-feature `config.toml`
+    /// with no `lighting` key parses with every Profile at
+    /// `LightingAssignment::Off` — the serde default *is* the migration,
+    /// exactly as every prior additive `Profile` field.
+    #[serde(default)]
+    pub lighting: LightingAssignment,
+    /// The brightness level (`0x00`-`0xFF`, raw wire byte — no percentage
+    /// remap) that applies regardless of which Lighting state is active
+    /// (`tartarus-backlight` ticket 01). A sibling field on `Profile`, not
+    /// nested in `LightingAssignment`, since it applies uniformly across
+    /// every variant (one more byte on the same one-shot frame).
+    /// `#[serde(default)]` without `skip_serializing_if`, matching
+    /// `lighting`'s own convention; defaults to `0` for a pre-feature
+    /// `config.toml`.
+    #[serde(default)]
+    pub brightness: u8,
     /// Chord Bindings active while this Profile's Base Layer is active
     /// (ticket 01/40 — CONTEXT.md: Chord): a `Binding` reused unchanged,
     /// keyed by the `Set<Input>` that must all be down together within the
@@ -488,6 +508,80 @@ pub struct StatusLeds {
     pub green: bool,
     #[serde(default)]
     pub blue: bool,
+}
+
+/// CONTEXT.md: Lighting assignment. The per-Profile choice of either a Fixed
+/// effect or a Custom layout — mutually exclusive, one per Profile
+/// (`tartarus-backlight` ticket 01) — asserted alongside `Profile.
+/// brightness`, which applies regardless of which state is active. `Off` is
+/// its own variant, not a bool — asserting it means sending the firmware's
+/// own "none" effect frame, not a config-level no-op distinct from a
+/// device-level one. `#[serde(tag = "type", rename_all = "snake_case")]`
+/// matches this file's existing tagging precedent for data-carrying enums
+/// (`Action`).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LightingAssignment {
+    #[default]
+    Off,
+    FixedEffect {
+        effect: FixedEffect,
+    },
+    CustomLayout {
+        colours: [Colour; 21],
+    },
+}
+
+/// CONTEXT.md: Fixed effect. One of the firmware's built-in, device-autonomous
+/// Lighting effects, asserted with a single one-shot command the firmware
+/// then runs on its own — `tartarus-backlight/spec.md`'s "Daemon
+/// architecture" type listing. `Reactive`/`Starlight` carry a real wire speed
+/// byte (1-4 / 1-3 respectively); range bounds are enforced at the GUI
+/// control level, not here (no `config::validate` rule beyond type bounds —
+/// ticket 01).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FixedEffect {
+    Static { colour: Colour },
+    Spectrum,
+    Reactive { colour: Colour, speed: u8 },
+    Wave { direction: WaveDirection },
+    Breath { style: BreathStyle },
+    Starlight { style: BreathStyle, speed: u8 },
+}
+
+/// CONTEXT.md: Fixed effect (Breath's/Starlight's own style parameter).
+/// `#[serde(tag = "style", rename_all = "snake_case")]` — a second tag key,
+/// distinct from `FixedEffect`'s own `"type"` tag, since a `Breath`/
+/// `Starlight` value nests one of these under its own `style` field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "style", rename_all = "snake_case")]
+pub enum BreathStyle {
+    Random,
+    Single { colour: Colour },
+    Dual { first: Colour, second: Colour },
+}
+
+/// CONTEXT.md: Fixed effect (Wave's own direction parameter). A fresh
+/// 2-variant type, **not** a reuse of `input::Direction` (ticket 01) — Wave
+/// only ever sends one of two wire values, and reusing the 4-variant
+/// axis-input type would make `Up`/`Down` representable-but-invalid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaveDirection {
+    Left,
+    Right,
+}
+
+/// CONTEXT.md: Lighting assignment. One matrix cell's colour — a **named
+/// struct**, never a tuple or hex string (ticket 01), the same reasoning
+/// `StatusLeds` already documents: keeps the type additive-friendly if a
+/// future field needs to land without touching every call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Colour {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
 }
 
 /// CONTEXT.md: Axis assignment. One of the 17 targets ticket 59 §3 settled —
@@ -1948,6 +2042,29 @@ action = { type = "keypress", key = "KEY_F1" }
                 blue: false,
             }
         );
+    }
+
+    #[test]
+    fn a_pre_lighting_config_defaults_lighting_off_and_zero_brightness() {
+        // A config.toml written before the Lighting feature has no
+        // `lighting`/`brightness` keys at all — it must still parse
+        // unchanged, with every Profile defaulting to Off at brightness 0
+        // (`tartarus-backlight` ticket 01: additive `#[serde(default)]`
+        // fields, no schema_version bump), exactly like the pre-status-LED
+        // case above.
+        let toml = r#"
+schema_version = 1
+active_profile = "Default"
+
+[profiles.Default.base.grid_r1c1]
+trigger = "fire_once"
+action = { type = "keypress", key = "KEY_F1" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let profile = &config.profiles["Default"];
+        assert_eq!(profile.lighting, LightingAssignment::Off);
+        assert_eq!(profile.lighting, LightingAssignment::default());
+        assert_eq!(profile.brightness, 0);
     }
 
     #[test]

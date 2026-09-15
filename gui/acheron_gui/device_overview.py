@@ -127,6 +127,12 @@ PLACEHOLDER_CONFIG = {
             "default_actuation": {"actuation": 128, "release": 112},
             "actuation_overrides": {},
             "status_leds": {"orange": False, "green": False, "blue": False},
+            # `tartarus-backlight` ticket 01: mirrors `DaemonStub._SEED_
+            # PROFILE`'s `lighting`/`brightness` keys — no unconditional
+            # reader exists yet, but the mirror obligation above applies to
+            # every `_SEED_PROFILE` key, not just the ones read today.
+            "lighting": {"type": "off"},
+            "brightness": 0,
             "axis_base": {},
             "axis_held": {},
         }

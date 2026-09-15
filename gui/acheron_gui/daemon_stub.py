@@ -90,6 +90,13 @@ class DaemonStub:
         # `GetConfig` hands back (`daemon/src/dbus/wire.rs::status_leds_to_dict`),
         # defaulting all-off like `StatusLeds::default()`.
         "status_leds": {"orange": False, "green": False, "blue": False},
+        # `tartarus-backlight` ticket 01: a Profile's Lighting assignment and
+        # brightness — the same `"type"`-tagged dict + plain byte the real
+        # Daemon's `GetConfig` hands back (`daemon/src/dbus/wire.rs::
+        # lighting_assignment_to_dict`), defaulting Off at zero brightness
+        # like `LightingAssignment::default()` / `Profile.brightness`.
+        "lighting": {"type": "off"},
+        "brightness": 0,
         # Ticket 40: a Profile's Chord Bindings, keyed the same way the real
         # Daemon's wire shape does — a "+"-joined, sorted string of member
         # Input strings (mirrors `daemon/src/config.rs::ChordKey`'s Display).
