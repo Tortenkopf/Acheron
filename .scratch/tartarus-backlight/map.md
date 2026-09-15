@@ -60,10 +60,13 @@ tickets (03, 04); `/research` already fired for ticket 01.
   ("Lighting effect", never a bare "Effect" as a standalone concept name) — the glossary entry
   for Action's avoid-list stays as-is; it governs what *Action* is called, not a blanket ban on
   the word.
-- **The scroll wheel, not the Mode key, is the 21st lit matrix cell** — corrected during
-  charting (the user's own hardware knowledge overrides the initial `device_overview.py`-layout
-  inference). The Mode key and thumbstick are shown in the Lighting tab for physical-layout
-  fidelity but stay inert/unlit (Q6).
+- **The scroll wheel, not the Mode key, is a lit matrix cell** — corrected during charting (the
+  user's own hardware knowledge overrides the initial `device_overview.py`-layout inference).
+  The Mode key and thumbstick are shown in the Lighting tab for physical-layout fidelity but
+  stay inert/unlit (Q6). **Superseded by ticket 02's hardware pass:** the wheel is column `19`
+  of 21, not the 21st/last cell as this note originally assumed — see ticket 02's Decisions-so-far
+  entry for the full column order. The Mode key/thumbstick finding held up, and turned out
+  stronger than stated: they're solid black plastic, not RGB-capable at all.
 
 **Precedent:** `tartarus-status-leds/map.md` and its `spec.md` are the template for this map's
 shape and for this effort's eventual spec's section list.
@@ -85,20 +88,53 @@ shape and for this effort's eventual spec's section list.
   write-then-arm two-step (`matrix_custom_frame` before `matrix_effect_custom`). **Genuinely
   undetermined from source and needs the real device:** which of the 21 matrix columns is the
   scroll wheel — no Tartarus-Pro-specific remap table exists anywhere in the driver or daemon.
+- [Hardware verification](./issues/02-hardware-verification.md) —
+  ([raw run log](./assets/02-RESULTS.md)) confirms Q6 physically (20 grid keys + wheel lit;
+  Mode key/thumbstick are solid black plastic, not merely unlit) and settles the column-order
+  gap ticket 01 left open: wire columns **`0..18` = grid keys `1..19`, `19` = the scroll wheel,
+  `20` = grid key `20`** — the wheel is second-to-last, **not** the 21st/last cell as charted
+  below in the original Q6 note. Also confirms no driver-mode change is needed for any backlight
+  effect (wave/static/breathing — single/dual/random — all ran from `device_mode 00 00`), that
+  Breath's `transaction_id` quirk is harmless (both `0x1F` and the driver's actual `0x3F` work —
+  spec can just use `0x1F`),
+  brightness is genuinely `0x00`–`0xFF` with `0x00` alone blacking out the matrix independent of
+  effect state, and no adverse device behaviour across ~15 writes + one relock.
+- [Daemon architecture for Lighting](./issues/03-daemon-architecture-for-lighting.md) —
+  ripple confirmed out of scope (it's exactly the "host-streamed animation" the map already
+  excludes). Lighting extends the existing `led` task rather than a sibling task, via a second
+  `watch<Option<LightingState>>` channel the same task `select!`s alongside the untouched
+  Status-LEDs channel, keeping writes to the shared control interface serialized. Config is a
+  new sum type, `LightingAssignment { Off | FixedEffect | CustomLayout }` plus a sibling
+  `brightness: u8`, with `FixedEffect`'s six variants fully typed now against ticket 01's wire
+  facts (GUI exposure per field stays ticket 04's call); `Off` doubles as the firmware's own
+  "none" effect frame, not a separate variant. Plain `#[serde(default)]`, no schema bump.
+  Dispatch wiring (`Effect::AssertLighting`) and startup/reconnect assertion timing mirror
+  Status LEDs exactly. **One deliberate asymmetry:** no shutdown-clear for Lighting — a new
+  fact surfaced that backlight effect-select frames use `VARSTORE` (persisted device-side),
+  unlike Status LEDs' `NOSTORE`, so leaving the last-asserted effect in place on daemon exit is
+  correct, not an oversight. Domain terms and the ADR are deferred to ticket 05, same lazy
+  discipline as Status LEDs.
+- [GUI/daemon surface for Lighting](./issues/04-gui-daemon-surface-for-lighting.md) —
+  corrects two gaps in ticket 03's type (`Reactive`/`Starlight` gain a `speed: u8` field;
+  `Wave` gets a fresh 2-variant `WaveDirection` instead of reusing the unrelated 4-variant
+  `input::Direction`). GUI: one flat 8-entry mode selector (Off + the 6 Fixed effects + Custom
+  layout, no nesting), every control living in a single horizontal strip above the device area
+  — settled via [a 3-variant prototype](../../../prototype/04-lighting-tab-layout/prototype.py)
+  (branch `prototype/tartarus-backlight-04-lighting-tab-layout`, not on `dev`) after text
+  grilling alone proved insufficient for this layout question. Custom layout's current-colour
+  picker + bulk-fill button live in that same strip (not a sidebar); its paint grid only
+  renders when Custom layout is selected, paints immediately per click (no Apply step);
+  eyedropper/palette reuse explicitly deferred past this ticket. Brightness is one always-
+  visible 0–255 slider, commit-on-release. D-Bus: one `SetLighting(a{sv}, y)` call mirroring
+  `SetStatusLeds`'s whole-payload shape and `Action`'s tagged-dict encoding; no `GetState()`
+  addition, no `rules.py` changes. Copy-from-Profile is client-side only, no new D-Bus method.
 
 ## Not yet specified
 
 <!-- in-scope fog; graduates to tickets as the frontier advances -->
 
-- **Exact per-effect parameter surface** — which of colour(s)/speed/direction each Fixed
-  effect exposes in the GUI. Graduates via ticket 04, once ticket 01's byte tables exist.
-- **`config.toml` schema shape and serde defaulting** for the `LightingAssignment` type.
-  Graduates via ticket 03.
-- **Matrix column-addressing order** — whether the Custom-layout frame's 21 cells run
-  grid-keys-then-wheel or some interleaved order. Graduates via tickets 01/02.
-- **Custom-layout painting UX details** — bulk-fill, palette reuse, eyedropper, and whether the
-  Grid destination's physical-layout button component can be reused as-is or needs a paint-mode
-  variant. Graduates via ticket 04.
+(empty — ticket 04 graduated both remaining fog patches: the per-effect parameter surface and
+the Custom-layout painting UX. Nothing left before ticket 05's spec.)
 
 ## Out of scope
 
@@ -116,3 +152,9 @@ shape and for this effort's eventual spec's section list.
 - **Host-streamed per-frame Custom-layout animation** — this effort covers one static per-key
   colour layout only. ADR-0006 already flagged streamed animation as a distinct future revisit
   of the `led` task's fd lifetime.
+- **Custom-layout painter eyedropper and named palette/swatch reuse** — ruled out of ticket 05's
+  spec (ticket 04 §3): a bulk-fill button ships, but loading a painted key's colour as the new
+  current-colour, or saving/reusing named colours across keys or Profiles, are real scope growth
+  (a second interaction mode; a new persisted concept with no config-model home) better judged
+  after the plain painter has seen use — a fresh ticket later if wanted, not a resumption of
+  this map.
