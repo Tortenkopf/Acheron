@@ -1,4 +1,5 @@
 Label: wayfinder:map
+Status: archived — destination reached 2026-09-15; all five tickets resolved, spec.md handed off. Implementation continues in a fresh, non-wayfinder effort (`tartarus-backlight-impl/`), not a resumption of this map.
 
 # Tartarus Pro backlight lighting
 
@@ -128,6 +129,13 @@ shape and for this effort's eventual spec's section list.
   visible 0–255 slider, commit-on-release. D-Bus: one `SetLighting(a{sv}, y)` call mirroring
   `SetStatusLeds`'s whole-payload shape and `Action`'s tagged-dict encoding; no `GetState()`
   addition, no `rules.py` changes. Copy-from-Profile is client-side only, no new D-Bus method.
+- [Write lighting spec](./issues/05-write-lighting-spec.md) — consolidated tickets 01–04 into
+  [`spec.md`](./spec.md) (same section list as `tartarus-status-leds/spec.md`), plus
+  [ADR-0012](../../docs/adr/0012-lighting-shares-the-led-task-no-varstore-shutdown-clear.md)
+  and four new `CONTEXT.md` entries (**Lighting**, **Lighting assignment**, **Fixed effect**,
+  **Custom layout**). `.scratch/README.md` flipped to "spec ready." Pure consolidation, no new
+  decisions — every ticket on this map is now resolved; implementation is a fresh effort
+  (`tartarus-backlight-impl`), not a resumption of this map.
 
 ## Not yet specified
 

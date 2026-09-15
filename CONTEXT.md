@@ -115,6 +115,22 @@ _Avoid_: profile LED, keymap indicator (Razer's Synapse term), Chroma (the separ
 The per-Profile triple of on/off states for the three Status LEDs. Every Profile has one (default all-off); the Daemon asserts the active Profile's assignment on Profile switch, on Daemon startup, and on every device (re)connect — the firmware reclaims the LEDs to its orange-only default on every USB enumeration, so re-assertion is mandatory, not an optimisation. Cleared to all-off on clean Daemon exit. Stored as a `[profiles.<name>.status_leds]` table in `config.toml`.
 _Avoid_: LED profile, LED state (too vague — reserve for the momentary hardware condition)
 
+**Lighting**:
+The Tartarus Pro's RGB backlight across its 20 grid keys and scroll wheel, distinct from the three fixed-colour Status LEDs. Driven only by the active Profile's Lighting assignment, never by a Binding or a Layer. The Mode key and thumbstick are shown alongside it in the GUI for physical-layout fidelity but are solid black plastic — not RGB-capable at all.
+_Avoid_: Chroma (Razer's own marketing name for this), backlight (fine as a casual descriptor, but "Lighting" is the domain term to use as the concept name)
+
+**Lighting assignment**:
+The per-Profile choice of either a Fixed effect or a Custom layout — mutually exclusive, one per Profile — plus a brightness level that applies regardless of which is active. Every Profile has one (default Off, matrix dark); the Daemon asserts the active Profile's assignment on Profile switch, on Daemon startup, and on every device (re)connect, the same assertion discipline as the Status LED assignment. Unlike Status LEDs, the firmware persists the asserted effect device-side (VARSTORE) across reconnects, so re-assertion guarantees the device matches `config.toml` rather than recovering from a guaranteed reset — and there is no shutdown-time clear (see ADR-0012). Stored as `lighting`/`brightness` fields on `Profile` in `config.toml`.
+_Avoid_: lighting profile, lighting state (too vague — reserve for the momentary hardware condition), backlight assignment
+
+**Fixed effect**:
+One of the firmware's built-in, device-autonomous Lighting effects — Static, Spectrum, Reactive, Wave, Breath, or Starlight — asserted with a single one-shot command the firmware then runs on its own, no further Daemon involvement. One of the two states a Lighting assignment may hold; mutually exclusive with Custom layout. Off is a separate Lighting-assignment state, not itself a Fixed effect. Ripple is deliberately not a Fixed effect — it is not a device-side command at all (OpenRazer fakes it with a host-streamed ~25 Hz write loop), which is exactly the host-streamed animation this effort's Custom layout excludes.
+_Avoid_: preset, mode, ripple (see above — not implemented)
+
+**Custom layout**:
+The other state a Lighting assignment may hold: a fixed, non-animated colour painted onto each matrix cell — the 20 grid keys and the scroll wheel — and asserted as a single static frame (a write-then-arm two-step on the wire). Mutually exclusive with Fixed effect. The Mode key and thumbstick are rendered in the GUI's Custom-layout painter for physical fidelity but are never paintable.
+_Avoid_: custom effect (Razer's own wire-command name — reserve for the wire-protocol layer, not this domain concept), per-key colour map
+
 ### Runtime
 
 **Daemon**:
