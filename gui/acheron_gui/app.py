@@ -479,6 +479,11 @@ class AcheronApplication(Gtk.Application):
         # all fit at first launch without GTK shrinking any button below its
         # new fixed size. Measured live against the real running window.
         win.set_default_size(1400, 860)
+        # tartarus-backlight ticket 04: a hard 1100px floor, not just a
+        # default — the Lighting tab's horizontal control strip needs that
+        # much width for its busiest mode (Starlight: style toggle + speed +
+        # 2 colour pickers) without wrapping or growing the window itself.
+        win.set_size_request(1100, -1)
         _wire_window_close_to_hide(win)
 
         # Ticket 102: a HeaderBar titlebar carrying the primary menu — just
