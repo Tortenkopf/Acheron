@@ -942,6 +942,11 @@ _DEFAULT_COLOUR = {"r": 255, "g": 255, "b": 255}
 # starts fully dark, not an arbitrary colour.
 _BLACK_COLOUR = {"r": 0, "g": 0, "b": 0}
 _CUSTOM_LAYOUT_KEY_COUNT = 21
+# How long the brightness slider waits after the last `value-changed` before
+# committing (`build_lighting_brightness`) — long enough that a drag's own
+# stream of ticks never lands a commit mid-drag, short enough to feel
+# immediate once the user stops moving it.
+_BRIGHTNESS_DEBOUNCE_MS = 300
 
 
 def _lighting_mode(lighting: dict) -> str:
@@ -1301,23 +1306,23 @@ def build_lighting_brightness(
     client, config: dict, profile: str, on_change: Callable[[], None]
 ) -> Gtk.Widget:
     """One always-visible `Gtk.Scale`, 0-255 raw byte, independent of the
-    selected mode — commits on drag-end only (ticket 04's settled pattern,
-    modelled on the actuation-point depth marker's own `on_drag_end`
-    commit), not per-tick. GTK4's `Gtk.Scale` has no built-in "drag ended"
-    signal, so this mirrors the ticket's own prototype: a plain
-    `Gtk.GestureClick`'s "released" plus a `Gtk.EventControllerKey`'s
-    "key-released" both fire the same commit, covering a mouse drag-release
-    and a keyboard nudge alike. The click gesture is attached to `row` (the
-    Scale's own parent), not the Scale itself, with `PropagationPhase.
-    CAPTURE` — `Gtk.Range`'s own internal drag gesture claims the pointer
-    sequence for its own dragging (it has to, to move the slider), which
-    denies a competing `GestureClick` attached directly to the Scale and
-    swallows its "released" signal entirely (a documented GTK4 gotcha, e.g.
-    github.com/JuliaGtk/Gtk4.jl/issues/77 — reproduced live in this repo
-    too). Capturing on the parent, ahead of the Scale's own bubble-phase
-    handling, sidesteps the claim race. `scale.on_drag_end` is also exposed
-    directly (same seam `binding_editor.DepthTrack` exposes) since a real
-    pointer drag-release can't be synthesized in a headless test."""
+    selected mode — commits shortly after the value stops changing, not
+    per-tick, so a drag doesn't flood `set_lighting` with one call per pixel.
+    An earlier version tried to commit on drag-*end* specifically, via a
+    `Gtk.GestureClick`'s "released" captured on `row` (the Scale's own
+    parent) ahead of `Gtk.Range`'s own internal drag gesture claiming the
+    pointer sequence (a documented GTK4 gotcha, e.g.
+    github.com/JuliaGtk/Gtk4.jl/issues/77). That capture-phase workaround
+    turned out not to fire reliably against a real `Gtk.Scale` drag in
+    practice (confirmed live: `value-changed` tracks the drag correctly, but
+    "released" never lands, so brightness silently never committed) — a gap
+    the test suite couldn't catch since it only ever drove the exposed
+    `scale.on_drag_end` seam directly, never the real gesture. A short
+    `GLib.timeout_add` debounce off `value-changed` instead has no gesture
+    ownership to race: it recommits ~this many ms after the last change,
+    covering a mouse drag-release and a keyboard nudge alike.
+    `scale.on_drag_end` stays exposed as the same test seam (a real pointer
+    drag-release can't be synthesized in a headless test)."""
     brightness = config["profiles"][profile]["brightness"]
 
     row = Gtk.Box(spacing=8)
@@ -1328,24 +1333,26 @@ def build_lighting_brightness(
     scale.set_digits(0)
     scale.set_size_request(160, -1)
 
-    draft = {"value": brightness}
-
-    def on_value_changed(s):
-        draft["value"] = int(s.get_value())
+    draft = {"value": brightness, "timeout_id": None}
 
     def commit(*_args):
         lighting = config["profiles"][profile]["lighting"]
         client.set_lighting(lighting, draft["value"])
         on_change()
 
+    def on_value_changed(s):
+        draft["value"] = int(s.get_value())
+        if draft["timeout_id"] is not None:
+            GLib.source_remove(draft["timeout_id"])
+
+        def fire():
+            draft["timeout_id"] = None
+            commit()
+            return GLib.SOURCE_REMOVE
+
+        draft["timeout_id"] = GLib.timeout_add(_BRIGHTNESS_DEBOUNCE_MS, fire)
+
     scale.connect("value-changed", on_value_changed)
-    click = Gtk.GestureClick()
-    click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-    click.connect("released", commit)
-    row.add_controller(click)
-    key_ctl = Gtk.EventControllerKey()
-    key_ctl.connect("key-released", commit)
-    scale.add_controller(key_ctl)
     scale.on_drag_end = commit
 
     row.append(scale)
