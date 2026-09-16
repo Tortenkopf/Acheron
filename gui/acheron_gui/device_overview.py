@@ -78,7 +78,7 @@ from gi.repository import Gdk, GLib, Gtk, Pango
 from .binding_editor import action_summary, build_binding_editor, build_chord_binding_dialog
 from .daemon_client import DaemonError
 from .gtk_utils import build_name_prompt_popover, build_pinned_sidebar_box
-from .inputs import GRID_COLS, GRID_ROWS, grid_input, input_label
+from .inputs import GRID_COLS, GRID_ROWS, LAYOUT_NUMBER, grid_input, input_label
 from .library_view import build_library_content, build_library_sidebar
 from .rules import chord_members_conflict
 
@@ -552,6 +552,56 @@ def make_input_button(
     return btn
 
 
+def build_device_geometry(cell_factory: Callable[[str, int, int], Gtk.Widget]) -> Gtk.Widget:
+    """The physical layout ticket 09's prototype settled (see this module's
+    own docstring): a 4x5 grid (row 4 four-wide), the scroll wheel
+    continuing row 4's missing 5th slot for three more rows (scroll up,
+    click, scroll down), and a thumbstick-diamond/Mode-key/key-20 column
+    beside it. Factored out of `build_main_view` by `tartarus-backlight`
+    ticket 05 so the Lighting tab's Custom-layout paint grid can render at
+    the exact same physical positions as the real Grid destination's
+    Binding buttons — button **behaviour** stays entirely with the caller's
+    `cell_factory(inp, w, h)`; this function only ever decides *where* each
+    Input's widget goes (and, for the Mode key, its round shape — a layout
+    fact, not a behavioural one, so it belongs here rather than in either
+    caller)."""
+    device = Gtk.Box(spacing=28)
+
+    grid = Gtk.Grid(row_spacing=4, column_spacing=4)
+    for r in range(1, GRID_ROWS + 1):
+        cols = GRID_COLS if r < GRID_ROWS else GRID_COLS - 1
+        for c in range(1, cols + 1):
+            grid.attach(cell_factory(grid_input(r, c), 100, 100), c - 1, r - 1, 1, 1)
+    wheel_col_index = GRID_COLS - 1
+    grid.attach(cell_factory("wheel_scroll_up", 100, 100), wheel_col_index, GRID_ROWS - 1, 1, 1)
+    grid.attach(cell_factory("wheel_middle", 100, 100), wheel_col_index, GRID_ROWS, 1, 1)
+    grid.attach(cell_factory("wheel_scroll_down", 100, 100), wheel_col_index, GRID_ROWS + 1, 1, 1)
+    device.append(grid)
+
+    stick_col = Gtk.Box(
+        orientation=Gtk.Orientation.VERTICAL, spacing=18, halign=Gtk.Align.CENTER, valign=Gtk.Align.START
+    )
+    mode_widget = cell_factory("mode_key", 100, 100)
+    mode_widget.add_css_class("mode-key")
+    stick_col.append(mode_widget)
+
+    # Diamond rotated 90° clockwise from a plain N/S/E/W layout — see
+    # `build_main_view`'s own historical comment for why (layout.md).
+    diamond = Gtk.Grid(row_spacing=2, column_spacing=2)
+    diamond.attach(cell_factory("thumbstick_left", 100, 100), 1, 0, 1, 1)
+    diamond.attach(cell_factory("thumbstick_down", 100, 100), 0, 1, 1, 1)
+    diamond.attach(cell_factory("thumbstick_up", 100, 100), 2, 1, 1, 1)
+    diamond.attach(cell_factory("thumbstick_right", 100, 100), 1, 2, 1, 1)
+    stick_col.append(diamond)
+
+    # Key 20 (the paddle below the diamond) is physically wider on the
+    # hardware — 150×100, per ticket 87's settled sizing.
+    stick_col.append(cell_factory(grid_input(4, 5), 150, 100))
+    device.append(stick_col)
+
+    return device
+
+
 def build_destination_switch(selected_dest: str, on_select: Callable[[str], None]) -> Gtk.Box:
     """Ticket 47's round-2 (variant D) winner: a plain-text, icon-free
     "Grid"/"Library" switcher sitting where the old Action-Table toggle
@@ -866,8 +916,10 @@ def build_status_leds_section(
 # mode). Off/Fixed-effect selection and every per-effect param change commit
 # immediately via `client.set_lighting(...)`, mirroring every other
 # immediate-write control on this panel — no Save/Apply button on the tab.
-# The Custom-layout paint grid itself is ticket 05; this ticket only shows a
-# placeholder device area. ---
+# The Custom-layout paint grid (ticket 05, `build_lighting_device_area`) is
+# the only device-area content that isn't a placeholder — it shares its
+# physical layout with the Grid destination's own button grid via
+# `build_device_geometry`. ---
 
 _LIGHTING_MODES = (
     ("off", "Off"),
@@ -942,6 +994,57 @@ def _custom_layout_colours(lighting: dict) -> list[dict]:
     if lighting["type"] == "custom_layout":
         return [dict(c) for c in lighting["colours"]]
     return [dict(_BLACK_COLOUR) for _ in range(_CUSTOM_LAYOUT_KEY_COUNT)]
+
+
+def _custom_layout_column(inp: str) -> int | None:
+    """Ticket 05's settled column addressing (spec "The wire frames", hardware-
+    verified): columns `0..18` = grid keys `1..19` in order, column `19` =
+    the scroll wheel — its three physical detents (`wheel_scroll_up`/
+    `_middle`/`_scroll_down`) all address this one column, since the real
+    device has exactly one LED under the whole wheel assembly, not one per
+    detent — and column `20` = grid key `20`. `None` for the Mode key and
+    every thumbstick direction: solid black plastic on the real unit, not
+    RGB-capable at all, so they have no column to paint."""
+    if inp in ("wheel_scroll_up", "wheel_middle", "wheel_scroll_down"):
+        return 19
+    number = LAYOUT_NUMBER.get(inp)
+    if number is None:
+        return None
+    # `LAYOUT_NUMBER` numbers every grid Input 1..20 (key 20 included); the
+    # wire's column order slots 1..19 in at 0..18 but jumps key 20 to
+    # column 20, past the wheel's column 19 — not a plain `number - 1`.
+    return 20 if number == 20 else number - 1
+
+
+_LIGHTING_SWATCH_PROVIDER_STATE: dict[str, Gtk.CssProvider] = {}
+
+
+def _swatch_css_id(column: int) -> str:
+    """A paint cell's colour-swatch CSS id is keyed by its own wire column
+    (0-20, `_custom_layout_column`'s range) — a small, fixed set reused
+    across every rebuild, not per-colour or per-widget-instance."""
+    return f"lighting-swatch-col-{column}"
+
+
+def _install_lighting_swatch_provider() -> Gtk.CssProvider:
+    """The one `Gtk.CssProvider` every Custom-layout paint cell's background
+    colour is expressed through — Gtk4 has no per-widget inline-style API,
+    and the app's one global stylesheet (`app.CSS`) is static text with no
+    notion of an arbitrary runtime RGB value. Registered on the display at
+    most once (lazily, the same `add_provider_for_display` call `app.py`
+    already makes once at startup for its own static CSS) and reused —
+    `build_lighting_device_area` below fully rewrites its content on every
+    render instead of adding a fresh provider per cell per rebuild, which
+    would otherwise accumulate unboundedly on the display for the lifetime
+    of this long-running tray app."""
+    provider = _LIGHTING_SWATCH_PROVIDER_STATE.get("provider")
+    if provider is None:
+        provider = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+        _LIGHTING_SWATCH_PROVIDER_STATE["provider"] = provider
+    return provider
 
 
 def _rgba_to_colour(rgba: Gdk.RGBA) -> dict:
@@ -1076,12 +1179,47 @@ def build_lighting_mode_selector(
     return box
 
 
+def build_lighting_custom_layout_controls(
+    client, config: dict, profile: str, paint_colour: dict, on_change: Callable[[], None]
+) -> Gtk.Widget:
+    """Custom layout's own per-mode params (ticket 05, spec §"GUI" Custom-
+    layout painter): a persistent current-colour picker plus the "Fill all
+    keys" bulk-fill button, in the same params slot every other mode's
+    controls occupy. `paint_colour` is `ui_state["lighting_paint_colour"]`
+    (mutated in place by the picker) — threaded down from `build_lighting_
+    content` so the picked colour survives a rebuild and the paint grid
+    below reads the same live value on every click, the way `chord_ui`
+    already survives rebuilds for Chord recording."""
+    box = Gtk.Box(spacing=12)
+
+    def on_colour_picked(c: dict) -> None:
+        paint_colour.update(c)
+
+    box.append(_lighting_labeled("Colour", _lighting_colour_button(paint_colour, on_colour_picked)))
+
+    fill_btn = Gtk.Button(label="Fill all keys")
+
+    def on_fill(_b):
+        filled = [dict(paint_colour) for _ in range(_CUSTOM_LAYOUT_KEY_COUNT)]
+        _commit_lighting(
+            client, config, profile, {"type": "custom_layout", "colours": filled}, on_change
+        )
+
+    fill_btn.connect("clicked", on_fill)
+    box.append(fill_btn)
+    return box
+
+
 def build_lighting_params(
-    client, config: dict, profile: str, on_change: Callable[[], None]
+    client, config: dict, profile: str, paint_colour: dict, on_change: Callable[[], None]
 ) -> Gtk.Widget:
     lighting = config["profiles"][profile]["lighting"]
     box = Gtk.Box(spacing=12)
     box.add_css_class("lighting-params-panel")
+
+    if lighting["type"] == "custom_layout":
+        box.append(build_lighting_custom_layout_controls(client, config, profile, paint_colour, on_change))
+        return box
 
     if lighting["type"] != "fixed_effect":
         box.append(Gtk.Label(label="No parameters for this mode.", css_classes=["dim"], xalign=0))
@@ -1245,49 +1383,131 @@ def build_lighting_copy_from_profile(
     return row
 
 
-def build_lighting_device_area(lighting_mode: str) -> Gtk.Widget:
-    """The device area below the control strip — always a placeholder for
-    this ticket (spec "device area shows the paint grid only for Custom
-    layout, a placeholder otherwise"); ticket 05 replaces this with the real
-    paint grid, rendered here only while `lighting_mode == "custom_layout"`."""
-    placeholder = Gtk.Label(
-        label=(
-            "Custom-layout painting arrives in a later ticket."
-            if lighting_mode == "custom_layout"
-            else ""
-        ),
-        css_classes=["dim"],
+def _lighting_paint_cell(
+    client,
+    config: dict,
+    profile: str,
+    colours: list[dict],
+    paint_colour: dict,
+    swatch_css: list[str],
+    on_change: Callable[[], None],
+    inp: str,
+    w: int,
+    h: int,
+) -> Gtk.Widget:
+    """One `build_device_geometry` cell for the Custom-layout paint grid.
+    The Mode key and every thumbstick direction (`_custom_layout_column`
+    returns `None` for them) render as an inert, unpaintable placeholder —
+    shown for physical fidelity only, matching the real device's solid
+    black plastic; `build_device_geometry` itself already adds the Mode
+    key's round `mode-key` shape class, so nothing more happens here for it.
+    Every other cell paints immediately on click: the full 21-colour array,
+    `colours[column]` set to the current `paint_colour`, committed via
+    `set_lighting` at the unchanged brightness — no working-copy/Apply
+    step, per the ticket. Its own current colour is appended to
+    `swatch_css` rather than applied via a fresh `Gtk.CssProvider` per
+    cell — see `_install_lighting_swatch_provider`."""
+    column = _custom_layout_column(inp)
+    if column is None:
+        inert = Gtk.Box()
+        inert.set_size_request(w, h)
+        inert.set_halign(Gtk.Align.CENTER)
+        inert.add_css_class("lighting-inert-cell")
+        inert.set_tooltip_text(f"{input_label(inp)} — solid black plastic, not RGB-capable")
+        return inert
+
+    css_id = _swatch_css_id(column)
+    colour = colours[column]
+    swatch_css.append(
+        f"#{css_id} {{ background-color: rgb({colour['r']},{colour['g']},{colour['b']}); }}"
     )
-    placeholder.add_css_class("lighting-device-placeholder")
-    placeholder.set_size_request(280, 160)
-    return placeholder
+
+    btn = Gtk.Button()
+    btn.set_size_request(w, h)
+    btn.set_halign(Gtk.Align.CENTER)
+    btn.add_css_class("lighting-paint-cell")
+    btn.set_name(css_id)
+    btn.set_tooltip_text(input_label(inp))
+
+    def on_clicked(_b):
+        updated = [dict(c) for c in colours]
+        updated[column] = dict(paint_colour)
+        _commit_lighting(
+            client, config, profile, {"type": "custom_layout", "colours": updated}, on_change
+        )
+
+    btn.connect("clicked", on_clicked)
+    return btn
+
+
+def build_lighting_device_area(
+    client,
+    config: dict,
+    profile: str,
+    lighting_mode: str,
+    paint_colour: dict,
+    on_change: Callable[[], None],
+) -> Gtk.Widget:
+    """The device area below the control strip: the real Custom-layout paint
+    grid (ticket 05) while Custom layout is selected — sharing `build_
+    device_geometry`'s exact physical positions with the Grid destination's
+    own button grid — or a plain placeholder for every other mode (ticket
+    04's original behaviour, unchanged). Not shown, not even dimmed, for
+    any mode but Custom layout."""
+    if lighting_mode != "custom_layout":
+        placeholder = Gtk.Label(label="", css_classes=["dim"])
+        placeholder.add_css_class("lighting-device-placeholder")
+        placeholder.set_size_request(280, 160)
+        return placeholder
+
+    lighting = config["profiles"][profile]["lighting"]
+    colours = _custom_layout_colours(lighting)
+    swatch_css: list[str] = []
+
+    def cell_factory(inp: str, w: int, h: int) -> Gtk.Widget:
+        return _lighting_paint_cell(
+            client, config, profile, colours, paint_colour, swatch_css, on_change, inp, w, h
+        )
+
+    device = build_device_geometry(cell_factory)
+    # One rewrite of the one shared provider's content per render — bounded
+    # to the 21 columns `_swatch_css_id` ever names, never growing with
+    # rebuild count the way a fresh per-cell provider would.
+    _install_lighting_swatch_provider().load_from_string("\n".join(swatch_css))
+    device.add_css_class("lighting-paint-grid")
+    return device
 
 
 def build_lighting_content(
-    client, config: dict, profile: str, on_change: Callable[[], None]
+    client, config: dict, profile: str, ui_state: dict, on_change: Callable[[], None]
 ) -> Gtk.Widget:
     """The Lighting destination's whole content area (ticket 04, spec
     §"GUI"): one horizontal control strip — mode selector + per-effect
     params + brightness, all in one row so the strip's height stays
     constant across every mode (the ticket's own prototype rejected a
     vertical stack for exactly that reason) — above a Copy-from-Profile
-    affordance and the (placeholder, until ticket 05) device area."""
+    affordance and the device area (a placeholder, except the ticket 05
+    Custom-layout paint grid)."""
     lighting = config["profiles"][profile]["lighting"]
     mode = _lighting_mode(lighting)
+    # Ticket 05: the paint grid's current-colour, surviving a rebuild the
+    # same way `chord_ui` does — a plain local default would reset to white
+    # every time a paint click's own `on_change` rebuilds this whole tree.
+    paint_colour = ui_state.setdefault("lighting_paint_colour", dict(_DEFAULT_COLOUR))
 
     root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
 
     strip = Gtk.Box(spacing=16)
     strip.append(build_lighting_mode_selector(client, config, profile, on_change))
     strip.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
-    strip.append(build_lighting_params(client, config, profile, on_change))
+    strip.append(build_lighting_params(client, config, profile, paint_colour, on_change))
     strip.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
     strip.append(build_lighting_brightness(client, config, profile, on_change))
     root.append(strip)
 
     root.append(build_lighting_copy_from_profile(client, config, profile, on_change))
     root.append(Gtk.Separator())
-    root.append(build_lighting_device_area(mode))
+    root.append(build_lighting_device_area(client, config, profile, mode, paint_colour, on_change))
 
     return root
 
@@ -1333,7 +1553,17 @@ def build_main_view(
             chord_ui["recorded"].append(inp)
         on_change()
 
-    def input_btn(inp: str, w=100, h=100, sensitive=True, insensitive_reason=None) -> Gtk.Button:
+    def input_btn(inp: str, w=100, h=100) -> Gtk.Button:
+        # Only the Mode key's sensitivity depends on anything beyond `inp`
+        # itself (`mode_key_role`, above) — computed here rather than taken
+        # as call-site args now that every caller goes through
+        # `build_device_geometry`'s fixed `cell_factory(inp, w, h)` shape.
+        sensitive = mode_key_bindable if inp == "mode_key" else True
+        insensitive_reason = (
+            "Layer-shift Mode key: switch it to Bound above to give it its own Binding"
+            if inp == "mode_key"
+            else None
+        )
         chord_classes, chord_tooltip = _chord_button_style(chords_on_layer, config, chord_ui, inp)
         return make_input_button(
             client,
@@ -1379,7 +1609,7 @@ def build_main_view(
     if dest == "library":
         right.append(build_library_content(client, config, profile, selected_layer, ui_state, on_change))
     elif dest == "lighting":
-        right.append(build_lighting_content(client, config, profile, on_change))
+        right.append(build_lighting_content(client, config, profile, ui_state, on_change))
     else:
         main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         main.set_hexpand(True)
@@ -1392,61 +1622,11 @@ def build_main_view(
         # own inter-row spacing, gives the grid itself room to breathe.
         device_row.set_margin_top(8)
 
-        device = Gtk.Box(spacing=28)
-
-        # Grid: rows 1-3 are a full 5 columns; row 4 is only 4 wide (16-19).
-        # The wheel occupies the same column-5 slot row 4's missing key would
-        # sit in (next to 19), continuing straight down for two more rows
-        # (scroll up, click, scroll down) — same Gtk.Grid, same button size,
-        # so it lines up exactly like a real 5th column rather than a
-        # detached panel.
-        grid = Gtk.Grid(row_spacing=4, column_spacing=4)
-        for r in range(1, GRID_ROWS + 1):
-            cols = GRID_COLS if r < GRID_ROWS else GRID_COLS - 1
-            for c in range(1, cols + 1):
-                grid.attach(input_btn(grid_input(r, c)), c - 1, r - 1, 1, 1)
-        wheel_col_index = GRID_COLS - 1
-        grid.attach(input_btn("wheel_scroll_up"), wheel_col_index, GRID_ROWS - 1, 1, 1)
-        grid.attach(input_btn("wheel_middle"), wheel_col_index, GRID_ROWS, 1, 1)
-        grid.attach(input_btn("wheel_scroll_down"), wheel_col_index, GRID_ROWS + 1, 1, 1)
-        device.append(grid)
-
-        # Thumbstick, further right — the Mode key sits directly above the
-        # diamond's top lobe (Left, per the rotation below), and "20" below
-        # it, each its own block with breathing room between; the diamond
-        # itself stays tight so it still reads as one control.
-        stick_col = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL, spacing=18, halign=Gtk.Align.CENTER, valign=Gtk.Align.START
-        )
-        # The Mode key's own Binding only matters — and is only editable —
-        # while `mode_key_role` is `Bound`; under the default `LayerSwitch`
-        # it's intercepted before any Binding lookup ever runs (ticket 18).
-        mode_btn = input_btn(
-            "mode_key",
-            100,
-            100,
-            sensitive=mode_key_bindable,
-            insensitive_reason="Layer-shift Mode key: switch it to Bound above to give it its own Binding",
-        )
-        mode_btn.add_css_class("mode-key")
-        stick_col.append(mode_btn)
-
-        # Diamond rotated 90° clockwise from a plain N/S/E/W layout: the
-        # lobe nearest the user's viewing angle when the device sits beside
-        # them on the desk (per layout.md) fires Left at top, Down at left,
-        # Up at right, Right at bottom — not the naive Up-at-top mapping.
-        diamond = Gtk.Grid(row_spacing=2, column_spacing=2)
-        diamond.attach(input_btn("thumbstick_left", 100, 100), 1, 0, 1, 1)
-        diamond.attach(input_btn("thumbstick_down", 100, 100), 0, 1, 1, 1)
-        diamond.attach(input_btn("thumbstick_up", 100, 100), 2, 1, 1, 1)
-        diamond.attach(input_btn("thumbstick_right", 100, 100), 1, 2, 1, 1)
-        stick_col.append(diamond)
-
-        # Key 20 (the paddle below the diamond) is physically wider on the
-        # hardware — 150×100, per ticket 87's settled sizing.
-        stick_col.append(input_btn(grid_input(4, 5), 150, 100))
-        device.append(stick_col)
-
+        # Ticket 05 factored the actual row/col loop + wheel/Mode-key/
+        # thumbstick placement into `build_device_geometry`, shared with the
+        # Lighting tab's Custom-layout paint grid — `input_btn` above is
+        # this destination's own `cell_factory`, unchanged behaviourally.
+        device = build_device_geometry(input_btn)
         device_row.append(device)
         # tartarus-status-leds ticket 04: the Status LEDs lozenge group,
         # between the thumbstick column and the Chords section. Profile-scoped

@@ -7,12 +7,13 @@ from acheron_gui.daemon_client import AlreadyExistsError, DaemonError, NotFoundE
 from acheron_gui.daemon_stub import DaemonStub
 from acheron_gui.device_overview import (
     PLACEHOLDER_CONFIG,
+    build_device_geometry,
     build_main_view,
     build_status_wrapped_view,
     compute_status,
 )
 from acheron_gui.library_view import build_library_sidebar
-from acheron_gui.inputs import ALL_INPUTS
+from acheron_gui.inputs import ALL_INPUTS, GRID_COLS, GRID_ROWS, grid_input, input_label
 
 from .widget_tree import button_labeled, editor_content, find_all, find_one
 
@@ -1270,3 +1271,173 @@ def test_lighting_tab_still_renders_stored_state_when_device_disconnected():
 
     assert "suggested-action" in _lighting_mode_btn(root, "Spectrum").get_css_classes()
     assert _brightness_scale(root).get_value() == 90
+
+
+# --- Custom-layout painter (tartarus-backlight ticket 05) -------------------
+
+
+def _paint_grids(root):
+    return find_all(root, lambda w: "lighting-paint-grid" in w.get_css_classes())
+
+
+def _paint_cells(root):
+    return find_all(
+        root, lambda w: isinstance(w, Gtk.Button) and "lighting-paint-cell" in w.get_css_classes()
+    )
+
+
+def _inert_cells(root):
+    return find_all(root, lambda w: "lighting-inert-cell" in w.get_css_classes())
+
+
+def _paint_cell_for(root, inp: str):
+    return find_one(
+        root,
+        lambda w: isinstance(w, Gtk.Button)
+        and "lighting-paint-cell" in w.get_css_classes()
+        and w.get_tooltip_text() == input_label(inp),
+    )
+
+
+def _pick_paint_colour(root, hex_colour: str) -> None:
+    """The custom-layout params panel's own current-colour picker is the
+    lone `Gtk.ColorDialogButton` on the tab in this mode (the per-key
+    swatches are plain `Gtk.Button`s, not colour pickers)."""
+    _colour_buttons(root)[0].set_rgba(_hex_rgba(hex_colour))
+
+
+def test_custom_layout_paint_grid_only_renders_when_custom_layout_is_selected():
+    stub = DaemonStub()  # seed Profile: Off
+
+    root = _build_lighting(stub)
+    assert _paint_grids(root) == []
+
+    stub.set_lighting({"type": "custom_layout", "colours": [{"r": 0, "g": 0, "b": 0}] * 21}, 0)
+    root = _build_lighting(stub)
+    assert len(_paint_grids(root)) == 1
+
+
+def test_clicking_a_grid_key_cell_paints_only_that_index():
+    stub = DaemonStub()
+    colours = [{"r": 5, "g": 5, "b": 5}] * 21
+    stub.set_lighting({"type": "custom_layout", "colours": colours}, 33)
+    stub.calls.clear()
+
+    root = _build_lighting(stub)
+    _pick_paint_colour(root, "#ff0000")
+    stub.calls.clear()
+
+    _paint_cell_for(root, "grid_r1c1").emit("clicked")
+
+    expected = [dict(c) for c in colours]
+    expected[0] = {"r": 255, "g": 0, "b": 0}  # column 0 = grid key 1
+    assert stub.calls == [("set_lighting", {"type": "custom_layout", "colours": expected}, 33)]
+
+
+def test_clicking_key_20_paints_column_20_not_19():
+    stub = DaemonStub()
+    colours = [{"r": 5, "g": 5, "b": 5}] * 21
+    stub.set_lighting({"type": "custom_layout", "colours": colours}, 33)
+    stub.calls.clear()
+
+    root = _build_lighting(stub)
+    _pick_paint_colour(root, "#00ff00")
+    stub.calls.clear()
+
+    _paint_cell_for(root, grid_input(4, 5)).emit("clicked")  # key 20's paddle
+
+    expected = [dict(c) for c in colours]
+    expected[20] = {"r": 0, "g": 255, "b": 0}
+    assert stub.calls == [("set_lighting", {"type": "custom_layout", "colours": expected}, 33)]
+    assert stub.calls[0][1]["colours"][19] == {"r": 5, "g": 5, "b": 5}  # wheel untouched
+
+
+def test_clicking_any_wheel_sub_cell_paints_the_shared_wheel_column():
+    stub = DaemonStub()
+    colours = [{"r": 5, "g": 5, "b": 5}] * 21
+
+    for wheel_input in ("wheel_scroll_up", "wheel_middle", "wheel_scroll_down"):
+        stub.set_lighting({"type": "custom_layout", "colours": colours}, 33)
+        stub.calls.clear()
+
+        root = _build_lighting(stub)
+        _pick_paint_colour(root, "#0000ff")
+        stub.calls.clear()
+
+        _paint_cell_for(root, wheel_input).emit("clicked")
+
+        expected = [dict(c) for c in colours]
+        expected[19] = {"r": 0, "g": 0, "b": 255}
+        assert stub.calls == [("set_lighting", {"type": "custom_layout", "colours": expected}, 33)]
+
+
+def test_fill_all_keys_sets_all_21_entries_to_the_current_colour():
+    stub = DaemonStub()
+    stub.set_lighting({"type": "custom_layout", "colours": [{"r": 9, "g": 9, "b": 9}] * 21}, 5)
+    stub.calls.clear()
+
+    root = _build_lighting(stub)
+    _pick_paint_colour(root, "#00ff00")
+    stub.calls.clear()
+
+    _params_btn(root, "Fill all keys").emit("clicked")
+
+    assert stub.calls == [
+        ("set_lighting", {"type": "custom_layout", "colours": [{"r": 0, "g": 255, "b": 0}] * 21}, 5)
+    ]
+
+
+def test_mode_key_and_thumbstick_cells_are_inert_not_paintable():
+    stub = DaemonStub()
+    stub.set_lighting({"type": "custom_layout", "colours": [{"r": 0, "g": 0, "b": 0}] * 21}, 0)
+
+    root = _build_lighting(stub)
+    inert = _inert_cells(root)
+
+    # Mode key + the four thumbstick directions — everything else on the
+    # device area is a paintable Gtk.Button.
+    assert len(inert) == 5
+    assert all(not isinstance(w, Gtk.Button) for w in inert)
+    tooltips = {w.get_tooltip_text() for w in inert}
+    assert tooltips == {
+        f"{input_label(inp)} — solid black plastic, not RGB-capable"
+        for inp in ("mode_key", "thumbstick_up", "thumbstick_down", "thumbstick_left", "thumbstick_right")
+    }
+
+
+def test_paint_grid_still_renders_stored_state_when_device_disconnected():
+    stub = DaemonStub()
+    colours = [{"r": 1, "g": 2, "b": 3}] * 21
+    stub.set_lighting({"type": "custom_layout", "colours": colours}, 10)
+    stub.simulate_device_disconnected()
+
+    outer = _build_status(stub, "running_disconnected", {"dest": "lighting"})
+    root = _device_overview_root(outer)
+
+    assert len(_paint_grids(root)) == 1
+    assert len(_paint_cells(root)) == 23  # 19 grid keys + 3 wheel sub-cells + key 20's paddle
+
+
+def test_shared_geometry_helper_produces_the_same_input_order_for_both_callers():
+    grid_order: list[str] = []
+    paint_order: list[str] = []
+
+    def grid_factory(inp, w, h):
+        grid_order.append(inp)
+        return Gtk.Button()
+
+    def paint_factory(inp, w, h):
+        paint_order.append(inp)
+        return Gtk.Button()
+
+    build_device_geometry(grid_factory)
+    build_device_geometry(paint_factory)
+
+    assert grid_order == paint_order
+    assert grid_order == (
+        [grid_input(r, c) for r in range(1, GRID_ROWS) for c in range(1, GRID_COLS + 1)]
+        + [grid_input(GRID_ROWS, c) for c in range(1, GRID_COLS)]
+        + ["wheel_scroll_up", "wheel_middle", "wheel_scroll_down"]
+        + ["mode_key", "thumbstick_left", "thumbstick_down", "thumbstick_up", "thumbstick_right"]
+        + [grid_input(GRID_ROWS, GRID_COLS)]
+    )
