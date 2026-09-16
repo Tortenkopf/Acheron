@@ -195,6 +195,16 @@ CSS = """
 .status-led-orange.lit { background-color: #ff9800; box-shadow: 0 0 8px 2px alpha(#ff9800, 0.75); }
 .status-led-green.lit { background-color: #4caf50; box-shadow: 0 0 8px 2px alpha(#4caf50, 0.75); }
 .status-led-blue.lit { background-color: #2196f3; box-shadow: 0 0 8px 2px alpha(#2196f3, 0.75); }
+/* tartarus-backlight-impl ticket 05's Custom-layout paint grid
+   (device_overview.py::_lighting_paint_cell) sets each cell's actual fill
+   through a runtime `Gtk.CssProvider` keyed by wire column (see
+   `_install_lighting_swatch_provider`) — but the theme's own button
+   `background-image` masks a plain `background-color` override regardless
+   of provider priority, same gotcha as `.marker-deep-actuation` and
+   `.status-led-*` above. Scoped to `.lighting-paint-cell` only — the Grid
+   destination's own keybind buttons use unrelated classes and must stay
+   themed normally. */
+.lighting-paint-cell { background-image: none; }
 """
 
 

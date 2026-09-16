@@ -3,6 +3,7 @@
 
 from gi.repository import Gdk, Gtk, Pango
 
+from acheron_gui.app import CSS
 from acheron_gui.daemon_client import AlreadyExistsError, DaemonError, NotFoundError
 from acheron_gui.daemon_stub import DaemonStub
 from acheron_gui.device_overview import (
@@ -1403,6 +1404,38 @@ def test_mode_key_and_thumbstick_cells_are_inert_not_paintable():
         f"{input_label(inp)} — solid black plastic, not RGB-capable"
         for inp in ("mode_key", "thumbstick_up", "thumbstick_down", "thumbstick_left", "thumbstick_right")
     }
+
+
+def test_lighting_paint_cell_css_defeats_the_theme_background_image():
+    """A paint cell's colour is set via a plain `background-color` in the
+    runtime swatch provider — GTK's own button `background-image` masks that
+    regardless of provider priority (the same gotcha `.marker-deep-actuation`
+    and `.status-led-*` already work around in this stylesheet), so
+    `.lighting-paint-cell` needs its own `background-image: none`. Scoped to
+    that one class only — the Grid destination's keybind buttons must keep
+    their normal theming."""
+    assert ".lighting-paint-cell { background-image: none; }" in CSS
+
+
+def test_painted_colours_are_loaded_into_the_swatch_css_provider(monkeypatch):
+    stub = DaemonStub()
+    colours = [{"r": 5, "g": 5, "b": 5}] * 21
+    colours[0] = {"r": 255, "g": 0, "b": 0}  # column 0 = grid key 1
+    stub.set_lighting({"type": "custom_layout", "colours": colours}, 33)
+
+    loaded_css = {}
+    original_load = Gtk.CssProvider.load_from_string
+
+    def capture_load(self, css):
+        loaded_css["text"] = css
+        return original_load(self, css)
+
+    monkeypatch.setattr(Gtk.CssProvider, "load_from_string", capture_load)
+
+    _build_lighting(stub)
+
+    assert "#lighting-swatch-col-0 { background-color: rgb(255,0,0); }" in loaded_css["text"]
+    assert "#lighting-swatch-col-1 { background-color: rgb(5,5,5); }" in loaded_css["text"]
 
 
 def test_paint_grid_still_renders_stored_state_when_device_disconnected():
