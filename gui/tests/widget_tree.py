@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 
-from gi.repository import Gtk
+from gi.repository import Gdk, Gtk
 
 
 def walk(widget: Gtk.Widget, _seen: set[Gtk.Widget] | None = None) -> Iterator[Gtk.Widget]:
@@ -71,3 +71,13 @@ def editor_content(btn: Gtk.Widget) -> Gtk.Widget:
     .get_child()` rather than a `Gtk.Popover`; centralized here so the
     accessor only needs updating in one place if it changes again."""
     return btn.binding_editor_window.get_child()
+
+
+def pick_colour(btn: Gtk.Widget, rgba: Gdk.RGBA) -> None:
+    """Simulates a user picking `rgba` in a Lighting colour button's picker
+    window (`device_overview.py::_lighting_colour_button`) without actually
+    presenting it: sets the embedded `Gtk.ColorChooserWidget`'s value
+    directly, then clicks "Select" the same way a real pick would."""
+    window = btn.colour_picker_window
+    find_one(window, lambda w: isinstance(w, Gtk.ColorChooserWidget)).set_rgba(rgba)
+    button_labeled(window, "Select").emit("clicked")

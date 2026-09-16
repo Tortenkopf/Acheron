@@ -144,6 +144,8 @@ class DaemonClient(Protocol):
 
     def set_status_leds(self, orange: bool, green: bool, blue: bool) -> None: ...
 
+    def set_lighting(self, assignment: dict, brightness: int) -> None: ...
+
     def set_deep_stage(self, input_str: str, layer: str, binding: dict) -> None: ...
 
     def clear_deep_stage(self, input_str: str, layer: str) -> None: ...
@@ -300,6 +302,12 @@ class DBusDaemonClient:
 
     def set_status_leds(self, orange: bool, green: bool, blue: bool) -> None:
         self._call("SetStatusLeds", GLib.Variant("(bbb)", (orange, green, blue)))
+
+    def set_lighting(self, assignment: dict, brightness: int) -> None:
+        parameters = GLib.Variant(
+            "(a{sv}y)", (wire.lighting_assignment_to_variant(assignment), brightness)
+        )
+        self._call("SetLighting", parameters)
 
     def set_deep_stage(self, input_str: str, layer: str, binding: dict) -> None:
         parameters = GLib.Variant(

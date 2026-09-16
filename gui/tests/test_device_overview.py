@@ -1,20 +1,22 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright © 2026 Justin Milatz
 
-from gi.repository import Gtk, Pango
+from gi.repository import Gdk, Gtk, Pango
 
+from acheron_gui.app import CSS
 from acheron_gui.daemon_client import AlreadyExistsError, DaemonError, NotFoundError
 from acheron_gui.daemon_stub import DaemonStub
 from acheron_gui.device_overview import (
     PLACEHOLDER_CONFIG,
+    build_device_geometry,
     build_main_view,
     build_status_wrapped_view,
     compute_status,
 )
 from acheron_gui.library_view import build_library_sidebar
-from acheron_gui.inputs import ALL_INPUTS
+from acheron_gui.inputs import ALL_INPUTS, GRID_COLS, GRID_ROWS, grid_input, input_label
 
-from .widget_tree import editor_content, find_all, find_one
+from .widget_tree import button_labeled, editor_content, find_all, find_one, pick_colour
 
 
 def _build(stub, ui_state):
@@ -919,3 +921,558 @@ def test_placeholder_config_renders_before_the_daemon_ever_answers():
     leds = _status_leds(root)
     assert len(leds) == 3
     assert all("lit" not in led.get_css_classes() for led in leds)
+
+
+# --- Lighting (tartarus-backlight ticket 04) --------------------------------
+
+
+def _hex_rgba(hex_colour: str) -> Gdk.RGBA:
+    rgba = Gdk.RGBA()
+    rgba.parse(hex_colour)
+    return rgba
+
+
+def _lighting_mode_selector(root):
+    return find_one(root, lambda w: isinstance(w, Gtk.Box) and "lighting-mode-selector" in w.get_css_classes())
+
+
+def _lighting_mode_btn(root, label):
+    return find_one(
+        _lighting_mode_selector(root), lambda w: isinstance(w, Gtk.Button) and w.get_label() == label
+    )
+
+
+def _lighting_params(root):
+    return find_one(root, lambda w: isinstance(w, Gtk.Box) and "lighting-params-panel" in w.get_css_classes())
+
+
+def _params_btn(root, label):
+    return find_one(_lighting_params(root), lambda w: isinstance(w, Gtk.Button) and w.get_label() == label)
+
+
+def _colour_buttons(root):
+    return find_all(
+        root, lambda w: isinstance(w, Gtk.Button) and getattr(w, "colour_picker_window", None) is not None
+    )
+
+
+def _brightness_scale(root):
+    return find_one(root, lambda w: isinstance(w, Gtk.Scale))
+
+
+def _build_lighting(stub, ui_state=None):
+    ui_state = dict(ui_state or {})
+    ui_state["dest"] = "lighting"
+    return _build(stub, ui_state)
+
+
+def test_lighting_is_a_third_arm_of_the_destination_switch_keeping_the_profile_sidebar():
+    stub = DaemonStub()
+
+    root = _build_lighting(stub)
+
+    assert "suggested-action" in _dest_switch_button(root, "Lighting").get_css_classes()
+    assert "suggested-action" not in _dest_switch_button(root, "Grid").get_css_classes()
+    # Grid's own Profile sidebar, not Library's Steppers/Macros swap.
+    assert find_one(root, lambda w: isinstance(w, Gtk.Label) and w.get_label() == "Profiles")
+
+
+def test_mode_selector_renders_the_active_profiles_stored_mode():
+    stub = DaemonStub()  # seed Profile: Off
+
+    root = _build_lighting(stub)
+
+    assert "suggested-action" in _lighting_mode_btn(root, "Off").get_css_classes()
+    assert "suggested-action" not in _lighting_mode_btn(root, "Static").get_css_classes()
+
+
+def test_mode_selector_renders_a_fixed_effect_and_custom_layout_correctly():
+    stub = DaemonStub()
+    stub.set_lighting({"type": "fixed_effect", "effect": {"type": "spectrum"}}, 100)
+
+    root = _build_lighting(stub)
+    assert "suggested-action" in _lighting_mode_btn(root, "Spectrum").get_css_classes()
+
+    stub.set_lighting({"type": "custom_layout", "colours": [{"r": 1, "g": 2, "b": 3}] * 21}, 100)
+    root = _build_lighting(stub)
+    assert "suggested-action" in _lighting_mode_btn(root, "Custom layout").get_css_classes()
+
+
+def test_selecting_off_calls_set_lighting_with_off_and_unchanged_brightness():
+    stub = DaemonStub()
+    stub.set_lighting({"type": "fixed_effect", "effect": {"type": "spectrum"}}, 77)
+    stub.calls.clear()
+
+    root = _build_lighting(stub)
+    _lighting_mode_btn(root, "Off").emit("clicked")
+
+    assert stub.calls == [("set_lighting", {"type": "off"}, 77)]
+
+
+def test_selecting_a_fixed_effect_seeds_default_params_and_commits_the_full_assignment():
+    stub = DaemonStub()  # seed Profile: Off, brightness 0
+
+    root = _build_lighting(stub)
+    _lighting_mode_btn(root, "Static").emit("clicked")
+
+    assert stub.calls == [
+        (
+            "set_lighting",
+            {"type": "fixed_effect", "effect": {"type": "static", "colour": {"r": 255, "g": 255, "b": 255}}},
+            0,
+        )
+    ]
+
+
+def test_selecting_the_already_active_mode_is_a_noop():
+    stub = DaemonStub()  # seed Profile: Off
+
+    root = _build_lighting(stub)
+    _lighting_mode_btn(root, "Off").emit("clicked")
+
+    assert stub.calls == []
+
+
+def test_selecting_custom_layout_from_a_profile_with_none_stored_defaults_to_21_black_entries():
+    stub = DaemonStub()
+
+    root = _build_lighting(stub)
+    _lighting_mode_btn(root, "Custom layout").emit("clicked")
+
+    assert stub.calls == [
+        ("set_lighting", {"type": "custom_layout", "colours": [{"r": 0, "g": 0, "b": 0}] * 21}, 0)
+    ]
+
+
+def test_static_colour_picker_commits_the_full_effect_immediately():
+    stub = DaemonStub()
+    stub.set_lighting({"type": "fixed_effect", "effect": {"type": "static", "colour": {"r": 1, "g": 1, "b": 1}}}, 50)
+    stub.calls.clear()
+
+    root = _build_lighting(stub)
+    colour_btn = _colour_buttons(root)[0]
+    pick_colour(colour_btn, _hex_rgba("#112233"))
+
+    assert stub.calls == [
+        (
+            "set_lighting",
+            {"type": "fixed_effect", "effect": {"type": "static", "colour": {"r": 17, "g": 34, "b": 51}}},
+            50,
+        )
+    ]
+
+
+def test_spectrum_mode_has_no_param_controls():
+    stub = DaemonStub()
+    stub.set_lighting({"type": "fixed_effect", "effect": {"type": "spectrum"}}, 0)
+
+    root = _build_lighting(stub)
+
+    assert _colour_buttons(root) == []
+    assert find_all(_lighting_params(root), lambda w: isinstance(w, Gtk.SpinButton)) == []
+
+
+def test_reactive_colour_and_speed_each_commit_the_full_updated_effect():
+    stub = DaemonStub()
+    stub.set_lighting(
+        {"type": "fixed_effect", "effect": {"type": "reactive", "colour": {"r": 1, "g": 1, "b": 1}, "speed": 1}}, 0
+    )
+    stub.calls.clear()
+
+    root = _build_lighting(stub)
+    spin = find_one(_lighting_params(root), lambda w: isinstance(w, Gtk.SpinButton))
+    spin.set_value(3)
+
+    assert stub.calls == [
+        (
+            "set_lighting",
+            {
+                "type": "fixed_effect",
+                "effect": {"type": "reactive", "colour": {"r": 1, "g": 1, "b": 1}, "speed": 3},
+            },
+            0,
+        )
+    ]
+
+    stub.calls.clear()
+    root = _build_lighting(stub)
+    colour_btn = _colour_buttons(root)[0]
+    pick_colour(colour_btn, _hex_rgba("#ff0000"))
+
+    assert stub.calls == [
+        (
+            "set_lighting",
+            {
+                "type": "fixed_effect",
+                "effect": {"type": "reactive", "colour": {"r": 255, "g": 0, "b": 0}, "speed": 3},
+            },
+            0,
+        )
+    ]
+
+
+def test_wave_direction_toggle_commits_the_full_updated_effect():
+    stub = DaemonStub()
+    stub.set_lighting({"type": "fixed_effect", "effect": {"type": "wave", "direction": "right"}}, 0)
+    stub.calls.clear()
+
+    root = _build_lighting(stub)
+    _params_btn(root, "◀ Left").emit("clicked")
+
+    assert stub.calls == [
+        ("set_lighting", {"type": "fixed_effect", "effect": {"type": "wave", "direction": "left"}}, 0)
+    ]
+
+
+def test_breath_style_switch_seeds_default_colours_which_then_commit_by_slot():
+    stub = DaemonStub()
+    stub.set_lighting({"type": "fixed_effect", "effect": {"type": "breath", "style": {"style": "random"}}}, 0)
+    stub.calls.clear()
+
+    root = _build_lighting(stub)
+    assert _colour_buttons(root) == []
+    _params_btn(root, "Dual").emit("clicked")
+
+    assert stub.calls == [
+        (
+            "set_lighting",
+            {
+                "type": "fixed_effect",
+                "effect": {
+                    "type": "breath",
+                    "style": {
+                        "style": "dual",
+                        "first": {"r": 255, "g": 255, "b": 255},
+                        "second": {"r": 255, "g": 255, "b": 255},
+                    },
+                },
+            },
+            0,
+        )
+    ]
+    stub.calls.clear()
+
+    root = _build_lighting(stub)
+    first_btn, second_btn = _colour_buttons(root)
+    pick_colour(second_btn, _hex_rgba("#00ff00"))
+
+    assert stub.calls == [
+        (
+            "set_lighting",
+            {
+                "type": "fixed_effect",
+                "effect": {
+                    "type": "breath",
+                    "style": {
+                        "style": "dual",
+                        "first": {"r": 255, "g": 255, "b": 255},
+                        "second": {"r": 0, "g": 255, "b": 0},
+                    },
+                },
+            },
+            0,
+        )
+    ]
+
+
+def test_starlight_params_include_style_speed_and_the_style_appropriate_colours():
+    stub = DaemonStub()
+    stub.set_lighting(
+        {
+            "type": "fixed_effect",
+            "effect": {"type": "starlight", "style": {"style": "single", "colour": {"r": 1, "g": 1, "b": 1}}, "speed": 1},
+        },
+        0,
+    )
+    stub.calls.clear()
+
+    root = _build_lighting(stub)
+    assert len(_colour_buttons(root)) == 1
+    spin = find_one(_lighting_params(root), lambda w: isinstance(w, Gtk.SpinButton))
+    spin.set_value(2)
+
+    assert stub.calls == [
+        (
+            "set_lighting",
+            {
+                "type": "fixed_effect",
+                "effect": {
+                    "type": "starlight",
+                    "style": {"style": "single", "colour": {"r": 1, "g": 1, "b": 1}},
+                    "speed": 2,
+                },
+            },
+            0,
+        )
+    ]
+
+
+def test_brightness_slider_is_always_visible_regardless_of_selected_mode():
+    stub = DaemonStub()
+
+    for assignment in (
+        {"type": "off"},
+        {"type": "fixed_effect", "effect": {"type": "spectrum"}},
+        {"type": "custom_layout", "colours": [{"r": 0, "g": 0, "b": 0}] * 21},
+    ):
+        stub.set_lighting(assignment, 0)
+        root = _build_lighting(stub)
+        assert _brightness_scale(root) is not None
+
+
+def test_brightness_commits_only_on_drag_end_not_per_tick():
+    stub = DaemonStub()
+    stub.set_lighting({"type": "fixed_effect", "effect": {"type": "spectrum"}}, 10)
+    stub.calls.clear()
+
+    root = _build_lighting(stub)
+    scale = _brightness_scale(root)
+    scale.set_value(200)  # per-tick movement — must not commit yet
+    assert stub.calls == []
+
+    scale.on_drag_end()
+
+    assert stub.calls == [
+        ("set_lighting", {"type": "fixed_effect", "effect": {"type": "spectrum"}}, 200)
+    ]
+
+
+def test_a_newly_created_profile_shows_off_lighting_at_brightness_zero():
+    stub = DaemonStub()
+    stub.set_lighting({"type": "fixed_effect", "effect": {"type": "spectrum"}}, 200)  # dirty the original
+    stub.create_profile("Fresh")
+    stub.switch_profile("Fresh")
+
+    root = _build_lighting(stub)
+
+    assert "suggested-action" in _lighting_mode_btn(root, "Off").get_css_classes()
+    assert _brightness_scale(root).get_value() == 0
+
+
+def test_copy_from_profile_reads_another_profiles_stored_values_and_calls_set_lighting():
+    stub = DaemonStub()
+    stub.create_profile("Other")
+    stub.switch_profile("Other")
+    other_assignment = {"type": "fixed_effect", "effect": {"type": "static", "colour": {"r": 9, "g": 8, "b": 7}}}
+    stub.set_lighting(other_assignment, 42)
+    stub.switch_profile("Default")
+    stub.calls.clear()
+
+    root = _build_lighting(stub)
+    button_labeled(root, "Copy").emit("clicked")
+
+    assert stub.calls == [("set_lighting", other_assignment, 42)]
+
+
+def test_lighting_tab_still_renders_stored_state_when_device_disconnected():
+    stub = DaemonStub()
+    stub.set_lighting({"type": "fixed_effect", "effect": {"type": "spectrum"}}, 90)
+    stub.simulate_device_disconnected()
+
+    outer = _build_status(stub, "running_disconnected", {"dest": "lighting"})
+    root = _device_overview_root(outer)
+
+    assert "suggested-action" in _lighting_mode_btn(root, "Spectrum").get_css_classes()
+    assert _brightness_scale(root).get_value() == 90
+
+
+# --- Custom-layout painter (tartarus-backlight ticket 05) -------------------
+
+
+def _paint_grids(root):
+    return find_all(root, lambda w: "lighting-paint-grid" in w.get_css_classes())
+
+
+def _paint_cells(root):
+    return find_all(
+        root, lambda w: isinstance(w, Gtk.Button) and "lighting-paint-cell" in w.get_css_classes()
+    )
+
+
+def _inert_cells(root):
+    return find_all(root, lambda w: "lighting-inert-cell" in w.get_css_classes())
+
+
+def _paint_cell_for(root, inp: str):
+    return find_one(
+        root,
+        lambda w: isinstance(w, Gtk.Button)
+        and "lighting-paint-cell" in w.get_css_classes()
+        and w.get_tooltip_text() == input_label(inp),
+    )
+
+
+def _pick_paint_colour(root, hex_colour: str) -> None:
+    """The custom-layout params panel's own current-colour picker is the
+    lone colour-picker button on the tab in this mode (the per-key
+    swatches are plain `Gtk.Button`s, not colour pickers)."""
+    pick_colour(_colour_buttons(root)[0], _hex_rgba(hex_colour))
+
+
+def test_custom_layout_paint_grid_only_renders_when_custom_layout_is_selected():
+    stub = DaemonStub()  # seed Profile: Off
+
+    root = _build_lighting(stub)
+    assert _paint_grids(root) == []
+
+    stub.set_lighting({"type": "custom_layout", "colours": [{"r": 0, "g": 0, "b": 0}] * 21}, 0)
+    root = _build_lighting(stub)
+    assert len(_paint_grids(root)) == 1
+
+
+def test_clicking_a_grid_key_cell_paints_only_that_index():
+    stub = DaemonStub()
+    colours = [{"r": 5, "g": 5, "b": 5}] * 21
+    stub.set_lighting({"type": "custom_layout", "colours": colours}, 33)
+    stub.calls.clear()
+
+    root = _build_lighting(stub)
+    _pick_paint_colour(root, "#ff0000")
+    stub.calls.clear()
+
+    _paint_cell_for(root, "grid_r1c1").emit("clicked")
+
+    expected = [dict(c) for c in colours]
+    expected[0] = {"r": 255, "g": 0, "b": 0}  # column 0 = grid key 1
+    assert stub.calls == [("set_lighting", {"type": "custom_layout", "colours": expected}, 33)]
+
+
+def test_clicking_key_20_paints_column_20_not_19():
+    stub = DaemonStub()
+    colours = [{"r": 5, "g": 5, "b": 5}] * 21
+    stub.set_lighting({"type": "custom_layout", "colours": colours}, 33)
+    stub.calls.clear()
+
+    root = _build_lighting(stub)
+    _pick_paint_colour(root, "#00ff00")
+    stub.calls.clear()
+
+    _paint_cell_for(root, grid_input(4, 5)).emit("clicked")  # key 20's paddle
+
+    expected = [dict(c) for c in colours]
+    expected[20] = {"r": 0, "g": 255, "b": 0}
+    assert stub.calls == [("set_lighting", {"type": "custom_layout", "colours": expected}, 33)]
+    assert stub.calls[0][1]["colours"][19] == {"r": 5, "g": 5, "b": 5}  # wheel untouched
+
+
+def test_clicking_any_wheel_sub_cell_paints_the_shared_wheel_column():
+    stub = DaemonStub()
+    colours = [{"r": 5, "g": 5, "b": 5}] * 21
+
+    for wheel_input in ("wheel_scroll_up", "wheel_middle", "wheel_scroll_down"):
+        stub.set_lighting({"type": "custom_layout", "colours": colours}, 33)
+        stub.calls.clear()
+
+        root = _build_lighting(stub)
+        _pick_paint_colour(root, "#0000ff")
+        stub.calls.clear()
+
+        _paint_cell_for(root, wheel_input).emit("clicked")
+
+        expected = [dict(c) for c in colours]
+        expected[19] = {"r": 0, "g": 0, "b": 255}
+        assert stub.calls == [("set_lighting", {"type": "custom_layout", "colours": expected}, 33)]
+
+
+def test_fill_all_keys_sets_all_21_entries_to_the_current_colour():
+    stub = DaemonStub()
+    stub.set_lighting({"type": "custom_layout", "colours": [{"r": 9, "g": 9, "b": 9}] * 21}, 5)
+    stub.calls.clear()
+
+    root = _build_lighting(stub)
+    _pick_paint_colour(root, "#00ff00")
+    stub.calls.clear()
+
+    _params_btn(root, "Fill all keys").emit("clicked")
+
+    assert stub.calls == [
+        ("set_lighting", {"type": "custom_layout", "colours": [{"r": 0, "g": 255, "b": 0}] * 21}, 5)
+    ]
+
+
+def test_mode_key_and_thumbstick_cells_are_inert_not_paintable():
+    stub = DaemonStub()
+    stub.set_lighting({"type": "custom_layout", "colours": [{"r": 0, "g": 0, "b": 0}] * 21}, 0)
+
+    root = _build_lighting(stub)
+    inert = _inert_cells(root)
+
+    # Mode key + the four thumbstick directions — everything else on the
+    # device area is a paintable Gtk.Button.
+    assert len(inert) == 5
+    assert all(not isinstance(w, Gtk.Button) for w in inert)
+    tooltips = {w.get_tooltip_text() for w in inert}
+    assert tooltips == {
+        f"{input_label(inp)} — solid black plastic, not RGB-capable"
+        for inp in ("mode_key", "thumbstick_up", "thumbstick_down", "thumbstick_left", "thumbstick_right")
+    }
+
+
+def test_lighting_paint_cell_css_defeats_the_theme_background_image():
+    """A paint cell's colour is set via a plain `background-color` in the
+    runtime swatch provider — GTK's own button `background-image` masks that
+    regardless of provider priority (the same gotcha `.marker-deep-actuation`
+    and `.status-led-*` already work around in this stylesheet), so
+    `.lighting-paint-cell` needs its own `background-image: none`. Scoped to
+    that one class only — the Grid destination's keybind buttons must keep
+    their normal theming."""
+    assert ".lighting-paint-cell { background-image: none; }" in CSS
+
+
+def test_painted_colours_are_loaded_into_the_swatch_css_provider(monkeypatch):
+    stub = DaemonStub()
+    colours = [{"r": 5, "g": 5, "b": 5}] * 21
+    colours[0] = {"r": 255, "g": 0, "b": 0}  # column 0 = grid key 1
+    stub.set_lighting({"type": "custom_layout", "colours": colours}, 33)
+
+    loaded_css = {}
+    original_load = Gtk.CssProvider.load_from_string
+
+    def capture_load(self, css):
+        loaded_css["text"] = css
+        return original_load(self, css)
+
+    monkeypatch.setattr(Gtk.CssProvider, "load_from_string", capture_load)
+
+    _build_lighting(stub)
+
+    assert "#lighting-swatch-col-0 { background-color: rgb(255,0,0); }" in loaded_css["text"]
+    assert "#lighting-swatch-col-1 { background-color: rgb(5,5,5); }" in loaded_css["text"]
+
+
+def test_paint_grid_still_renders_stored_state_when_device_disconnected():
+    stub = DaemonStub()
+    colours = [{"r": 1, "g": 2, "b": 3}] * 21
+    stub.set_lighting({"type": "custom_layout", "colours": colours}, 10)
+    stub.simulate_device_disconnected()
+
+    outer = _build_status(stub, "running_disconnected", {"dest": "lighting"})
+    root = _device_overview_root(outer)
+
+    assert len(_paint_grids(root)) == 1
+    assert len(_paint_cells(root)) == 23  # 19 grid keys + 3 wheel sub-cells + key 20's paddle
+
+
+def test_shared_geometry_helper_produces_the_same_input_order_for_both_callers():
+    grid_order: list[str] = []
+    paint_order: list[str] = []
+
+    def grid_factory(inp, w, h):
+        grid_order.append(inp)
+        return Gtk.Button()
+
+    def paint_factory(inp, w, h):
+        paint_order.append(inp)
+        return Gtk.Button()
+
+    build_device_geometry(grid_factory)
+    build_device_geometry(paint_factory)
+
+    assert grid_order == paint_order
+    assert grid_order == (
+        [grid_input(r, c) for r in range(1, GRID_ROWS) for c in range(1, GRID_COLS + 1)]
+        + [grid_input(GRID_ROWS, c) for c in range(1, GRID_COLS)]
+        + ["wheel_scroll_up", "wheel_middle", "wheel_scroll_down"]
+        + ["mode_key", "thumbstick_left", "thumbstick_down", "thumbstick_up", "thumbstick_right"]
+        + [grid_input(GRID_ROWS, GRID_COLS)]
+    )

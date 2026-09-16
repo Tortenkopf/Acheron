@@ -90,6 +90,13 @@ class DaemonStub:
         # `GetConfig` hands back (`daemon/src/dbus/wire.rs::status_leds_to_dict`),
         # defaulting all-off like `StatusLeds::default()`.
         "status_leds": {"orange": False, "green": False, "blue": False},
+        # `tartarus-backlight` ticket 01: a Profile's Lighting assignment and
+        # brightness — the same `"type"`-tagged dict + plain byte the real
+        # Daemon's `GetConfig` hands back (`daemon/src/dbus/wire.rs::
+        # lighting_assignment_to_dict`), defaulting Off at zero brightness
+        # like `LightingAssignment::default()` / `Profile.brightness`.
+        "lighting": {"type": "off"},
+        "brightness": 0,
         # Ticket 40: a Profile's Chord Bindings, keyed the same way the real
         # Daemon's wire shape does — a "+"-joined, sorted string of member
         # Input strings (mirrors `daemon/src/config.rs::ChordKey`'s Display).
@@ -130,7 +137,7 @@ class DaemonStub:
         self._capture_mode = "digital"
         # Ticket 99: the real Daemon reports its compile-time `crate::VERSION`
         # here; the stub stands in with a bare release string.
-        self._daemon_version = "1.2.3"
+        self._daemon_version = "1.3.0"
         # Ticket 101: the real Daemon reads these off the connected Tartarus
         # Pro over the Interface-2 control channel once per connect. The stub
         # stands in with plausible fixed values (the documented values for
@@ -631,6 +638,16 @@ class DaemonStub:
             "blue": blue,
         }
         self.calls.append(("set_status_leds", orange, green, blue))
+
+    def set_lighting(self, assignment: dict, brightness: int) -> None:
+        # `tartarus-backlight` ticket 03: the whole assignment + brightness in
+        # one call, mirroring `set_status_leds` exactly — always an edit to
+        # the active Profile. Mirrors what a real `GetConfig` would return
+        # after the call so stub-backed GUI code rebuilding from config sees
+        # it.
+        self._profiles[self._active_profile]["lighting"] = copy.deepcopy(assignment)
+        self._profiles[self._active_profile]["brightness"] = brightness
+        self.calls.append(("set_lighting", copy.deepcopy(assignment), brightness))
 
     # --- tartarus-dual-stage-keys ticket 05: deep-stage D-Bus surface -------
     #

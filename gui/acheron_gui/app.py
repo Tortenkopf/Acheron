@@ -195,6 +195,22 @@ CSS = """
 .status-led-orange.lit { background-color: #ff9800; box-shadow: 0 0 8px 2px alpha(#ff9800, 0.75); }
 .status-led-green.lit { background-color: #4caf50; box-shadow: 0 0 8px 2px alpha(#4caf50, 0.75); }
 .status-led-blue.lit { background-color: #2196f3; box-shadow: 0 0 8px 2px alpha(#2196f3, 0.75); }
+/* tartarus-backlight-impl ticket 05's Custom-layout paint grid
+   (device_overview.py::_lighting_paint_cell) sets each cell's actual fill
+   through a runtime `Gtk.CssProvider` keyed by wire column (see
+   `_install_lighting_swatch_provider`) — but the theme's own button
+   `background-image` masks a plain `background-color` override regardless
+   of provider priority, same gotcha as `.marker-deep-actuation` and
+   `.status-led-*` above. Scoped to `.lighting-paint-cell` only — the Grid
+   destination's own keybind buttons use unrelated classes and must stay
+   themed normally. */
+.lighting-paint-cell { background-image: none; }
+/* The Lighting tab's colour-picker swatches (device_overview.py::
+   _lighting_colour_button) are a flat-fill Gdk.Texture on a Gtk.Picture, not
+   a themed button background, so they need no background-image override —
+   just a border so a near-black or near-white pick still reads as a swatch
+   against the panel. */
+.lighting-colour-swatch { border: 1px solid alpha(currentColor, 0.35); border-radius: 3px; }
 """
 
 
@@ -479,6 +495,11 @@ class AcheronApplication(Gtk.Application):
         # all fit at first launch without GTK shrinking any button below its
         # new fixed size. Measured live against the real running window.
         win.set_default_size(1400, 860)
+        # tartarus-backlight ticket 04: a hard 1100px floor, not just a
+        # default — the Lighting tab's horizontal control strip needs that
+        # much width for its busiest mode (Starlight: style toggle + speed +
+        # 2 colour pickers) without wrapping or growing the window itself.
+        win.set_size_request(1100, -1)
         _wire_window_close_to_hide(win)
 
         # Ticket 102: a HeaderBar titlebar carrying the primary menu — just

@@ -23,6 +23,8 @@ def test_fresh_stub_matches_the_seed_configs_shape():
                 "default_actuation": {"actuation": 128, "release": 112},
                 "actuation_overrides": {},
                 "status_leds": {"orange": False, "green": False, "blue": False},
+                "lighting": {"type": "off"},
+                "brightness": 0,
                 "chords_base": {},
                 "chords_held": {},
                 "axis_base": {},
@@ -42,7 +44,7 @@ def test_fresh_stub_matches_the_seed_configs_shape():
         "active_toggles": [],
         "device_connected": True,
         "capture_mode": "digital",
-        "daemon_version": "1.2.3",
+        "daemon_version": "1.3.0",
         # Ticket 101: present because the stub starts "connected".
         "firmware_version": "v1.2",
         "serial_number": "PM2443F36300141",
@@ -164,6 +166,8 @@ def test_create_profile_adds_an_empty_profile():
         "default_actuation": {"actuation": 128, "release": 112},
         "actuation_overrides": {},
         "status_leds": {"orange": False, "green": False, "blue": False},
+        "lighting": {"type": "off"},
+        "brightness": 0,
         "chords_base": {},
         "chords_held": {},
         "axis_base": {},
@@ -805,6 +809,21 @@ def test_set_status_leds_updates_the_active_profile_and_records_the_call():
         "blue": True,
     }
     assert stub.calls == [("set_status_leds", True, False, True)]
+
+
+def test_set_lighting_updates_the_active_profile_and_records_the_call():
+    # `tartarus-backlight` ticket 03: the whole assignment + brightness in
+    # one call, always an edit to the active Profile. `get_config` reflects
+    # it the way a real `GetConfig` would after `SetLighting`.
+    stub = DaemonStub()
+    assignment = {"type": "fixed_effect", "effect": {"type": "spectrum"}}
+
+    stub.set_lighting(assignment, 128)
+
+    profile = stub.get_config()["profiles"]["Default"]
+    assert profile["lighting"] == assignment
+    assert profile["brightness"] == 128
+    assert stub.calls == [("set_lighting", assignment, 128)]
 
 
 # --- tartarus-dual-stage-keys ticket 05: deep-stage D-Bus surface -----------

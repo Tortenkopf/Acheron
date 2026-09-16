@@ -16,10 +16,11 @@ Copyright © 2026 Justin Milatz
 
 ---
 
-Acheron builds macros, layers, and profiles for the Razer Tartarus Pro on Linux,
-and remaps its keys. It offers full operational feature parity with Razer Synapse
-plus extra features: it enables the use of the Tartarus Pro's analog keys and
-allows a second "deep stage" per key.
+Acheron is a replacement for Razer Synapse on Linux for the Razer Tartarus Pro.
+It can create profiles, layers, key-maps, macros and key-steppers using multiple
+trigger modes. It enables using the analog keys and allows the binding of a
+second "deep stage" per key and makes it possible to bind the diagonals on the
+4-way thumbsticks.
 It talks to the device directly through the Linux kernel (`evdev` in, `uinput` out).
 
 ---
@@ -80,6 +81,10 @@ Acheron is two cooperating pieces:
   half-press / full-press).
 - **Mouse-button hold** — Hold-to-repeat on a mouse button is a real sustained
   press, so click-and-drag works.
+- **Lighting** — give each Profile its own RGB backlight across the 20 grid
+  keys and scroll wheel: a firmware **Fixed effect** (Static, Spectrum,
+  Reactive, Wave, Breath, Starlight) or a hand-painted **Custom layout**, plus
+  a brightness level that applies to either.
 - **System tray icon** — active profile/layer at a glance, quick profile
   switching, and pause/resume of the Daemon.
 - **Plain TOML config** at `~/.config/acheron/config.toml` — hand-editable and
@@ -90,7 +95,6 @@ configure the controls you care about.
 
 ### What it is not
 
-- Not a lighting/RGB tool — OpenRazer already covers that for this device.
 - Not an automatic per-application profile switcher — profile switching is
   always manual.
 - Not a general remapper — it models *this* device specifically. It is written
@@ -165,8 +169,8 @@ membership take full effect (or unplug/replug the device).
 ### Building a release
 
 Both components self-label their version from git. A plain `main` checkout
-reports `1.2.3-dev+<short-hash>`; a checkout sitting exactly on the `v1.2.3`
-tag (or a tarball with no `.git`) reports the bare `1.2.3`. **Tag the release
+reports `1.3.0-dev+<short-hash>`; a checkout sitting exactly on the `v1.3.0`
+tag (or a tarball with no `.git`) reports the bare `1.3.0`. **Tag the release
 commit before building** the artifacts you hand to users. The canonical
 version numbers live in `daemon/Cargo.toml` and `gui/acheron_gui/__init__.py`
 (`_BASE_VERSION`); a release bumps both. `daemon/build.rs` honours an explicit
@@ -217,9 +221,11 @@ run `acheron-gui`.
   is active.
 - **Chords**: turn on "Select Chord members", click two or more controls on the
   grid, then "Binding →" to give the set an Action.
-- **Library** (the Grid / Library switch) holds your named **Macros** and
-  **Steppers**. Edits there save automatically. Assign them to a control from
-  the binding editor.
+- **Library** (the Grid / Library / Lighting switch) holds your named
+  **Macros** and **Steppers**. Edits there save automatically. Assign them to
+  a control from the binding editor.
+- **Lighting** (the same switch) sets the active Profile's backlight — see
+  [Lighting](#lighting) below.
 - The **tray icon** shows the active profile and layer, switches profiles, and
   pauses/resumes the Daemon. Closing the main window hides it to the tray; use
   the tray's **Quit** to actually exit the GUI (the Daemon keeps running).
@@ -258,6 +264,29 @@ the key travels through both bands:
 Deep stages need analog capture — in digital-capture mode the controls grey
 out and only the primary fires. Removing the primary Binding removes the deep
 stage with it.
+
+### Lighting
+
+Every Profile carries its own backlight look across the 20 grid keys and
+scroll wheel (the Mode key and thumbstick are solid black plastic — not
+lit). Open the **Lighting** destination and pick a mode: **Off**, one of six
+firmware **Fixed effects** (Static, Spectrum, Reactive, Wave, Breath,
+Starlight — each with whatever colour/speed/direction controls it takes), or
+**Custom layout**. Every change commits immediately; there's no Save button.
+
+- **Custom layout** turns the device area into a paint grid — pick a current
+  colour and click keys to paint them, or use **Fill all keys** to set a base
+  colour first.
+- **Brightness** is one slider, always visible regardless of mode, and
+  applies on top of whichever effect or layout is active.
+- **Copy from Profile** copies another Profile's whole Lighting assignment
+  (mode, params, and brightness) onto the one you're editing.
+
+The backlight follows the active Profile: switching Profiles re-asserts that
+Profile's Lighting, and the Daemon re-asserts it on startup and on every
+device reconnect, so it never drifts from what's stored. A Custom layout
+persists on the device across reconnects, so it stays lit even while the
+Daemon or GUI is closed.
 
 ### Configuration file
 

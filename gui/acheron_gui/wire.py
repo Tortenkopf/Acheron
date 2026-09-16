@@ -97,3 +97,96 @@ def binding_to_variant(binding: dict) -> dict[str, GLib.Variant]:
     result = action_to_variant(binding)
     result["trigger"] = GLib.Variant("s", binding["trigger"])
     return result
+
+
+def _colour_to_variant(colour: dict) -> GLib.Variant:
+    """`colour` is `{"r": int, "g": int, "b": int}` — the same shape
+    `GetConfig()` hands back (`colour_to_dict`'s `a{sv}` shape, unpacked), so
+    reading a Profile's `lighting` off `GetConfig()` and feeding it straight
+    back into `set_lighting` (e.g. "copy from Profile X") needs no
+    translation. `SetLighting`'s own wire encoding for a Colour is a `(yyy)`
+    byte-triple instead — the daemon's deliberate, minimal choice for this
+    one decode path (`colour_from_field`'s doc comment in
+    `daemon/src/dbus/wire.rs`), so this helper is the one place that
+    translation happens, not the Python-side dict shape."""
+    return GLib.Variant("(yyy)", (colour["r"], colour["g"], colour["b"]))
+
+
+def _breath_style_to_variant(style: dict) -> dict[str, GLib.Variant]:
+    """`style` carries `"style"` plus `Single`'s `"colour"` or `Dual`'s
+    `"first"`/`"second"`, matching `breath_style_to_dict`'s `"style"` tag —
+    distinct from `FixedEffect`'s own `"type"` tag, mirroring
+    `config::BreathStyle`'s two-tag-keys-at-two-levels shape exactly."""
+    kind = style["style"]
+    if kind == "random":
+        return {"style": GLib.Variant("s", "random")}
+    if kind == "single":
+        return {
+            "style": GLib.Variant("s", "single"),
+            "colour": _colour_to_variant(style["colour"]),
+        }
+    if kind == "dual":
+        return {
+            "style": GLib.Variant("s", "dual"),
+            "first": _colour_to_variant(style["first"]),
+            "second": _colour_to_variant(style["second"]),
+        }
+    raise ValueError(f"{kind!r} is not a valid BreathStyle")
+
+
+def _fixed_effect_to_variant(effect: dict) -> dict[str, GLib.Variant]:
+    """Matches `fixed_effect_to_dict`'s `"type"`-tagged shape."""
+    kind = effect["type"]
+    if kind == "static":
+        return {
+            "type": GLib.Variant("s", "static"),
+            "colour": _colour_to_variant(effect["colour"]),
+        }
+    if kind == "spectrum":
+        return {"type": GLib.Variant("s", "spectrum")}
+    if kind == "reactive":
+        return {
+            "type": GLib.Variant("s", "reactive"),
+            "colour": _colour_to_variant(effect["colour"]),
+            "speed": GLib.Variant("y", effect["speed"]),
+        }
+    if kind == "wave":
+        return {
+            "type": GLib.Variant("s", "wave"),
+            "direction": GLib.Variant("s", effect["direction"]),
+        }
+    if kind == "breath":
+        return {
+            "type": GLib.Variant("s", "breath"),
+            "style": GLib.Variant("a{sv}", _breath_style_to_variant(effect["style"])),
+        }
+    if kind == "starlight":
+        return {
+            "type": GLib.Variant("s", "starlight"),
+            "style": GLib.Variant("a{sv}", _breath_style_to_variant(effect["style"])),
+            "speed": GLib.Variant("y", effect["speed"]),
+        }
+    raise ValueError(f"{kind!r} is not a valid FixedEffect type")
+
+
+def lighting_assignment_to_variant(assignment: dict) -> dict[str, GLib.Variant]:
+    """`assignment` is `LightingAssignment`'s `"type"`-tagged dict
+    (`Off`/`FixedEffect`/`CustomLayout`), the same shape `GetConfig()` hands
+    back for a Profile's `"lighting"` entry — matches
+    `lighting_assignment_to_dict`'s `"type"` tag convention for
+    `SetLighting`'s request (`tartarus-backlight` ticket 03)."""
+    kind = assignment["type"]
+    if kind == "off":
+        return {"type": GLib.Variant("s", "off")}
+    if kind == "fixed_effect":
+        return {
+            "type": GLib.Variant("s", "fixed_effect"),
+            "effect": GLib.Variant("a{sv}", _fixed_effect_to_variant(assignment["effect"])),
+        }
+    if kind == "custom_layout":
+        colours = [(c["r"], c["g"], c["b"]) for c in assignment["colours"]]
+        return {
+            "type": GLib.Variant("s", "custom_layout"),
+            "colours": GLib.Variant("a(yyy)", colours),
+        }
+    raise ValueError(f"{kind!r} is not a valid LightingAssignment type")

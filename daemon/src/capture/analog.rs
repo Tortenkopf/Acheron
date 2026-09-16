@@ -42,7 +42,10 @@ use tokio::task::JoinSet;
 
 use super::evdev_source::{self, interruptible_sleep, poll_readable};
 use super::{CaptureSource, EventState, PhysicalEvent};
-use crate::config::{ActuationPoint, StatusLeds};
+use crate::config::{
+    ActuationPoint, BreathStyle, Colour, FixedEffect, LightingAssignment, LightingState,
+    StatusLeds, WaveDirection,
+};
 use crate::input::{Input, Node};
 
 // ---------------------------------------------------------------------------
@@ -566,6 +569,233 @@ pub fn assert_status_leds(leds: StatusLeds) -> io::Result<()> {
 /// `(0, 0, 0)` is hardware-reachable (charting ticket 01, criterion 5).
 pub fn clear_status_leds() -> io::Result<()> {
     send_status_leds(STATUS_LED_OFF, STATUS_LED_OFF, STATUS_LED_OFF)
+}
+
+// ---------------------------------------------------------------------------
+// Lighting writes (`tartarus-backlight`, ADR-0012). Siblings of the
+// Status-LED writes above: one freshly-opened, immediately-closed
+// Interface-2 control fd per assert, no read-back, no retry loop, no
+// driver-mode call, no unlock. Byte layout is settled by
+// `research/backlight-wire-protocol.md` and verified on hardware (charting
+// ticket 02) — not re-derived here. Unlike Status LEDs there is no
+// shutdown-clear equivalent (ADR-0012: every frame below carries VARSTORE,
+// so the firmware persists the asserted effect device-side).
+// ---------------------------------------------------------------------------
+
+/// The storage-mode byte every Lighting effect-select frame carries — unlike
+/// the Status-LED frame's inert storage byte, this one actually matters
+/// (VARSTORE = firmware-persisted). The custom-frame write and the
+/// custom-effect arm frame both hardcode their equivalent byte to `0x00`
+/// instead (spec.md §"Custom layout").
+const VARSTORE: u8 = 0x01;
+/// The backlight's dedicated LED id, distinct from the Status LEDs'
+/// `STATUS_LED_ID` (`SIDE_STRIPE_LED`).
+const BACKLIGHT_LED: u8 = 0x05;
+/// Brightness targets this LED id instead of `BACKLIGHT_LED` — a
+/// Tartarus-Pro/V2-specific quirk (spec.md §"Brightness").
+const ZERO_LED: u8 = 0x00;
+/// Every Lighting effect-select frame uses `transaction_id 0x1F`, including
+/// Breath — the driver source's own frame actually transmits `0x3F` for
+/// Breath (a copy/paste bug, spec.md §"The wire frames" / research §7), but
+/// ticket 02 confirmed `0x1F` works on hardware too, so the spec uses it
+/// uniformly for consistency with every other effect.
+const LIGHTING_TXN: u8 = 0x1F;
+const LIGHTING_CMD_CLASS: u8 = 0x0F;
+const LIGHTING_EFFECT_CMD_ID: u8 = 0x02;
+const LIGHTING_CUSTOM_FRAME_CMD_ID: u8 = 0x03;
+const LIGHTING_BRIGHTNESS_CMD_ID: u8 = 0x04;
+
+const EFFECT_NONE: u8 = 0x00;
+const EFFECT_STATIC: u8 = 0x01;
+const EFFECT_BREATH: u8 = 0x02;
+const EFFECT_SPECTRUM: u8 = 0x03;
+const EFFECT_WAVE: u8 = 0x04;
+const EFFECT_REACTIVE: u8 = 0x05;
+const EFFECT_STARLIGHT: u8 = 0x07;
+const EFFECT_CUSTOM: u8 = 0x08;
+
+const WAVE_RIGHT: u8 = 0x01;
+const WAVE_LEFT: u8 = 0x02;
+/// The fixed wave speed byte every Tartarus Pro wave frame carries (lower =
+/// faster per the driver's own comment) — not user-configurable.
+const WAVE_SPEED: u8 = 0x28;
+
+/// The Pro's `1×21` matrix: 20 grid keys + the scroll wheel (spec.md
+/// §"Column addressing" — `LightingAssignment::CustomLayout`'s `colours`
+/// array is already in this column order; `assert_lighting` never remaps
+/// it). `stop_col` for a full-row write is `MATRIX_COLUMNS - 1`.
+const MATRIX_COLUMNS: usize = 21;
+/// `matrix_custom_frame`'s `data_size` is a fixed `0x47` (71) regardless of
+/// actual row length — 5 header bytes plus up to 63 bytes of RGB data,
+/// zero-padded (spec.md §"Custom layout" / research §10.1).
+const CUSTOM_FRAME_DATA_SIZE: usize = 71;
+const CUSTOM_EFFECT_ARM_DATA_SIZE: usize = 12;
+
+fn wave_direction_byte(direction: WaveDirection) -> u8 {
+    match direction {
+        WaveDirection::Right => WAVE_RIGHT,
+        WaveDirection::Left => WAVE_LEFT,
+    }
+}
+
+/// The style-count byte (0/1/2) plus 0/1/2 colours, shared by Breath's and
+/// Starlight's tail (spec.md §"The wire frames" / research §7-§8) — the only
+/// piece the two effects actually share; `a3`/`a4` differ per caller
+/// (`breath_tail`/`starlight_tail` below), so those stay separate.
+fn style_count_and_colours(style: &BreathStyle) -> (u8, Vec<u8>) {
+    match style {
+        BreathStyle::Random => (0x00, vec![]),
+        BreathStyle::Single { colour } => (0x01, vec![colour.r, colour.g, colour.b]),
+        BreathStyle::Dual { first, second } => (
+            0x02,
+            vec![first.r, first.g, first.b, second.r, second.g, second.b],
+        ),
+    }
+}
+
+/// Breath's `arg3`/`arg4`/`arg5` tail — `a3` repeats the style count, `a4` is
+/// always `0x00`.
+fn breath_tail(style: &BreathStyle) -> Vec<u8> {
+    let (count, colours) = style_count_and_colours(style);
+    let mut tail = vec![count, 0x00, count];
+    tail.extend(colours);
+    tail
+}
+
+/// Starlight's tail — `a3` is always `0x00`, `a4` carries the speed byte.
+fn starlight_tail(style: &BreathStyle, speed: u8) -> Vec<u8> {
+    let (count, colours) = style_count_and_colours(style);
+    let mut tail = vec![0x00, speed, count];
+    tail.extend(colours);
+    tail
+}
+
+/// `effect id` + argument tail for one `FixedEffect`, per spec.md §"The wire
+/// frames" table.
+fn fixed_effect_id_and_tail(effect: &FixedEffect) -> (u8, Vec<u8>) {
+    match effect {
+        FixedEffect::Static { colour } => (
+            EFFECT_STATIC,
+            vec![0x00, 0x00, 0x01, colour.r, colour.g, colour.b],
+        ),
+        FixedEffect::Spectrum => (EFFECT_SPECTRUM, vec![0x00, 0x00, 0x00]),
+        FixedEffect::Wave { direction } => (
+            EFFECT_WAVE,
+            vec![wave_direction_byte(*direction), WAVE_SPEED, 0x00],
+        ),
+        FixedEffect::Reactive { colour, speed } => (
+            EFFECT_REACTIVE,
+            vec![0x00, *speed, 0x01, colour.r, colour.g, colour.b],
+        ),
+        FixedEffect::Breath { style } => (EFFECT_BREATH, breath_tail(style)),
+        FixedEffect::Starlight { style, speed } => {
+            (EFFECT_STARLIGHT, starlight_tail(style, *speed))
+        }
+    }
+}
+
+/// The full argument list for one effect-select frame (`command_id 0x02`):
+/// `[VARSTORE, BACKLIGHT_LED, effect id, ...tail]`.
+fn effect_args(effect_id: u8, tail: &[u8]) -> Vec<u8> {
+    let mut args = vec![VARSTORE, BACKLIGHT_LED, effect_id];
+    args.extend_from_slice(tail);
+    args
+}
+
+/// `matrix_custom_frame`'s fixed 71-byte argument list: `[0x00, 0x00,
+/// row_index, start_col, stop_col, RGB×21, ...zero padding]` (spec.md
+/// §"Custom layout" / research §10.1). `a0`/`a1` are left zero — this
+/// command carries no `variable_storage`/`led_id` concept.
+fn custom_frame_args(colours: &[Colour; MATRIX_COLUMNS]) -> [u8; CUSTOM_FRAME_DATA_SIZE] {
+    let mut args = [0u8; CUSTOM_FRAME_DATA_SIZE];
+    args[2] = 0x00; // row_index — the Pro's matrix has only row 0
+    args[3] = 0x00; // start_col
+    args[4] = (MATRIX_COLUMNS - 1) as u8; // stop_col
+    for (i, colour) in colours.iter().enumerate() {
+        let offset = 5 + i * 3;
+        args[offset] = colour.r;
+        args[offset + 1] = colour.g;
+        args[offset + 2] = colour.b;
+    }
+    args
+}
+
+/// `matrix_effect_custom`'s argument list — the generic "display whatever's
+/// staged" trigger. `variable_storage`/`led_id` are hardcoded `0x00` here,
+/// not `VARSTORE`/`BACKLIGHT_LED` (spec.md §"Custom layout" / research
+/// §10.2).
+fn custom_effect_arm_args() -> [u8; CUSTOM_EFFECT_ARM_DATA_SIZE] {
+    let mut args = [0u8; CUSTOM_EFFECT_ARM_DATA_SIZE];
+    args[2] = EFFECT_CUSTOM;
+    args
+}
+
+fn brightness_args(brightness: u8) -> [u8; 3] {
+    [VARSTORE, ZERO_LED, brightness]
+}
+
+/// One `HIDIOCSFEATURE` write on `control` carrying a Lighting frame — every
+/// Lighting command shares `LIGHTING_TXN`/`LIGHTING_CMD_CLASS`, so callers
+/// only ever vary `cmd_id`/`args`. Shared by every arm of `assert_lighting`
+/// so a future change to the shared envelope (e.g. the Breath
+/// `transaction_id` quirk noted on `LIGHTING_TXN`) can't be applied to only
+/// some call sites by accident.
+fn send_lighting_cmd(control: &fs::File, cmd_id: u8, args: &[u8]) -> io::Result<()> {
+    send_feature(
+        control,
+        &mut build_razer_cmd(LIGHTING_TXN, LIGHTING_CMD_CLASS, cmd_id, args),
+    )
+}
+
+/// Physically drive the backlight to `state` (CONTEXT.md: Lighting
+/// assignment). Discovers a fresh Interface-2 control fd, sends one
+/// effect-select write (`Off`/`FixedEffect`) or the two-step
+/// custom-frame-write-then-arm (`CustomLayout`) for `state.assignment`, then
+/// sends a brightness write for `state.brightness` — every variant above
+/// ends with one, so the brightness byte always accompanies whichever
+/// assignment was asserted — all on the same short-lived fd, then drops it.
+/// No read-back, no retry loop, no driver-mode call, no unlock — like every
+/// other write in this file, a failed step aborts the whole assert rather
+/// than skipping ahead to the next one. Device absent ⇒
+/// `Err(io::ErrorKind::NotFound)`, exactly like `relock()`/
+/// `assert_status_leds`. Called by the `led` task (`crate::led`) on a
+/// `spawn_blocking` thread whenever dispatch pushes a new `LightingState` —
+/// Daemon startup and every device (re)connect (Profile switch and
+/// `SetLighting` follow in a later ticket). Works identically in Analog and
+/// Digital Capture mode: this opens its own Interface-2 fd regardless of
+/// what capture is doing, and never sends a driver-mode command.
+pub fn assert_lighting(state: LightingState) -> io::Result<()> {
+    let control = open_control_fd()?;
+    match &state.assignment {
+        LightingAssignment::Off => {
+            send_lighting_cmd(
+                &control,
+                LIGHTING_EFFECT_CMD_ID,
+                &effect_args(EFFECT_NONE, &[0x00, 0x00, 0x00]),
+            )?;
+        }
+        LightingAssignment::FixedEffect { effect } => {
+            let (effect_id, tail) = fixed_effect_id_and_tail(effect);
+            send_lighting_cmd(
+                &control,
+                LIGHTING_EFFECT_CMD_ID,
+                &effect_args(effect_id, &tail),
+            )?;
+        }
+        LightingAssignment::CustomLayout { colours } => {
+            send_lighting_cmd(
+                &control,
+                LIGHTING_CUSTOM_FRAME_CMD_ID,
+                &custom_frame_args(colours),
+            )?;
+            send_lighting_cmd(&control, LIGHTING_EFFECT_CMD_ID, &custom_effect_arm_args())?;
+        }
+    }
+    send_lighting_cmd(
+        &control,
+        LIGHTING_BRIGHTNESS_CMD_ID,
+        &brightness_args(state.brightness),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1434,6 +1664,192 @@ mod tests {
         );
         // `prototype/01-status-leds/prototype.py` selftest: "LED all-off crc == 0x0f".
         assert_eq!(off[89], 0x0F, "all-off crc");
+    }
+
+    // -- Lighting frames: byte tables ported from
+    // `research/backlight-wire-protocol.md`, verified on hardware by charting
+    // ticket 02 (not re-verified here) — these tests only pin the Rust
+    // translation of that already-verified table, the same role
+    // `status_led_frame_matches_the_hardware_verified_bytes` plays above. --
+
+    fn colour(r: u8, g: u8, b: u8) -> Colour {
+        Colour { r, g, b }
+    }
+
+    #[test]
+    fn off_frame_sends_the_none_effect_with_no_colour() {
+        let args = effect_args(EFFECT_NONE, &[0x00, 0x00, 0x00]);
+        assert_eq!(
+            args,
+            vec![VARSTORE, BACKLIGHT_LED, EFFECT_NONE, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn static_frame_carries_one_colour() {
+        let (effect_id, tail) = fixed_effect_id_and_tail(&FixedEffect::Static {
+            colour: colour(0xFF, 0x10, 0x20),
+        });
+        assert_eq!(effect_id, EFFECT_STATIC);
+        let args = effect_args(effect_id, &tail);
+        assert_eq!(
+            args,
+            vec![
+                VARSTORE,
+                BACKLIGHT_LED,
+                EFFECT_STATIC,
+                0x00,
+                0x00,
+                0x01,
+                0xFF,
+                0x10,
+                0x20
+            ]
+        );
+    }
+
+    #[test]
+    fn spectrum_frame_carries_no_parameters() {
+        let (effect_id, tail) = fixed_effect_id_and_tail(&FixedEffect::Spectrum);
+        assert_eq!(effect_id, EFFECT_SPECTRUM);
+        assert_eq!(tail, vec![0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn wave_frame_encodes_direction_and_the_fixed_speed_byte() {
+        let (effect_id, right) = fixed_effect_id_and_tail(&FixedEffect::Wave {
+            direction: WaveDirection::Right,
+        });
+        assert_eq!(effect_id, EFFECT_WAVE);
+        assert_eq!(right, vec![0x01, WAVE_SPEED, 0x00], "right = 0x01");
+
+        let (_, left) = fixed_effect_id_and_tail(&FixedEffect::Wave {
+            direction: WaveDirection::Left,
+        });
+        assert_eq!(left, vec![0x02, WAVE_SPEED, 0x00], "left = 0x02");
+    }
+
+    #[test]
+    fn reactive_frame_carries_speed_and_one_colour() {
+        let (effect_id, tail) = fixed_effect_id_and_tail(&FixedEffect::Reactive {
+            colour: colour(0x01, 0x02, 0x03),
+            speed: 0x04,
+        });
+        assert_eq!(effect_id, EFFECT_REACTIVE);
+        assert_eq!(tail, vec![0x00, 0x04, 0x01, 0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn breath_random_carries_no_colour_and_repeats_the_zero_count_at_a3_and_a5() {
+        let (effect_id, tail) = fixed_effect_id_and_tail(&FixedEffect::Breath {
+            style: BreathStyle::Random,
+        });
+        assert_eq!(effect_id, EFFECT_BREATH);
+        assert_eq!(tail, vec![0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn breath_single_repeats_the_one_count_at_a3_and_a5_around_a4_zero() {
+        let (_, tail) = fixed_effect_id_and_tail(&FixedEffect::Breath {
+            style: BreathStyle::Single {
+                colour: colour(0x11, 0x22, 0x33),
+            },
+        });
+        assert_eq!(tail, vec![0x01, 0x00, 0x01, 0x11, 0x22, 0x33]);
+    }
+
+    #[test]
+    fn breath_dual_repeats_the_two_count_and_carries_both_colours() {
+        let (_, tail) = fixed_effect_id_and_tail(&FixedEffect::Breath {
+            style: BreathStyle::Dual {
+                first: colour(0x01, 0x02, 0x03),
+                second: colour(0x04, 0x05, 0x06),
+            },
+        });
+        assert_eq!(
+            tail,
+            vec![0x02, 0x00, 0x02, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06]
+        );
+    }
+
+    #[test]
+    fn starlight_random_fixes_a3_zero_and_carries_the_speed_byte_at_a4() {
+        let (effect_id, tail) = fixed_effect_id_and_tail(&FixedEffect::Starlight {
+            style: BreathStyle::Random,
+            speed: 0x02,
+        });
+        assert_eq!(effect_id, EFFECT_STARLIGHT);
+        assert_eq!(tail, vec![0x00, 0x02, 0x00]);
+    }
+
+    #[test]
+    fn starlight_dual_carries_speed_and_both_colours() {
+        let (_, tail) = fixed_effect_id_and_tail(&FixedEffect::Starlight {
+            style: BreathStyle::Dual {
+                first: colour(0x0A, 0x0B, 0x0C),
+                second: colour(0x0D, 0x0E, 0x0F),
+            },
+            speed: 0x03,
+        });
+        assert_eq!(
+            tail,
+            vec![0x00, 0x03, 0x02, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F]
+        );
+    }
+
+    #[test]
+    fn custom_frame_args_place_row_and_column_headers_then_21_rgb_triples() {
+        let mut colours = [colour(0x00, 0x00, 0x00); MATRIX_COLUMNS];
+        colours[0] = colour(0xAA, 0xBB, 0xCC);
+        colours[20] = colour(0x11, 0x22, 0x33);
+        let args = custom_frame_args(&colours);
+
+        assert_eq!(
+            args.len(),
+            CUSTOM_FRAME_DATA_SIZE,
+            "fixed 71-byte data_size"
+        );
+        assert_eq!(args[2], 0x00, "row_index");
+        assert_eq!(args[3], 0x00, "start_col");
+        assert_eq!(args[4], 0x14, "stop_col = 20 (21 columns, 0-indexed)");
+        assert_eq!((args[5], args[6], args[7]), (0xAA, 0xBB, 0xCC), "column 0");
+        assert_eq!(
+            (args[65], args[66], args[67]),
+            (0x11, 0x22, 0x33),
+            "column 20"
+        );
+        assert!(args[68..].iter().all(|&b| b == 0x00), "tail zero-padded");
+    }
+
+    #[test]
+    fn custom_effect_arm_args_are_a_bare_trigger_with_no_varstore_or_led_id() {
+        let args = custom_effect_arm_args();
+        assert_eq!(args.len(), CUSTOM_EFFECT_ARM_DATA_SIZE);
+        assert_eq!(args[0], 0x00, "a0 is not VARSTORE here");
+        assert_eq!(args[1], 0x00, "a1 is not BACKLIGHT_LED here");
+        assert_eq!(args[2], EFFECT_CUSTOM);
+        assert!(args[3..].iter().all(|&b| b == 0x00));
+    }
+
+    #[test]
+    fn brightness_args_target_zero_led_not_backlight_led() {
+        assert_eq!(brightness_args(0x80), [VARSTORE, ZERO_LED, 0x80]);
+    }
+
+    #[test]
+    fn a_fixed_effect_frame_carries_the_lighting_txn_and_command_class() {
+        let (effect_id, tail) = fixed_effect_id_and_tail(&FixedEffect::Spectrum);
+        let cmd = build_razer_cmd(
+            LIGHTING_TXN,
+            LIGHTING_CMD_CLASS,
+            LIGHTING_EFFECT_CMD_ID,
+            &effect_args(effect_id, &tail),
+        );
+        assert_eq!(cmd[2], 0x1F, "transaction_id");
+        assert_eq!(cmd[6], 0x06, "data_size");
+        assert_eq!(cmd[7], 0x0F, "command_class");
+        assert_eq!(cmd[8], 0x02, "command_id");
+        assert_eq!(cmd[10], BACKLIGHT_LED, "arg1 = BACKLIGHT_LED id");
     }
 
     // -- pure response parsing (research §3.3/§3.4/§5) --------------------
