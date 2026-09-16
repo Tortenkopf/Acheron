@@ -1075,17 +1075,94 @@ def _lighting_labeled(label_text: str, widget: Gtk.Widget) -> Gtk.Box:
     return row
 
 
-def _lighting_colour_button(colour: dict, on_commit: Callable[[dict], None]) -> Gtk.ColorDialogButton:
-    dialog = Gtk.ColorDialog(title="Pick a colour")
-    btn = Gtk.ColorDialogButton(dialog=dialog)
-    # Connected only after the initial value is set, so seeding the button
-    # from stored config never itself fires a spurious commit.
-    btn.set_rgba(_colour_to_rgba(colour))
+_COLOUR_SWATCH_SIZE = (28, 24)
 
-    def on_notify(b, _pspec):
-        on_commit(_rgba_to_colour(b.get_rgba()))
 
-    btn.connect("notify::rgba", on_notify)
+def _solid_colour_texture(colour: dict, width: int, height: int) -> Gdk.Texture:
+    """A flat-fill texture for a colour swatch. Not a Cairo-drawn
+    `Gtk.DrawingArea`: this environment's GTK has no `gi._gi_cairo` foreign-
+    struct bridge installed, which makes any `set_draw_func` callback taking
+    a `cairo.Context` argument fail at paint time (a packaging gap, not a
+    code bug) — `Gdk.MemoryTexture` needs no Cairo interop at all."""
+    row = bytes((colour["r"], colour["g"], colour["b"])) * width
+    return Gdk.MemoryTexture.new(
+        width, height, Gdk.MemoryFormat.R8G8B8, GLib.Bytes.new(row * height), width * 3
+    )
+
+
+def _lighting_colour_button(colour: dict, on_commit: Callable[[dict], None]) -> Gtk.Button:
+    """A colour swatch button + picker window for every Lighting colour pick
+    (per-effect colours, Breath's two style colours, the Custom-layout paint
+    colour). Built on a plain `Gtk.Window` wrapping a bare
+    `Gtk.ColorChooserWidget` plus our own Cancel/Select row — not
+    `Gtk.ColorDialogButton`/`Gtk.ColorDialog`, and not the older
+    `Gtk.ColorChooserDialog` either: both size their window to a fixed
+    natural height that ignores `set_default_size` on this GTK/Wayland
+    stack, so the "Custom" colour-editor tab (bigger than the initial
+    swatch-grid tab) always needed an internal scrollbar to see the rest of
+    itself. A plain `Gtk.Window` has no such override — verified (see the
+    Binding editor's identical `Gtk.Window`-not-`Gtk.Dialog` fix above, live-
+    tested on real hardware for the same GTK4/Wayland sizing-constraint
+    class of bug) to naturally grow to fit the editor tab, with zero
+    scrolling, the moment the user opens it."""
+    current = dict(colour)
+
+    swatch = Gtk.Picture(content_fit=Gtk.ContentFit.FILL)
+    swatch.set_size_request(*_COLOUR_SWATCH_SIZE)
+    swatch.add_css_class("lighting-colour-swatch")
+    swatch.set_paintable(_solid_colour_texture(current, *_COLOUR_SWATCH_SIZE))
+
+    btn = Gtk.Button(child=swatch)
+    btn.set_tooltip_text("Pick a colour")
+
+    chooser = Gtk.ColorChooserWidget()
+    chooser.set_use_alpha(False)  # LED colours are opaque; on_commit ignores alpha anyway
+    chooser.set_rgba(_colour_to_rgba(colour))
+
+    window = Gtk.Window(modal=True, title="Pick a colour")
+    window.set_hide_on_close(True)
+
+    box = Gtk.Box(
+        orientation=Gtk.Orientation.VERTICAL,
+        spacing=8,
+        margin_top=8,
+        margin_bottom=8,
+        margin_start=8,
+        margin_end=8,
+    )
+    box.append(chooser)
+
+    button_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+    cancel_btn = Gtk.Button(label="Cancel")
+    select_btn = Gtk.Button(label="Select")
+    select_btn.add_css_class("suggested-action")
+    button_row.append(cancel_btn)
+    button_row.append(select_btn)
+    box.append(button_row)
+    window.set_child(box)
+
+    def on_cancel(_b):
+        chooser.set_rgba(_colour_to_rgba(current))  # discard any in-progress pick
+        window.close()
+
+    def on_select(_b):
+        current.update(_rgba_to_colour(chooser.get_rgba()))
+        swatch.set_paintable(_solid_colour_texture(current, *_COLOUR_SWATCH_SIZE))
+        window.close()
+        on_commit(dict(current))
+
+    cancel_btn.connect("clicked", on_cancel)
+    select_btn.connect("clicked", on_select)
+
+    def on_clicked(_b):
+        window.set_transient_for(btn.get_root())
+        window.present()
+
+    btn.connect("clicked", on_clicked)
+    # Exposed for tests, which need to reach the picker without actually
+    # presenting a real top-level window in a headless run — same reason
+    # `make_input_button`'s `btn.binding_editor_window` is exposed.
+    btn.colour_picker_window = window
     return btn
 
 

@@ -16,7 +16,7 @@ from acheron_gui.device_overview import (
 from acheron_gui.library_view import build_library_sidebar
 from acheron_gui.inputs import ALL_INPUTS, GRID_COLS, GRID_ROWS, grid_input, input_label
 
-from .widget_tree import button_labeled, editor_content, find_all, find_one
+from .widget_tree import button_labeled, editor_content, find_all, find_one, pick_colour
 
 
 def _build(stub, ui_state):
@@ -951,7 +951,9 @@ def _params_btn(root, label):
 
 
 def _colour_buttons(root):
-    return find_all(root, lambda w: isinstance(w, Gtk.ColorDialogButton))
+    return find_all(
+        root, lambda w: isinstance(w, Gtk.Button) and getattr(w, "colour_picker_window", None) is not None
+    )
 
 
 def _brightness_scale(root):
@@ -1049,7 +1051,7 @@ def test_static_colour_picker_commits_the_full_effect_immediately():
 
     root = _build_lighting(stub)
     colour_btn = _colour_buttons(root)[0]
-    colour_btn.set_rgba(_hex_rgba("#112233"))
+    pick_colour(colour_btn, _hex_rgba("#112233"))
 
     assert stub.calls == [
         (
@@ -1095,7 +1097,7 @@ def test_reactive_colour_and_speed_each_commit_the_full_updated_effect():
     stub.calls.clear()
     root = _build_lighting(stub)
     colour_btn = _colour_buttons(root)[0]
-    colour_btn.set_rgba(_hex_rgba("#ff0000"))
+    pick_colour(colour_btn, _hex_rgba("#ff0000"))
 
     assert stub.calls == [
         (
@@ -1152,7 +1154,7 @@ def test_breath_style_switch_seeds_default_colours_which_then_commit_by_slot():
 
     root = _build_lighting(stub)
     first_btn, second_btn = _colour_buttons(root)
-    second_btn.set_rgba(_hex_rgba("#00ff00"))
+    pick_colour(second_btn, _hex_rgba("#00ff00"))
 
     assert stub.calls == [
         (
@@ -1302,9 +1304,9 @@ def _paint_cell_for(root, inp: str):
 
 def _pick_paint_colour(root, hex_colour: str) -> None:
     """The custom-layout params panel's own current-colour picker is the
-    lone `Gtk.ColorDialogButton` on the tab in this mode (the per-key
+    lone colour-picker button on the tab in this mode (the per-key
     swatches are plain `Gtk.Button`s, not colour pickers)."""
-    _colour_buttons(root)[0].set_rgba(_hex_rgba(hex_colour))
+    pick_colour(_colour_buttons(root)[0], _hex_rgba(hex_colour))
 
 
 def test_custom_layout_paint_grid_only_renders_when_custom_layout_is_selected():

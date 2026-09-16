@@ -205,6 +205,12 @@ CSS = """
    destination's own keybind buttons use unrelated classes and must stay
    themed normally. */
 .lighting-paint-cell { background-image: none; }
+/* The Lighting tab's colour-picker swatches (device_overview.py::
+   _lighting_colour_button) are a flat-fill Gdk.Texture on a Gtk.Picture, not
+   a themed button background, so they need no background-image override —
+   just a border so a near-black or near-white pick still reads as a swatch
+   against the panel. */
+.lighting-colour-swatch { border: 1px solid alpha(currentColor, 0.35); border-radius: 3px; }
 """
 
 
