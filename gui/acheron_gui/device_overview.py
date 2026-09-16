@@ -1489,12 +1489,11 @@ def build_lighting_content(
     client, config: dict, profile: str, ui_state: dict, on_change: Callable[[], None]
 ) -> Gtk.Widget:
     """The Lighting destination's whole content area (ticket 04, spec
-    §"GUI"): one horizontal control strip — mode selector + per-effect
-    params + brightness, all in one row so the strip's height stays
+    §"GUI"): a mode selector + brightness strip so that row's height stays
     constant across every mode (the ticket's own prototype rejected a
-    vertical stack for exactly that reason) — above a Copy-from-Profile
-    affordance and the device area (a placeholder, except the ticket 05
-    Custom-layout paint grid)."""
+    vertical stack for exactly that reason), then a second row pairing
+    Copy-from-Profile with the per-effect params, above the device area
+    (a placeholder, except the ticket 05 Custom-layout paint grid)."""
     lighting = config["profiles"][profile]["lighting"]
     mode = _lighting_mode(lighting)
     # Ticket 05: the paint grid's current-colour, surviving a rebuild the
@@ -1507,12 +1506,13 @@ def build_lighting_content(
     strip = Gtk.Box(spacing=16)
     strip.append(build_lighting_mode_selector(client, config, profile, on_change))
     strip.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
-    strip.append(build_lighting_params(client, config, profile, paint_colour, on_change))
-    strip.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
     strip.append(build_lighting_brightness(client, config, profile, on_change))
     root.append(strip)
 
-    root.append(build_lighting_copy_from_profile(client, config, profile, on_change))
+    copy_row = build_lighting_copy_from_profile(client, config, profile, on_change)
+    copy_row.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+    copy_row.append(build_lighting_params(client, config, profile, paint_colour, on_change))
+    root.append(copy_row)
     root.append(Gtk.Separator())
     root.append(build_lighting_device_area(client, config, profile, mode, paint_colour, on_change))
 
