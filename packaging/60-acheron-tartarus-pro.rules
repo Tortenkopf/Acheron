@@ -14,3 +14,14 @@
 # distros already put the primary login user there) for this to take
 # effect.
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="0244", MODE="0660", GROUP="plugdev"
+
+# Grants the same `plugdev` group access to the device's evdev `event*`
+# nodes (Digital Capture — reading the keypad's own keystrokes to remap
+# them; see `daemon/src/input.rs`'s `/dev/input/by-id/...-event-*` paths).
+# These ship `root:input 0660` by default, and desktop distros generally do
+# NOT put the login user in `input` (unlike `plugdev`) since that group
+# grants raw read access to every input device on the system, including
+# other keyboards. Scoping this rule to the Tartarus Pro's own
+# idVendor/idProduct — rather than adding the user to `input` — avoids
+# handing out that blanket access for the sake of one device.
+SUBSYSTEM=="input", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="0244", MODE="0660", GROUP="plugdev"
