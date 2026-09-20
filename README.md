@@ -119,6 +119,12 @@ key still works, just without pressure.
   and XFCE are expected to work but are not regularly tested. On **GNOME** the
   tray icon needs the *AppIndicator and KStatusNotifierItem Support* extension
   (`gnome-shell-extension-appindicator`) — GNOME has no built-in tray.
+- **[OpenRazer](https://openrazer.github.io/) 3.12.4 or newer.** Acheron depends
+  on it: the Tartarus Pro's support needs a current OpenRazer, and without it
+  the Daemon can't open the device's input nodes (`EACCES`), so digital capture
+  fails. Ubuntu's own archive ships an older 3.11.0, so install from the
+  [OpenRazer PPA](https://openrazer.github.io/#ubuntu) (`ppa:openrazer/stable`).
+  Tested with 3.12.4.
 - Membership of the **`plugdev`** group (most desktop distros already add your
   login user). This is what lets the Daemon reach the analog interface without
   root.
@@ -385,6 +391,10 @@ Acheron — and the Macro feature especially — is entirely your own responsibi
   KStatusNotifierItem Support* GNOME extension.
 - **`acheron-gui: command not found`** from the app grid — `~/.local/bin` is
   not on your `PATH`.
+- **Daemon can't open the device / `EACCES` on a fresh install.** OpenRazer
+  isn't installed, or it is older than 3.12.4. Install or upgrade it (see
+  [System requirements](#system-requirements)), then unplug and replug the
+  device.
 - **Analog features unavailable / "digital capture".** The udev rule isn't in
   effect yet, or you're not in `plugdev`. Re-run the `sudo` commands
   `install.sh` printed, confirm `groups` lists `plugdev`, then log out and back
