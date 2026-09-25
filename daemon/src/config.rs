@@ -491,6 +491,15 @@ pub enum StagingMode {
     QuickSkip,
 }
 
+impl StagingMode {
+    /// Whether this mode runs the per-press ~50ms window (buffered primary
+    /// `Down`, Armed → Skipped / Late) — Quick-Skip's machine, shared by
+    /// every mode built on it.
+    pub fn is_windowed(self) -> bool {
+        matches!(self, StagingMode::QuickSkip)
+    }
+}
+
 /// CONTEXT.md: Status LED assignment. The per-Profile triple of on/off states
 /// for the three fixed-colour (orange, green, blue) indicator LEDs on the
 /// device's left side (`tartarus-status-leds` ticket 01). A **named struct**,

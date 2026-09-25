@@ -266,7 +266,7 @@ impl DispatchState {
         // physical edge against the key's Quick-Skip / deep-repeat machine,
         // folding what used to be two hand-rolled blocks (the `quick_skip_key`
         // divert and the general deep-repeat swallow) plus the
-        // `begin_quick_skip` / `is_late` / `primary_handed_off` / `deep_repeat`
+        // `begin_windowed_press` / `is_late` / `primary_handed_off` / `deep_repeat`
         // reach-through into one call. `Handled` ⇒ the edge is consumed;
         // `NotMine { machine_sequenced }` ⇒ run the ordinary Binding path,
         // and — when `feed` tracks this key — build the following `perform`
@@ -7073,7 +7073,7 @@ mod tests {
         // A single hidraw report jumping straight from released past the
         // deep Actuation point — the real primary `Down` PhysicalEvent
         // carries `depth: Some(250)`, already past the deep band's own
-        // threshold (220/200). `begin_quick_skip` resolves this
+        // threshold (220/200). `begin_windowed_press` resolves this
         // synchronously from that event's own depth field: `KEY_A` (primary)
         // must never appear at all, only `KEY_B` (deep).
         let config = dual_stage_config(
@@ -7670,7 +7670,7 @@ mod tests {
         // queued real primary `Up`: `update` runs the `Late -> None` row, whose
         // lone `ReleasePrimary` it `continue`s past (the ordinary `rx_events`
         // edge is meant to release it). But for a Quick-Skip key `feed` swallows
-        // that ordinary edge — so `end_quick_skip` must force-release the
+        // that ordinary edge — so `end_windowed_press` must force-release the
         // primary itself, or `value=1` latches forever (kernel autorepeat).
         let config = dual_stage_config(
             StagingMode::QuickSkip,
@@ -7893,7 +7893,7 @@ mod tests {
         // depth) is ever drained. Drives `DispatchState` directly (the
         // `Seam` seam, ticket 09) so this specific ordering — `update_stages`
         // before `handle_event` — is deterministic rather than left to
-        // `tokio::select!`'s fairness draw. `begin_quick_skip` must defer to
+        // `tokio::select!`'s fairness draw. `begin_windowed_press` must defer to
         // `update`'s already-tracked `rt.deep` in that case, not the event's
         // own stale depth field, or a fast full press would wrongly Arm (and
         // later fire Late) instead of resolving Skipped.

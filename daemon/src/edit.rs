@@ -322,13 +322,13 @@ pub enum Edit {
     /// (`Effect::StopStage(input)` whenever the `.mode` field actually
     /// changes — post-release ticket 23 case B7): a mode change, unlike an
     /// Actuation-point change, can strand Quick-Skip's own per-press phase
-    /// machine (`rt.quick_skip`), since the next `advance` would run the *new*
+    /// machine (`rt.window`), since the next `advance` would run the *new*
     /// mode's transition table against a phase value the *old* mode wrote.
     /// There is no clean "the next tick reconciles" guarantee here (there is
     /// for `SetDeepActuation`, where `analog::observe` just re-thresholds).
     /// Force-releasing the live deep slot lets the new mode start from a known
     /// state — the next `Engine::update` tick re-adopts at the current Depth
-    /// under the new mode with a clean `quick_skip = None`. Only sound because
+    /// under the new mode with a clean `window = None`. Only sound because
     /// ticket 23 also makes `stage::Engine::stop_stage` reset-and-keep the
     /// runtime entry: a `SetStagingMode` on the active Layer with the key held
     /// would otherwise hit the same re-fire bug B12 fixes (the deep Binding is
