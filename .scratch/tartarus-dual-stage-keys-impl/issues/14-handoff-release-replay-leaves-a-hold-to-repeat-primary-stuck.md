@@ -17,7 +17,7 @@ Daemon-only.
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 ## Repro
 
@@ -93,7 +93,28 @@ source.
 
 ## Acceptance
 
-- [ ] The repro test above passes: every primary `value=1` is balanced
-- [ ] Same check for the `(Up, Up) -> (Down, Down)` row with the real `Down` arriving after its depth tick (or documented as not affected)
-- [ ] `either-or-staging-mode`'s `dual_stage_set_staging_mode_out_of_either_or_mid_press_leaves_nothing_stuck` can drive the real Up before the depth tick (it currently orders them the other way to dodge this bug)
-- [ ] Existing dual-stage tests stay green
+- [x] The repro test above passes: every primary `value=1` is balanced
+- [x] Same check for the `(Up, Up) -> (Down, Down)` row with the real `Down` arriving after its depth tick (or documented as not affected)
+- [x] `either-or-staging-mode`'s `dual_stage_set_staging_mode_out_of_either_or_mid_press_leaves_nothing_stuck` can drive the real Up before the depth tick (it currently orders them the other way to dodge this bug)
+- [x] Existing dual-stage tests stay green
+
+## Comments
+
+### 2026-09-26 — fix
+
+- **The release row (the ticket's repro).** Fixed at the source, as suggested.
+  - `executor::FiringKeys` puts `held` and a `force_released` latch under one mutex.
+  - `FiringHandle::force_release_stuck` sets the latch. A firing force-released before its task ran then force-releases whatever it still holds once its steps finish. This works on the multi-thread runtime too.
+  - A balanced Fire-once or Macro holds nothing at the end, so nothing changes for it.
+- **The mirror row `(Up, Up) -> (Down, Down)` was affected, by a different mechanism.**
+  - With the real `Down` after the depth tick, the late `Down` fired the primary a second time under the deep stage. The release row's `RepressPrimary` then replaced that firing's `firings` entry, so its held key had no owner. This was the same hole as `Engine::update`'s old "Toggle picks up a second loop" residual gap.
+  - Fix: `stage::Engine::feed` swallows a non-windowed real `Down` while the primary is handed off, since that edge was already performed by the replay.
+  - Any real `Up` clears the hand-off before `feed`'s early returns, so a quick re-press is never swallowed.
+  - Recorded in spec.md under the Handoff table.
+- **Hardening.** `trigger::Slots::perform` force-releases and removes a firing it is about to replace, before spawning the new one (`release_displaced_firing`), so an entry still holding a key can't be dropped.
+  - Found by a quick re-press whose `Down` beat a coalesced 250→150 depth tick: that tick's `[ReleaseDeep, RepressPrimary]` re-pressed over the live real press.
+  - It only ever acts on a finished firing (`decide`'s overlap guard drops a spawn over an unfinished one).
+
+**Residuals.** Both are pre-existing, neither leaves a key stuck, and neither is fixed here:
+- **Re-press dropped by the overlap guard.** A re-press `Down` landing after the release row but before its `RepressPrimary` task has run meets `FiringUnfinished`, so the overlap guard drops it. The press's `Repeat`s then emit `value=2` against a key the latch already released.
+- **Primary and deep stage autorepeat together.** A quick `Up` + re-press `Down` can both land before a depth tick that coalesces to `(Down, Down)`. The primary is then held alongside a live deep stage with no hand-off recorded, so both autorepeat until the next depth tick.

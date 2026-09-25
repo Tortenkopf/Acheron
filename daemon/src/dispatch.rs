@@ -6989,6 +6989,130 @@ mod tests {
         harness.shut_down().await;
     }
 
+    /// Every `value=1` of `code` in `events` balanced by a `value=0` —
+    /// nothing left held down at the OS level.
+    fn assert_balanced(events: &[(evdev::KeyCode, i32)], code: evdev::KeyCode) {
+        let downs = events.iter().filter(|&&e| e == (code, 1)).count();
+        let ups = events.iter().filter(|&&e| e == (code, 0)).count();
+        assert_eq!(downs, ups, "{code:?} left stuck: {events:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_handoff_real_up_before_the_release_depth_tick_leaves_nothing_stuck() {
+        // `tartarus-dual-stage-keys` ticket 14: the release row `[ReleaseDeep, RepressPrimary,
+        // ReleasePrimary]` spawns the primary's held `KeyDown` and
+        // force-releases it before that firing's task has run. With the real
+        // Up already consumed, nothing else would ever release it.
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        // The real Up lands first; the depth tick for the same release second.
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+
+        let events = events_of(&harness.shut_down().await);
+        assert_balanced(&events, evdev::KeyCode::KEY_A);
+        assert_balanced(&events, evdev::KeyCode::KEY_B);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_handoff_real_down_after_the_press_depth_tick_leaves_nothing_stuck() {
+        // `tartarus-dual-stage-keys` ticket 14's mirror row: `(Up, Up) -> (Down, Down)` walks
+        // `[FirePrimary, ReleasePrimary, FireDeep]` — the same
+        // spawn-then-immediately-force-release shape — with the real Down
+        // arriving only after that depth tick.
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        harness.press_analog(Input::Grid(1, 1), 250).await;
+        settle().await;
+        harness.repeat_analog(Input::Grid(1, 1), 250).await;
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        settle().await;
+
+        let events = events_of(&harness.shut_down().await);
+        assert_balanced(&events, evdev::KeyCode::KEY_A);
+        assert_balanced(&events, evdev::KeyCode::KEY_B);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_handoff_real_down_after_the_press_depth_tick_starts_no_second_toggle() {
+        // The Toggle shape of `tartarus-dual-stage-keys` ticket 14's mirror
+        // row: the late real Down must not start a second loop under the deep
+        // stage, one `ReleasePrimary` has already stopped.
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            toggle_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        harness.press_analog(Input::Grid(1, 1), 250).await;
+        settle().await;
+        assert!(
+            harness.get_state().await.active_toggles.is_empty(),
+            "no primary Toggle may run under the deep stage"
+        );
+        harness.shut_down().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_handoff_quick_repress_racing_the_release_depth_tick_still_fires() {
+        // The late-Down swallow (`tartarus-dual-stage-keys` ticket 14) is
+        // scoped to the press the depth tick ran ahead of: a real Up ends that
+        // press, so a re-press whose Down beats the release depth tick fires
+        // the primary as usual.
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        let before = events_of(&harness.sink.batches()).len();
+
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        settle().await;
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        settle().await;
+        let events = events_of(&harness.sink.batches());
+        assert!(
+            events[before..].contains(&(evdev::KeyCode::KEY_A, 1)),
+            "the re-press fires the primary: {events:?}"
+        );
+
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+        let events = events_of(&harness.shut_down().await);
+        assert_balanced(&events, evdev::KeyCode::KEY_A);
+    }
+
     #[tokio::test]
     async fn dual_stage_no_return_keeps_the_hold_to_repeat_primary_suppressed_past_the_deep_band() {
         // No-Return doesn't repress on the way out, so its primary stays
@@ -8190,11 +8314,11 @@ mod tests {
         settle().await;
         harness.repeat_analog(Input::Grid(1, 1), 250).await;
         settle().await;
-        // Depth before the real Up: the reverse order trips a separate,
-        // plain-Handoff race on the `(Down, Down) -> (Up, Up)` replay.
-        harness.push_depth([(Input::Grid(1, 1), 0)]);
-        settle().await;
+        // The real Up before the release depth tick — the order that used to
+        // strand the replayed primary (`tartarus-dual-stage-keys` ticket 14).
         harness.release_analog(Input::Grid(1, 1), 0).await;
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
         settle().await;
 
         let events = events_of(&harness.shut_down().await);

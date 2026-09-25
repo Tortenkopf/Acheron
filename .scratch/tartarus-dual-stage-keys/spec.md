@@ -230,6 +230,14 @@ Fire-once/Macro precedent, nothing dual-stage-specific.
 | (Down,Down)→(Up,Up), 1-report skip | Release Deep → Repress Primary → Primary Up (real) |
 | no crossing | Nothing |
 
+The replay performs each 1-report-skip row in full off the depth tick, so the real primary edge for
+that same crossing can arrive afterwards. That edge has already been performed and is spent: a
+real Down arriving while the primary is handed off to the deep stage is swallowed, so it neither
+holds the primary under the deep stage nor starts a second Toggle loop. Any real Up ends the
+hand-off, so a quick re-press is never swallowed. A primary firing that a row re-presses and then
+releases before its task has run still releases its key once the task does
+(`tartarus-dual-stage-keys-impl` ticket 14).
+
 **No-Return** — identical to Handoff except the down-direction never represses:
 
 | Transition | Emitted ops, in order |

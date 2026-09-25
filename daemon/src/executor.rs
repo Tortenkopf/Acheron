@@ -329,6 +329,36 @@ pub(crate) fn compile_stepper_item(item: StepperItem) -> Vec<MacroStep> {
     }
 }
 
+/// A one-shot firing's cross-task-visible key bookkeeping: `held` mirrors
+/// `ActiveToggle`'s own loop-private set, and `force_released` latches the
+/// first `FiringHandle::force_release_stuck` so a firing force-released
+/// *before* its task wrote a `KeyDown` (`tartarus-dual-stage-keys` ticket 14)
+/// still releases that key once its steps finish. One mutex over both, so
+/// `run_once`'s final check and the force-release can't interleave.
+#[derive(Default)]
+struct FiringKeys {
+    held: HashSet<KeyCode>,
+    force_released: bool,
+}
+
+impl FiringKeys {
+    /// `force_release_stuck`'s half: latch, then take everything held now.
+    fn latch_and_take(&mut self) -> Vec<KeyCode> {
+        self.force_released = true;
+        self.held.drain().collect()
+    }
+
+    /// `run_once`'s end-of-steps half: whatever is still held, if a
+    /// force-release already came and went; nothing otherwise.
+    fn take_if_force_released(&mut self) -> Vec<KeyCode> {
+        if self.force_released {
+            self.held.drain().collect()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
 /// Walks `steps` once, in order, sleeping between `Delay` steps — shared
 /// shape with `execute_step`'s Toggle-loop version, but tracking `held` in a
 /// cross-task-visible `Mutex` rather than a loop-private `&mut` since a
@@ -336,42 +366,54 @@ pub(crate) fn compile_stepper_item(item: StepperItem) -> Vec<MacroStep> {
 /// from the dispatch task later (ticket 33's stuck-key fix: force-released
 /// on the bound Input's physical `Up`, not just on an explicit stop).
 /// `held` only ever mirrors reality (a write suppression withheld), same
-/// rationale as `execute_step`. Returns `Err` only when the injector task
-/// itself has died (a genuine, fatal Daemon condition, not something this
-/// firing should retry).
+/// rationale as `execute_step`. Once the steps are walked, a firing already
+/// force-released releases whatever it still holds itself
+/// (`tartarus-dual-stage-keys` ticket 14): the
+/// force-release ran before this task pressed it — e.g. `stage::Engine`'s
+/// `[ReleaseDeep, RepressPrimary, ReleasePrimary]` row, performed
+/// back-to-back on the dispatch task — so no later edge would. Returns `Err`
+/// only when the injector task itself has died (a genuine, fatal Daemon
+/// condition, not something this firing should retry).
 async fn run_once(
     injector: &Injector,
     steps: &[MacroStep],
-    held: &Mutex<HashSet<KeyCode>>,
+    keys: &Mutex<FiringKeys>,
 ) -> Result<(), InjectorClosed> {
     for step in steps {
         match step {
             MacroStep::KeyDown(key) => {
                 let applied = injector.set_key_state(*key, true).await?;
                 if applied {
-                    held.lock().expect("held mutex poisoned").insert(*key);
+                    keys.lock().expect("firing keys mutex poisoned").held.insert(*key);
                 }
             }
             MacroStep::KeyUp(key) => {
                 let applied = injector.set_key_state(*key, false).await?;
                 if applied {
-                    held.lock().expect("held mutex poisoned").remove(key);
+                    keys.lock().expect("firing keys mutex poisoned").held.remove(key);
                 }
             }
             MacroStep::Delay(duration) => tokio::time::sleep(*duration).await,
         }
     }
+    let leftover = keys
+        .lock()
+        .expect("firing keys mutex poisoned")
+        .take_if_force_released();
+    for key in leftover {
+        injector.force_release_key(key).await?;
+    }
     Ok(())
 }
 
 /// A spawned Fire-once/Hold-to-repeat firing, as tracked in dispatch's
-/// `HashMap<Input, FiringHandle>`. `held` mirrors `ActiveToggle`'s own
+/// `HashMap<Input, FiringHandle>`. `keys.held` mirrors `ActiveToggle`'s own
 /// `held: HashSet<Key>` discipline, just shared with the dispatch task
 /// instead of kept loop-private, since ticket 33's fix needs to read (and
 /// force-release) it from the outside, on the bound Input's physical `Up`.
 pub struct FiringHandle {
     handle: JoinHandle<()>,
-    held: Arc<Mutex<HashSet<KeyCode>>>,
+    keys: Arc<Mutex<FiringKeys>>,
 }
 
 impl FiringHandle {
@@ -398,14 +440,16 @@ impl FiringHandle {
     /// this (`held` is empty — a no-op); an *unbalanced* one (a bare
     /// `KeyDown` with no matching `KeyUp`, used to fake a sustained "hold")
     /// is exactly what this releases, instead of leaving it stuck at the OS
-    /// level until reboot.
+    /// level until reboot. Also latches `force_released`, so a firing whose
+    /// task hasn't written its `KeyDown` yet releases it itself once its
+    /// steps finish (`tartarus-dual-stage-keys` ticket 14) rather than
+    /// leaving it stuck.
     pub async fn force_release_stuck(&self, injector: &Injector) {
-        let stuck: Vec<KeyCode> = self
-            .held
+        let stuck = self
+            .keys
             .lock()
-            .expect("held mutex poisoned")
-            .drain()
-            .collect();
+            .expect("firing keys mutex poisoned")
+            .latch_and_take();
         for key in stuck {
             let _ = injector.force_release_key(key).await;
         }
@@ -415,15 +459,15 @@ impl FiringHandle {
 /// Spawns a one-shot firing: walks `steps` exactly once. Used for Fire-once
 /// (on `Down`) and Hold-to-repeat (on `Down` and every subsequent `Repeat`)
 /// — fire-and-forget from the dispatch task's point of view, except for the
-/// `held` handle it hands back so a later physical `Up` can force-release
+/// `FiringHandle` it hands back so a later physical `Up` can force-release
 /// anything left stuck (ticket 33).
 pub fn spawn_fire_once(injector: Injector, steps: Vec<MacroStep>) -> FiringHandle {
-    let held = Arc::new(Mutex::new(HashSet::new()));
-    let held_task = held.clone();
+    let keys = Arc::new(Mutex::new(FiringKeys::default()));
+    let keys_task = keys.clone();
     let handle = tokio::spawn(async move {
-        let _ = run_once(&injector, &steps, &held_task).await;
+        let _ = run_once(&injector, &steps, &keys_task).await;
     });
-    FiringHandle { handle, held }
+    FiringHandle { handle, keys }
 }
 
 /// A running Toggle, as tracked in dispatch's `HashMap<Input, ActiveToggle>`
@@ -1207,6 +1251,28 @@ mod tests {
         assert_eq!(batches.len(), 2, "the Up must fire once the dwell elapses");
         assert_eq!(key_and_value(batches[0][0]), (KeyCode::BTN_SOUTH, 1));
         assert_eq!(key_and_value(batches[1][0]), (KeyCode::BTN_SOUTH, 0));
+    }
+
+    #[tokio::test]
+    async fn force_release_before_the_firing_has_run_still_releases_its_held_key() {
+        // Ticket 14: a force-release that lands before the spawned task has
+        // written its `KeyDown` saw an empty `held` set and released nothing,
+        // leaving the key the task then pressed stuck down.
+        let sink = RecordingSink::new();
+        let (inj, inj_handle) = injector::spawn(sink.clone(), sink.clone());
+
+        let firing = spawn_fire_once(
+            inj.clone(),
+            held_key_down_steps(Modifiers::default(), KeyCode::KEY_X),
+        );
+        firing.force_release_stuck(&inj).await;
+        firing.join().await;
+
+        drop(inj);
+        inj_handle.await.unwrap().unwrap();
+
+        let events: Vec<_> = sink.batches().iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(events, vec![(KeyCode::KEY_X, 1), (KeyCode::KEY_X, 0)]);
     }
 
     #[tokio::test]

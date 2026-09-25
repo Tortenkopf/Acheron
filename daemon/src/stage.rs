@@ -599,20 +599,20 @@ impl Engine {
     /// separately-arriving real primary edge under `tokio::select!`'s
     /// unordered tie-break between the `rx_events` and `rx_depth.changed()`
     /// arms — closing the ordering race spec.md flags ticket 01's original
-    /// design hadn't fully covered. Accepted residual gap, narrow enough
-    /// that it isn't specially engineered around (same class as ticket 39's
-    /// own accepted gap): if the real primary edge for that same crossing
-    /// arrives *after* this synchronous handling, a Toggle primary can pick
-    /// up a second, unwanted loop. Reachable by a single hidraw report
-    /// jumping from fully released past the deep Actuation point in one
-    /// sample — and, since `rx_depth` is a coalescing `watch` channel (the
-    /// latest snapshot only, never a queue) while `rx_events` is a
-    /// non-lossy `mpsc`, also by *separate* reports whose depth snapshots
-    /// happen to coalesce into one `rx_depth.changed()` tick because
-    /// dispatch's `select!` loop was busy handling something else across
-    /// them — the same coalescing-under-load characteristic every
-    /// `rx_depth` consumer in this file already has (Axis resolution,
-    /// Analog-repeat's rate curve), not something specific to this row.
+    /// design hadn't fully covered. The real primary edge for that same
+    /// crossing can still arrive *after* this synchronous handling — a single
+    /// hidraw report jumping from fully released past the deep Actuation
+    /// point, or separate reports whose snapshots coalesce into one
+    /// `rx_depth.changed()` tick (`rx_depth` is a coalescing `watch`,
+    /// `rx_events` a non-lossy `mpsc`; the same coalescing-under-load every
+    /// `rx_depth` consumer in this file already has). `feed` swallows such a
+    /// late `Down` while the primary is handed off, so it neither holds the
+    /// primary under the deep stage nor starts a second Toggle loop. The
+    /// release mirror — the real `Up` handled first, then `[ReleaseDeep,
+    /// RepressPrimary, ReleasePrimary]` — releases the `RepressPrimary`
+    /// firing before its task has run, and `FiringHandle::force_release_stuck`'s
+    /// latch has that firing release its own key once it does
+    /// (`tartarus-dual-stage-keys` ticket 14).
     pub(crate) async fn update(
         &mut self,
         deps: EngineDeps<'_>,
@@ -840,6 +840,9 @@ impl Engine {
     ///   needed (driving a Hold-to-repeat deep stage off a primary `Repeat`)
     ///   has already been applied. See `StageOutcome` for `machine_sequenced`.
     ///
+    /// Any real `Up` also clears the primary hand-off first, before any row
+    /// below is chosen (`tartarus-dual-stage-keys` ticket 14).
+    ///
     /// The routing matrix (every row is pre-ticket-17 `handle_event`
     /// behaviour, relocated not rewritten — Additive's rows were dropped with
     /// the mode, ADR-0009):
@@ -857,6 +860,7 @@ impl Engine {
     /// | Quick-Skip `Up` while `Skipped` / `None` | `Handled(vec![])` — `end_windowed_press` releases the deep stage, force-releases the primary (unless a flushed tap's Up is pending) |
     /// | Quick-Skip `Up` / `Repeat` once `Late` | runs the general rows (plain Handoff) |
     /// | Either-Or `Up` / `Repeat` once `Late` | runs the general rows, but "drive deep repeat" is a no-op (`deep_locked_out`) and the primary is never handed off |
+    /// | non-windowed primary `Down`, primary handed off to deep (a depth tick already replayed this press's crossing) | `Handled(vec![])` — swallowed |
     /// | any mode, `Repeat`, primary handed off to deep | drive deep repeat, `Handled(vec![])` |
     /// | any mode, `Repeat`, primary **not** handed off | drive deep repeat, `NotMine { true }` |
     ///
@@ -883,6 +887,16 @@ impl Engine {
         // Digital-mode primary (the deep stage is inert for free) or the
         // Chord machine's synthetic retroactive Down — neither diverts, and
         // both keep the ordinary user-initiated Fire-once dwell.
+        // A real `Up` ends the press whatever else this edge turns out to be,
+        // so the hand-off ends with it — cleared ahead of every early return
+        // below, or a stale hand-off would swallow the next press's `Down`
+        // (see the late-`Down` guard further down). `update` clears it too
+        // once its shadow primary band goes Up, but that can lag this edge.
+        if event.state == EventState::Up
+            && let Some(rt) = self.runtime.get_mut(&event.input)
+        {
+            rt.primary_handed_off = false;
+        }
         let Some(deep_cfg) = profile.deep_stages.get(&event.input).copied() else {
             return Ok(StageOutcome::NotMine {
                 machine_sequenced: false,
@@ -929,6 +943,19 @@ impl Engine {
                 // `EventState::Up | EventState::Repeat => {}` empty arm did.
                 EventState::Up | EventState::Repeat => {}
             }
+        }
+
+        // A real primary `Down` landing while the primary is already handed
+        // off belongs to a press `update` has run ahead of: a depth tick
+        // walked `(Up, Up) -> (Down, Down)`'s `[FirePrimary, ReleasePrimary,
+        // FireDeep]` before this edge was handled. The primary edge is spent,
+        // so firing it again would hold it under the deep stage and orphan
+        // the firing when the release row's `RepressPrimary` replaces its
+        // entry (`tartarus-dual-stage-keys` ticket 14). Any real `Up` has
+        // already cleared the hand-off above, so a quick re-press isn't
+        // swallowed too.
+        if event.state == EventState::Down && self.primary_handed_off(event.input) {
+            return Ok(StageOutcome::Handled(Vec::new()));
         }
 
         // A synthesized primary `Repeat` pulse also drives a Hold-to-repeat
@@ -2225,6 +2252,84 @@ mod tests {
                 machine_sequenced: true
             }
         );
+    }
+
+    // ── Ticket 14: a real Down the depth tick already replayed is spent ──
+
+    #[tokio::test(start_paused = true)]
+    async fn feed_down_swallowed_once_primary_handed_off_to_deep() {
+        let config = dual_stage_cfg(
+            StagingMode::Handoff,
+            TriggerMode::HoldToRepeat,
+            TriggerMode::HoldToRepeat,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+        // The depth tick runs ahead of the real Down: `[FirePrimary,
+        // ReleasePrimary, FireDeep]` hands the primary off.
+        engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 250u8)]))
+            .await
+            .unwrap();
+        assert!(engine.primary_handed_off(KEY));
+        let out = engine
+            .feed(fx.deps(&config), edge(EventState::Down, Some(250)))
+            .await
+            .unwrap();
+        assert_eq!(out, StageOutcome::Handled(Vec::new()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn feed_up_clears_the_hand_off_so_a_re_press_down_falls_through() {
+        let config = dual_stage_cfg(
+            StagingMode::Handoff,
+            TriggerMode::HoldToRepeat,
+            TriggerMode::HoldToRepeat,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+        engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 250u8)]))
+            .await
+            .unwrap();
+        engine
+            .feed(fx.deps(&config), edge(EventState::Up, Some(0)))
+            .await
+            .unwrap();
+        assert!(!engine.primary_handed_off(KEY));
+        let out = engine
+            .feed(fx.deps(&config), edge(EventState::Down, Some(150)))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            StageOutcome::NotMine {
+                machine_sequenced: true
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn feed_up_without_depth_still_clears_the_hand_off() {
+        // An `Up` that `feed` otherwise returns early on (no Depth) still ends
+        // the press, so it can't leave a stale hand-off to swallow the next
+        // press's Down.
+        let config = dual_stage_cfg(
+            StagingMode::Handoff,
+            TriggerMode::HoldToRepeat,
+            TriggerMode::HoldToRepeat,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+        engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 250u8)]))
+            .await
+            .unwrap();
+        engine
+            .feed(fx.deps(&config), edge(EventState::Up, None))
+            .await
+            .unwrap();
+        assert!(!engine.primary_handed_off(KEY));
     }
 
     // ── Ticket 13: the outer `Up` disarms the Quick-Skip window in `feed` ──
