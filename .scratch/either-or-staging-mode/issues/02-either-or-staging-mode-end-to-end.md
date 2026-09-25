@@ -58,6 +58,6 @@ no-behaviour-change prefactor (`WindowPhase` / `window`, `StagingMode::is_window
   the `(Down, Down) -> (Up, Up)` depth tick, the replayed `[ReleaseDeep, RepressPrimary,
   ReleasePrimary]` leaves a Hold-to-repeat primary held. `force_release` doesn't catch
   the fresh re-press. It reproduces with no Either-Or involvement, so the mode-flip test
-  drives depth before the Up.
+  drives depth before the Up. Filed as [`tartarus-dual-stage-keys-impl` ticket 14](../../tartarus-dual-stage-keys-impl/issues/14-handoff-release-replay-leaves-a-hold-to-repeat-primary-stuck.md).
 
 Hardware verification is still pending.
