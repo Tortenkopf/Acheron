@@ -16,7 +16,7 @@ dispatch loop.
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] A quick shallow tap on a Quick-Skip key emits the primary's Down on release and its Up ~40ms later (paused-time dispatch test)
 - [x] The existing test asserting "early Up cancels with nothing emitted" is replaced by the flush behaviour, not left alongside it
@@ -25,7 +25,7 @@ dispatch loop.
 - [x] A Layer/Profile switch or capture-mode flip with an Up pending cancels it and leaves the primary released (nothing stuck down)
 - [x] A Layer/Profile switch or capture-mode flip while still *Armed* still cancels silently: nothing fires
 - [x] Skipped and Late behaviour are unchanged (existing Quick-Skip tests stay green)
-- [ ] Verified on hardware: a quick tap on a Quick-Skip key produces the primary
+- [x] Verified on hardware: a quick tap on a Quick-Skip key produces the primary
 
 ## Comments
 

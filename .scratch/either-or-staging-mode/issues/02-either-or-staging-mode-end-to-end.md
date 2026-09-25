@@ -27,7 +27,7 @@ stage, which is exactly what this mode forbids.
 
 **Blocked by:** 01 (Quick-Skip plays a quick shallow tap as a primary tap)
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] Prefactor lands with every existing Quick-Skip test green and no behaviour change
 - [x] `either_or` round-trips through `config.toml` and the D-Bus wire; the GUI test stub accepts it
@@ -40,7 +40,7 @@ stage, which is exactly what this mode forbids.
 - [x] Dispatch: a quick shallow tap flushes the primary as a tap (ticket 01's behaviour, under Either-Or)
 - [x] Switching a held key's Staging mode into or out of Either-Or leaves nothing stuck (the existing mode-change teardown covers it)
 - [x] README's dual-stage section gains an Either-Or bullet
-- [ ] Verified on hardware: a fast full press gives deep only; a normal press held and pushed through to full depth gives primary only
+- [x] Verified on hardware: a fast full press gives deep only; a normal press held and pushed through to full depth gives primary only
 
 ## Comments
 
