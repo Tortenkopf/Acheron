@@ -33,11 +33,11 @@
 //! deadline) returns `vec![StageOp::Nothing]` — literally the table's own
 //! "no crossing" entry, so a caller can match on it the same way it matches
 //! any other row. A **defined crossing whose designed effect is silence**
-//! (Quick-Skip's early-Up cancellation, or the primary's permanently-inert
-//! final release once Skipped) returns an *empty* `Vec` — a crossing did
-//! happen, the state machine just has nothing to perform for it. Collapsing
-//! these into one convention would blur "nothing crossed" with "something
-//! crossed but is deliberately silent," which spec.md treats as distinct.
+//! (the primary's permanently-inert final release once Quick-Skip is
+//! Skipped) returns an *empty* `Vec` — a crossing did happen, the state
+//! machine just has nothing to perform for it. Collapsing these into one
+//! convention would blur "nothing crossed" with "something crossed but is
+//! deliberately silent," which spec.md treats as distinct.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -50,6 +50,7 @@ use crate::capture::analog::{self, KeyState, RepeatSchedule};
 use crate::capture::{EventState, PhysicalEvent};
 use crate::config::{Action, Binding, Config, Layer, StagingMode, TriggerMode};
 use crate::edit::Edit;
+use crate::executor;
 use crate::injector::Injector;
 use crate::input::Input;
 use crate::stepper;
@@ -97,6 +98,12 @@ pub(crate) enum StageOp {
     FireDeep,
     ReleaseDeep,
     SuppressPrimary,
+    /// Quick-Skip's early-Up flush (`either-or-staging-mode` spec §"Early-Up
+    /// flush"): the key was released inside the window without reaching the
+    /// deep band, so the buffered primary `Down` is performed now and its Up
+    /// is deferred by `executor::FIRE_ONCE_KEY_DWELL` — a tap, shifted in
+    /// time, rather than the dropped press it used to be.
+    FlushPrimary,
     /// The "no crossing" table row itself — see the module doc's note on
     /// `Nothing` vs. an empty `Vec`.
     Nothing,
@@ -255,7 +262,7 @@ fn quick_skip_advance(
                 vec![StageOp::SuppressPrimary, StageOp::FireDeep],
                 Some(QuickSkipPhase::Skipped),
             ),
-            ((Down, Up), (Up, Up)) => (Vec::new(), None),
+            ((Down, Up), (Up, Up)) => (vec![StageOp::FlushPrimary], None),
             _ => (
                 unreachable_transition(prev, next),
                 Some(QuickSkipPhase::Armed { deadline }),
@@ -383,6 +390,14 @@ struct KeyRuntime {
     /// `primary_handed_off` re-confirmation to the `stop_stage` path
     /// (ticket 24).
     deep_repeat_suppressed: bool,
+    /// When a Quick-Skip early-Up flush's deferred primary Up is due
+    /// (`FlushPrimary`: the Down was performed on the release, the Up follows
+    /// one `executor::FIRE_ONCE_KEY_DWELL` later). A timed event riding the
+    /// same `Engine::next_deadline` / `Engine::tick` mechanism the window
+    /// itself uses — never a sleep in the dispatch loop. Performed early by a
+    /// re-press (`begin_quick_skip`); cancelled by `stop_all` / `stop_stage`,
+    /// whose teardown force-releases the primary instead.
+    pending_release: Option<Instant>,
 }
 
 /// `dispatch_individual_down`'s exact Down-side logic — get, short-circuit
@@ -408,6 +423,33 @@ async fn fire<K: Eq + Hash + Clone>(
     let decision = trigger::decide(binding, deps.macros, EventState::Down, slot);
     slots.perform(decision, key, binding, deps).await?;
     Ok(None)
+}
+
+/// Performs a flushed tap's deferred Up with real-Up semantics —
+/// `decide(binding, Up, slot)` + `perform`, exactly the ordinary path's own
+/// `Up` arm — not `ReleasePrimary`'s `stop_toggle` + `force_release`: a
+/// flushed Toggle keeps running past its release, as a physical tap's would.
+///
+/// A Fire-once primary's deferred Up performs nothing: its own
+/// `FIRE_ONCE_KEY_DWELL` already *is* the tap's Up, and its real Up would
+/// only be `ForceReleaseStuck`'s sweep of a firing that self-balances —
+/// landing on the very instant the dwell's own `KeyUp` does, emitting that
+/// Up twice. It is still *scheduled* (see `Engine::flush`), since the pending
+/// Up is also what tells `end_quick_skip` that the tap owns its release.
+async fn release_flushed_primary(
+    individual: &mut Slots<Input>,
+    input: Input,
+    binding: &Binding,
+    deps: PerformDeps<'_>,
+) -> io::Result<()> {
+    if binding.trigger == TriggerMode::FireOnce
+        || matches!(binding.action, Action::ProfileSwitch { .. })
+    {
+        return Ok(());
+    }
+    let slot = individual.slot(&input);
+    let decision = trigger::decide(binding, deps.macros, EventState::Up, slot);
+    individual.perform(decision, input, binding, deps).await
 }
 
 /// `capture::analog::KeyState` <-> this module's local `Band` — the two are
@@ -730,6 +772,22 @@ impl Engine {
                     // all (unlike `ReleasePrimary`, there is nothing live to
                     // force-release).
                     StageOp::SuppressPrimary => {}
+                    // The depth path saw the early release before the real
+                    // `Up` edge did — flush here; `end_quick_skip` then sees
+                    // the pending release and leaves the tap alone.
+                    StageOp::FlushPrimary => {
+                        let Some(binding) = profile.layer(active_layer).get(&input).cloned() else {
+                            continue;
+                        };
+                        let deps = PerformDeps::new(
+                            injector,
+                            config,
+                            cursors,
+                            toggle_lap_target,
+                            toggle_autorepeat_schedule,
+                        );
+                        edits.extend(self.flush(individual, input, &binding, deps).await?);
+                    }
                 }
             }
         }
@@ -761,7 +819,8 @@ impl Engine {
     /// | non-Quick-Skip primary `Down` (Handoff / No-Return) | `NotMine { true }` |
     /// | Quick-Skip `Down` | `Handled` — `begin_quick_skip` arms or resolves Skipped |
     /// | Quick-Skip `Repeat` while `Armed` / `Skipped` | `Handled(vec![])` — swallowed |
-    /// | Quick-Skip `Up` while `Armed` / `Skipped` / `None` | `Handled(vec![])` — `end_quick_skip` disarms the deadline, releases the deep stage, force-releases the primary |
+    /// | Quick-Skip `Up` while `Armed` | `Handled(edits)` — `end_quick_skip` flushes the buffered primary as a tap (Down now, Up deferred) |
+    /// | Quick-Skip `Up` while `Skipped` / `None` | `Handled(vec![])` — `end_quick_skip` releases the deep stage, force-releases the primary (unless a flushed tap's Up is pending) |
     /// | Quick-Skip `Up` / `Repeat` once `Late` | runs the general rows (plain Handoff) |
     /// | any mode, `Repeat`, primary handed off to deep | drive deep repeat, `Handled(vec![])` |
     /// | any mode, `Repeat`, primary **not** handed off | drive deep repeat, `NotMine { true }` |
@@ -823,11 +882,11 @@ impl Engine {
                     // coalescing `rx_depth` tick, which a quick shallow tap can
                     // race past entirely, leaving the deadline to misfire
                     // `RepressPrimary` into a press with no release edge left
-                    // (`tartarus-dual-stage-keys` ticket 13). Also force-
-                    // releases the primary itself — see `end_quick_skip`.
-                    self.end_quick_skip(deps.individual, deps.injector, event.input)
-                        .await?;
-                    return Ok(StageOutcome::Handled(Vec::new()));
+                    // (`tartarus-dual-stage-keys` ticket 13). Flushes a
+                    // still-Armed primary as a tap, else force-releases the
+                    // primary itself — see `end_quick_skip`.
+                    let edits = self.end_quick_skip(deps, event.input).await?;
+                    return Ok(StageOutcome::Handled(edits));
                 }
                 // `Late`: the deadline already fired the primary retroactively,
                 // so the rest of the press runs as ordinary Handoff — fall to
@@ -886,11 +945,11 @@ impl Engine {
         let EngineDeps {
             config,
             active_layer,
+            individual,
             injector,
             cursors,
             toggle_lap_target,
             toggle_autorepeat_schedule,
-            ..
         } = deps;
         let profile = config
             .active_profile()
@@ -900,6 +959,26 @@ impl Engine {
             .get(&input)
             .copied()
             .expect("feed only calls this for a configured Quick-Skip key");
+        let rt = self.runtime.entry(input).or_default();
+        // A re-press landing before the last flushed tap's deferred Up:
+        // perform that Up now, then begin this press normally.
+        if rt.pending_release.take().is_some()
+            && let Some(primary_binding) = profile.layer(active_layer).get(&input)
+        {
+            release_flushed_primary(
+                individual,
+                input,
+                primary_binding,
+                PerformDeps::new(
+                    injector,
+                    config,
+                    cursors,
+                    toggle_lap_target,
+                    toggle_autorepeat_schedule,
+                ),
+            )
+            .await?;
+        }
         let rt = self.runtime.entry(input).or_default();
         // Structurally the key was at rest (`(Up, Up)`) the instant before
         // this real primary `Down` — *unless* `update`'s own `rx_depth`-
@@ -958,7 +1037,8 @@ impl Engine {
                 | StageOp::FirePrimary
                 | StageOp::RepressPrimary
                 | StageOp::ReleasePrimary
-                | StageOp::ReleaseDeep => debug_assert!(
+                | StageOp::ReleaseDeep
+                | StageOp::FlushPrimary => debug_assert!(
                     false,
                     "quick_skip_advance's `None`-phase branch only ever emits an \
                      empty Vec (Armed) or [SuppressPrimary, FireDeep] (already hot), \
@@ -967,6 +1047,33 @@ impl Engine {
             }
         }
         Ok(edits)
+    }
+
+    /// Performs a `FlushPrimary` op — shared by `update` (the `rx_depth` tick
+    /// saw the early release first) and `end_quick_skip` (the real `Up` edge
+    /// did). Fires the buffered primary `Down` now against `individual`, as
+    /// `tick`'s `RepressPrimary` does, but deliberately built with the
+    /// user-initiated `PerformDeps::new` rather than `new_machine_sequenced`:
+    /// a flushed tap is a canned one-shot the user physically made, so a
+    /// Fire-once primary keeps its own dwell (spec: "its own dwell applies"),
+    /// just as on a single-stage key. Then records the tap's deferred Up,
+    /// due one `executor::FIRE_ONCE_KEY_DWELL` from now — for every primary
+    /// but a `ProfileSwitch`, whose `Edit` is returned instead and which has
+    /// no Up at all.
+    async fn flush(
+        &mut self,
+        individual: &mut Slots<Input>,
+        input: Input,
+        binding: &Binding,
+        deps: PerformDeps<'_>,
+    ) -> io::Result<Option<Edit>> {
+        let edit = fire(individual, input, binding, deps).await?;
+        if edit.is_none()
+            && let Some(rt) = self.runtime.get_mut(&input)
+        {
+            rt.pending_release = Some(Instant::now() + executor::FIRE_ONCE_KEY_DWELL);
+        }
+        Ok(edit)
     }
 
     /// Resolves a Quick-Skip key's real outer `Up` the same way
@@ -983,13 +1090,15 @@ impl Engine {
     ///
     /// When a Quick-Skip phase is live (`Armed` / `Skipped`) it drives the
     /// pure core with `next == (Up, Up)` — dropping the phase to `None` (which
-    /// disarms `next_deadline`) and, for a `Skipped` key still in the deep band
-    /// on a 1-report skip straight to released, releasing the deep stage
-    /// (No-Return's release shape — the primary was suppressed for the whole
-    /// press and is never touched). `None` on entry means an `rx_depth` cancel
-    /// tick already ran the pure core's `((Down, Up), (Up, Up)) => (vec![],
-    /// None)` row (kept as a harmless idempotent double-confirm), or the key
-    /// was never armed.
+    /// disarms the window's deadline). An `Armed` key flushes its buffered
+    /// primary as a tap (`FlushPrimary`: Down now, Up one
+    /// `executor::FIRE_ONCE_KEY_DWELL` later via `pending_release`); a
+    /// `Skipped` key still in the deep band on a 1-report skip straight to
+    /// released releases the deep stage (No-Return's release shape — the
+    /// primary was suppressed for the whole press and is never touched).
+    /// `None` on entry means an `rx_depth` tick already ran the pure core's
+    /// release row (flushing an `Armed` tap itself), or the key was never
+    /// armed.
     ///
     /// Either way it then **force-releases the primary** on `individual`. Every
     /// Quick-Skip edge `feed` sees while not `Late` is swallowed for the
@@ -1001,14 +1110,27 @@ impl Engine {
     /// past its own now-lone `ReleasePrimary` — nothing else would ever release
     /// that held primary (kernel autorepeat, permanent under Hold-to-repeat).
     /// `force_release` is the same op the ordinary `(_, Up)` path runs
-    /// (`ForceReleaseStuck`): a no-op when the primary never fired (`Armed` /
-    /// `Skipped`), and idempotent if the ordinary path did run.
+    /// (`ForceReleaseStuck`): a no-op when the primary never fired
+    /// (`Skipped`), and idempotent if the ordinary path did run. Skipped
+    /// while a flushed tap's Up is pending — that tap releases itself.
     async fn end_quick_skip(
         &mut self,
-        individual: &mut Slots<Input>,
-        injector: &Injector,
+        deps: EngineDeps<'_>,
         input: Input,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<Edit>> {
+        let EngineDeps {
+            config,
+            active_layer,
+            individual,
+            injector,
+            cursors,
+            toggle_lap_target,
+            toggle_autorepeat_schedule,
+        } = deps;
+        let profile = config
+            .active_profile()
+            .expect("load_or_seed validates active_profile names a real profile");
+        let mut edits = Vec::new();
         let rt = self.runtime.entry(input).or_default();
         if rt.quick_skip.is_some() {
             let prev = (to_band(rt.primary), to_band(rt.deep));
@@ -1028,16 +1150,38 @@ impl Engine {
                     // No-Return's release shape — the primary was suppressed
                     // for the whole press (Skipped) and is never touched.
                     StageOp::ReleaseDeep => self.release_deep_slot(input, injector).await,
+                    StageOp::FlushPrimary => {
+                        let Some(binding) = profile.layer(active_layer).get(&input) else {
+                            continue;
+                        };
+                        let deps = PerformDeps::new(
+                            injector,
+                            config,
+                            cursors,
+                            toggle_lap_target,
+                            toggle_autorepeat_schedule,
+                        );
+                        edits.extend(self.flush(individual, input, binding, deps).await?);
+                    }
                     other => debug_assert!(
                         false,
-                        "a Quick-Skip outer release only ever emits ReleaseDeep or \
-                         nothing, got {other:?}"
+                        "a Quick-Skip outer release only ever emits ReleaseDeep, \
+                         FlushPrimary or nothing, got {other:?}"
                     ),
                 }
             }
         }
-        individual.force_release(&input, injector).await;
-        Ok(())
+        // A flushed tap (this edge's, or an `rx_depth` tick's that raced
+        // ahead of it) owns its own deferred Up — force-releasing here would
+        // cut the tap short.
+        if self
+            .runtime
+            .get(&input)
+            .is_none_or(|rt| rt.pending_release.is_none())
+        {
+            individual.force_release(&input, injector).await;
+        }
+        Ok(edits)
     }
 
     /// Whether `input`'s Quick-Skip runtime state is currently `Late` — the
@@ -1132,15 +1276,21 @@ impl Engine {
     /// Unlike Chord's single global window, every Quick-Skip key arms its
     /// own independent deadline, so this takes the minimum rather than
     /// reading one shared value.
+    ///
+    /// A flushed tap's pending deferred Up (`KeyRuntime::pending_release`) is
+    /// a deadline on the same arm.
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         self.runtime
             .values()
-            .filter_map(|rt| next_deadline(rt.quick_skip))
+            .flat_map(|rt| [next_deadline(rt.quick_skip), rt.pending_release])
+            .flatten()
             .min()
     }
 
     /// Fires every Quick-Skip key whose deadline has elapsed by `now`
-    /// (ticket 04) — the `wait_for_stage_deadline` `select!` arm's handler.
+    /// (ticket 04) — the `wait_for_stage_deadline` `select!` arm's handler —
+    /// after first performing every flushed tap's deferred Up that has come
+    /// due.
     /// A spurious call before any deadline has actually elapsed (or after
     /// `stop_all`/an early `Up` already cancelled it) touches nothing, the
     /// same tolerance `chord::tick` extends. Collects the elapsed keys
@@ -1163,6 +1313,33 @@ impl Engine {
         let profile = config
             .active_profile()
             .expect("load_or_seed validates active_profile names a real profile");
+        let released: Vec<Input> = self
+            .runtime
+            .iter()
+            .filter(|(_, rt)| rt.pending_release.is_some_and(|due| now >= due))
+            .map(|(&input, _)| input)
+            .collect();
+        for input in released {
+            if let Some(rt) = self.runtime.get_mut(&input) {
+                rt.pending_release = None;
+            }
+            let Some(primary_binding) = profile.layer(active_layer).get(&input) else {
+                continue;
+            };
+            release_flushed_primary(
+                individual,
+                input,
+                primary_binding,
+                PerformDeps::new(
+                    injector,
+                    config,
+                    cursors,
+                    toggle_lap_target,
+                    toggle_autorepeat_schedule,
+                ),
+            )
+            .await?;
+        }
         let elapsed: Vec<Input> = self
             .runtime
             .iter()
@@ -1220,7 +1397,9 @@ impl Engine {
     }
 
     /// Force-releases every live deep firing/Toggle and resets every per-key
-    /// `KeyState`/Quick-Skip runtime state — wired into the same call sites
+    /// `KeyState`/Quick-Skip runtime state (cancelling any flushed tap's
+    /// pending Up — every caller's teardown drains `individual` right after,
+    /// which releases that primary) — wired into the same call sites
     /// as `analog_repeat::Engine::stop_all()` (`handle_layer_switch`,
     /// `handle_capture_mode_change`'s Digital-transition branch). The other
     /// Layer's stage for the same Input, if any, never picks up mid-Depth:
@@ -1306,9 +1485,21 @@ impl Engine {
     /// Removing that one frame too needs the cleared `Layer` threaded
     /// through the effect so `release_deep_slot` can be skipped when it
     /// isn't the active Layer — flagged in ticket 23, not required.
-    pub(crate) async fn stop_stage(&mut self, input: Input, injector: &Injector) {
+    ///
+    /// A flushed tap's pending Up is cancelled with the reset; the primary is
+    /// force-released on `individual` right here instead, since nothing else
+    /// in the `StopStage` effect touches the primary keyspace.
+    pub(crate) async fn stop_stage(
+        &mut self,
+        input: Input,
+        individual: &Slots<Input>,
+        injector: &Injector,
+    ) {
         self.release_deep_slot(input, injector).await;
         if let Some(rt) = self.runtime.get_mut(&input) {
+            if rt.pending_release.is_some() {
+                individual.force_release(&input, injector).await;
+            }
             // Carry `primary_handed_off` — `stop_stage` doesn't re-press the
             // primary, so a handed-off primary stays handed off, and `feed`
             // must keep swallowing its `Repeat`s without waiting for the
@@ -1481,12 +1672,16 @@ mod tests {
     }
 
     #[test]
-    fn quick_skip_cancels_outright_on_an_early_up() {
+    fn quick_skip_flushes_the_buffered_primary_as_a_tap_on_an_early_up() {
         let armed = Some(QuickSkipPhase::Armed {
             deadline: Instant::now() + QUICK_SKIP_WINDOW,
         });
         let (ops, phase) = advance((Down, Up), (Up, Up), StagingMode::QuickSkip, armed);
-        assert!(ops.is_empty(), "buffered Down dropped, nothing emitted");
+        assert_eq!(
+            ops,
+            vec![StageOp::FlushPrimary],
+            "the buffered Down fires now, as a tap"
+        );
         assert_eq!(phase, None);
     }
 
@@ -1927,15 +2122,26 @@ mod tests {
             .unwrap();
         let deadline = engine.next_deadline().expect("the ~50ms window is armed");
 
-        // A quick shallow release — never reached the deep band.
+        // A quick shallow release — never reached the deep band. The
+        // buffered primary is flushed as a tap: held now, its Up deferred.
         let out = engine
             .feed(fx.deps(&config), edge(EventState::Up, Some(0)))
             .await
             .unwrap();
         assert_eq!(out, StageOutcome::Handled(Vec::new()));
+        settle().await;
 
-        // The window is disarmed off the edge itself — no `rx_depth` tick needed.
+        // The window is disarmed off the edge itself — no `rx_depth` tick
+        // needed; the only deadline left is the flushed tap's own Up.
         assert_eq!(engine.runtime.get(&KEY).and_then(|rt| rt.quick_skip), None);
+        let release_due = engine
+            .next_deadline()
+            .expect("the flushed tap's Up is pending");
+        assert_eq!(release_due, Instant::now() + executor::FIRE_ONCE_KEY_DWELL);
+        assert!(release_due < deadline);
+
+        engine.tick(fx.deps(&config), release_due).await.unwrap();
+        settle().await;
         assert_eq!(engine.next_deadline(), None);
 
         // The deadline that would have fired `RepressPrimary` is inert now.
@@ -1943,9 +2149,21 @@ mod tests {
             .tick(fx.deps(&config), deadline + Duration::from_millis(1))
             .await
             .unwrap();
+        settle().await;
         assert!(edits.is_empty());
         assert!(engine.slots.slot(&StageKey(KEY)).is_none());
-        assert!(fx.individual.slot(&KEY).is_none());
+
+        let events: Vec<_> = fx
+            .sink
+            .batches()
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect();
+        assert_eq!(
+            events,
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "exactly one tap of the primary, nothing latched"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1978,9 +2196,141 @@ mod tests {
             .unwrap();
 
         // No further `rx_depth` change is pending — the window must already be
-        // disarmed, or the deadline latches the primary down forever.
+        // disarmed, or the deadline latches the primary down forever. The only
+        // deadline left is the flushed tap's own deferred Up.
         assert_eq!(engine.runtime.get(&KEY).and_then(|rt| rt.quick_skip), None);
-        assert_eq!(engine.next_deadline(), None);
+        assert_eq!(
+            engine.next_deadline(),
+            Some(Instant::now() + executor::FIRE_ONCE_KEY_DWELL)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn update_flushes_an_early_release_and_the_later_real_up_leaves_the_tap_alone() {
+        // The `rx_depth` tick observes the early release before the queued
+        // real `Up` edge: `update` flushes the tap itself, and the real `Up`
+        // must not cut it short with `end_quick_skip`'s force-release.
+        let config = dual_stage_cfg(
+            StagingMode::QuickSkip,
+            TriggerMode::HoldToRepeat,
+            TriggerMode::HoldToRepeat,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+
+        engine
+            .feed(fx.deps(&config), edge(EventState::Down, Some(150)))
+            .await
+            .unwrap();
+        engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 150u8)]))
+            .await
+            .unwrap();
+        engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 50u8)]))
+            .await
+            .unwrap();
+        engine
+            .feed(fx.deps(&config), edge(EventState::Up, Some(50)))
+            .await
+            .unwrap();
+        settle().await;
+        let batches = fx.sink.batches();
+        let held: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(held, vec![(evdev::KeyCode::KEY_A, 1)], "still mid-tap");
+
+        tokio::time::advance(executor::FIRE_ONCE_KEY_DWELL).await;
+        let now = Instant::now();
+        engine.tick(fx.deps(&config), now).await.unwrap();
+        settle().await;
+        let batches = fx.sink.batches();
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_flushed_fire_once_tap_keeps_its_dwell_when_the_real_up_lands_mid_tap() {
+        // The depth tick flushes a Fire-once primary and its firing task gets
+        // to press `KEY_A` before the queued real `Up` edge arrives. That
+        // `Up` must not force-release the key out from under the dwell (an
+        // Up at t≈0, then the dwell's own Up again at t+40).
+        let config = dual_stage_cfg(
+            StagingMode::QuickSkip,
+            TriggerMode::FireOnce,
+            TriggerMode::FireOnce,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+
+        engine
+            .feed(fx.deps(&config), edge(EventState::Down, Some(150)))
+            .await
+            .unwrap();
+        engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 150u8)]))
+            .await
+            .unwrap();
+        engine
+            .update(fx.deps(&config), &HashMap::from([(KEY, 50u8)]))
+            .await
+            .unwrap();
+        settle().await;
+        engine
+            .feed(fx.deps(&config), edge(EventState::Up, Some(50)))
+            .await
+            .unwrap();
+        settle().await;
+        let batches = fx.sink.batches();
+        let held: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(held, vec![(evdev::KeyCode::KEY_A, 1)], "still mid-dwell");
+
+        tokio::time::advance(executor::FIRE_ONCE_KEY_DWELL).await;
+        let now = Instant::now();
+        engine.tick(fx.deps(&config), now).await.unwrap();
+        settle().await;
+        let batches = fx.sink.batches();
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "one Up, from the dwell itself"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_stage_with_a_flushed_up_pending_cancels_it_and_releases_the_primary() {
+        let config = dual_stage_cfg(
+            StagingMode::QuickSkip,
+            TriggerMode::HoldToRepeat,
+            TriggerMode::HoldToRepeat,
+        );
+        let mut fx = StageFixture::new();
+        let mut engine = Engine::default();
+
+        engine
+            .feed(fx.deps(&config), edge(EventState::Down, Some(150)))
+            .await
+            .unwrap();
+        engine
+            .feed(fx.deps(&config), edge(EventState::Up, Some(50)))
+            .await
+            .unwrap();
+        settle().await;
+        assert!(engine.next_deadline().is_some());
+
+        engine.stop_stage(KEY, &fx.individual, &fx.inj).await;
+        settle().await;
+        assert_eq!(engine.next_deadline(), None, "the pending Up is cancelled");
+        let batches = fx.sink.batches();
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "…and the primary force-released, nothing stuck down"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2069,7 +2419,7 @@ mod tests {
 
         // The other Layer's deep Binding is cleared while this Layer's stays
         // valid — the active-Layer `deep_layer` guard is still true.
-        engine.stop_stage(KEY, &fx.inj).await;
+        engine.stop_stage(KEY, &fx.individual, &fx.inj).await;
         assert!(
             engine.slots.slot(&StageKey(KEY)).is_none(),
             "the live deep slot is force-released (accepted one-frame residual)"
@@ -2123,7 +2473,7 @@ mod tests {
             .deep_base
             .remove(&KEY);
 
-        engine.stop_stage(KEY, &fx.inj).await;
+        engine.stop_stage(KEY, &fx.individual, &fx.inj).await;
 
         let edits = engine
             .update(fx.deps(&config_cleared), &HashMap::from([(KEY, 250u8)]))
@@ -2162,7 +2512,7 @@ mod tests {
         );
         assert!(engine.slots.slot(&StageKey(KEY)).is_some());
 
-        engine.stop_stage(KEY, &fx.inj).await;
+        engine.stop_stage(KEY, &fx.individual, &fx.inj).await;
 
         let rt = engine
             .runtime
@@ -2212,7 +2562,7 @@ mod tests {
         );
 
         // `SetStagingMode` / cross-Layer clear force-releases it and resets.
-        engine.stop_stage(KEY, &fx.inj).await;
+        engine.stop_stage(KEY, &fx.individual, &fx.inj).await;
         settle().await;
         assert!(
             matches!(
@@ -2294,7 +2644,7 @@ mod tests {
             "the primary is handed off before the clear"
         );
 
-        engine.stop_stage(KEY, &fx.inj).await;
+        engine.stop_stage(KEY, &fx.individual, &fx.inj).await;
         settle().await;
         assert!(
             engine.primary_handed_off(KEY),
@@ -2362,7 +2712,7 @@ mod tests {
             .await
             .unwrap();
         settle().await;
-        engine.stop_stage(KEY, &fx.inj).await;
+        engine.stop_stage(KEY, &fx.individual, &fx.inj).await;
         assert!(engine.primary_handed_off(KEY), "carried");
 
         // Re-adopt with the key now back in the primary band only.

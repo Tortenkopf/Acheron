@@ -775,7 +775,9 @@ impl DispatchState {
                 }
                 edit::Effect::TearDown(reason) => self.tear_down(reason).await,
                 edit::Effect::StopStage(input) => {
-                    self.stage.stop_stage(input, &self.injector).await;
+                    self.stage
+                        .stop_stage(input, &self.individual, &self.injector)
+                        .await;
                 }
                 edit::Effect::StopChord(key) => {
                     // The Chord-keyspace sibling of `StopStage` (ticket 22):
@@ -7204,13 +7206,16 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn dual_stage_quick_skip_early_up_cancels_with_nothing_emitted() {
-        // The primary crosses and arms the window, but the key is released
-        // again before the deadline elapses and before the deep band is ever
-        // reached — cancelled outright: neither stage ever fires.
+    async fn dual_stage_quick_skip_quick_shallow_tap_fires_the_primary_as_a_tap() {
+        // `either-or-staging-mode` §"Early-Up flush": the primary crosses and
+        // arms the window, but the key is released again before the deadline
+        // and before the deep band is ever reached. The buffered primary is
+        // flushed as a tap — its Down on the release, its Up one canned-tap
+        // dwell (40ms) later — through the real `run` loop's stage-deadline
+        // arm.
         let config = dual_stage_config(
             StagingMode::QuickSkip,
-            keypress_binding(evdev::KeyCode::KEY_A),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
             keypress_binding(evdev::KeyCode::KEY_B),
         );
         let harness = CommandHarness::spawn(config);
@@ -7218,21 +7223,369 @@ mod tests {
         harness.press_analog(Input::Grid(1, 1), 150).await;
         harness.push_depth([(Input::Grid(1, 1), 150)]);
         settle().await;
+        assert!(harness.sink.batches().is_empty(), "still buffered");
 
         tokio::time::advance(Duration::from_millis(10)).await;
         harness.release_analog(Input::Grid(1, 1), 50).await;
         harness.push_depth([(Input::Grid(1, 1), 50)]);
         settle().await;
+        let events = |h: &CommandHarness| -> Vec<_> {
+            let batches = h.sink.batches();
+            batches.iter().map(|b| key_and_value(b[0])).collect()
+        };
+        assert_eq!(
+            events(&harness),
+            vec![(evdev::KeyCode::KEY_A, 1)],
+            "the buffered primary Down is performed on the release"
+        );
 
-        // Advancing well past the window confirms it was genuinely
-        // cancelled, not merely still Armed and about to fire Late.
+        tokio::time::advance(executor::FIRE_ONCE_KEY_DWELL - Duration::from_millis(1)).await;
+        settle().await;
+        assert_eq!(events(&harness), vec![(evdev::KeyCode::KEY_A, 1)]);
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        settle().await;
+        assert_eq!(
+            events(&harness),
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "its Up follows one canned-tap dwell later"
+        );
+
+        // Well past the original window: no Late re-fire, nothing further.
         tokio::time::advance(Duration::from_millis(100)).await;
         settle().await;
 
         let batches = harness.shut_down().await;
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)]
+        );
+    }
+
+    /// A quick shallow tap on `Grid(1, 1)` through the `Seam`: the primary
+    /// crosses (arming the Quick-Skip window) and releases 10ms later
+    /// without reaching the deep band. Returns the `Up` edge's `Edit`s.
+    async fn quick_skip_shallow_tap(seam: &mut Seam) -> Vec<edit::Edit> {
+        let edits = seam
+            .feed(PhysicalEvent {
+                input: Input::Grid(1, 1),
+                state: EventState::Down,
+                depth: Some(150),
+            })
+            .await;
+        assert!(edits.is_empty());
+        tokio::time::advance(Duration::from_millis(10)).await;
+        seam.feed(PhysicalEvent {
+            input: Input::Grid(1, 1),
+            state: EventState::Up,
+            depth: Some(50),
+        })
+        .await
+    }
+
+    /// Advances paused time by `by`, then runs the stage-deadline arm the
+    /// way `run`'s `select!` would once it elapsed.
+    async fn advance_stages(seam: &mut Seam, by: Duration) -> Vec<edit::Edit> {
+        tokio::time::advance(by).await;
+        let edits = seam
+            .state
+            .tick_stages(&seam.config, Instant::now())
+            .await
+            .unwrap();
+        settle().await;
+        edits
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_quick_skip_flushed_fire_once_primary_fires_once() {
+        let mut seam = Seam::new(dual_stage_config(
+            StagingMode::QuickSkip,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        ));
+
+        assert!(quick_skip_shallow_tap(&mut seam).await.is_empty());
+        advance_stages(&mut seam, executor::FIRE_ONCE_KEY_DWELL).await;
+        advance_stages(&mut seam, Duration::from_millis(100)).await;
+
+        let batches = seam.finish().await;
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "a Fire-once primary fires exactly once"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_quick_skip_flushed_toggle_primary_keeps_running_after_the_tap() {
+        let mut seam = Seam::new(dual_stage_config(
+            StagingMode::QuickSkip,
+            toggle_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        ));
+
+        quick_skip_shallow_tap(&mut seam).await;
+        advance_stages(&mut seam, Duration::from_millis(100)).await;
+
+        let batches = seam.sink.batches();
         assert!(
-            batches.is_empty(),
-            "an early Up before either the deadline or the deep band must emit nothing"
+            !batches.is_empty() && key_and_value(batches[0][0]) == (evdev::KeyCode::KEY_A, 1),
+            "the Toggle started on the flush: {batches:?}"
+        );
+        assert!(
+            !batches
+                .iter()
+                .any(|b| key_and_value(b[0]) == (evdev::KeyCode::KEY_A, 0)),
+            "a Toggle outlives its release — the deferred Up must not stop it: {batches:?}"
+        );
+        seam.finish().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_quick_skip_flushed_mouse_button_primary_is_held_for_the_dwell() {
+        let button = evdev::KeyCode::BTN_LEFT;
+        let mut seam = Seam::new(dual_stage_config(
+            StagingMode::QuickSkip,
+            hold_to_repeat_binding(button),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        ));
+
+        quick_skip_shallow_tap(&mut seam).await;
+        advance_stages(
+            &mut seam,
+            executor::FIRE_ONCE_KEY_DWELL - Duration::from_millis(1),
+        )
+        .await;
+        let batches = seam.sink.batches();
+        let held: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(held, vec![(button, 1)]);
+
+        advance_stages(&mut seam, Duration::from_millis(1)).await;
+        let batches = seam.finish().await;
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![(button, 1), (button, 0)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_quick_skip_flushed_controller_button_primary_taps_the_gamepad() {
+        let button = evdev::KeyCode::BTN_SOUTH;
+        let mut seam = Seam::new(dual_stage_config(
+            StagingMode::QuickSkip,
+            Binding {
+                trigger: TriggerMode::HoldToRepeat,
+                action: Action::ControllerButton { button },
+            },
+            keypress_binding(evdev::KeyCode::KEY_B),
+        ));
+
+        quick_skip_shallow_tap(&mut seam).await;
+        advance_stages(
+            &mut seam,
+            executor::FIRE_ONCE_KEY_DWELL - Duration::from_millis(1),
+        )
+        .await;
+        let held: Vec<_> = seam
+            .gamepad_batches()
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect();
+        assert_eq!(held, vec![(button, 1)]);
+
+        advance_stages(&mut seam, Duration::from_millis(1)).await;
+        let gamepad: Vec<_> = seam
+            .gamepad_batches()
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect();
+        assert_eq!(
+            gamepad,
+            vec![(button, 1), (button, 0)],
+            "Down, 40ms, Up — on the gamepad device"
+        );
+        seam.finish().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_quick_skip_flushed_profile_switch_primary_switches_profile() {
+        let mut config = dual_stage_config(
+            StagingMode::QuickSkip,
+            Binding {
+                trigger: TriggerMode::FireOnce,
+                action: Action::ProfileSwitch {
+                    target: "Gaming".to_string(),
+                },
+            },
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        config
+            .profiles
+            .insert("Gaming".to_string(), Profile::default());
+        let mut seam = Seam::new(config);
+
+        let edits = quick_skip_shallow_tap(&mut seam).await;
+        assert_eq!(
+            edits,
+            vec![edit::Edit::SwitchProfile {
+                name: "Gaming".to_string()
+            }]
+        );
+        assert_eq!(
+            seam.state.stage.next_deadline(),
+            None,
+            "a ProfileSwitch has no deferred Up to perform"
+        );
+        assert!(seam.finish().await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_quick_skip_re_press_before_the_flushed_up_performs_it_first() {
+        let mut seam = Seam::new(dual_stage_config(
+            StagingMode::QuickSkip,
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        ));
+
+        quick_skip_shallow_tap(&mut seam).await;
+        tokio::time::advance(Duration::from_millis(10)).await;
+        seam.feed(PhysicalEvent {
+            input: Input::Grid(1, 1),
+            state: EventState::Down,
+            depth: Some(150),
+        })
+        .await;
+        let batches = seam.sink.batches();
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "the pending Up is performed immediately on the re-press"
+        );
+        // …and the new press begins normally: Armed, with a fresh window.
+        assert_eq!(
+            seam.state.stage.next_deadline(),
+            Some(Instant::now() + Duration::from_millis(50))
+        );
+
+        // It resolves Late like any other press, and the old pending Up
+        // never lands on top of it.
+        advance_stages(&mut seam, Duration::from_millis(50)).await;
+        let batches = seam.finish().await;
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 0),
+                (evdev::KeyCode::KEY_A, 1),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_quick_skip_layer_switch_with_a_flushed_up_pending_releases_the_primary() {
+        let config = dual_stage_config(
+            StagingMode::QuickSkip,
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        tokio::time::advance(Duration::from_millis(10)).await;
+        harness.release_analog(Input::Grid(1, 1), 50).await;
+        harness.push_depth([(Input::Grid(1, 1), 50)]);
+        settle().await;
+
+        harness.press(Input::ModeKey).await;
+        settle().await;
+        let events: Vec<_> = harness
+            .sink
+            .batches()
+            .iter()
+            .map(|b| key_and_value(b[0]))
+            .collect();
+        assert_eq!(
+            events,
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "the switch's teardown releases the flushed primary immediately"
+        );
+
+        tokio::time::advance(Duration::from_millis(100)).await;
+        settle().await;
+        harness.release(Input::ModeKey).await;
+        let batches = harness.shut_down().await;
+        assert_eq!(batches.len(), 2, "the cancelled pending Up fires nothing");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_quick_skip_profile_switch_with_a_flushed_up_pending_releases_primary() {
+        let mut config = dual_stage_config(
+            StagingMode::QuickSkip,
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        config
+            .profiles
+            .insert("Gaming".to_string(), Profile::default());
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        tokio::time::advance(Duration::from_millis(10)).await;
+        harness.release_analog(Input::Grid(1, 1), 50).await;
+        harness.push_depth([(Input::Grid(1, 1), 50)]);
+        settle().await;
+
+        harness.switch_profile("Gaming").await.unwrap();
+        settle().await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        settle().await;
+
+        let batches = harness.shut_down().await;
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "released by the switch's teardown, nothing stuck and nothing doubled"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_quick_skip_capture_flip_with_a_flushed_up_pending_releases_the_primary() {
+        let mut seam = Seam::new(dual_stage_config(
+            StagingMode::QuickSkip,
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        ));
+        seam.state
+            .handle_capture_mode_change(CaptureMode::Analog)
+            .await;
+
+        quick_skip_shallow_tap(&mut seam).await;
+        seam.state
+            .handle_capture_mode_change(CaptureMode::Digital)
+            .await;
+        settle().await;
+        assert_eq!(
+            seam.state.stage.next_deadline(),
+            None,
+            "the pending Up is cancelled"
+        );
+
+        let batches = seam.finish().await;
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "the flip's teardown releases the flushed primary"
         );
     }
 
@@ -7276,12 +7629,20 @@ mod tests {
         })
         .await;
 
+        // The window is disarmed off the edge itself; the only deadline left
+        // is the flushed tap's own deferred Up, well inside the window.
+        let release_due = seam
+            .state
+            .stage
+            .next_deadline()
+            .expect("the flushed tap's Up is pending");
         assert!(
-            seam.state.stage.next_deadline().is_none(),
+            release_due < deadline,
             "the outer Up must disarm the window off the edge itself"
         );
 
-        // Fire the deadline arm anyway — it must be inert now.
+        // Fire the deadline arm past the old window — the tap's Up lands and
+        // the window's `RepressPrimary` stays inert.
         tokio::time::advance(Duration::from_millis(100)).await;
         let edits = seam
             .state
@@ -7289,12 +7650,15 @@ mod tests {
             .await
             .unwrap();
         assert!(edits.is_empty());
+        assert!(seam.state.stage.next_deadline().is_none());
+        settle().await;
 
         let batches = seam.finish().await;
-        assert!(
-            batches.is_empty(),
-            "neither stage ever fired — nothing must be emitted, least of all a \
-             stuck primary value=1: {batches:?}"
+        let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
+        assert_eq!(
+            events,
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "the primary is flushed as one tap — never a stuck value=1"
         );
     }
 
