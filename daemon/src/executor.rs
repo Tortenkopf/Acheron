@@ -384,13 +384,19 @@ async fn run_once(
             MacroStep::KeyDown(key) => {
                 let applied = injector.set_key_state(*key, true).await?;
                 if applied {
-                    keys.lock().expect("firing keys mutex poisoned").held.insert(*key);
+                    keys.lock()
+                        .expect("firing keys mutex poisoned")
+                        .held
+                        .insert(*key);
                 }
             }
             MacroStep::KeyUp(key) => {
                 let applied = injector.set_key_state(*key, false).await?;
                 if applied {
-                    keys.lock().expect("firing keys mutex poisoned").held.remove(key);
+                    keys.lock()
+                        .expect("firing keys mutex poisoned")
+                        .held
+                        .remove(key);
                 }
             }
             MacroStep::Delay(duration) => tokio::time::sleep(*duration).await,

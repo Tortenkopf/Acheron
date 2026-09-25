@@ -7489,10 +7489,7 @@ mod tests {
         advance_stages(&mut seam, Duration::from_millis(1)).await;
         let batches = seam.finish().await;
         let events: Vec<_> = batches.iter().map(|b| key_and_value(b[0])).collect();
-        assert_eq!(
-            events,
-            vec![(button, 1), (button, 0)]
-        );
+        assert_eq!(events, vec![(button, 1), (button, 0)]);
     }
 
     #[tokio::test(start_paused = true)]

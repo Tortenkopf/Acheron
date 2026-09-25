@@ -152,7 +152,9 @@ pub(crate) fn advance(
     match mode {
         StagingMode::Handoff => (handoff(prev, next), None),
         StagingMode::NoReturn => (no_return(prev, next), None),
-        StagingMode::QuickSkip | StagingMode::EitherOr => windowed_advance(prev, next, mode, window),
+        StagingMode::QuickSkip | StagingMode::EitherOr => {
+            windowed_advance(prev, next, mode, window)
+        }
     }
 }
 
@@ -285,9 +287,7 @@ fn windowed_advance(
                 (vec![StageOp::Nothing], Some(WindowPhase::Skipped))
             }
             ((Down, Up), (Down, Down)) => (vec![StageOp::FireDeep], Some(WindowPhase::Skipped)),
-            ((Down, Down), (Down, Up)) => {
-                (vec![StageOp::ReleaseDeep], Some(WindowPhase::Skipped))
-            }
+            ((Down, Down), (Down, Up)) => (vec![StageOp::ReleaseDeep], Some(WindowPhase::Skipped)),
             ((Down, Up), (Up, Up)) => (Vec::new(), None),
             ((Down, Down), (Up, Up)) => (vec![StageOp::ReleaseDeep], None),
             _ => (
@@ -934,7 +934,9 @@ impl Engine {
                     // (`tartarus-dual-stage-keys` ticket 13). Flushes a
                     // still-Armed primary as a tap, else force-releases the
                     // primary itself — see `end_windowed_press`.
-                    let edits = self.end_windowed_press(deps, event.input, deep_cfg.mode).await?;
+                    let edits = self
+                        .end_windowed_press(deps, event.input, deep_cfg.mode)
+                        .await?;
                     return Ok(StageOutcome::Handled(edits));
                 }
                 // `Late`: the deadline already fired the primary retroactively,
@@ -1197,12 +1199,7 @@ impl Engine {
         let rt = self.runtime.entry(input).or_default();
         if rt.window.is_some() {
             let prev = (to_band(rt.primary), to_band(rt.deep));
-            let (ops, phase) = advance(
-                prev,
-                (Band::Up, Band::Up),
-                mode,
-                rt.window,
-            );
+            let (ops, phase) = advance(prev, (Band::Up, Band::Up), mode, rt.window);
             rt.primary = KeyState::Up;
             rt.deep = KeyState::Up;
             rt.window = phase;
@@ -1577,7 +1574,8 @@ impl Engine {
             // the deep band — a shape no other mode leaves behind. The reset
             // re-adopts `(Down, Down)` as a hand-off under whatever mode comes
             // next, so make that true: release the primary now.
-            let held_in_deep_band = rt.window == Some(WindowPhase::Late) && rt.deep == KeyState::Down;
+            let held_in_deep_band =
+                rt.window == Some(WindowPhase::Late) && rt.deep == KeyState::Down;
             if rt.pending_release.is_some() || held_in_deep_band {
                 individual.force_release(&input, injector).await;
             }
@@ -1912,9 +1910,16 @@ mod tests {
         let late = Some(WindowPhase::Late);
         assert!(deep_locked_out(StagingMode::EitherOr, late));
         for window in [None, armed, Some(WindowPhase::Skipped)] {
-            assert!(!deep_locked_out(StagingMode::EitherOr, window), "{window:?}");
+            assert!(
+                !deep_locked_out(StagingMode::EitherOr, window),
+                "{window:?}"
+            );
         }
-        for mode in [StagingMode::Handoff, StagingMode::NoReturn, StagingMode::QuickSkip] {
+        for mode in [
+            StagingMode::Handoff,
+            StagingMode::NoReturn,
+            StagingMode::QuickSkip,
+        ] {
             assert!(!deep_locked_out(mode, late), "{mode:?}");
         }
     }
