@@ -109,11 +109,11 @@ pub(crate) enum StageOp {
     Nothing,
 }
 
-/// Quick-Skip's own per-press runtime state (spec.md "Quick-Skip" table),
-/// layered on top of Handoff's mechanics. `None` (outside this type, carried
-/// by the caller as `Option<WindowPhase>`) means "not currently mid a
-/// Quick-Skip press" — every other Staging mode, or a Quick-Skip key at rest
-/// between presses.
+/// The per-press runtime state of a windowed Staging mode (spec.md
+/// "Quick-Skip" table; Either-Or shares it — `StagingMode::is_windowed`).
+/// `None` (outside this type, carried by the caller as
+/// `Option<WindowPhase>`) means "not currently mid a windowed press" — a
+/// non-windowed Staging mode, or a windowed key at rest between presses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WindowPhase {
     /// The primary's real Down is buffered (ticket 04's dispatch-side
@@ -135,9 +135,9 @@ pub(crate) enum WindowPhase {
 
 /// Advances one key's combined `(primary, deep)` band state by one
 /// transition, producing the ordered `Vec<StageOp>` spec.md's Staging-mode
-/// tables specify (Additive's was dropped — ADR-0009), plus the Quick-Skip
-/// phase this transition leaves the key in (always `None` for every mode but
-/// `QuickSkip`). A same-report double-crossing is handled by mechanical
+/// tables specify (Additive's was dropped — ADR-0009), plus the window
+/// phase this transition leaves the key in (always `None` for a mode that
+/// isn't `is_windowed`). A same-report double-crossing is handled by mechanical
 /// replay: `prev`/`next` may differ by more than one band at once (the
 /// 1-report-skip rows), resolved as a single ordered op sequence, never
 /// short-circuited.
@@ -188,6 +188,14 @@ pub(crate) fn tick(
     }
 }
 
+/// Whether the deep band is inert for the rest of this press — an Either-Or
+/// key gone Late (the primary fired off the deadline). The one Either-Or
+/// decision both the Late transition table (`either_or_late`) and
+/// `Engine::deep_repeat` consult.
+pub(crate) fn deep_locked_out(mode: StagingMode, window: Option<WindowPhase>) -> bool {
+    mode == StagingMode::EitherOr && window == Some(WindowPhase::Late)
+}
+
 /// **Handoff** (spec.md's default mode): crossing into the deep band
 /// releases the primary and fires the deep stage; crossing back out
 /// releases the deep and re-presses the primary.
@@ -227,8 +235,9 @@ fn no_return(prev: Bands, next: Bands) -> Vec<StageOp> {
     }
 }
 
-/// **Quick-Skip**: a per-press Armed→Skipped/Late runtime state layered on
-/// Handoff's mechanics (spec.md "Quick-Skip" table). `window == None`
+/// **Quick-Skip** and **Either-Or**: a per-press Armed→Skipped/Late runtime
+/// state layered on Handoff's mechanics (spec.md "Quick-Skip" table). The two
+/// modes differ only once Late (`deep_locked_out`). `window == None`
 /// means "at rest between presses" — the only transition it accepts is a
 /// fresh outer Down, which either arms the window or (a same-report or
 /// already-arrived deep crossing) resolves synchronously to Skipped, per
@@ -287,7 +296,7 @@ fn windowed_advance(
             ),
         },
         Some(WindowPhase::Late) => {
-            let ops = if mode == StagingMode::EitherOr {
+            let ops = if deep_locked_out(mode, window) {
                 either_or_late(prev, next)
             } else {
                 handoff(prev, next)
@@ -347,8 +356,8 @@ fn unreachable_transition(prev: Bands, next: Bands) -> Vec<StageOp> {
 /// One key's combined runtime state the `Engine` tracks across depth ticks:
 /// a shadow primary-band `KeyState` (fed by the same raw `rx_depth` stream
 /// as the deep band, never the primary's own `PhysicalEvent` — ADR-0007),
-/// the deep-band `KeyState`, and Quick-Skip's own per-press phase (`None` for
-/// every mode but `QuickSkip`, and for a `QuickSkip` key at rest between
+/// the deep-band `KeyState`, and a windowed mode's per-press phase (`None` for
+/// a non-windowed mode, and for a windowed key at rest between
 /// presses — ticket 04's `begin_windowed_press`/`tick` are the only writers of a
 /// `Some` value here). `Default` is a fresh key that has never crossed
 /// either band — equivalent to `(Band::Up, Band::Up)`.
@@ -683,7 +692,7 @@ impl Engine {
                 // double-crossing ordinarily resolves synchronously from the
                 // event's own depth field (see `begin_windowed_press`'s doc). No
                 // op is ever decided here for this edge — the same way the
-                // other three modes leave their own lone `FirePrimary`/
+                // non-windowed modes leave their own lone `FirePrimary`/
                 // `ReleasePrimary` transitions to the real event path below
                 // rather than double-performing them — but shadow-band
                 // tracking above still stays live regardless, unconditionally
@@ -838,13 +847,16 @@ impl Engine {
     /// | Situation | returns |
     /// |---|---|
     /// | not a dual-stage key on this Layer, or no Depth on the edge | `NotMine { false }` |
-    /// | non-Quick-Skip primary `Down` (Handoff / No-Return) | `NotMine { true }` |
+    /// | non-windowed primary `Down` (Handoff / No-Return) | `NotMine { true }` |
+    ///
+    /// The windowed rows below apply to Quick-Skip and Either-Or alike:
+    ///
     /// | Quick-Skip `Down` | `Handled` — `begin_windowed_press` arms or resolves Skipped |
     /// | Quick-Skip `Repeat` while `Armed` / `Skipped` | `Handled(vec![])` — swallowed |
     /// | Quick-Skip `Up` while `Armed` | `Handled(edits)` — `end_windowed_press` flushes the buffered primary as a tap (Down now, Up deferred) |
     /// | Quick-Skip `Up` while `Skipped` / `None` | `Handled(vec![])` — `end_windowed_press` releases the deep stage, force-releases the primary (unless a flushed tap's Up is pending) |
     /// | Quick-Skip `Up` / `Repeat` once `Late` | runs the general rows (plain Handoff) |
-    /// | Either-Or | every Quick-Skip row above; once `Late` "drive deep repeat" is a no-op (the deep band is locked out) and the primary is never handed off |
+    /// | Either-Or `Up` / `Repeat` once `Late` | runs the general rows, but "drive deep repeat" is a no-op (`deep_locked_out`) and the primary is never handed off |
     /// | any mode, `Repeat`, primary handed off to deep | drive deep repeat, `Handled(vec![])` |
     /// | any mode, `Repeat`, primary **not** handed off | drive deep repeat, `NotMine { true }` |
     ///
@@ -1275,11 +1287,11 @@ impl Engine {
         // An Either-Or key gone Late has the deep band locked out: with an
         // empty deep slot, `decide`'s "`Repeat` with no firing re-presses
         // first" rule would *fire* the deep stage here.
-        if self.is_late(input)
-            && profile
-                .deep_stages
-                .get(&input)
-                .is_some_and(|cfg| cfg.mode == StagingMode::EitherOr)
+        let window = self.runtime.get(&input).and_then(|rt| rt.window);
+        if profile
+            .deep_stages
+            .get(&input)
+            .is_some_and(|cfg| deep_locked_out(cfg.mode, window))
         {
             return Ok(());
         }
@@ -1523,7 +1535,9 @@ impl Engine {
     ///
     /// A flushed tap's pending Up is cancelled with the reset; the primary is
     /// force-released on `individual` right here instead, since nothing else
-    /// in the `StopStage` effect touches the primary keyspace.
+    /// in the `StopStage` effect touches the primary keyspace. So is an
+    /// Either-Or Late primary held in the deep band, which the re-adoption
+    /// would otherwise take for handed off while it is still down.
     pub(crate) async fn stop_stage(
         &mut self,
         input: Input,
@@ -1532,14 +1546,19 @@ impl Engine {
     ) {
         self.release_deep_slot(input, injector).await;
         if let Some(rt) = self.runtime.get_mut(&input) {
-            if rt.pending_release.is_some() {
+            // An Either-Or key gone Late holds its primary straight through
+            // the deep band — a shape no other mode leaves behind. The reset
+            // re-adopts `(Down, Down)` as a hand-off under whatever mode comes
+            // next, so make that true: release the primary now.
+            let held_in_deep_band = rt.window == Some(WindowPhase::Late) && rt.deep == KeyState::Down;
+            if rt.pending_release.is_some() || held_in_deep_band {
                 individual.force_release(&input, injector).await;
             }
             // Carry `primary_handed_off` — `stop_stage` doesn't re-press the
             // primary, so a handed-off primary stays handed off, and `feed`
             // must keep swallowing its `Repeat`s without waiting for the
             // next `rx_depth`-driven `update` tick (ticket 24).
-            let primary_handed_off = rt.primary_handed_off;
+            let primary_handed_off = rt.primary_handed_off || held_in_deep_band;
             *rt = KeyRuntime {
                 just_reset: true,
                 deep_repeat_suppressed: true,
@@ -1855,6 +1874,21 @@ mod tests {
             let (ops, phase) = advance(prev, next, StagingMode::EitherOr, late);
             assert_eq!(ops, expected, "either_or late {prev:?} -> {next:?}");
             assert_eq!(phase, expected_phase, "either_or late {prev:?} -> {next:?}");
+        }
+    }
+
+    #[test]
+    fn only_an_either_or_key_gone_late_has_the_deep_band_locked_out() {
+        let armed = Some(WindowPhase::Armed {
+            deadline: Instant::now() + QUICK_SKIP_WINDOW,
+        });
+        let late = Some(WindowPhase::Late);
+        assert!(deep_locked_out(StagingMode::EitherOr, late));
+        for window in [None, armed, Some(WindowPhase::Skipped)] {
+            assert!(!deep_locked_out(StagingMode::EitherOr, window), "{window:?}");
+        }
+        for mode in [StagingMode::Handoff, StagingMode::NoReturn, StagingMode::QuickSkip] {
+            assert!(!deep_locked_out(mode, late), "{mode:?}");
         }
     }
 

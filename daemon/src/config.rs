@@ -3360,7 +3360,7 @@ mode = "handoff"
         );
     }
 
-    // --- `config::validate` (ticket 04)---------------------------------
+    // --- `config::validate` (ticket 04) ---------------------------------
     //
     // One synchronous case per structural invariant `validate` owns — no
     // tokio, no tempfile. The `parse` tests above now exercise `validate`

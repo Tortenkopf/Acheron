@@ -8152,6 +8152,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn dual_stage_set_staging_mode_out_of_either_or_mid_press_leaves_nothing_stuck() {
+        // An Either-Or key gone Late holds its primary straight through the
+        // deep band — a shape Handoff never leaves behind. The flip must
+        // release that primary, so the new mode's re-adoption of
+        // `(Down, Down)` as a hand-off is true, not a held primary it would
+        // swallow the Repeats of and then re-press on the way out.
         let config = dual_stage_config(
             StagingMode::EitherOr,
             hold_to_repeat_binding(evdev::KeyCode::KEY_A),
@@ -8159,7 +8164,6 @@ mod tests {
         );
         let harness = CommandHarness::spawn(config);
 
-        // Late and held in the deep band: the primary is held.
         harness.press_analog(Input::Grid(1, 1), 150).await;
         harness.push_depth([(Input::Grid(1, 1), 150)]);
         settle().await;
@@ -8176,23 +8180,37 @@ mod tests {
             .await
             .unwrap();
         settle().await;
+        assert_eq!(
+            events_of(&harness.sink.batches()),
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "the flip releases the primary held in the deep band"
+        );
+
         harness.push_depth([(Input::Grid(1, 1), 250)]);
         settle().await;
+        harness.repeat_analog(Input::Grid(1, 1), 250).await;
+        settle().await;
+        // Depth before the real Up: the reverse order trips a separate,
+        // plain-Handoff race on the `(Down, Down) -> (Up, Up)` replay.
         harness.push_depth([(Input::Grid(1, 1), 0)]);
         settle().await;
         harness.release_analog(Input::Grid(1, 1), 0).await;
         settle().await;
 
         let events = events_of(&harness.shut_down().await);
-        assert_eq!(
-            events.last(),
-            Some(&(evdev::KeyCode::KEY_A, 0)),
-            "the held primary is released: {events:?}"
-        );
         assert!(
             !events.iter().any(|&(c, _)| c == evdev::KeyCode::KEY_B),
             "the deep stage never fired: {events:?}"
         );
+        let a_down = events
+            .iter()
+            .filter(|&&e| e == (evdev::KeyCode::KEY_A, 1))
+            .count();
+        let a_up = events
+            .iter()
+            .filter(|&&e| e == (evdev::KeyCode::KEY_A, 0))
+            .count();
+        assert_eq!(a_down, a_up, "nothing left stuck: {events:?}");
     }
 
     #[tokio::test(start_paused = true)]
