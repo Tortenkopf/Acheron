@@ -468,7 +468,7 @@ pub struct DeepStageConfig {
     pub mode: StagingMode,
 }
 
-/// CONTEXT.md: Staging mode. The three staging modes governing how a grid
+/// CONTEXT.md: Staging mode. The four staging modes governing how a grid
 /// key's primary and deep stages hand off as Depth crosses the deep band.
 /// `Default = Handoff` — the canonical "camera shutter" mode — so
 /// `SetDeepActuation`/`SetStagingMode` can `.entry(input).or_default()` into
@@ -489,6 +489,9 @@ pub enum StagingMode {
     Handoff,
     NoReturn,
     QuickSkip,
+    /// Quick-Skip's window with the deep stage locked out once the primary
+    /// fires (`either-or-staging-mode`): each press fires exactly one stage.
+    EitherOr,
 }
 
 impl StagingMode {
@@ -496,7 +499,7 @@ impl StagingMode {
     /// `Down`, Armed → Skipped / Late) — Quick-Skip's machine, shared by
     /// every mode built on it.
     pub fn is_windowed(self) -> bool {
-        matches!(self, StagingMode::QuickSkip)
+        matches!(self, StagingMode::QuickSkip | StagingMode::EitherOr)
     }
 }
 
@@ -1279,7 +1282,7 @@ impl fmt::Display for ConfigError {
             ),
             ConfigError::RemovedStagingModeAdditive(paths) => write!(
                 f,
-                "config.toml uses the Additive staging mode, which has been removed (a real keyboard can't hold two autorepeating keys — see ADR-0009), at: {} — rebind the deep stage to Handoff, No-Return, or Quick-Skip, or move the \"press two things\" behaviour into a Macro bound to the deep stage",
+                "config.toml uses the Additive staging mode, which has been removed (a real keyboard can't hold two autorepeating keys — see ADR-0009), at: {} — rebind the deep stage to Handoff, No-Return, Quick-Skip, or Either-Or, or move the \"press two things\" behaviour into a Macro bound to the deep stage",
                 paths.join(", ")
             ),
             ConfigError::InvalidAnalogRepeatInput(input) => write!(
@@ -3334,7 +3337,30 @@ mode = "handoff"
         );
     }
 
-    // --- `config::validate` (ticket 04) ---------------------------------
+    #[test]
+    fn either_or_staging_mode_round_trips_through_config_toml() {
+        let mut config = Config::seed();
+        let profile = config.profiles.get_mut(DEFAULT_PROFILE_NAME).unwrap();
+        profile.deep_stages.insert(
+            Input::Grid(1, 1),
+            DeepStageConfig {
+                actuation: ActuationPoint {
+                    actuation: 220,
+                    release: 200,
+                },
+                mode: StagingMode::EitherOr,
+            },
+        );
+        let toml = toml::to_string(&config).unwrap();
+        assert!(toml.contains(r#"mode = "either_or""#), "{toml}");
+        let parsed: Config = toml::from_str(&toml).unwrap();
+        assert_eq!(
+            parsed.profiles[DEFAULT_PROFILE_NAME].deep_stages[&Input::Grid(1, 1)].mode,
+            StagingMode::EitherOr
+        );
+    }
+
+    // --- `config::validate` (ticket 04)---------------------------------
     //
     // One synchronous case per structural invariant `validate` owns — no
     // tokio, no tempfile. The `parse` tests above now exercise `validate`

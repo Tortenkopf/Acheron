@@ -266,6 +266,10 @@ the key travels through both bands:
 - **Quick-Skip** — reaching the deep band within about 50 ms of the primary
   point suppresses the primary's press entirely (for a fast full-press you
   never wanted the light press for); otherwise it behaves as Handoff.
+- **Either-Or** — each press fires exactly one stage. Reach the deep band
+  within about 50 ms of the primary point and only the deep stage fires;
+  otherwise the primary fires (up to 50 ms late) and the deep stage is locked
+  out until you let go, so pushing further down mid-hold does nothing.
 
 Deep stages need analog capture — in digital-capture mode the controls grey
 out and only the primary fires. Removing the primary Binding removes the deep

@@ -1032,6 +1032,16 @@ def test_set_staging_mode_creates_a_fresh_config_and_only_writes_mode():
     assert stub.calls[-1] == ("set_staging_mode", "grid_r1c1", "quick_skip")
 
 
+def test_set_staging_mode_accepts_either_or():
+    stub = DaemonStub()
+    stub.set_deep_actuation("grid_r1c1", 220, 200)
+
+    stub.set_staging_mode("grid_r1c1", "either_or")
+
+    cfg = stub.get_config()["profiles"]["Default"]["deep_stages"]["grid_r1c1"]
+    assert cfg["mode"] == "either_or"
+
+
 def test_set_staging_mode_on_an_existing_entry_leaves_its_actuation_untouched():
     stub = DaemonStub()
     stub.set_deep_actuation("grid_r1c1", 220, 200)

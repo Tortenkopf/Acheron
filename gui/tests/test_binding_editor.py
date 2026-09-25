@@ -1442,6 +1442,25 @@ def test_picking_a_staging_mode_calls_set_staging_mode():
     assert ("set_staging_mode", "grid_r1c1", "no_return") in stub.calls
 
 
+def test_the_staging_mode_row_lists_either_or_after_quick_skip():
+    stub = DaemonStub()
+    editor = _dual_stage_editor(stub)
+    _add_deep_stage(editor)
+    stub.calls.clear()
+
+    labels = [
+        w.get_label()
+        for w in find_all(editor, lambda w: isinstance(w, Gtk.ToggleButton))
+        if w.get_label() in {"Handoff", "No-Return", "Quick-Skip", "Either-Or"}
+    ]
+    assert labels == ["Handoff", "No-Return", "Quick-Skip", "Either-Or"]
+
+    either_or = find_one(editor, lambda w: isinstance(w, Gtk.ToggleButton) and w.get_label() == "Either-Or")
+    assert "locked out" in either_or.get_tooltip_text()
+    either_or.set_active(True)
+    assert ("set_staging_mode", "grid_r1c1", "either_or") in stub.calls
+
+
 def test_saving_the_deep_stage_sends_set_deep_stage_with_the_edited_binding():
     stub = DaemonStub()
     editor = _dual_stage_editor(stub)

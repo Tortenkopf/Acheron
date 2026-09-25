@@ -7933,6 +7933,332 @@ mod tests {
         );
     }
 
+    // ── `either-or-staging-mode`: Quick-Skip's window, deep locked out once
+    // Late ─────────────────────────────────────────────────────────────────
+
+    fn events_of(batches: &[Vec<evdev::InputEvent>]) -> Vec<(evdev::KeyCode, i32)> {
+        batches.iter().map(|b| key_and_value(b[0])).collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_either_or_fast_full_press_fires_the_deep_stage_only() {
+        let config = dual_stage_config(
+            StagingMode::EitherOr,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 250).await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        settle().await;
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+
+        assert_eq!(
+            events_of(&harness.shut_down().await),
+            vec![(evdev::KeyCode::KEY_B, 1), (evdev::KeyCode::KEY_B, 0)],
+            "a fast full press fires the deep stage only — the primary never"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_either_or_slow_press_to_full_depth_fires_the_primary_only() {
+        let config = dual_stage_config(
+            StagingMode::EitherOr,
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        tokio::time::advance(Duration::from_millis(60)).await;
+        settle().await;
+        assert_eq!(
+            events_of(&harness.sink.batches()),
+            vec![(evdev::KeyCode::KEY_A, 1)],
+            "the window elapsed: the primary fires, late"
+        );
+
+        // Down into the deep band and back out: nothing, either way.
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        assert_eq!(
+            events_of(&harness.sink.batches()),
+            vec![(evdev::KeyCode::KEY_A, 1)],
+            "the deep band is inert once Late — the primary stays held"
+        );
+
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+        assert_eq!(
+            events_of(&harness.shut_down().await),
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "the primary is released on the real Up"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_either_or_late_released_from_the_deep_band_releases_the_primary() {
+        // A 1-report skip straight from the deep band to released, the depth
+        // tick landing before the real Up.
+        let config = dual_stage_config(
+            StagingMode::EitherOr,
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        tokio::time::advance(Duration::from_millis(60)).await;
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        settle().await;
+
+        assert_eq!(
+            events_of(&harness.shut_down().await),
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_either_or_late_primary_keeps_repeating_and_the_deep_never_fires() {
+        // Both stages Hold-to-repeat, held in the deep band once Late: the
+        // primary's own Repeats keep reaching it, and `deep_repeat` must stay
+        // silent — `decide`'s "`Repeat` with no firing re-presses first" rule
+        // would otherwise fire the deep stage off an empty slot.
+        let config = dual_stage_config(
+            StagingMode::EitherOr,
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        tokio::time::advance(Duration::from_millis(60)).await;
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        for _ in 0..3 {
+            harness.repeat_analog(Input::Grid(1, 1), 250).await;
+            settle().await;
+        }
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+
+        assert_eq!(
+            events_of(&harness.shut_down().await),
+            vec![
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 2),
+                (evdev::KeyCode::KEY_A, 2),
+                (evdev::KeyCode::KEY_A, 2),
+                (evdev::KeyCode::KEY_A, 0),
+            ],
+            "the primary keeps repeating in the deep band; the deep stage never fires"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_either_or_late_repeated_deep_excursions_emit_nothing() {
+        let config = dual_stage_config(
+            StagingMode::EitherOr,
+            keypress_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        tokio::time::advance(Duration::from_millis(60)).await;
+        settle().await;
+        let after_late = harness.sink.batches().len();
+        for _ in 0..3 {
+            harness.push_depth([(Input::Grid(1, 1), 250)]);
+            settle().await;
+            harness.push_depth([(Input::Grid(1, 1), 150)]);
+            settle().await;
+        }
+        assert_eq!(
+            harness.sink.batches().len(),
+            after_late,
+            "no dip into or out of the deep band emits anything once Late"
+        );
+
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+        assert_eq!(
+            events_of(&harness.shut_down().await),
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "the Fire-once primary fired once, late, and nothing else"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_either_or_quick_shallow_tap_fires_the_primary_as_a_tap() {
+        let config = dual_stage_config(
+            StagingMode::EitherOr,
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+            keypress_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        tokio::time::advance(Duration::from_millis(10)).await;
+        harness.release_analog(Input::Grid(1, 1), 50).await;
+        harness.push_depth([(Input::Grid(1, 1), 50)]);
+        settle().await;
+        assert_eq!(
+            events_of(&harness.sink.batches()),
+            vec![(evdev::KeyCode::KEY_A, 1)],
+            "the buffered primary Down is performed on the release"
+        );
+
+        tokio::time::advance(executor::FIRE_ONCE_KEY_DWELL - Duration::from_millis(1)).await;
+        settle().await;
+        assert_eq!(events_of(&harness.sink.batches()).len(), 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        settle().await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        settle().await;
+
+        assert_eq!(
+            events_of(&harness.shut_down().await),
+            vec![(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "its Up follows one canned-tap dwell later"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_set_staging_mode_out_of_either_or_mid_press_leaves_nothing_stuck() {
+        let config = dual_stage_config(
+            StagingMode::EitherOr,
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        // Late and held in the deep band: the primary is held.
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        tokio::time::advance(Duration::from_millis(60)).await;
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+
+        harness
+            .apply(edit::Edit::SetStagingMode {
+                input: Input::Grid(1, 1),
+                mode: StagingMode::Handoff,
+            })
+            .await
+            .unwrap();
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        settle().await;
+
+        let events = events_of(&harness.shut_down().await);
+        assert_eq!(
+            events.last(),
+            Some(&(evdev::KeyCode::KEY_A, 0)),
+            "the held primary is released: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|&(c, _)| c == evdev::KeyCode::KEY_B),
+            "the deep stage never fired: {events:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dual_stage_set_staging_mode_into_either_or_mid_press_leaves_nothing_stuck() {
+        let config = dual_stage_config(
+            StagingMode::Handoff,
+            hold_to_repeat_binding(evdev::KeyCode::KEY_A),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_B),
+        );
+        let harness = CommandHarness::spawn(config);
+
+        // Handoff, held in the deep band: the deep stage is held.
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+
+        harness
+            .apply(edit::Edit::SetStagingMode {
+                input: Input::Grid(1, 1),
+                mode: StagingMode::EitherOr,
+            })
+            .await
+            .unwrap();
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        harness.repeat_analog(Input::Grid(1, 1), 250).await;
+        settle().await;
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+        let settled = harness.sink.batches().len();
+
+        // The next press runs as Either-Or: slow, so primary only.
+        harness.press_analog(Input::Grid(1, 1), 150).await;
+        harness.push_depth([(Input::Grid(1, 1), 150)]);
+        settle().await;
+        tokio::time::advance(Duration::from_millis(60)).await;
+        settle().await;
+        harness.push_depth([(Input::Grid(1, 1), 250)]);
+        settle().await;
+        harness.release_analog(Input::Grid(1, 1), 0).await;
+        harness.push_depth([(Input::Grid(1, 1), 0)]);
+        settle().await;
+
+        let batches = harness.shut_down().await;
+        let events = events_of(&batches);
+        assert_eq!(
+            events[..settled],
+            [
+                (evdev::KeyCode::KEY_A, 1),
+                (evdev::KeyCode::KEY_A, 0),
+                (evdev::KeyCode::KEY_B, 1),
+                (evdev::KeyCode::KEY_B, 0),
+            ],
+            "the mode flip released the held deep stage and nothing re-fired"
+        );
+        assert_eq!(
+            events[settled..],
+            [(evdev::KeyCode::KEY_A, 1), (evdev::KeyCode::KEY_A, 0)],
+            "the next press runs as Either-Or"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn dual_stage_layer_switch_mid_press_force_releases_a_live_deep_toggle() {
         let config = dual_stage_config(

@@ -127,7 +127,9 @@ pub(crate) enum WindowPhase {
     /// takes No-Return's shape (no `RepressPrimary`).
     Skipped,
     /// The deadline elapsed first — `tick` already emitted the retroactive
-    /// `RepressPrimary`; the rest of this press runs plain Handoff.
+    /// `RepressPrimary`; the rest of this press runs plain Handoff under
+    /// Quick-Skip, and with the deep band locked out under Either-Or
+    /// (`either_or_late`).
     Late,
 }
 
@@ -150,7 +152,7 @@ pub(crate) fn advance(
     match mode {
         StagingMode::Handoff => (handoff(prev, next), None),
         StagingMode::NoReturn => (no_return(prev, next), None),
-        StagingMode::QuickSkip => windowed_advance(prev, next, window),
+        StagingMode::QuickSkip | StagingMode::EitherOr => windowed_advance(prev, next, mode, window),
     }
 }
 
@@ -235,6 +237,7 @@ fn no_return(prev: Bands, next: Bands) -> Vec<StageOp> {
 fn windowed_advance(
     prev: Bands,
     next: Bands,
+    mode: StagingMode,
     window: Option<WindowPhase>,
 ) -> (Vec<StageOp>, Option<WindowPhase>) {
     use Band::{Down, Up};
@@ -284,7 +287,11 @@ fn windowed_advance(
             ),
         },
         Some(WindowPhase::Late) => {
-            let ops = handoff(prev, next);
+            let ops = if mode == StagingMode::EitherOr {
+                either_or_late(prev, next)
+            } else {
+                handoff(prev, next)
+            };
             let phase = if next == (Up, Up) {
                 None
             } else {
@@ -292,6 +299,21 @@ fn windowed_advance(
             };
             (ops, phase)
         }
+    }
+}
+
+/// **Either-Or, from Late** (`either-or-staging-mode` spec): the primary
+/// fired off the deadline and the deep band is inert for the rest of the
+/// press — crossings into and out of it emit nothing, the primary stays held
+/// straight through, and the lone `ReleasePrimary` on the way out is left to
+/// the real `Up`, as Handoff's own outer edge is.
+fn either_or_late(prev: Bands, next: Bands) -> Vec<StageOp> {
+    use Band::{Down, Up};
+    match (prev, next) {
+        ((Down, Up), (Down, Up)) | ((Down, Down), (Down, Down)) => vec![StageOp::Nothing],
+        ((Down, Up), (Down, Down)) | ((Down, Down), (Down, Up)) => Vec::new(),
+        ((Down, Up), (Up, Up)) | ((Down, Down), (Up, Up)) => vec![StageOp::ReleasePrimary],
+        _ => unreachable_transition(prev, next),
     }
 }
 
@@ -822,6 +844,7 @@ impl Engine {
     /// | Quick-Skip `Up` while `Armed` | `Handled(edits)` — `end_windowed_press` flushes the buffered primary as a tap (Down now, Up deferred) |
     /// | Quick-Skip `Up` while `Skipped` / `None` | `Handled(vec![])` — `end_windowed_press` releases the deep stage, force-releases the primary (unless a flushed tap's Up is pending) |
     /// | Quick-Skip `Up` / `Repeat` once `Late` | runs the general rows (plain Handoff) |
+    /// | Either-Or | every Quick-Skip row above; once `Late` "drive deep repeat" is a no-op (the deep band is locked out) and the primary is never handed off |
     /// | any mode, `Repeat`, primary handed off to deep | drive deep repeat, `Handled(vec![])` |
     /// | any mode, `Repeat`, primary **not** handed off | drive deep repeat, `NotMine { true }` |
     ///
@@ -1249,6 +1272,17 @@ impl Engine {
         let profile = config
             .active_profile()
             .expect("load_or_seed validates active_profile names a real profile");
+        // An Either-Or key gone Late has the deep band locked out: with an
+        // empty deep slot, `decide`'s "`Repeat` with no firing re-presses
+        // first" rule would *fire* the deep stage here.
+        if self.is_late(input)
+            && profile
+                .deep_stages
+                .get(&input)
+                .is_some_and(|cfg| cfg.mode == StagingMode::EitherOr)
+        {
+            return Ok(());
+        }
         let Some(deep_binding) = profile.deep_layer(active_layer).get(&input) else {
             return Ok(());
         };
@@ -1768,6 +1802,60 @@ mod tests {
         let (ops, phase) = advance((Up, Up), (Down, Up), StagingMode::QuickSkip, cancelled);
         assert!(ops.is_empty());
         assert!(matches!(phase, Some(WindowPhase::Armed { .. })));
+    }
+
+    // ── Either-Or ────────────────────────────────────────────────────────
+    //
+    // Quick-Skip's window with the deep stage locked out once Late: the
+    // Armed and Skipped rows are Quick-Skip's own, only Late differs.
+
+    #[test]
+    fn either_or_armed_and_skipped_rows_mirror_quick_skip() {
+        let armed = Some(WindowPhase::Armed {
+            deadline: Instant::now() + QUICK_SKIP_WINDOW,
+        });
+        let skipped = Some(WindowPhase::Skipped);
+        let cases: &[(Bands, Bands, Option<WindowPhase>)] = &[
+            ((Up, Up), (Down, Down), None),
+            ((Down, Up), (Down, Up), armed),
+            ((Down, Up), (Down, Down), armed),
+            ((Down, Up), (Up, Up), armed),
+            ((Down, Up), (Down, Down), skipped),
+            ((Down, Down), (Down, Up), skipped),
+            ((Down, Up), (Up, Up), skipped),
+            ((Down, Down), (Up, Up), skipped),
+        ];
+        for &(prev, next, window) in cases {
+            assert_eq!(
+                advance(prev, next, StagingMode::EitherOr, window),
+                advance(prev, next, StagingMode::QuickSkip, window),
+                "either_or {prev:?} -> {next:?} from {window:?}"
+            );
+        }
+        let (ops, phase) = advance((Up, Up), (Down, Up), StagingMode::EitherOr, None);
+        assert!(ops.is_empty(), "the real Down is buffered, not fired");
+        assert!(matches!(phase, Some(WindowPhase::Armed { .. })));
+    }
+
+    #[test]
+    fn either_or_late_locks_the_deep_band_out() {
+        let late = Some(WindowPhase::Late);
+        let cases: &[(Bands, Bands, &[StageOp], Option<WindowPhase>)] = &[
+            // Deep crossings in either direction: nothing, the primary
+            // stays held straight through.
+            ((Down, Up), (Down, Down), &[], late),
+            ((Down, Down), (Down, Up), &[], late),
+            // The release is a lone ReleasePrimary — left to the real Up.
+            ((Down, Up), (Up, Up), &[StageOp::ReleasePrimary], None),
+            ((Down, Down), (Up, Up), &[StageOp::ReleasePrimary], None),
+            ((Down, Up), (Down, Up), &[StageOp::Nothing], late),
+            ((Down, Down), (Down, Down), &[StageOp::Nothing], late),
+        ];
+        for &(prev, next, expected, expected_phase) in cases {
+            let (ops, phase) = advance(prev, next, StagingMode::EitherOr, late);
+            assert_eq!(ops, expected, "either_or late {prev:?} -> {next:?}");
+            assert_eq!(phase, expected_phase, "either_or late {prev:?} -> {next:?}");
+        }
     }
 
     // ── Disjoint-stacked-band invariant ─────────────────────────────────

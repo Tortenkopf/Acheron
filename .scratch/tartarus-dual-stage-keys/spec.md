@@ -258,7 +258,7 @@ mechanics:
 |---|---|
 | Deep reached within the window (incl. resolved synchronously if already hot on the triggering report) | → **Skipped**: Suppress Primary (buffered Down dropped for good) → Fire Deep |
 | Deadline elapses, deep never reached | → **Late**: Repress Primary (retroactive, via `dispatch_individual_down`) → runs as ordinary Handoff for the rest of the press |
-| Up arrives first (deadline not elapsed, deep never reached) | → cancelled: buffered Down dropped, nothing emitted |
+| Up arrives first (deadline not elapsed, deep never reached) | → cancelled: buffered Down dropped, nothing emitted — **superseded** by the early-Up flush in [`either-or-staging-mode/spec.md`](../either-or-staging-mode/spec.md) |
 | Layer/Profile switch or capture-mode flip while Armed | → cancelled via `stage::Engine::stop_all()` |
 
 Once **Skipped**, every subsequent dip into/out of the deep band for the rest of *this* press
