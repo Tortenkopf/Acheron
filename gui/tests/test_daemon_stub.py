@@ -44,7 +44,7 @@ def test_fresh_stub_matches_the_seed_configs_shape():
         "active_toggles": [],
         "device_connected": True,
         "capture_mode": "digital",
-        "daemon_version": "1.3.2",
+        "daemon_version": "1.3.3",
         # Ticket 101: present because the stub starts "connected".
         "firmware_version": "v1.2",
         "serial_number": "PM2443F36300141",
@@ -1030,6 +1030,16 @@ def test_set_staging_mode_creates_a_fresh_config_and_only_writes_mode():
         "mode": "quick_skip",
     }
     assert stub.calls[-1] == ("set_staging_mode", "grid_r1c1", "quick_skip")
+
+
+def test_set_staging_mode_accepts_either_or():
+    stub = DaemonStub()
+    stub.set_deep_actuation("grid_r1c1", 220, 200)
+
+    stub.set_staging_mode("grid_r1c1", "either_or")
+
+    cfg = stub.get_config()["profiles"]["Default"]["deep_stages"]["grid_r1c1"]
+    assert cfg["mode"] == "either_or"
 
 
 def test_set_staging_mode_on_an_existing_entry_leaves_its_actuation_untouched():

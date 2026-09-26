@@ -199,6 +199,7 @@ pub fn staging_mode_str(mode: StagingMode) -> &'static str {
         StagingMode::Handoff => "handoff",
         StagingMode::NoReturn => "no_return",
         StagingMode::QuickSkip => "quick_skip",
+        StagingMode::EitherOr => "either_or",
     }
 }
 
@@ -207,6 +208,7 @@ pub fn staging_mode_from_str(s: &str) -> Result<StagingMode, String> {
         "handoff" => Ok(StagingMode::Handoff),
         "no_return" => Ok(StagingMode::NoReturn),
         "quick_skip" => Ok(StagingMode::QuickSkip),
+        "either_or" => Ok(StagingMode::EitherOr),
         other => Err(format!("{other:?} is not a valid staging mode")),
     }
 }
@@ -1978,6 +1980,7 @@ mod tests {
             StagingMode::Handoff,
             StagingMode::NoReturn,
             StagingMode::QuickSkip,
+            StagingMode::EitherOr,
         ] {
             let s = staging_mode_str(mode);
             assert_eq!(staging_mode_from_str(s).unwrap(), mode);

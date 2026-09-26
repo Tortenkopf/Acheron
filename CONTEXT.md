@@ -95,7 +95,7 @@ A `(ActuationPoint, Binding)` pair — an Actuation/Release point paired with a 
 _Avoid_: sub-binding, second binding, layer (Actuation stage is a depth concept, unrelated to the Base/Held Layer)
 
 **Staging mode**:
-A per-Input, per-Profile choice governing how a grid key's primary and deep Actuation stages hand off as Depth crosses the deep band: Handoff, No-Return, or Quick-Skip. Shared across Base and Held, like the deep stage's own Actuation point — it interprets physical travel, not what either stage does when triggered. A key with no deep stage has no meaningful Staging mode. (A fourth mode, Additive, was removed — ADR-0009.)
+A per-Input, per-Profile choice governing how a grid key's primary and deep Actuation stages hand off as Depth crosses the deep band: Handoff, No-Return, Quick-Skip, or Either-Or. Shared across Base and Held, like the deep stage's own Actuation point — it interprets physical travel, not what either stage does when triggered. A key with no deep stage has no meaningful Staging mode. (A fourth mode, Additive, was removed — ADR-0009.)
 _Avoid_: transition mode, handoff mode (reserved for the Handoff mode specifically)
 
 **Handoff**:
@@ -105,7 +105,11 @@ The Staging mode where crossing into the deep band releases the primary stage an
 The Staging mode identical to Handoff on the way deeper, but the primary stage does not re-press on the way back up — once the deep stage has fired, the key stays quiet until fully released and pressed again.
 
 **Quick-Skip**:
-The Staging mode where the primary stage's Down is held back for a ~50ms window (the Chord-detection window's constant, reused): if the deep band is reached within that window, the primary is suppressed entirely for the rest of the press (never fires, and its eventual release does not fire it either — the release path behaves like No-Return); otherwise the primary fires late (delayed by up to the window) and the key runs as ordinary Handoff for the rest of the press. Costs up to 50ms of primary-Down latency by construction — the price of not knowing, at the moment of the primary crossing, whether the press will continue into the deep band.
+The Staging mode where the primary stage's Down is held back for a ~50ms window (the Chord-detection window's constant, reused): if the deep band is reached within that window, the primary is suppressed entirely for the rest of the press (never fires, and its eventual release does not fire it either — the release path behaves like No-Return); otherwise the primary fires late (delayed by up to the window) and the key runs as ordinary Handoff for the rest of the press. A press released inside the window without reaching the deep band still fires the primary, as a tap: its Down on the release, its Up one canned-tap dwell (~40ms) later. Costs up to 50ms of primary-Down latency by construction — the price of not knowing, at the moment of the primary crossing, whether the press will continue into the deep band.
+
+**Either-Or**:
+The Staging mode identical to Quick-Skip except once the primary has fired: the deep stage is then locked out for the rest of the press — the primary stays held through any excursion into and out of the deep band and releases only when the key is. Each press fires exactly one of the two stages, chosen by whether the deep band is reached within the ~50ms window.
+_Avoid_: exclusive mode, lockout mode, Quick-Lock
 
 **Status LED**:
 One of the three fixed-colour (orange, green, blue) on/off indicator LEDs on the device's left side. On/off only — no brightness, no custom colour, no non-static effect (all hardware limits). Driven only by the active Profile's Status LED assignment, never by a Binding or a Layer.

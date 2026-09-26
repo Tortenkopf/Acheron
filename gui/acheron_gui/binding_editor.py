@@ -1057,6 +1057,13 @@ STAGING_MODES: list[tuple[str, str, str]] = [
         "primary's Down entirely; otherwise the primary fires (up to 50 ms late) "
         "and the key behaves as Handoff for the rest of the press.",
     ),
+    (
+        "either_or",
+        "Either-Or",
+        "Reaching the deep band within ~50 ms of the primary point fires only the "
+        "deep stage; otherwise the primary fires (up to 50 ms late) and the deep "
+        "stage is locked out until the key is released.",
+    ),
 ]
 
 def _deep_action_types(available_action_types: list[tuple[str, str]]) -> list[tuple[str, str]]:

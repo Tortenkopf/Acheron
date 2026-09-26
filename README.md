@@ -175,8 +175,8 @@ membership take full effect (or unplug/replug the device).
 ### Building a release
 
 Both components self-label their version from git. A plain `main` checkout
-reports `1.3.2-dev+<short-hash>`; a checkout sitting exactly on the `v1.3.2`
-tag (or a tarball with no `.git`) reports the bare `1.3.2`. **Tag the release
+reports `1.3.3-dev+<short-hash>`; a checkout sitting exactly on the `v1.3.3`
+tag (or a tarball with no `.git`) reports the bare `1.3.3`. **Tag the release
 commit before building** the artifacts you hand to users. The canonical
 version numbers live in `daemon/Cargo.toml` and `gui/acheron_gui/__init__.py`
 (`_BASE_VERSION`); a release bumps both. `daemon/build.rs` honours an explicit
@@ -266,6 +266,10 @@ the key travels through both bands:
 - **Quick-Skip** — reaching the deep band within about 50 ms of the primary
   point suppresses the primary's press entirely (for a fast full-press you
   never wanted the light press for); otherwise it behaves as Handoff.
+- **Either-Or** — each press fires exactly one stage. Reach the deep band
+  within about 50 ms of the primary point and only the deep stage fires;
+  otherwise the primary fires (up to 50 ms late) and the deep stage is locked
+  out until you let go, so pushing further down mid-hold does nothing.
 
 Deep stages need analog capture — in digital-capture mode the controls grey
 out and only the primary fires. Removing the primary Binding removes the deep

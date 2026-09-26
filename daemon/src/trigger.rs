@@ -527,6 +527,7 @@ impl<K: Eq + Hash + Clone> Slots<K> {
                 {
                     steps = executor::fire_once_key_steps(mods, code);
                 }
+                self.release_displaced_firing(&key, deps.injector).await;
                 let handle = executor::spawn_fire_once(deps.injector.clone(), steps);
                 self.firings.insert(key, handle);
             }
@@ -537,6 +538,7 @@ impl<K: Eq + Hash + Clone> Slots<K> {
                 // `ChordEffect::ReleaseChordFiring` (Chord) later, which drain
                 // the firing's whole `held` set, reusing ticket 33's
                 // force-release path rather than inventing new architecture.
+                self.release_displaced_firing(&key, deps.injector).await;
                 let handle = executor::spawn_fire_once(
                     deps.injector.clone(),
                     executor::held_key_down_steps(modifiers, code),
@@ -587,6 +589,20 @@ impl<K: Eq + Hash + Clone> Slots<K> {
             }
         }
         Ok(())
+    }
+
+    /// Force-releases **and removes** the firing a new spawn on `key` is
+    /// about to replace, *before* that spawn, so its `ForceRelease` reaches
+    /// the injector ahead of the new firing's `KeyDown`. A balanced, finished
+    /// firing holds nothing (a no-op); a bare `HoldKeyDown` still holding its
+    /// key would otherwise drop out of `firings` with that key down and
+    /// nothing left to release it — e.g. a dual-stage key's `RepressPrimary`
+    /// over a real re-press that raced ahead of a coalesced depth tick
+    /// (`tartarus-dual-stage-keys` ticket 14).
+    async fn release_displaced_firing(&mut self, key: &K, injector: &Injector) {
+        if let Some(firing) = self.firings.remove(key) {
+            firing.force_release_stuck(injector).await;
+        }
     }
 
     /// Ticket 33's force-release, factored out of the individual `Up` arm, the
@@ -656,13 +672,10 @@ impl<K: Eq + Hash + Clone> Slots<K> {
     /// (`tartarus-dual-stage-keys` ticket 03) on a Layer/Profile switch or an
     /// Analog→Digital capture-mode flip. Unlike `stop_all_toggles`, also
     /// covers a stuck bare `KeyDown` (`HoldKeyDown`) a live Fire-once/
-    /// Hold-to-repeat firing may be holding. Same narrow, pre-existing race
-    /// `force_release` itself always had: a firing spawned an instant
-    /// earlier that `tokio` hasn't polled yet has nothing in `held` to
-    /// release, and the caller discarding this `Slots<K>` right after (as
-    /// `stage::Engine::stop_all()` does) means nothing will ever reach it
-    /// again — not a new risk this method introduces, just this method's
-    /// own share of it.
+    /// Hold-to-repeat firing may be holding — including one spawned an
+    /// instant earlier that `tokio` hasn't polled yet, which
+    /// `force_release_stuck`'s latch has release its key itself once it
+    /// runs (`tartarus-dual-stage-keys` ticket 14).
     pub(crate) async fn stop_all(&mut self, injector: &Injector) {
         for firing in self.firings.values() {
             firing.force_release_stuck(injector).await;
