@@ -7,3 +7,7 @@ Local markdown — issues and specs live as files under `.scratch/<feature-slug>
 ### Domain docs
 
 Single-context — one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+### Releases
+
+Cutting a release onto `main` (version bump, squashed release commit, tag, GitHub release). See `docs/agents/release.md`.
