@@ -404,7 +404,26 @@ impl DispatchState {
                     edits.extend(self.dispatch_individual_down(config, input, false).await?);
                 }
                 chord::ChordEffect::ForceReleaseIndividual { input } => {
-                    self.individual.force_release(&input, &self.injector).await;
+                    // An unbound member's `FireIndividual` was a passthrough
+                    // Down (`dispatch_individual_down`'s `None` arm), which
+                    // leaves no `individual` firing to force-release — so the
+                    // matching passthrough Up goes out here instead, or the
+                    // member's native key stays down at the OS level.
+                    let profile = config
+                        .active_profile()
+                        .expect("load_or_seed validates active_profile names a real profile");
+                    if profile.layer(self.active_layer).contains_key(&input) {
+                        self.individual.force_release(&input, &self.injector).await;
+                    } else {
+                        self.injector
+                            .inject_physical(PhysicalEvent {
+                                input,
+                                state: EventState::Up,
+                                depth: None,
+                            })
+                            .await
+                            .map_err(io::Error::other)?;
+                    }
                 }
             }
         }
@@ -3827,6 +3846,40 @@ mod tests {
         assert_eq!(
             state.profile, "Gaming",
             "the member's individual ProfileSwitch Binding fired retroactively and committed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unbound_chord_member_released_early_releases_its_passthrough_key() {
+        // An unbound member's retroactive Down is a passthrough `inject_physical`,
+        // which leaves no `individual` firing behind — so the early-release
+        // path's `ForceReleaseIndividual` must send the passthrough Up itself,
+        // or the member's native key stays down at the OS level (a quick tap
+        // of an unbound Chord member left `KEY_3` stuck on real hardware).
+        let mut profile = Profile::default();
+        profile.chords_base.insert(
+            ChordKey::new(BTreeSet::from([Input::Grid(1, 1), Input::Grid(1, 2)])),
+            hold_to_repeat_binding(evdev::KeyCode::KEY_E),
+        );
+        let harness = CommandHarness::spawn(config_with_profile(profile));
+
+        // Tap one member and release it before the rest of the Chord joins.
+        harness.press(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        harness.release(Input::Grid(1, 1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        let batches = harness.shut_down().await;
+        assert_eq!(
+            batches
+                .iter()
+                .map(|b| key_and_value(b[0]))
+                .collect::<Vec<_>>(),
+            vec![(evdev::KeyCode::KEY_1, 1), (evdev::KeyCode::KEY_1, 0)],
         );
     }
 
