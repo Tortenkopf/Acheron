@@ -40,7 +40,7 @@ window, not headless. Then either:
 
 **Blocked by:** None.
 
-**Status:** ready-for-human (2026-10-15): the in-process rebuild path levels off, but the live growth isn't reproduced; one live re-run is needed (see Comments)
+**Status:** closed, won't fix (2026-10-15): the user accepted the residue; see the last comment
 
 - [x] A repeatable measurement on a real mapped window: N Device Overview rebuilds with RSS
       sampled, driven without the physical Mode key (e.g. in-process rebuild calls, or
@@ -116,3 +116,9 @@ window, not headless. Then either:
   - If it keeps adding ~0.085 MB per signal, the leak is on the live signal path, not the
     rebuild. Bisect it next: run the GUI with the real Daemon but disable the tray icon (one
     line), then compare.
+
+- 2026-10-15: **Closed, won't fix.** The user decided to skip the three-burst live re-run. In
+  practice the Mode key is never pressed this often, let alone while the GUI window is open. The
+  worst case measured live was ~0.085 MB per signal with the window visible, against 0 while
+  hidden (ticket 06). That's an accepted residue. The live growth stays unattributed. If it ever
+  matters, the next step above and `gui/tools/soak_visible_rebuild.py` are the starting point.
