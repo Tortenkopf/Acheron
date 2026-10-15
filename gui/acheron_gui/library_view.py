@@ -571,7 +571,12 @@ def _mount_picker_mode_switch(
         rerender()
         on_mode_changed(mode)
 
+    # Weak: the switch buttons inside `switch_slot` reach this via `set_mode`
+    # (CONTRIBUTING.md, "GUI signal handlers").
+    switch_slot_ref = switch_slot.weak_ref()
+
     def rerender() -> None:
+        switch_slot = switch_slot_ref()
         clear_children(switch_slot)
         switch = build_library_picker_switch(current_mode(), set_mode)
         switch.set_sensitive(sensitive())

@@ -44,14 +44,19 @@ def _weak_widgets(root: Gtk.Widget) -> list:
     return [w.weak_ref() for w in walk(root)]
 
 
-def _survivors(refs: list) -> list[str]:
-    """The type names of every widget in `refs` still alive once the main
-    context is pumped and the cycle collector has run to a fixed point —
+def _settle() -> None:
+    """Pumps the main context and runs the cycle collector to a fixed point —
     one collection can free a widget whose disposal only then lets GTK drop
     the last references to others."""
     _pump_main_context()
     while gc.collect():
         _pump_main_context()
+
+
+def _survivors(refs: list) -> list[str]:
+    """The type names of every widget in `refs` still alive once `_settle()`
+    has freed everything it can."""
+    _settle()
     return sorted(type(w).__name__ for w in (r() for r in refs) if w is not None)
 
 
@@ -265,3 +270,55 @@ def test_each_action_kinds_editor_fields_are_freed(inp, kind):
 
     assert _survivors(refs) == []
     assert toplevels() == [app.window]
+
+
+def _live_widget_wrappers() -> int:
+    """How many `Gtk.Widget` Python wrappers are alive right now — the
+    leak's own symptom, which grew by about 558 per rebuild before this
+    effort's fixes."""
+    _settle()
+    return sum(1 for o in gc.get_objects() if isinstance(o, Gtk.Widget))
+
+
+def _library_app(tab: str) -> _App:
+    """An `_App` on the Library destination's `tab`, with one Macro and one
+    Stepper, each with a step/item, so its browse list and editor columns
+    are built."""
+    app = _App({"dest": "library", "library_tab": tab, "selected_layer": "base"})
+    app.stub.create_macro("Combo", [{"type": "key_down", "key": "KEY_A"}])
+    app.stub.create_stepper("Wheel", [{"type": "key", "key": "KEY_1"}])
+    app.rebuild()
+    return app
+
+
+_DESTINATIONS = {
+    "grid": _App,
+    "library-macros": lambda: _library_app("macros"),
+    "library-steppers": lambda: _library_app("steppers"),
+    "lighting": _lighting_app,
+}
+
+
+@pytest.mark.parametrize("dest", _DESTINATIONS)
+def test_rebuilding_frees_every_widget_of_the_previous_build(dest):
+    app = _DESTINATIONS[dest]()
+    first_build = _weak_widgets(app.content_box.get_first_child())
+
+    for _ in range(SOAK_REBUILDS):
+        app.rebuild()
+
+    assert _survivors(first_build) == []
+    assert toplevels() == [app.window]
+
+
+@pytest.mark.parametrize("dest", _DESTINATIONS)
+def test_rebuilding_does_not_grow_the_live_widget_wrapper_count(dest):
+    app = _DESTINATIONS[dest]()
+    for _ in range(3):
+        app.rebuild()
+    settled = _live_widget_wrappers()
+
+    for _ in range(SOAK_REBUILDS):
+        app.rebuild()
+
+    assert _live_widget_wrappers() <= settled
