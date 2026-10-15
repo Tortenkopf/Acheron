@@ -43,7 +43,7 @@ Ticket 20: `_wire_status_tracking` subscribes to the Daemon-presence
 (`NameOwnerChanged`) and `DeviceConnectionChanged` signals and keeps a live
 `{"daemon_running", "device_connected"}` dict in sync, rebuilding on every
 transition — the same deferred-via-`GLib.idle_add` pattern as the two
-callbacks above, and for the same reentrancy reason. `rebuild()` only calls
+callbacks above, and for the same reentrancy reason. `refresh()` only calls
 `get_config()`/`get_state()` while `daemon_running` is true (those calls
 would simply fail otherwise); while it isn't, or on a failed call racing a
 just-reported disconnect, it keeps showing the last successfully fetched
@@ -51,6 +51,12 @@ Config (`device_overview.PLACEHOLDER_CONFIG` if there's never been one)
 underneath the status chip's dimmed overlay — `build_status_wrapped_view`
 disables the whole thing either way, so stale data being visible-but-inert
 is harmless.
+
+gui-memory-leak ticket 06: `_wire_rebuild_deferral_while_hidden` gates
+every rebuild trigger (Layer, Profile, status, committed edits). Each one
+still runs `refresh()`, re-reading the Daemon and updating the tray icon,
+but Device Overview itself is only rebuilt while the window is visible,
+and once when it's next shown from the tray.
 
 Ticket 21: `_ensure_daemon_started_on_launch` is the GUI's half of the
 login-autostart-plus-safety-net design (spec.md "Packaging and lifecycle") —
@@ -366,6 +372,45 @@ def _wire_status_tracking(client: DaemonClient, on_change: Callable[[], None]) -
     return status
 
 
+def _wire_rebuild_deferral_while_hidden(
+    window, refresh: Callable[[], None], rebuild_view: Callable[[], None]
+) -> Callable[[], None]:
+    """gui-memory-leak ticket 06: returns the `on_change` every rebuild
+    trigger calls (Layer, Profile, Daemon status, Capture mode, committed
+    edits). It always runs `refresh()` (re-read the Daemon's state and keep
+    the tray icon live). It runs `rebuild_view()` (tear down and rebuild Device
+    Overview) only while `window` is visible. While the window is hidden to
+    the tray (`_wire_window_close_to_hide`), a trigger only marks the view
+    stale, and the next `notify::visible` to shown rebuilds it once. Nobody
+    can see a hidden window's view, and the Mode key alone triggers two
+    rebuilds per tap during a game.
+
+    `notify::visible` covers every way the window comes back: the tray's
+    own activation and a second launch both go through `_present_window`'s
+    `set_visible(True)`. It fires before `present()`, so the window shows
+    current state from its first frame.
+
+    `window` is duck-typed (`get_visible()` + `connect()`), same reasoning
+    as `_wire_focus_tracking`'s own `window` parameter.
+    """
+    stale = {"view": False}
+
+    def on_change() -> None:
+        refresh()
+        if window.get_visible():
+            rebuild_view()
+        else:
+            stale["view"] = True
+
+    def on_visible_changed(*_args) -> None:
+        if window.get_visible() and stale["view"]:
+            stale["view"] = False
+            rebuild_view()
+
+    window.connect("notify::visible", on_visible_changed)
+    return on_change
+
+
 def _wire_window_close_to_hide(window) -> None:
     """Ticket 36's minimize-to-tray: the titlebar close button hides the
     main window instead of destroying it. Returning `True` from
@@ -520,7 +565,8 @@ class AcheronApplication(Gtk.Application):
         # (`org.kde.StatusNotifierItem` + `com.canonical.dbusmenu`), not a
         # widget in `content_box`'s own tree. Held on `self` so it outlives
         # `do_activate` (nothing else keeps it referenced otherwise); kept
-        # in sync by `rebuild()`'s own `update()` call below rather than any
+        # in sync by `refresh()`'s own `update()` call below (on every
+        # trigger, even while the window is hidden) rather than any
         # D-Bus subscriptions of its own, per ticket 36's design.
         self._tray_icon = TrayIcon(
             self._client,
@@ -548,8 +594,7 @@ class AcheronApplication(Gtk.Application):
         # GetConfig().
         last_known = {"config": PLACEHOLDER_CONFIG, "profile": "Default", "layer": "base"}
 
-        def rebuild():
-            clear_children(content_box)
+        def refresh():
             if status["daemon_running"]:
                 try:
                     config = self._client.get_config()
@@ -580,6 +625,10 @@ class AcheronApplication(Gtk.Application):
                     status["capture_mode"] = capture_mode
             current_status = compute_status(status["daemon_running"], status["device_connected"])
             self._tray_icon.update(last_known["config"], last_known["profile"], current_status)
+
+        def rebuild_view():
+            clear_children(content_box)
+            current_status = compute_status(status["daemon_running"], status["device_connected"])
             content_box.append(
                 build_status_wrapped_view(
                     self._client,
@@ -608,6 +657,7 @@ class AcheronApplication(Gtk.Application):
 
             GLib.idle_add(apply)
 
+        rebuild = _wire_rebuild_deferral_while_hidden(win, refresh, rebuild_view)
         self._client.subscribe_layer_changed(on_layer_changed)
         self._client.subscribe_profile_changed(on_profile_changed)
         status = _wire_status_tracking(self._client, rebuild)
@@ -639,6 +689,8 @@ class AcheronApplication(Gtk.Application):
         while context.iteration(False):
             pass
 
+        # The window isn't shown yet, so this only refreshes and marks the
+        # view stale: `_present_window`'s `set_visible(True)` builds it.
         rebuild()
         win.set_child(content_box)
         return win

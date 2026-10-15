@@ -10,6 +10,7 @@ from acheron_gui.app import (
     _ensure_daemon_started_on_launch,
     _present_window,
     _wire_focus_tracking,
+    _wire_rebuild_deferral_while_hidden,
     _wire_status_tracking,
     _wire_window_close_to_hide,
 )
@@ -418,3 +419,118 @@ def test_about_dialog_state_is_none_when_get_state_raises_a_daemon_error():
             raise DaemonError("vanished mid-call")
 
     assert _about_dialog_state(_Boom(), daemon_running=True) is None
+
+
+class _FakeShowableWindow:
+    """Stands in for the main `Gtk.ApplicationWindow`'s visibility — hidden
+    to the tray (`_wire_window_close_to_hide`) and shown again
+    (`_present_window`) — which a headless test has no window manager to
+    drive. Mirrors `_FakeFocusWindow`'s own role above."""
+
+    def __init__(self, visible: bool = True):
+        self._visible = visible
+        self._handlers: list = []
+
+    def get_visible(self) -> bool:
+        return self._visible
+
+    def connect(self, signal_name: str, callback) -> None:
+        assert signal_name == "notify::visible"
+        self._handlers.append(callback)
+
+    def simulate_visibility_change(self, visible: bool) -> None:
+        self._visible = visible
+        for handler in self._handlers:
+            handler(self, None)
+
+
+class _Counter:
+    """A zero-argument callable counting its own calls."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self) -> None:
+        self.calls += 1
+
+
+def _wire_deferral(visible: bool):
+    window = _FakeShowableWindow(visible)
+    refresh, rebuild = _Counter(), _Counter()
+    on_change = _wire_rebuild_deferral_while_hidden(window, refresh, rebuild)
+    return window, refresh, rebuild, on_change
+
+
+def test_rebuild_deferral_refreshes_and_rebuilds_immediately_while_visible():
+    _window, refresh, rebuild, on_change = _wire_deferral(visible=True)
+
+    on_change()
+    on_change()
+
+    assert (refresh.calls, rebuild.calls) == (2, 2)
+
+
+def test_rebuild_deferral_refreshes_but_never_rebuilds_while_hidden():
+    _window, refresh, rebuild, on_change = _wire_deferral(visible=False)
+
+    for _ in range(5):
+        on_change()
+
+    assert (refresh.calls, rebuild.calls) == (5, 0)
+
+
+def test_rebuild_deferral_rebuilds_exactly_once_on_showing_after_hidden_triggers():
+    window, refresh, rebuild, on_change = _wire_deferral(visible=True)
+    window.simulate_visibility_change(False)
+    for _ in range(5):
+        on_change()
+
+    window.simulate_visibility_change(True)
+
+    assert (refresh.calls, rebuild.calls) == (5, 1)
+
+
+def test_rebuild_deferral_does_not_rebuild_on_showing_when_nothing_changed_while_hidden():
+    window, _refresh, rebuild, on_change = _wire_deferral(visible=True)
+    on_change()
+    window.simulate_visibility_change(False)
+
+    window.simulate_visibility_change(True)
+
+    assert rebuild.calls == 1
+
+
+def test_rebuild_deferral_runs_a_deferred_rebuild_only_on_the_first_showing():
+    window, _refresh, rebuild, on_change = _wire_deferral(visible=False)
+    on_change()
+    window.simulate_visibility_change(True)
+    window.simulate_visibility_change(False)
+
+    window.simulate_visibility_change(True)
+
+    assert rebuild.calls == 1
+
+
+def test_rebuild_deferral_does_not_rebuild_on_hiding():
+    window, _refresh, rebuild, on_change = _wire_deferral(visible=True)
+    on_change()
+
+    window.simulate_visibility_change(False)
+
+    assert rebuild.calls == 1
+
+
+def test_rebuild_deferral_still_lets_status_tracking_update_while_hidden():
+    # `_wire_status_tracking` updates `status` before calling `on_change`,
+    # so a hidden window still reopens onto the current status.
+    stub = DaemonStub()
+    _window, refresh, rebuild, on_change = _wire_deferral(visible=False)
+    status = _wire_status_tracking(stub, on_change)
+
+    stub.simulate_device_disconnected()
+    stub.simulate_capture_mode("analog")
+    _pump_idle_callbacks()
+
+    assert status == {"daemon_running": True, "device_connected": False, "capture_mode": "analog"}
+    assert refresh.calls > 0
+    assert rebuild.calls == 0
