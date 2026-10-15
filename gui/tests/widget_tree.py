@@ -92,11 +92,27 @@ def editor_content(btn: Gtk.Widget) -> Gtk.Widget:
     return open_window(btn).get_child()
 
 
+def colour_buttons(root: Gtk.Widget) -> list[Gtk.Button]:
+    """Every Lighting colour swatch button (`device_overview.py::
+    _lighting_colour_button`) under `root`."""
+    return find_all(
+        root,
+        lambda w: isinstance(w, Gtk.Button)
+        and w.get_child() is not None
+        and "lighting-colour-swatch" in w.get_child().get_css_classes(),
+    )
+
+
+def colour_chooser(window: Gtk.Window) -> Gtk.ColorChooserWidget:
+    """The `Gtk.ColorChooserWidget` inside a Lighting colour picker window."""
+    return find_one(window, lambda w: isinstance(w, Gtk.ColorChooserWidget))
+
+
 def pick_colour(btn: Gtk.Widget, rgba: Gdk.RGBA) -> None:
     """Simulates a user picking `rgba` in a Lighting colour button's picker
     window (`device_overview.py::_lighting_colour_button`): opens it, sets
     the embedded `Gtk.ColorChooserWidget`'s value directly, then clicks
     "Select" the same way a real pick would."""
     window = open_window(btn)
-    find_one(window, lambda w: isinstance(w, Gtk.ColorChooserWidget)).set_rgba(rgba)
+    colour_chooser(window).set_rgba(rgba)
     button_labeled(window, "Select").emit("clicked")

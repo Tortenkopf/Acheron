@@ -471,26 +471,18 @@ def make_input_button(
         if on_click_override is not None:
             on_click_override(inp)
             return
-        window = open_editor_window(b)
-        if window is None:
-            window = _build_binding_editor_window(
+        _present_editor_window(
+            b,
+            lambda: _build_binding_editor_window(
                 client, config, profile, layer, inp, on_change, capture_mode, b
-            )
-            b._open_editor_window = window
-        window.set_transient_for(b.get_root())
-        window.present()
-
-    def on_root_changed(b, _pspec):
-        # A rebuild clears the tree this button sits in, taking it out of
-        # the main window: an editor it still has open goes with it, so no
-        # top-level window outlives the Device Overview that spawned it.
-        # Skips the editor's own deferred `on_change()`: this rebuild
-        # already re-reads the config an Apply may have committed.
-        if b.get_root() is None and open_editor_window(b) is not None:
-            _destroy_editor_window(b)
+            ),
+        )
 
     btn.connect("clicked", on_click)
-    btn.connect("notify::root", on_root_changed)
+    # Skips the editor's own deferred `on_change()`: the rebuild that took
+    # `btn` out of the window already re-reads the config an Apply may
+    # have committed.
+    btn.connect("notify::root", _destroy_editor_window_on_leaving_root)
     return btn
 
 
@@ -580,6 +572,17 @@ def _build_binding_editor_window(
     return window
 
 
+def _present_editor_window(btn: Gtk.Button, build: Callable[[], Gtk.Window]) -> None:
+    """Presents the editor window `btn` has open, first building it with
+    `build()` if none is open."""
+    window = open_editor_window(btn)
+    if window is None:
+        window = build()
+        btn._open_editor_window = window
+    window.set_transient_for(btn.get_root())
+    window.present()
+
+
 def _destroy_editor_window(btn: Gtk.Button) -> None:
     """Destroys the editor window `btn` has open and forgets it. Cleared
     here rather than from the window's `destroy` signal, which doesn't fire
@@ -589,12 +592,20 @@ def _destroy_editor_window(btn: Gtk.Button) -> None:
     window.destroy()
 
 
+def _destroy_editor_window_on_leaving_root(btn: Gtk.Button, _pspec) -> None:
+    """`notify::root` handler for an editor button: a rebuild clears the
+    tree `btn` sits in, taking it out of the main window, and an editor it
+    still has open goes with it, so no top-level window outlives the
+    Device Overview that spawned it."""
+    if btn.get_root() is None and open_editor_window(btn) is not None:
+        _destroy_editor_window(btn)
+
+
 def open_editor_window(btn: Gtk.Button) -> Gtk.Window | None:
     """The editor window a Device Overview Input button (`make_input_button`)
     or a Lighting colour button (`_lighting_colour_button`) currently has
-    open, or `None` when none is open. (A Lighting colour button still
-    keeps its pre-built picker until gui-memory-leak ticket 03.) Exposed for tests, which reach
-    an editor's content by clicking the button and then reading this —
+    open, or `None` when none is open. Exposed for tests, which reach an
+    editor's content by clicking the button and then reading this —
     unlike the old Gtk.Popover, there's no `btn.get_popover()`-style GTK API
     for "the window this button opens"."""
     return getattr(btn, "_open_editor_window", None)
@@ -1162,12 +1173,28 @@ def _lighting_colour_button(colour: dict, on_commit: Callable[[dict], None]) -> 
     btn = Gtk.Button(child=swatch)
     btn.set_tooltip_text("Pick a colour")
 
+    def on_click(b):
+        _present_editor_window(b, lambda: _build_colour_picker_window(current, swatch, on_commit, b))
+
+    btn.connect("clicked", on_click)
+    btn.connect("notify::root", _destroy_editor_window_on_leaving_root)
+    return btn
+
+
+def _build_colour_picker_window(
+    current: dict, swatch: Gtk.Picture, on_commit: Callable[[dict], None], btn: Gtk.Button
+) -> Gtk.Window:
+    """The "Pick a colour" window `_lighting_colour_button`'s `btn` opens,
+    pre-set to the swatch's `current` colour. gui-memory-leak ticket 03:
+    built on every open and destroyed on every close, never pre-built and
+    hidden, for the same reason as `_build_binding_editor_window`. Select
+    commits `current` and repaints `swatch`; Cancel and the window's own
+    close commit nothing."""
     chooser = Gtk.ColorChooserWidget()
     chooser.set_use_alpha(False)  # LED colours are opaque; on_commit ignores alpha anyway
-    chooser.set_rgba(_colour_to_rgba(colour))
+    chooser.set_rgba(_colour_to_rgba(current))
 
     window = Gtk.Window(modal=True, title="Pick a colour")
-    window.set_hide_on_close(True)
 
     box = Gtk.Box(
         orientation=Gtk.Orientation.VERTICAL,
@@ -1189,25 +1216,24 @@ def _lighting_colour_button(colour: dict, on_commit: Callable[[dict], None]) -> 
     window.set_child(box)
 
     def on_cancel(_b):
-        chooser.set_rgba(_colour_to_rgba(current))  # discard any in-progress pick
-        window.close()
+        _destroy_editor_window(btn)
 
     def on_select(_b):
         current.update(_rgba_to_colour(chooser.get_rgba()))
         swatch.set_paintable(_solid_colour_texture(current, *_COLOUR_SWATCH_SIZE))
-        window.close()
+        # Destroyed before `on_commit`, so a rebuild it drives never finds
+        # this window still open.
+        _destroy_editor_window(btn)
         on_commit(dict(current))
+
+    def on_close_request(_w):
+        _destroy_editor_window(btn)
+        return True  # already destroyed; stop GTK's own default close
 
     cancel_btn.connect("clicked", on_cancel)
     select_btn.connect("clicked", on_select)
-
-    def on_clicked(_b):
-        window.set_transient_for(btn.get_root())
-        btn._open_editor_window = window
-        window.present()
-
-    btn.connect("clicked", on_clicked)
-    return btn
+    window.connect("close-request", on_close_request)
+    return window
 
 
 _STYLE_OPTIONS = (("random", "Random"), ("single", "Single"), ("dual", "Dual"))

@@ -14,7 +14,7 @@ from acheron_gui.daemon_stub import DaemonStub
 from acheron_gui.device_overview import build_status_wrapped_view, open_editor_window
 from acheron_gui.gtk_utils import clear_children
 
-from .widget_tree import find_one, toplevels
+from .widget_tree import colour_buttons, find_one, toplevels
 
 SOAK_REBUILDS = 15
 
@@ -66,11 +66,43 @@ class _App:
             and w.get_child().get_label().startswith(face),
         )
 
+    def colour_button(self) -> Gtk.Button:
+        return colour_buttons(self.content_box)[0]
+
 
 def test_rebuilding_the_grid_view_leaves_no_toplevel_window_but_the_main_one():
     app = _App()
 
     for _ in range(SOAK_REBUILDS):
+        app.rebuild()
+
+    assert toplevels() == [app.window]
+
+
+def _lighting_app() -> _App:
+    """An `_App` on the Lighting tab, with an effect that has a colour
+    swatch so the tab builds a colour button."""
+    app = _App({"dest": "lighting", "selected_layer": "base"})
+    app.stub.set_lighting({"type": "fixed_effect", "effect": {"type": "static", "colour": {"r": 1, "g": 1, "b": 1}}}, 50)
+    app.rebuild()
+    return app
+
+
+def test_rebuilding_the_lighting_view_leaves_no_toplevel_window_but_the_main_one():
+    app = _lighting_app()
+
+    for _ in range(SOAK_REBUILDS):
+        app.rebuild()
+
+    assert toplevels() == [app.window]
+
+
+def test_rebuilding_while_a_lighting_colour_picker_is_open_leaves_no_toplevel_window_behind():
+    app = _lighting_app()
+
+    for _ in range(SOAK_REBUILDS):
+        app.colour_button().emit("clicked")
+        assert len(toplevels()) == 2
         app.rebuild()
 
     assert toplevels() == [app.window]

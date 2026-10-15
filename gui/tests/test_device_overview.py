@@ -18,7 +18,17 @@ from acheron_gui.device_overview import (
 from acheron_gui.library_view import build_library_sidebar
 from acheron_gui.inputs import ALL_INPUTS, GRID_COLS, GRID_ROWS, grid_input, input_label
 
-from .widget_tree import button_labeled, editor_content, find_all, find_one, pick_colour, toplevels
+from .widget_tree import (
+    button_labeled,
+    colour_buttons,
+    colour_chooser,
+    editor_content,
+    find_all,
+    find_one,
+    open_window,
+    pick_colour,
+    toplevels,
+)
 
 
 def _build(stub, ui_state):
@@ -1022,15 +1032,6 @@ def _params_btn(root, label):
     return find_one(_lighting_params(root), lambda w: isinstance(w, Gtk.Button) and w.get_label() == label)
 
 
-def _colour_buttons(root):
-    return find_all(
-        root,
-        lambda w: isinstance(w, Gtk.Button)
-        and w.get_child() is not None
-        and "lighting-colour-swatch" in w.get_child().get_css_classes(),
-    )
-
-
 def _brightness_scale(root):
     return find_one(root, lambda w: isinstance(w, Gtk.Scale))
 
@@ -1044,7 +1045,7 @@ def _build_lighting(stub, ui_state=None):
 def test_a_lighting_colour_button_exposes_the_picker_window_it_opened_once_clicked():
     stub = DaemonStub()
     stub.set_lighting({"type": "fixed_effect", "effect": {"type": "static", "colour": {"r": 1, "g": 1, "b": 1}}}, 50)
-    btn = _colour_buttons(_build_lighting(stub))[0]
+    btn = colour_buttons(_build_lighting(stub))[0]
 
     assert open_editor_window(btn) is None
 
@@ -1052,7 +1053,74 @@ def test_a_lighting_colour_button_exposes_the_picker_window_it_opened_once_click
 
     window = open_editor_window(btn)
     assert window.get_title() == "Pick a colour"
-    find_one(window, lambda w: isinstance(w, Gtk.ColorChooserWidget))
+    colour_chooser(window)
+
+
+def _picker_rgba(window: Gtk.Window) -> dict:
+    rgba = colour_chooser(window).get_rgba()
+    return {"r": round(rgba.red * 255), "g": round(rgba.green * 255), "b": round(rgba.blue * 255)}
+
+
+def _static_lighting_stub(colour: dict) -> DaemonStub:
+    stub = DaemonStub()
+    stub.set_lighting({"type": "fixed_effect", "effect": {"type": "static", "colour": colour}}, 50)
+    stub.calls.clear()
+    return stub
+
+
+def test_building_the_lighting_tab_builds_no_colour_picker_windows():
+    root = _build_lighting(_static_lighting_stub({"r": 1, "g": 1, "b": 1}))
+
+    assert colour_buttons(root)
+    assert len(toplevels()) == 0
+
+
+def test_a_lighting_colour_picker_opens_preset_to_the_swatchs_current_colour():
+    btn = colour_buttons(_build_lighting(_static_lighting_stub({"r": 0x11, "g": 0x22, "b": 0x33})))[0]
+
+    btn.emit("clicked")
+
+    assert _picker_rgba(open_editor_window(btn)) == {"r": 0x11, "g": 0x22, "b": 0x33}
+
+
+def test_selecting_in_a_lighting_colour_picker_destroys_it_and_reopens_at_the_new_colour():
+    stub = _static_lighting_stub({"r": 1, "g": 1, "b": 1})
+    btn = colour_buttons(_build_lighting(stub))[0]
+
+    pick_colour(btn, _hex_rgba("#445566"))
+
+    assert len(stub.calls) == 1
+    assert open_editor_window(btn) is None
+    assert len(toplevels()) == 0
+    btn.emit("clicked")
+    assert _picker_rgba(open_editor_window(btn)) == {"r": 0x44, "g": 0x55, "b": 0x66}
+
+
+def test_cancelling_a_lighting_colour_picker_commits_nothing_and_destroys_it():
+    stub = _static_lighting_stub({"r": 1, "g": 1, "b": 1})
+    btn = colour_buttons(_build_lighting(stub))[0]
+    window = open_window(btn)
+    colour_chooser(window).set_rgba(_hex_rgba("#ff0000"))
+
+    button_labeled(window, "Cancel").emit("clicked")
+
+    assert stub.calls == []
+    assert open_editor_window(btn) is None
+    assert len(toplevels()) == 0
+    btn.emit("clicked")
+    assert _picker_rgba(open_editor_window(btn)) == {"r": 1, "g": 1, "b": 1}
+
+
+def test_closing_a_lighting_colour_picker_commits_nothing_and_destroys_it():
+    stub = _static_lighting_stub({"r": 1, "g": 1, "b": 1})
+    btn = colour_buttons(_build_lighting(stub))[0]
+    btn.emit("clicked")
+
+    open_editor_window(btn).emit("close-request")
+
+    assert stub.calls == []
+    assert open_editor_window(btn) is None
+    assert len(toplevels()) == 0
 
 
 def test_lighting_is_a_third_arm_of_the_destination_switch_keeping_the_profile_sidebar():
@@ -1139,7 +1207,7 @@ def test_static_colour_picker_commits_the_full_effect_immediately():
     stub.calls.clear()
 
     root = _build_lighting(stub)
-    colour_btn = _colour_buttons(root)[0]
+    colour_btn = colour_buttons(root)[0]
     pick_colour(colour_btn, _hex_rgba("#112233"))
 
     assert stub.calls == [
@@ -1157,7 +1225,7 @@ def test_spectrum_mode_has_no_param_controls():
 
     root = _build_lighting(stub)
 
-    assert _colour_buttons(root) == []
+    assert colour_buttons(root) == []
     assert find_all(_lighting_params(root), lambda w: isinstance(w, Gtk.SpinButton)) == []
 
 
@@ -1185,7 +1253,7 @@ def test_reactive_colour_and_speed_each_commit_the_full_updated_effect():
 
     stub.calls.clear()
     root = _build_lighting(stub)
-    colour_btn = _colour_buttons(root)[0]
+    colour_btn = colour_buttons(root)[0]
     pick_colour(colour_btn, _hex_rgba("#ff0000"))
 
     assert stub.calls == [
@@ -1219,7 +1287,7 @@ def test_breath_style_switch_seeds_default_colours_which_then_commit_by_slot():
     stub.calls.clear()
 
     root = _build_lighting(stub)
-    assert _colour_buttons(root) == []
+    assert colour_buttons(root) == []
     _params_btn(root, "Dual").emit("clicked")
 
     assert stub.calls == [
@@ -1242,7 +1310,7 @@ def test_breath_style_switch_seeds_default_colours_which_then_commit_by_slot():
     stub.calls.clear()
 
     root = _build_lighting(stub)
-    first_btn, second_btn = _colour_buttons(root)
+    first_btn, second_btn = colour_buttons(root)
     pick_colour(second_btn, _hex_rgba("#00ff00"))
 
     assert stub.calls == [
@@ -1276,7 +1344,7 @@ def test_starlight_params_include_style_speed_and_the_style_appropriate_colours(
     stub.calls.clear()
 
     root = _build_lighting(stub)
-    assert len(_colour_buttons(root)) == 1
+    assert len(colour_buttons(root)) == 1
     spin = find_one(_lighting_params(root), lambda w: isinstance(w, Gtk.SpinButton))
     spin.set_value(2)
 
@@ -1395,7 +1463,7 @@ def _pick_paint_colour(root, hex_colour: str) -> None:
     """The custom-layout params panel's own current-colour picker is the
     lone colour-picker button on the tab in this mode (the per-key
     swatches are plain `Gtk.Button`s, not colour pickers)."""
-    pick_colour(_colour_buttons(root)[0], _hex_rgba(hex_colour))
+    pick_colour(colour_buttons(root)[0], _hex_rgba(hex_colour))
 
 
 def test_custom_layout_paint_grid_only_renders_when_custom_layout_is_selected():
