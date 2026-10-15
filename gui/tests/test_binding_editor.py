@@ -499,6 +499,29 @@ def test_depth_track_set_live_value_updates_the_fill_and_tolerates_none():
     assert not track.fill.get_visible()
 
 
+def test_dragging_a_depth_track_marker_reports_the_move_and_the_drop():
+    """The drag gesture reaches the bar through the gesture itself, not a
+    held reference — so this drags with nothing in Python holding the bar,
+    as in a built editor."""
+    moved, dropped = [], []
+    box = Gtk.Box()
+    box.append(
+        DepthTrack(
+            markers=[{"value": 128, "css": "marker-actuation", "draggable": True}],
+            on_marker_moved=lambda i, v: moved.append((i, v)),
+            on_drag_end=lambda i, v: dropped.append((i, v)),
+        )
+    )
+    drag = box.get_first_child().observe_controllers().get_item(0)
+
+    drag.emit("drag-begin", 160.0, 0.0)
+    drag.emit("drag-update", 64.0, 0.0)
+    drag.emit("drag-end", 64.0, 0.0)
+
+    assert moved == [(0, 179)]
+    assert dropped == [(0, 179)]
+
+
 # --- Key/mouse-button picker (ticket 42) ---
 
 

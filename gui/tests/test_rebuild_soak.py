@@ -2,19 +2,30 @@
 # Copyright © 2026 Justin Milatz
 
 """Soak tests for the GUI memory leak across Device Overview rebuilds
-(`.scratch/gui-memory-leak`). They drive the app's real rebuild path —
-`build_status_wrapped_view` into one persistent box, through a `rebuild`
-closure shaped like `app.py`'s own (clear the box, rebuild into it, pass
-`rebuild` itself as `on_change`) — many times over, pumping the main
-context in between the way a running main loop would."""
+and Binding-editor opens (`.scratch/gui-memory-leak`). They drive the
+app's real rebuild path — `build_status_wrapped_view` into one persistent
+box, through a `rebuild` closure shaped like `app.py`'s own (clear the box,
+rebuild into it, pass `rebuild` itself as `on_change`) — many times over,
+pumping the main context in between the way a running main loop would.
 
+"Freed" is checked with GObject weak references (`GObject.Object.weak_ref`,
+on the widget itself, not its short-lived Python wrapper) to every widget of
+a tree, taken while it was still built: after `gc.collect()`, none may still
+resolve. A widget kept alive by a reference cycle that crosses GTK's own
+C-side ownership (a signal handler capturing its widget's ancestor) never
+does."""
+
+import gc
+
+import pytest
 from gi.repository import GLib, Gtk
 
 from acheron_gui.daemon_stub import DaemonStub
 from acheron_gui.device_overview import build_status_wrapped_view, open_editor_window
 from acheron_gui.gtk_utils import clear_children
+from acheron_gui.inputs import ACTION_TYPES, input_label
 
-from .widget_tree import colour_buttons, find_one, toplevels
+from .widget_tree import button_labeled, colour_buttons, find_all, find_one, toplevels, walk
 
 SOAK_REBUILDS = 15
 
@@ -26,6 +37,34 @@ def _pump_main_context() -> None:
     context = GLib.MainContext.default()
     while context.iteration(False):
         pass
+
+
+def _weak_widgets(root: Gtk.Widget) -> list:
+    """A GObject weak reference to every widget currently in `root`'s tree."""
+    return [w.weak_ref() for w in walk(root)]
+
+
+def _survivors(refs: list) -> list[str]:
+    """The type names of every widget in `refs` still alive once the main
+    context is pumped and the cycle collector has run to a fixed point —
+    one collection can free a widget whose disposal only then lets GTK drop
+    the last references to others."""
+    _pump_main_context()
+    while gc.collect():
+        _pump_main_context()
+    return sorted(type(w).__name__ for w in (r() for r in refs) if w is not None)
+
+
+def _action_dropdown(root: Gtk.Widget) -> Gtk.DropDown:
+    """The (first) Action dropdown in a Binding editor: the plain editor
+    has one, the grid key's dual-stage panel one per stage."""
+    row = find_all(
+        root,
+        lambda w: isinstance(w, Gtk.Box)
+        and isinstance(w.get_first_child(), Gtk.Label)
+        and w.get_first_child().get_label() == "Action",
+    )[0]
+    return find_one(row, lambda w: isinstance(w, Gtk.DropDown))
 
 
 class _App:
@@ -128,4 +167,101 @@ def test_opening_and_closing_an_editor_leaves_no_toplevel_window_behind():
         open_editor_window(btn).emit("close-request")
         _pump_main_context()
 
+    assert toplevels() == [app.window]
+
+
+def test_rebuilding_while_an_editor_is_open_frees_that_editor():
+    app = _App()
+    refs = []
+
+    for _ in range(SOAK_REBUILDS):
+        app.input_button("1").emit("clicked")
+        refs += _weak_widgets(open_editor_window(app.input_button("1")))
+        app.rebuild()
+
+    assert _survivors(refs) == []
+
+
+@pytest.mark.parametrize("inp", ["grid_r1c1", "mode_key"])
+def test_opening_and_closing_an_editor_frees_it(inp):
+    app = _App()
+    btn = app.input_button(input_label(inp))
+    refs = []
+
+    for _ in range(SOAK_REBUILDS):
+        btn.emit("clicked")
+        window = open_editor_window(btn)
+        refs += _weak_widgets(window)
+        window.emit("close-request")
+        del window
+
+    assert _survivors(refs) == []
+    assert toplevels() == [app.window]
+
+
+@pytest.mark.parametrize("inp", ["grid_r1c1", "mode_key"])
+def test_saving_and_closing_an_editor_frees_it(inp):
+    app = _App()
+    refs = []
+
+    for _ in range(SOAK_REBUILDS):
+        btn = app.input_button(input_label(inp))
+        btn.emit("clicked")
+        window = open_editor_window(btn)
+        refs += _weak_widgets(window)
+        button_labeled(window, "Save").emit("clicked")
+        del window, btn
+
+    assert _survivors(refs) == []
+    assert toplevels() == [app.window]
+
+
+def test_applying_in_a_grid_keys_editor_frees_the_panel_it_replaces():
+    app = _App()
+    btn = app.input_button("1")
+    btn.emit("clicked")
+    window = open_editor_window(btn)
+    refs = []
+
+    for _ in range(SOAK_REBUILDS):
+        refs += _weak_widgets(window)
+        button_labeled(window, "Apply").emit("clicked")
+    refs += _weak_widgets(window)
+    window.emit("close-request")
+    del window
+
+    assert _survivors(refs) == []
+    assert toplevels() == [app.window]
+
+
+_EDITOR_KINDS = [
+    (inp, kind)
+    for inp in ("grid_r1c1", "mode_key")
+    for kind, _ in ACTION_TYPES
+    if kind != "axis" or inp == "grid_r1c1"  # Axis is offered on grid keys only
+]
+
+
+@pytest.mark.parametrize(("inp", "kind"), _EDITOR_KINDS)
+def test_each_action_kinds_editor_fields_are_freed(inp, kind):
+    app = _App()
+    btn = app.input_button(input_label(inp))
+    refs = []
+
+    for _ in range(SOAK_REBUILDS // 3):
+        btn.emit("clicked")
+        window = open_editor_window(btn)
+        action_dd = _action_dropdown(window)
+        offered = [action_dd.get_model().get_string(i) for i in range(action_dd.get_model().get_n_items())]
+        chosen = offered.index(dict(ACTION_TYPES)[kind])
+        action_dd.set_selected(chosen)
+        refs += _weak_widgets(window)
+        # On to another kind, so the chosen kind's fields leave the tree
+        # while the editor is still open.
+        action_dd.set_selected(1 if chosen == 0 else 0)
+        refs += _weak_widgets(window)
+        window.emit("close-request")
+        del window, action_dd
+
+    assert _survivors(refs) == []
     assert toplevels() == [app.window]

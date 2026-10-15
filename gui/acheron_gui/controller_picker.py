@@ -228,7 +228,12 @@ def build_inline_controller_picker(
     def render_summary():
         summary_label.set_label(f"Selected: {LABEL_BY_CODE.get(state['code'], state['code'])}")
 
+    # Weak: the buttons inside `panel` reach this via `on_pick` (CONTRIBUTING.md,
+    # "GUI signal handlers").
+    panel_ref = panel.weak_ref()
+
     def render_panel():
+        panel = panel_ref()
         clear_children(panel)
         panel.append(_pad_diagram(on_pick, state["code"]))
         panel.append(_extra_grid(on_pick, state["code"]))

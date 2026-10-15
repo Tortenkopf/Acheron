@@ -188,10 +188,16 @@ class DepthTrack(Gtk.Overlay):
             self.add_overlay(mw)
             self.marker_widgets.append(mw)
 
+        # Not bound methods: a controller this bar owns must not hold the bar
+        # itself (CONTRIBUTING.md, "GUI signal handlers"), so each handler
+        # reads the bar back off the gesture instead.
         drag = Gtk.GestureDrag()
-        drag.connect("drag-begin", self._on_drag_begin)
-        drag.connect("drag-update", self._on_drag_update)
-        drag.connect("drag-end", self._on_drag_end)
+        for signal, handler in (
+            ("drag-begin", DepthTrack._on_drag_begin),
+            ("drag-update", DepthTrack._on_drag_update),
+            ("drag-end", DepthTrack._on_drag_end),
+        ):
+            drag.connect(signal, lambda g, x, y, handler=handler: handler(g.get_widget(), g, x, y))
         self.add_controller(drag)
         self._drag_index: int | None = None
         self._drag_start_value = 0
@@ -848,6 +854,9 @@ def build_action_and_trigger_fields(
     # `render_action_editor()`, which is where an Action-kind change can pull
     # `analog_repeat` out of the model entirely (Profile Switch, Axis).
     analog_hint = Gtk.Label(label=_ANALOG_REPEAT_HINT, xalign=0, wrap=True, css_classes=["dim"])
+    # Weak: `trigger_dd`'s and `action_dd`'s handlers reach this, and both sit
+    # inside `fields` (CONTRIBUTING.md, "GUI signal handlers").
+    fields_ref, trigger_row_ref = fields.weak_ref(), trigger_row.weak_ref()
 
     def sync_analog_hint() -> None:
         idx = trigger_dd.get_selected()
@@ -855,9 +864,9 @@ def build_action_and_trigger_fields(
         want = selected == "analog_repeat"
         present = analog_hint.get_parent() is not None
         if want and not present:
-            fields.insert_child_after(analog_hint, trigger_row)
+            fields_ref().insert_child_after(analog_hint, trigger_row_ref())
         elif present and not want:
-            fields.remove(analog_hint)
+            fields_ref().remove(analog_hint)
 
     trigger_dd.connect("notify::selected", lambda *_: sync_analog_hint())
 
@@ -1452,7 +1461,12 @@ def build_dual_stage_panel(
         if track_holder["track"] is not None:
             track_holder["track"].set_live_value(depth)
 
+    # Weak: every handler inside `panel` reaches `rebuild` (CONTRIBUTING.md,
+    # "GUI signal handlers").
+    panel_ref = panel.weak_ref()
+
     def rebuild() -> None:
+        panel = panel_ref()
         capture_draft()
         clear_children(panel)
 
