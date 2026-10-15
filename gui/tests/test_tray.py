@@ -363,3 +363,56 @@ def test_update_emits_new_icon_new_title_and_new_status():
     assert icon_calls == [None]
     assert title_calls == [None]
     assert status_calls == ["Active"]
+
+
+def _record_every_signal(bus):
+    """Every signal the tray sends the host, in order, by name."""
+    menu = bus.published[MENU_OBJECT_PATH]
+    item = bus.published[ITEM_OBJECT_PATH]
+    sent = []
+    menu.LayoutUpdated.connect(lambda *_a: sent.append("LayoutUpdated"))
+    menu.ItemsPropertiesUpdated.connect(lambda *_a: sent.append("ItemsPropertiesUpdated"))
+    item.NewIcon.connect(lambda: sent.append("NewIcon"))
+    item.NewTitle.connect(lambda: sent.append("NewTitle"))
+    item.NewStatus.connect(lambda _s: sent.append("NewStatus"))
+    return sent
+
+
+def test_an_update_that_changes_nothing_sends_the_host_nothing():
+    # Every Mode-key press and release reaches update() unchanged; each
+    # signal costs gnome-shell a menu/icon re-fetch (gui-memory-leak ticket 08).
+    tray, bus, _show, _quit = _make_tray()
+    config = {"profiles": {"Default": {}, "Gaming": {}}}
+    tray.update(config, "Default", "running_connected")
+    sent = _record_every_signal(bus)
+    revision = _menu_layout(bus)[0].GetLayout(0, -1, [])[0]
+
+    for _ in range(3):
+        tray.update({"profiles": {"Default": {}, "Gaming": {}}}, "Default", "running_connected")
+
+    assert sent == []
+    assert _menu_layout(bus)[0].GetLayout(0, -1, [])[0] == revision
+
+
+def test_the_first_update_publishes_the_menu_and_icon():
+    tray, bus, _show, _quit = _make_tray()
+    sent = _record_every_signal(bus)
+
+    tray.update({"profiles": {"Default": {}}}, "Default", "not_running")
+
+    assert sent == ["LayoutUpdated", "NewIcon", "NewTitle", "NewStatus"]
+
+
+def test_an_update_signals_when_the_status_profile_or_profile_list_changes():
+    tray, bus, _show, _quit = _make_tray()
+    tray.update({"profiles": {"Default": {}}}, "Default", "running_connected")
+    sent = _record_every_signal(bus)
+
+    tray.update({"profiles": {"Default": {}}}, "Default", "running_disconnected")
+    tray.update({"profiles": {"Default": {}, "Gaming": {}}}, "Default", "running_disconnected")
+    tray.update({"profiles": {"Default": {}, "Gaming": {}}}, "Gaming", "running_disconnected")
+    tray.update({"profiles": {"Default": {}, "Racing": {}}}, "Default", "running_disconnected")
+    tray.update({"profiles": {"Default": {}}}, "Default", "running_disconnected")
+
+    assert sent.count("LayoutUpdated") == 5
+    assert sent.count("NewIcon") == 5
