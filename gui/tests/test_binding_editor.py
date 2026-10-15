@@ -13,7 +13,7 @@ from acheron_gui.binding_editor import (
 )
 from acheron_gui.daemon_client import InvalidBindingError
 from acheron_gui.daemon_stub import DaemonStub
-from acheron_gui.device_overview import make_input_button
+from acheron_gui.device_overview import make_input_button, open_editor_window
 from acheron_gui.inputs import ACTION_TYPES, TRIGGER_OPTIONS
 
 from .widget_tree import button_labeled, editor_content, find_all, find_one
@@ -1838,7 +1838,9 @@ def _dismiss(btn):
     # `Gtk.Window.close()` only emits `close-request` for a realized window,
     # which a headless test never has — emit it directly, standing in for the
     # WM close button / Escape / Save's own `window.close()`.
-    btn.binding_editor_window.emit("close-request")
+    window = open_editor_window(btn)
+    assert window is not None, "no editor window is open to dismiss"
+    window.emit("close-request")
 
 
 def test_apply_button_is_plain_while_save_keeps_the_accent():
@@ -1983,6 +1985,7 @@ def test_open_and_close_with_no_commit_drives_no_on_change():
     stub = DaemonStub()
     btn, changed = _grid_editor_button(stub)
 
+    btn.emit("clicked")
     _dismiss(btn)
 
     assert changed == []

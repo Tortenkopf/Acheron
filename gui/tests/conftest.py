@@ -22,3 +22,14 @@ def _tray_icon_dir(tmp_path, monkeypatch):
     on construction. Redirect that to a per-test tmp dir so the suite never
     writes into the real user data dir."""
     monkeypatch.setenv("ACHERON_TRAY_ICON_DIR", str(tmp_path / "tray-icons"))
+
+
+@pytest.fixture(autouse=True)
+def _no_real_window_presentation(monkeypatch):
+    """Tests reach an editor window by clicking its button, whose handler
+    calls `Gtk.Window.present()`. With a compositor around, that would map
+    a real (modal) window on the developer's desktop for every click, and
+    without one its behaviour isn't something to depend on. Tests only ever
+    read the window's content through `open_editor_window`, so presenting is
+    a no-op here."""
+    monkeypatch.setattr(Gtk.Window, "present", lambda self: None)

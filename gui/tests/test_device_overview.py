@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright © 2026 Justin Milatz
 
-from gi.repository import Gdk, Gtk, Pango
+from gi.repository import Gdk, GLib, Gtk, Pango
 
 from acheron_gui.app import CSS
 from acheron_gui.daemon_client import AlreadyExistsError, DaemonError, NotFoundError
@@ -12,6 +12,8 @@ from acheron_gui.device_overview import (
     build_main_view,
     build_status_wrapped_view,
     compute_status,
+    make_input_button,
+    open_editor_window,
 )
 from acheron_gui.library_view import build_library_sidebar
 from acheron_gui.inputs import ALL_INPUTS, GRID_COLS, GRID_ROWS, grid_input, input_label
@@ -119,18 +121,45 @@ def test_grid_destination_selection_survives_a_rebuild():
     assert len(input_buttons) == len(ALL_INPUTS)
 
 
-def _grid_button(root, label, profile="Default", layer="base"):
-    """Locates one specific device button by the title its
-    `binding_editor_window` was built with — every device button carries
-    this attribute (`make_input_button`), unique per `(profile, layer,
-    input_label)`."""
-    title = f"{profile} / {layer} / {label}"
+def _grid_button(root, label):
+    """Locates one specific device button by the bold Input label on its
+    face (`make_input_button`) — unique within one built Device Overview.
+    Not by its editor window's title: finding a button that way means
+    clicking it, which in "Select Chord members" mode records a Chord
+    member instead of opening an editor."""
+    face = f"<b>{GLib.markup_escape_text(label)}</b>\n"
     return find_one(
         root,
         lambda w: isinstance(w, Gtk.Button)
-        and getattr(w, "binding_editor_window", None) is not None
-        and w.binding_editor_window.get_title() == title,
+        and isinstance(w.get_child(), Gtk.Label)
+        and w.get_child().get_label().startswith(face),
     )
+
+
+def test_an_input_button_exposes_the_editor_window_it_opened_once_clicked():
+    stub = DaemonStub()
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+
+    assert open_editor_window(btn) is None
+
+    btn.emit("clicked")
+
+    window = open_editor_window(btn)
+    assert window.get_title() == "Default / base / 1"
+    find_one(window.get_child(), lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Save")
+
+
+def test_an_input_button_in_chord_selecting_mode_opens_no_editor_window():
+    stub = DaemonStub()
+    picked = []
+    btn = make_input_button(
+        stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None, on_click_override=picked.append
+    )
+
+    btn.emit("clicked")
+
+    assert picked == ["grid_r1c1"]
+    assert open_editor_window(btn) is None
 
 
 def test_device_buttons_are_a_fixed_size_cap_not_a_growing_floor():
@@ -952,7 +981,10 @@ def _params_btn(root, label):
 
 def _colour_buttons(root):
     return find_all(
-        root, lambda w: isinstance(w, Gtk.Button) and getattr(w, "colour_picker_window", None) is not None
+        root,
+        lambda w: isinstance(w, Gtk.Button)
+        and w.get_child() is not None
+        and "lighting-colour-swatch" in w.get_child().get_css_classes(),
     )
 
 
@@ -964,6 +996,20 @@ def _build_lighting(stub, ui_state=None):
     ui_state = dict(ui_state or {})
     ui_state["dest"] = "lighting"
     return _build(stub, ui_state)
+
+
+def test_a_lighting_colour_button_exposes_the_picker_window_it_opened_once_clicked():
+    stub = DaemonStub()
+    stub.set_lighting({"type": "fixed_effect", "effect": {"type": "static", "colour": {"r": 1, "g": 1, "b": 1}}}, 50)
+    btn = _colour_buttons(_build_lighting(stub))[0]
+
+    assert open_editor_window(btn) is None
+
+    btn.emit("clicked")
+
+    window = open_editor_window(btn)
+    assert window.get_title() == "Pick a colour"
+    find_one(window, lambda w: isinstance(w, Gtk.ColorChooserWidget))
 
 
 def test_lighting_is_a_third_arm_of_the_destination_switch_keeping_the_profile_sidebar():

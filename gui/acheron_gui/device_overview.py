@@ -541,15 +541,21 @@ def make_input_button(
             on_click_override(inp)
             return
         window.set_transient_for(btn.get_root())
+        btn._open_editor_window = window
         window.present()
 
     btn.connect("clicked", on_click)
-    # Exposed for tests, which need to reach the editor's content without
-    # actually presenting a real top-level window in a headless run (unlike
-    # the old Gtk.Popover, there's no `btn.get_popover()`-style GTK API for
-    # "the window this button opens").
-    btn.binding_editor_window = window
     return btn
+
+
+def open_editor_window(btn: Gtk.Button) -> Gtk.Window | None:
+    """The editor window a Device Overview Input button (`make_input_button`)
+    or a Lighting colour button (`_lighting_colour_button`) currently has
+    open, or `None` before it has opened one. Exposed for tests, which reach
+    an editor's content by clicking the button and then reading this —
+    unlike the old Gtk.Popover, there's no `btn.get_popover()`-style GTK API
+    for "the window this button opens"."""
+    return getattr(btn, "_open_editor_window", None)
 
 
 def build_device_geometry(cell_factory: Callable[[str, int, int], Gtk.Widget]) -> Gtk.Widget:
@@ -726,9 +732,8 @@ def build_chords_section(
                 chord_ui["edit_key"],
             )
             # Exposed for tests, which need to reach a fresh dialog's
-            # content without a real windowing system — mirrors
-            # `make_input_button`'s own `btn.binding_editor_window`, except
-            # this one is rebuilt per click rather than built once, since
+            # content without a real windowing system — the Chord dialog's
+            # counterpart to `open_editor_window`, rebuilt per click since
             # `members`/`existing` differ every time.
             binding_btn.last_chord_dialog = dialog
             dialog.present()
@@ -1156,13 +1161,10 @@ def _lighting_colour_button(colour: dict, on_commit: Callable[[dict], None]) -> 
 
     def on_clicked(_b):
         window.set_transient_for(btn.get_root())
+        btn._open_editor_window = window
         window.present()
 
     btn.connect("clicked", on_clicked)
-    # Exposed for tests, which need to reach the picker without actually
-    # presenting a real top-level window in a headless run — same reason
-    # `make_input_button`'s `btn.binding_editor_window` is exposed.
-    btn.colour_picker_window = window
     return btn
 
 

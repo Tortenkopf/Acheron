@@ -28,6 +28,8 @@ from collections.abc import Callable, Iterator
 
 from gi.repository import Gdk, Gtk
 
+from acheron_gui.device_overview import open_editor_window
+
 
 def walk(widget: Gtk.Widget, _seen: set[Gtk.Widget] | None = None) -> Iterator[Gtk.Widget]:
     if _seen is None:
@@ -65,19 +67,29 @@ def button_labeled(root: Gtk.Widget, label: str) -> Gtk.Button:
     return find_one(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == label)
 
 
+def open_window(btn: Gtk.Widget) -> Gtk.Window:
+    """The editor window `btn` has open, clicking it first if nothing is
+    open yet — the same path a user takes. `present()` is a no-op under
+    test (see `conftest.py`), so no real window is ever mapped."""
+    if open_editor_window(btn) is None:
+        btn.emit("clicked")
+    window = open_editor_window(btn)
+    assert window is not None, "clicking the button opened no editor window"
+    return window
+
+
 def editor_content(btn: Gtk.Widget) -> Gtk.Widget:
     """The Binding-editor content of a Device Overview grid button. Since
-    ticket 44's Popover->Window conversion, that's `btn.binding_editor_window
-    .get_child()` rather than a `Gtk.Popover`; centralized here so the
-    accessor only needs updating in one place if it changes again."""
-    return btn.binding_editor_window.get_child()
+    ticket 44's Popover->Window conversion, that's the content of the
+    window the button opens rather than a `Gtk.Popover`."""
+    return open_window(btn).get_child()
 
 
 def pick_colour(btn: Gtk.Widget, rgba: Gdk.RGBA) -> None:
     """Simulates a user picking `rgba` in a Lighting colour button's picker
-    window (`device_overview.py::_lighting_colour_button`) without actually
-    presenting it: sets the embedded `Gtk.ColorChooserWidget`'s value
-    directly, then clicks "Select" the same way a real pick would."""
-    window = btn.colour_picker_window
+    window (`device_overview.py::_lighting_colour_button`): opens it, sets
+    the embedded `Gtk.ColorChooserWidget`'s value directly, then clicks
+    "Select" the same way a real pick would."""
+    window = open_window(btn)
     find_one(window, lambda w: isinstance(w, Gtk.ColorChooserWidget)).set_rgba(rgba)
     button_labeled(window, "Select").emit("clicked")

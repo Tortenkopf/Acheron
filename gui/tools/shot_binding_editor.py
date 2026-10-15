@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import acheron_gui.app as _app_mod  # noqa: E402
 from acheron_gui.app import AcheronApplication  # noqa: E402
 from acheron_gui.daemon_stub import DaemonStub  # noqa: E402
+from acheron_gui.device_overview import open_editor_window  # noqa: E402
 
 
 class _NoTray:
@@ -72,22 +73,18 @@ def _items(dd):
     return [m.get_string(i) for i in range(m.get_n_items())]
 
 
-def _editor_window(app):
-    """The single modal Binding-editor Gtk.Window (make_input_button exposes
-    it on every grid button as `.binding_editor_window`)."""
+def _input_button(app, label: str):
+    """The Device Overview Input button whose face starts with the bold
+    Input `label` (make_input_button's markup)."""
+    face = f"<b>{GLib.markup_escape_text(label)}</b>\n"
     for w in _walk(app.get_active_window()):
-        bew = getattr(w, "binding_editor_window", None)
-        if bew is not None:
-            return bew
-    raise AssertionError("no binding_editor_window found in the widget tree")
-
-
-def _input_button(app, title_suffix: str):
-    for w in _walk(app.get_active_window()):
-        bew = getattr(w, "binding_editor_window", None)
-        if bew is not None and bew.get_title().split("/")[-1].strip() == title_suffix:
+        if (
+            isinstance(w, Gtk.Button)
+            and isinstance(w.get_child(), Gtk.Label)
+            and w.get_child().get_label().startswith(face)
+        ):
             return w
-    raise AssertionError(f"no input button whose editor title ends {title_suffix!r}")
+    raise AssertionError(f"no input button labelled {label!r}")
 
 
 def _action_trigger_dd(win):
@@ -132,12 +129,10 @@ def main() -> None:
     app.set_application_id("com.acheron.gui.shot95")
     app.set_flags(Gio.ApplicationFlags.NON_UNIQUE)
 
-    def open_editor(title_suffix):
-        btn = _input_button(app, title_suffix)
-        bew = btn.binding_editor_window
-        bew.set_transient_for(app.get_active_window())
-        bew.present()
-        return bew
+    def open_editor(label):
+        btn = _input_button(app, label)
+        btn.emit("clicked")  # builds/presents the editor transient for the main window
+        return open_editor_window(btn)
 
     def select_action(bew, label):
         add, _ = _action_trigger_dd(bew)
