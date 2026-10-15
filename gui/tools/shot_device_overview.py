@@ -65,10 +65,13 @@ def _walk(widget):
 
 
 def _grid_buttons(root):
+    """Every Device Overview Input button (make_input_button), each paired
+    with its Input label — the bold first line of its face."""
     return [
-        w
+        (w.get_child().get_text().split("\n")[0], w)
         for w in _walk(root)
-        if isinstance(w, Gtk.Button) and getattr(w, "binding_editor_window", None) is not None
+        if isinstance(w, Gtk.Button)
+        and {"bound", "empty", "axis-stripe"} & set(w.get_css_classes())
     ]
 
 
@@ -126,13 +129,10 @@ def main() -> None:
         win = app.get_active_window()
         _shot(win, outdir / "device_overview.png")
         with open(outdir / "tooltips.txt", "w") as fh:
-            for btn in sorted(
-                _grid_buttons(win), key=lambda b: b.binding_editor_window.get_title()
-            ):
-                title = btn.binding_editor_window.get_title()
+            for label, btn in sorted(_grid_buttons(win), key=lambda pair: pair[0]):
                 tip = btn.get_tooltip_text()
-                fh.write(f"{title}\n    tooltip: {tip!r}\n")
-                print(f"{title} -> {tip!r}")
+                fh.write(f"{label}\n    tooltip: {tip!r}\n")
+                print(f"{label} -> {tip!r}")
         app.quit()
 
     app.connect("activate", lambda _a: GLib.timeout_add(900, run))

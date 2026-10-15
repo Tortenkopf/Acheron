@@ -337,6 +337,9 @@ class TrayIcon:
         self._on_show_window = on_show_window
         self._on_quit = on_quit
         self._status = "not_running"
+        # The (status, profile, Profile names) the last `update()`
+        # published, `None` until the first one.
+        self._shown: tuple[str, str, list[str]] | None = None
         self._menu_model = MenuModel()
 
         # Ticket 97: the SNI host reads the status-dot SVGs from a stable
@@ -371,10 +374,21 @@ class TrayIcon:
         `config` as-is, including while it's `app.py`'s own stale
         `last_known`/`PLACEHOLDER_CONFIG` during a Daemon outage — same
         "keep showing the last-known data" tradeoff `app.py`'s `rebuild()`
-        already accepts for the main window."""
+        already accepts for the main window.
+
+        A no-op when `status`, `profile` and the Profile list all match the
+        last call (gui-memory-leak ticket 08). `app.py` calls this on every
+        trigger, including each Mode-key press and release, and a Layer
+        change never alters the tray. Every signal below makes the SNI host
+        (GNOME's appindicator extension, inside gnome-shell) re-fetch the
+        menu and icon, and a hidden-in-tray Mode-key session's flood of
+        them left the whole desktop unresponsive to clicks."""
+        profiles = list(config["profiles"])
+        shown = (status, profile, profiles)
+        if shown == self._shown:
+            return
         self._status = status
         daemon_running = status != "not_running"
-        profiles = list(config["profiles"])
 
         def toggle_daemon(daemon_running: bool = daemon_running) -> None:
             try:
@@ -408,6 +422,8 @@ class TrayIcon:
         self._item_service.NewIcon()
         self._item_service.NewTitle()
         self._item_service.NewStatus("Active")
+        # Recorded only once published, so a failure above retries next time.
+        self._shown = shown
 
     def _switch_profile(self, name: str) -> None:
         try:

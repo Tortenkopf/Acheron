@@ -131,6 +131,26 @@ and it can be verified before merge.
 - Match the surrounding code — its naming, comment density, and idioms. The
   existing files are the style guide.
 
+- **GUI signal handlers must not hold their widget's ancestors.** A handler
+  connected on a widget or event controller must not strongly reach (through
+  its closure, however indirectly) any ancestor of that widget, nor the
+  widget that owns the controller. GTK's parent→child and
+  widget→controller ownership lives on the C side, where Python's cycle
+  collector can't see it, so such a cycle is never freed: every rebuilt or
+  closed subtree leaks. The usual trap is a `render()` closure that
+  captures the container it clears and refills, reached from the buttons it
+  puts inside that container. Instead:
+  - read the target off the signal's emitter (`gesture.get_widget()`,
+    `widget.get_ancestor(Gtk.Popover)`), or
+  - hold it through `widget.weak_ref()` and resolve that at call time. Not
+    Python's `weakref.ref(widget)`: that refers to the short-lived PyGObject
+    wrapper, which dies as soon as Python drops it even while the widget
+    lives on.
+
+  Capturing the widget itself, a sibling, or a descendant is fine.
+  `gui/tests/test_rebuild_soak.py` checks for this (gui-memory-leak ticket
+  04).
+
 - **Adding a new mutating D-Bus method** (ticket 05 / 11). Every mutating
   operation flows wire args → `edit::Edit` variant → `edit::plan` arm →
   `dispatch`'s single `Command::Apply` arm (no per-operation code) → an

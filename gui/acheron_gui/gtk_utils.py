@@ -62,7 +62,7 @@ def build_name_prompt_popover(
     error_label.set_visible(False)
     box.append(error_label)
 
-    def on_submit_clicked(_widget):
+    def on_submit_clicked(widget):
         name = entry.get_text().strip()
         if not name:
             error_label.set_label("Name can't be empty")
@@ -74,7 +74,9 @@ def build_name_prompt_popover(
             error_label.set_label(f"{client_error_context}: {exc}")
             error_label.set_visible(True)
             return
-        popover.popdown()
+        # Read off the emitter (the Entry or the submit button), not
+        # captured (CONTRIBUTING.md, "GUI signal handlers").
+        widget.get_ancestor(Gtk.Popover).popdown()
 
     submit_btn = Gtk.Button(label=submit_label)
     submit_btn.add_css_class("suggested-action")

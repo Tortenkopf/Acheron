@@ -372,7 +372,12 @@ def build_inline_key_picker(
     def render_summary():
         summary_label.set_label(f"Selected: {LABEL_BY_CODE.get(state['code'], state['code'])}")
 
+    # Weak: the keycaps inside `grid_slot` reach this via `on_pick` (CONTRIBUTING.md,
+    # "GUI signal handlers").
+    grid_slot_ref = grid_slot.weak_ref()
+
     def render_grid():
+        grid_slot = grid_slot_ref()
         clear_children(grid_slot)
         grid_slot.append(_keyboard_grid(on_pick, state["code"]))
 

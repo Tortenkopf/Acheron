@@ -28,6 +28,8 @@ from collections.abc import Callable, Iterator
 
 from gi.repository import Gdk, Gtk
 
+from acheron_gui.device_overview import open_editor_window
+
 
 def walk(widget: Gtk.Widget, _seen: set[Gtk.Widget] | None = None) -> Iterator[Gtk.Widget]:
     if _seen is None:
@@ -65,19 +67,52 @@ def button_labeled(root: Gtk.Widget, label: str) -> Gtk.Button:
     return find_one(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == label)
 
 
+def toplevels() -> list[Gtk.Window]:
+    """Every top-level window GTK is still holding in its process-wide
+    list, i.e. every one not yet destroyed."""
+    model = Gtk.Window.get_toplevels()
+    return [model.get_item(i) for i in range(model.get_n_items())]
+
+
+def open_window(btn: Gtk.Widget) -> Gtk.Window:
+    """The editor window `btn` has open, clicking it first if nothing is
+    open yet — the same path a user takes. `present()` is a no-op under
+    test (see `conftest.py`), so no real window is ever mapped."""
+    if open_editor_window(btn) is None:
+        btn.emit("clicked")
+    window = open_editor_window(btn)
+    assert window is not None, "clicking the button opened no editor window"
+    return window
+
+
 def editor_content(btn: Gtk.Widget) -> Gtk.Widget:
     """The Binding-editor content of a Device Overview grid button. Since
-    ticket 44's Popover->Window conversion, that's `btn.binding_editor_window
-    .get_child()` rather than a `Gtk.Popover`; centralized here so the
-    accessor only needs updating in one place if it changes again."""
-    return btn.binding_editor_window.get_child()
+    ticket 44's Popover->Window conversion, that's the content of the
+    window the button opens rather than a `Gtk.Popover`."""
+    return open_window(btn).get_child()
+
+
+def colour_buttons(root: Gtk.Widget) -> list[Gtk.Button]:
+    """Every Lighting colour swatch button (`device_overview.py::
+    _lighting_colour_button`) under `root`."""
+    return find_all(
+        root,
+        lambda w: isinstance(w, Gtk.Button)
+        and w.get_child() is not None
+        and "lighting-colour-swatch" in w.get_child().get_css_classes(),
+    )
+
+
+def colour_chooser(window: Gtk.Window) -> Gtk.ColorChooserWidget:
+    """The `Gtk.ColorChooserWidget` inside a Lighting colour picker window."""
+    return find_one(window, lambda w: isinstance(w, Gtk.ColorChooserWidget))
 
 
 def pick_colour(btn: Gtk.Widget, rgba: Gdk.RGBA) -> None:
     """Simulates a user picking `rgba` in a Lighting colour button's picker
-    window (`device_overview.py::_lighting_colour_button`) without actually
-    presenting it: sets the embedded `Gtk.ColorChooserWidget`'s value
-    directly, then clicks "Select" the same way a real pick would."""
-    window = btn.colour_picker_window
-    find_one(window, lambda w: isinstance(w, Gtk.ColorChooserWidget)).set_rgba(rgba)
+    window (`device_overview.py::_lighting_colour_button`): opens it, sets
+    the embedded `Gtk.ColorChooserWidget`'s value directly, then clicks
+    "Select" the same way a real pick would."""
+    window = open_window(btn)
+    colour_chooser(window).set_rgba(rgba)
     button_labeled(window, "Select").emit("clicked")

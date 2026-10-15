@@ -188,10 +188,16 @@ class DepthTrack(Gtk.Overlay):
             self.add_overlay(mw)
             self.marker_widgets.append(mw)
 
+        # Not bound methods: a controller this bar owns must not hold the bar
+        # itself (CONTRIBUTING.md, "GUI signal handlers"), so each handler
+        # reads the bar back off the gesture instead.
         drag = Gtk.GestureDrag()
-        drag.connect("drag-begin", self._on_drag_begin)
-        drag.connect("drag-update", self._on_drag_update)
-        drag.connect("drag-end", self._on_drag_end)
+        for signal, handler in (
+            ("drag-begin", DepthTrack._on_drag_begin),
+            ("drag-update", DepthTrack._on_drag_update),
+            ("drag-end", DepthTrack._on_drag_end),
+        ):
+            drag.connect(signal, lambda g, x, y, handler=handler: handler(g.get_widget(), g, x, y))
         self.add_controller(drag)
         self._drag_index: int | None = None
         self._drag_start_value = 0
@@ -293,17 +299,18 @@ def build_actuation_section(
     signal connection on every one of this editor's frequent eager rebuilds.
 
     `on_saved` (ticket 27's live-hardware verification caught this): every
-    popover for every Grid key is pre-built once, from one `GetConfig()`
-    snapshot, during the app's own `rebuild()` — there is no Daemon signal
-    for actuation-point/default changes (unlike `capture_mode`), so without
-    forcing a rebuild, a `default_actuation`/override change made here was
-    invisible in *any* freshly opened popover (this one or another key's)
-    until the GUI was restarted. `set_actuation_point`/`clear_actuation_point`
-    only ever affect this one key and already update this popover's own
-    markers directly, so they're left alone; `set_default_actuation`/
-    `reset_actuation_points` affect other keys' popovers too, so they call
-    `on_saved()` on success, same as Save/Clear above — popping this popover
-    down and forcing the next one open to read fresh data.
+    Grid key's editor is built from the one `GetConfig()` snapshot taken by
+    the app's own `rebuild()`, even when it's opened long after — there is
+    no Daemon signal for actuation-point/default changes (unlike
+    `capture_mode`), so without forcing a rebuild, a `default_actuation`/
+    override change made here was invisible in *any* freshly opened popover
+    (this one or another key's) until the GUI was restarted.
+    `set_actuation_point`/`clear_actuation_point` only ever affect this one
+    key and already update this popover's own markers directly, so they're
+    left alone; `set_default_actuation`/`reset_actuation_points` affect
+    other keys' popovers too, so they call `on_saved()` on success, same as
+    Save/Clear above — popping this popover down and forcing the next one
+    open to read fresh data.
     """
     profile_dict = config["profiles"][profile]
     default_actuation = profile_dict["default_actuation"]
@@ -847,6 +854,9 @@ def build_action_and_trigger_fields(
     # `render_action_editor()`, which is where an Action-kind change can pull
     # `analog_repeat` out of the model entirely (Profile Switch, Axis).
     analog_hint = Gtk.Label(label=_ANALOG_REPEAT_HINT, xalign=0, wrap=True, css_classes=["dim"])
+    # Weak: `trigger_dd`'s and `action_dd`'s handlers reach this, and both sit
+    # inside `fields` (CONTRIBUTING.md, "GUI signal handlers").
+    fields_ref, trigger_row_ref = fields.weak_ref(), trigger_row.weak_ref()
 
     def sync_analog_hint() -> None:
         idx = trigger_dd.get_selected()
@@ -854,9 +864,9 @@ def build_action_and_trigger_fields(
         want = selected == "analog_repeat"
         present = analog_hint.get_parent() is not None
         if want and not present:
-            fields.insert_child_after(analog_hint, trigger_row)
+            fields_ref().insert_child_after(analog_hint, trigger_row_ref())
         elif present and not want:
-            fields.remove(analog_hint)
+            fields_ref().remove(analog_hint)
 
     trigger_dd.connect("notify::selected", lambda *_: sync_analog_hint())
 
@@ -1249,9 +1259,9 @@ def build_dual_stage_panel(
     # Each of these commits real Daemon state and then rebuilds the panel
     # locally (the window stays open, like Apply). They call `on_commit()`
     # on success for the same reason Apply does — so dismissing the window
-    # afterwards drives the one deferred `on_change()` that refreshes every
-    # other cached editor's snapshot, even if the user never touches
-    # Save/Apply/Clear.
+    # afterwards drives the one deferred `on_change()` that refreshes the
+    # config snapshot every other key's editor opens from, even if the user
+    # never touches Save/Apply/Clear.
 
     def on_add_deep() -> None:
         if not has_primary():
@@ -1451,7 +1461,12 @@ def build_dual_stage_panel(
         if track_holder["track"] is not None:
             track_holder["track"].set_live_value(depth)
 
+    # Weak: every handler inside `panel` reaches `rebuild` (CONTRIBUTING.md,
+    # "GUI signal handlers").
+    panel_ref = panel.weak_ref()
+
     def rebuild() -> None:
+        panel = panel_ref()
         capture_draft()
         clear_children(panel)
 
@@ -1924,10 +1939,9 @@ def build_chord_binding_dialog(
     membership (`members`) is fully decided before this dialog ever opens
     (the caller's own grid selection in `device_overview.py`), so there is
     no Input picker here, unlike `build_binding_editor`'s per-Input popover.
-    A fresh dialog is built and presented per call rather than built once
-    and reused (unlike ticket 44's per-key editor windows) — `members` and
-    `existing` differ on every "Binding →"/"Edit" click, so there is nothing
-    to usefully cache here.
+    A fresh dialog is built and presented per call, like ticket 44's
+    per-key editor windows — `members` and `existing` differ on every
+    "Binding →"/"Edit" click anyway.
 
     `editing_key` is the Chord's *original* `+`-joined member-key string
     when editing an existing Chord whose membership may have just changed

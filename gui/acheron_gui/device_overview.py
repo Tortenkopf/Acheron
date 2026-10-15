@@ -467,58 +467,92 @@ def make_input_button(
     else:
         btn.set_tooltip_text(full_text)
 
-    # Ticket 44 (live-verified on real hardware): a real top-level Gtk.Window
-    # instead of a Gtk.Popover anchored to `btn`. The Binding editor's
-    # content — now including ticket 44's always-inline key/mouse-button
-    # picker — is tall enough that GTK4/Wayland's Popover positioning has no
-    # valid place to put it for nearly every Device Overview grid button,
-    # even with the main window maximized: a Popover is constrained to its
-    # own toplevel's local bounds, not the full screen, and this content
-    # routinely needs more room than a grid button's surrounding space
-    # provides within that toplevel. A real Window is placed by the window
-    # manager across the whole screen instead, sidestepping the constraint
-    # entirely. Built once (like the old popover) and shown/hidden via
-    # present()/close() rather than recreated per click — which needs
-    # `set_hide_on_close`: unlike Gtk.Popover.popdown(), Gtk.Window.close()
-    # *destroys* the window by default. Live-verified as a real bug: without
-    # this, the second open of the same key re-presented an already-
-    # destroyed window ("A window is shown after it has been destroyed" per
-    # GTK's own warning), corrupting its content and eventually hanging the
-    # whole app after a few open/close cycles.
+    def on_click(b):
+        if on_click_override is not None:
+            on_click_override(inp)
+            return
+        _present_editor_window(
+            b,
+            lambda: _build_binding_editor_window(
+                client, config, profile, layer, inp, on_change, capture_mode, b
+            ),
+        )
+
+    btn.connect("clicked", on_click)
+    # Skips the editor's own deferred `on_change()`: the rebuild that took
+    # `btn` out of the window already re-reads the config an Apply may
+    # have committed.
+    btn.connect("notify::root", _destroy_editor_window_on_leaving_root)
+    return btn
+
+
+def _build_binding_editor_window(
+    client,
+    config: dict,
+    profile: str,
+    layer: str,
+    inp: str,
+    on_change: Callable[[], None],
+    capture_mode: str,
+    btn: Gtk.Button,
+) -> Gtk.Window:
+    """The Binding editor window `make_input_button`'s `btn` opens, built
+    from the config snapshot `btn` itself was built from.
+
+    Ticket 44 (live-verified on real hardware): a real top-level Gtk.Window
+    instead of a Gtk.Popover anchored to `btn`. The Binding editor's
+    content — now including ticket 44's always-inline key/mouse-button
+    picker — is tall enough that GTK4/Wayland's Popover positioning has no
+    valid place to put it for nearly every Device Overview grid button,
+    even with the main window maximized: a Popover is constrained to its
+    own toplevel's local bounds, not the full screen, and this content
+    routinely needs more room than a grid button's surrounding space
+    provides within that toplevel. A real Window is placed by the window
+    manager across the whole screen instead, sidestepping the constraint
+    entirely.
+
+    gui-memory-leak ticket 02: built on every open and destroyed on every
+    close, never pre-built and hidden. GTK keeps a top-level window in its
+    process-wide list until it's destroyed, so the old pre-built,
+    hide-on-close window (one per Input, rebuilt with every Device
+    Overview) was never freed, along with its ~400 widgets. Since each open
+    builds a fresh window, no destroyed window is ever re-presented — the
+    hazard hide-on-close used to guard against ("A window is shown after it
+    has been destroyed", which corrupted the content and eventually hung
+    the app)."""
     window = Gtk.Window(modal=True, title=f"{profile} / {layer} / {input_label(inp)}")
-    window.set_hide_on_close(True)
 
     # tartarus-dual-stage-keys ticket 10: the full app rebuild moved off the
-    # per-Save path onto the window's close-request handler, fired once per
-    # editing session and only when a Save or Apply actually committed
-    # something (`committed`). The grid-key panel's **Apply** commits and
-    # rebuilds itself in place *without* closing; `on_commit` arms this flag
-    # so the eventual dismissal — Save's own `window.close()`, the WM close
-    # button, or Escape — still drives exactly one `on_change()`. A pure
-    # open/close (nothing committed) leaves the cached hide-on-close window
-    # untouched and skips the rebuild, keeping "reopen is instant".
+    # per-Save path onto the window's close, fired once per editing session
+    # and only when a Save or Apply actually committed something
+    # (`committed`). The grid-key panel's **Apply** commits and rebuilds
+    # itself in place *without* closing; `on_commit` arms this flag so the
+    # eventual dismissal — Save, the WM close button, or Escape — still
+    # drives exactly one `on_change()`. A pure open/close (nothing
+    # committed) skips the rebuild.
     committed = {"yes": False}
 
     def mark_committed():
         committed["yes"] = True
 
-    def rebuild_if_committed():
+    def close():
+        # Destroyed before `on_change()`, so the rebuild it drives never
+        # finds this window still open.
+        _destroy_editor_window(btn)
         if committed["yes"]:
             committed["yes"] = False
             on_change()
 
     def on_saved():
         committed["yes"] = True
-        window.close()
-        # `Gtk.Window.close()` only emits `close-request` for a realized
-        # window, so drive the deferred rebuild directly here too; when the
-        # signal *does* also fire (a mapped window), `rebuild_if_committed`
-        # is a no-op the second time (the flag is already cleared).
-        rebuild_if_committed()
+        # Not `window.close()`: that only emits `close-request` for a
+        # realized window, so drive the close (and the deferred rebuild)
+        # directly instead.
+        close()
 
     def on_close_request(_w):
-        rebuild_if_committed()
-        return False  # let hide-on-close proceed
+        close()
+        return True  # already destroyed; stop GTK's own default close
 
     window.connect("close-request", on_close_request)
 
@@ -535,21 +569,46 @@ def make_input_button(
         client, config, profile, layer, inp, on_saved, capture_mode, on_commit=mark_committed
     )
     window.set_child(editor)
+    return window
 
-    def on_click(_b):
-        if on_click_override is not None:
-            on_click_override(inp)
-            return
-        window.set_transient_for(btn.get_root())
-        window.present()
 
-    btn.connect("clicked", on_click)
-    # Exposed for tests, which need to reach the editor's content without
-    # actually presenting a real top-level window in a headless run (unlike
-    # the old Gtk.Popover, there's no `btn.get_popover()`-style GTK API for
-    # "the window this button opens").
-    btn.binding_editor_window = window
-    return btn
+def _present_editor_window(btn: Gtk.Button, build: Callable[[], Gtk.Window]) -> None:
+    """Presents the editor window `btn` has open, first building it with
+    `build()` if none is open."""
+    window = open_editor_window(btn)
+    if window is None:
+        window = build()
+        btn._open_editor_window = window
+    window.set_transient_for(btn.get_root())
+    window.present()
+
+
+def _destroy_editor_window(btn: Gtk.Button) -> None:
+    """Destroys the editor window `btn` has open and forgets it. Cleared
+    here rather than from the window's `destroy` signal, which doesn't fire
+    while the window's Python wrapper is still alive."""
+    window = btn._open_editor_window
+    btn._open_editor_window = None
+    window.destroy()
+
+
+def _destroy_editor_window_on_leaving_root(btn: Gtk.Button, _pspec) -> None:
+    """`notify::root` handler for an editor button: a rebuild clears the
+    tree `btn` sits in, taking it out of the main window, and an editor it
+    still has open goes with it, so no top-level window outlives the
+    Device Overview that spawned it."""
+    if btn.get_root() is None and open_editor_window(btn) is not None:
+        _destroy_editor_window(btn)
+
+
+def open_editor_window(btn: Gtk.Button) -> Gtk.Window | None:
+    """The editor window a Device Overview Input button (`make_input_button`)
+    or a Lighting colour button (`_lighting_colour_button`) currently has
+    open, or `None` when none is open. Exposed for tests, which reach an
+    editor's content by clicking the button and then reading this —
+    unlike the old Gtk.Popover, there's no `btn.get_popover()`-style GTK API
+    for "the window this button opens"."""
+    return getattr(btn, "_open_editor_window", None)
 
 
 def build_device_geometry(cell_factory: Callable[[str, int, int], Gtk.Widget]) -> Gtk.Widget:
@@ -726,9 +785,8 @@ def build_chords_section(
                 chord_ui["edit_key"],
             )
             # Exposed for tests, which need to reach a fresh dialog's
-            # content without a real windowing system — mirrors
-            # `make_input_button`'s own `btn.binding_editor_window`, except
-            # this one is rebuilt per click rather than built once, since
+            # content without a real windowing system — the Chord dialog's
+            # counterpart to `open_editor_window`, rebuilt per click since
             # `members`/`existing` differ every time.
             binding_btn.last_chord_dialog = dialog
             dialog.present()
@@ -1115,12 +1173,28 @@ def _lighting_colour_button(colour: dict, on_commit: Callable[[dict], None]) -> 
     btn = Gtk.Button(child=swatch)
     btn.set_tooltip_text("Pick a colour")
 
+    def on_click(b):
+        _present_editor_window(b, lambda: _build_colour_picker_window(current, swatch, on_commit, b))
+
+    btn.connect("clicked", on_click)
+    btn.connect("notify::root", _destroy_editor_window_on_leaving_root)
+    return btn
+
+
+def _build_colour_picker_window(
+    current: dict, swatch: Gtk.Picture, on_commit: Callable[[dict], None], btn: Gtk.Button
+) -> Gtk.Window:
+    """The "Pick a colour" window `_lighting_colour_button`'s `btn` opens,
+    pre-set to the swatch's `current` colour. gui-memory-leak ticket 03:
+    built on every open and destroyed on every close, never pre-built and
+    hidden, for the same reason as `_build_binding_editor_window`. Select
+    commits `current` and repaints `swatch`; Cancel and the window's own
+    close commit nothing."""
     chooser = Gtk.ColorChooserWidget()
     chooser.set_use_alpha(False)  # LED colours are opaque; on_commit ignores alpha anyway
-    chooser.set_rgba(_colour_to_rgba(colour))
+    chooser.set_rgba(_colour_to_rgba(current))
 
     window = Gtk.Window(modal=True, title="Pick a colour")
-    window.set_hide_on_close(True)
 
     box = Gtk.Box(
         orientation=Gtk.Orientation.VERTICAL,
@@ -1142,28 +1216,24 @@ def _lighting_colour_button(colour: dict, on_commit: Callable[[dict], None]) -> 
     window.set_child(box)
 
     def on_cancel(_b):
-        chooser.set_rgba(_colour_to_rgba(current))  # discard any in-progress pick
-        window.close()
+        _destroy_editor_window(btn)
 
     def on_select(_b):
         current.update(_rgba_to_colour(chooser.get_rgba()))
         swatch.set_paintable(_solid_colour_texture(current, *_COLOUR_SWATCH_SIZE))
-        window.close()
+        # Destroyed before `on_commit`, so a rebuild it drives never finds
+        # this window still open.
+        _destroy_editor_window(btn)
         on_commit(dict(current))
+
+    def on_close_request(_w):
+        _destroy_editor_window(btn)
+        return True  # already destroyed; stop GTK's own default close
 
     cancel_btn.connect("clicked", on_cancel)
     select_btn.connect("clicked", on_select)
-
-    def on_clicked(_b):
-        window.set_transient_for(btn.get_root())
-        window.present()
-
-    btn.connect("clicked", on_clicked)
-    # Exposed for tests, which need to reach the picker without actually
-    # presenting a real top-level window in a headless run — same reason
-    # `make_input_button`'s `btn.binding_editor_window` is exposed.
-    btn.colour_picker_window = window
-    return btn
+    window.connect("close-request", on_close_request)
+    return window
 
 
 _STYLE_OPTIONS = (("random", "Random"), ("single", "Single"), ("dual", "Dual"))

@@ -13,7 +13,7 @@ from acheron_gui.binding_editor import (
 )
 from acheron_gui.daemon_client import InvalidBindingError
 from acheron_gui.daemon_stub import DaemonStub
-from acheron_gui.device_overview import make_input_button
+from acheron_gui.device_overview import make_input_button, open_editor_window
 from acheron_gui.inputs import ACTION_TYPES, TRIGGER_OPTIONS
 
 from .widget_tree import button_labeled, editor_content, find_all, find_one
@@ -362,10 +362,10 @@ def test_reset_all_keys_to_profile_default_calls_reset_actuation_points():
 
 def test_set_as_profile_default_closes_the_popover_and_refreshes_the_cached_config():
     # Ticket 27's live-hardware verification caught this: every Grid key's
-    # popover is pre-built once from a single `GetConfig()` snapshot, and
-    # there's no Daemon signal for a `default_actuation` change (unlike
-    # `capture_mode`) — so without forcing a rebuild here, a new default was
-    # invisible in any freshly opened popover until the whole GUI restarted.
+    # editor is built from the single `GetConfig()` snapshot taken at the
+    # last rebuild, and there's no Daemon signal for a `default_actuation`
+    # change (unlike `capture_mode`) — so without forcing a rebuild here, a
+    # new default was invisible in any freshly opened popover until the whole GUI restarted.
     stub = DaemonStub()
     changed = []
 
@@ -497,6 +497,29 @@ def test_depth_track_set_live_value_updates_the_fill_and_tolerates_none():
     track.set_live_value(None)
     assert track.live_value is None
     assert not track.fill.get_visible()
+
+
+def test_dragging_a_depth_track_marker_reports_the_move_and_the_drop():
+    """The drag gesture reaches the bar through the gesture itself, not a
+    held reference — so this drags with nothing in Python holding the bar,
+    as in a built editor."""
+    moved, dropped = [], []
+    box = Gtk.Box()
+    box.append(
+        DepthTrack(
+            markers=[{"value": 128, "css": "marker-actuation", "draggable": True}],
+            on_marker_moved=lambda i, v: moved.append((i, v)),
+            on_drag_end=lambda i, v: dropped.append((i, v)),
+        )
+    )
+    drag = box.get_first_child().observe_controllers().get_item(0)
+
+    drag.emit("drag-begin", 160.0, 0.0)
+    drag.emit("drag-update", 64.0, 0.0)
+    drag.emit("drag-end", 64.0, 0.0)
+
+    assert moved == [(0, 179)]
+    assert dropped == [(0, 179)]
 
 
 # --- Key/mouse-button picker (ticket 42) ---
@@ -1838,7 +1861,9 @@ def _dismiss(btn):
     # `Gtk.Window.close()` only emits `close-request` for a realized window,
     # which a headless test never has — emit it directly, standing in for the
     # WM close button / Escape / Save's own `window.close()`.
-    btn.binding_editor_window.emit("close-request")
+    window = open_editor_window(btn)
+    assert window is not None, "no editor window is open to dismiss"
+    window.emit("close-request")
 
 
 def test_apply_button_is_plain_while_save_keeps_the_accent():
@@ -1975,7 +2000,9 @@ def test_close_after_apply_drives_exactly_one_on_change():
     _dismiss(btn)
     assert changed == [1]
 
-    _dismiss(btn)  # a second dismissal must not re-fire
+    # The window was destroyed on close; a fresh session must not re-fire.
+    btn.emit("clicked")
+    _dismiss(btn)
     assert changed == [1]
 
 
@@ -1983,6 +2010,7 @@ def test_open_and_close_with_no_commit_drives_no_on_change():
     stub = DaemonStub()
     btn, changed = _grid_editor_button(stub)
 
+    btn.emit("clicked")
     _dismiss(btn)
 
     assert changed == []
@@ -2008,7 +2036,9 @@ def test_save_after_apply_still_commits_and_closes_once():
         {"trigger": "hold_to_repeat", "type": "keypress", "key": "KEY_F2", "modifiers": []},
     )
     assert changed == [1]
-    _dismiss(btn)  # nothing left to flush
+    assert open_editor_window(btn) is None  # Save destroyed the window
+    btn.emit("clicked")  # a fresh session has nothing left to flush
+    _dismiss(btn)
     assert changed == [1]
 
 
@@ -2062,8 +2092,8 @@ def test_apply_with_an_axis_primary_falls_back_to_close_and_reopen():
 
 def test_add_deep_stage_then_dismiss_drives_exactly_one_on_change():
     # A structural edit that commits real Daemon state also arms the deferred
-    # rebuild, so closing the window afterwards refreshes the other cached
-    # editors even though Save/Apply/Clear were never clicked.
+    # rebuild, so closing the window afterwards refreshes the snapshot the
+    # other editors open from even though Save/Apply/Clear were never clicked.
     stub = DaemonStub()
     stub.set_binding(
         "grid_r1c1", "base",
@@ -2076,5 +2106,6 @@ def test_add_deep_stage_then_dismiss_drives_exactly_one_on_change():
 
     _dismiss(btn)
     assert changed == [1]
+    btn.emit("clicked")
     _dismiss(btn)
     assert changed == [1]

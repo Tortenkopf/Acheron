@@ -154,7 +154,12 @@ def build_inline_axis_picker(
         label = AXIS_LABEL_BY_TARGET.get(state["target"], "None") if state["target"] else "None"
         summary_label.set_label(f"Selected: {label}")
 
+    # Weak: the buttons inside `panel` reach this via `on_pick` (CONTRIBUTING.md,
+    # "GUI signal handlers").
+    panel_ref = panel.weak_ref()
+
     def render_panel():
+        panel = panel_ref()
         clear_children(panel)
         current = state["target"] or ""
         panel.append(_diagram(current, on_pick))
