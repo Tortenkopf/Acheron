@@ -467,58 +467,100 @@ def make_input_button(
     else:
         btn.set_tooltip_text(full_text)
 
-    # Ticket 44 (live-verified on real hardware): a real top-level Gtk.Window
-    # instead of a Gtk.Popover anchored to `btn`. The Binding editor's
-    # content — now including ticket 44's always-inline key/mouse-button
-    # picker — is tall enough that GTK4/Wayland's Popover positioning has no
-    # valid place to put it for nearly every Device Overview grid button,
-    # even with the main window maximized: a Popover is constrained to its
-    # own toplevel's local bounds, not the full screen, and this content
-    # routinely needs more room than a grid button's surrounding space
-    # provides within that toplevel. A real Window is placed by the window
-    # manager across the whole screen instead, sidestepping the constraint
-    # entirely. Built once (like the old popover) and shown/hidden via
-    # present()/close() rather than recreated per click — which needs
-    # `set_hide_on_close`: unlike Gtk.Popover.popdown(), Gtk.Window.close()
-    # *destroys* the window by default. Live-verified as a real bug: without
-    # this, the second open of the same key re-presented an already-
-    # destroyed window ("A window is shown after it has been destroyed" per
-    # GTK's own warning), corrupting its content and eventually hanging the
-    # whole app after a few open/close cycles.
+    def on_click(b):
+        if on_click_override is not None:
+            on_click_override(inp)
+            return
+        window = open_editor_window(b)
+        if window is None:
+            window = _build_binding_editor_window(
+                client, config, profile, layer, inp, on_change, capture_mode, b
+            )
+            b._open_editor_window = window
+        window.set_transient_for(b.get_root())
+        window.present()
+
+    def on_root_changed(b, _pspec):
+        # A rebuild clears the tree this button sits in, taking it out of
+        # the main window: an editor it still has open goes with it, so no
+        # top-level window outlives the Device Overview that spawned it.
+        # Skips the editor's own deferred `on_change()`: this rebuild
+        # already re-reads the config an Apply may have committed.
+        if b.get_root() is None and open_editor_window(b) is not None:
+            _destroy_editor_window(b)
+
+    btn.connect("clicked", on_click)
+    btn.connect("notify::root", on_root_changed)
+    return btn
+
+
+def _build_binding_editor_window(
+    client,
+    config: dict,
+    profile: str,
+    layer: str,
+    inp: str,
+    on_change: Callable[[], None],
+    capture_mode: str,
+    btn: Gtk.Button,
+) -> Gtk.Window:
+    """The Binding editor window `make_input_button`'s `btn` opens, built
+    from the config snapshot `btn` itself was built from.
+
+    Ticket 44 (live-verified on real hardware): a real top-level Gtk.Window
+    instead of a Gtk.Popover anchored to `btn`. The Binding editor's
+    content — now including ticket 44's always-inline key/mouse-button
+    picker — is tall enough that GTK4/Wayland's Popover positioning has no
+    valid place to put it for nearly every Device Overview grid button,
+    even with the main window maximized: a Popover is constrained to its
+    own toplevel's local bounds, not the full screen, and this content
+    routinely needs more room than a grid button's surrounding space
+    provides within that toplevel. A real Window is placed by the window
+    manager across the whole screen instead, sidestepping the constraint
+    entirely.
+
+    gui-memory-leak ticket 02: built on every open and destroyed on every
+    close, never pre-built and hidden. GTK keeps a top-level window in its
+    process-wide list until it's destroyed, so the old pre-built,
+    hide-on-close window (one per Input, rebuilt with every Device
+    Overview) was never freed, along with its ~400 widgets. Since each open
+    builds a fresh window, no destroyed window is ever re-presented — the
+    hazard hide-on-close used to guard against ("A window is shown after it
+    has been destroyed", which corrupted the content and eventually hung
+    the app)."""
     window = Gtk.Window(modal=True, title=f"{profile} / {layer} / {input_label(inp)}")
-    window.set_hide_on_close(True)
 
     # tartarus-dual-stage-keys ticket 10: the full app rebuild moved off the
-    # per-Save path onto the window's close-request handler, fired once per
-    # editing session and only when a Save or Apply actually committed
-    # something (`committed`). The grid-key panel's **Apply** commits and
-    # rebuilds itself in place *without* closing; `on_commit` arms this flag
-    # so the eventual dismissal — Save's own `window.close()`, the WM close
-    # button, or Escape — still drives exactly one `on_change()`. A pure
-    # open/close (nothing committed) leaves the cached hide-on-close window
-    # untouched and skips the rebuild, keeping "reopen is instant".
+    # per-Save path onto the window's close, fired once per editing session
+    # and only when a Save or Apply actually committed something
+    # (`committed`). The grid-key panel's **Apply** commits and rebuilds
+    # itself in place *without* closing; `on_commit` arms this flag so the
+    # eventual dismissal — Save, the WM close button, or Escape — still
+    # drives exactly one `on_change()`. A pure open/close (nothing
+    # committed) skips the rebuild.
     committed = {"yes": False}
 
     def mark_committed():
         committed["yes"] = True
 
-    def rebuild_if_committed():
+    def close():
+        # Destroyed before `on_change()`, so the rebuild it drives never
+        # finds this window still open.
+        _destroy_editor_window(btn)
         if committed["yes"]:
             committed["yes"] = False
             on_change()
 
     def on_saved():
         committed["yes"] = True
-        window.close()
-        # `Gtk.Window.close()` only emits `close-request` for a realized
-        # window, so drive the deferred rebuild directly here too; when the
-        # signal *does* also fire (a mapped window), `rebuild_if_committed`
-        # is a no-op the second time (the flag is already cleared).
-        rebuild_if_committed()
+        # Not `window.close()`: that only emits `close-request` for a
+        # realized window, so drive the close (and the deferred rebuild)
+        # directly instead.
+        close()
 
     def on_close_request(_w):
-        rebuild_if_committed()
-        return False  # let hide-on-close proceed
+        close()
+        return True  # already destroyed; stop GTK's own default close
 
     window.connect("close-request", on_close_request)
 
@@ -535,23 +577,23 @@ def make_input_button(
         client, config, profile, layer, inp, on_saved, capture_mode, on_commit=mark_committed
     )
     window.set_child(editor)
+    return window
 
-    def on_click(_b):
-        if on_click_override is not None:
-            on_click_override(inp)
-            return
-        window.set_transient_for(btn.get_root())
-        btn._open_editor_window = window
-        window.present()
 
-    btn.connect("clicked", on_click)
-    return btn
+def _destroy_editor_window(btn: Gtk.Button) -> None:
+    """Destroys the editor window `btn` has open and forgets it. Cleared
+    here rather than from the window's `destroy` signal, which doesn't fire
+    while the window's Python wrapper is still alive."""
+    window = btn._open_editor_window
+    btn._open_editor_window = None
+    window.destroy()
 
 
 def open_editor_window(btn: Gtk.Button) -> Gtk.Window | None:
     """The editor window a Device Overview Input button (`make_input_button`)
     or a Lighting colour button (`_lighting_colour_button`) currently has
-    open, or `None` before it has opened one. Exposed for tests, which reach
+    open, or `None` when none is open. (A Lighting colour button still
+    keeps its pre-built picker until gui-memory-leak ticket 03.) Exposed for tests, which reach
     an editor's content by clicking the button and then reading this —
     unlike the old Gtk.Popover, there's no `btn.get_popover()`-style GTK API
     for "the window this button opens"."""

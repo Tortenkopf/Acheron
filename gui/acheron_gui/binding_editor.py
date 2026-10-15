@@ -293,17 +293,18 @@ def build_actuation_section(
     signal connection on every one of this editor's frequent eager rebuilds.
 
     `on_saved` (ticket 27's live-hardware verification caught this): every
-    popover for every Grid key is pre-built once, from one `GetConfig()`
-    snapshot, during the app's own `rebuild()` — there is no Daemon signal
-    for actuation-point/default changes (unlike `capture_mode`), so without
-    forcing a rebuild, a `default_actuation`/override change made here was
-    invisible in *any* freshly opened popover (this one or another key's)
-    until the GUI was restarted. `set_actuation_point`/`clear_actuation_point`
-    only ever affect this one key and already update this popover's own
-    markers directly, so they're left alone; `set_default_actuation`/
-    `reset_actuation_points` affect other keys' popovers too, so they call
-    `on_saved()` on success, same as Save/Clear above — popping this popover
-    down and forcing the next one open to read fresh data.
+    Grid key's editor is built from the one `GetConfig()` snapshot taken by
+    the app's own `rebuild()`, even when it's opened long after — there is
+    no Daemon signal for actuation-point/default changes (unlike
+    `capture_mode`), so without forcing a rebuild, a `default_actuation`/
+    override change made here was invisible in *any* freshly opened popover
+    (this one or another key's) until the GUI was restarted.
+    `set_actuation_point`/`clear_actuation_point` only ever affect this one
+    key and already update this popover's own markers directly, so they're
+    left alone; `set_default_actuation`/`reset_actuation_points` affect
+    other keys' popovers too, so they call `on_saved()` on success, same as
+    Save/Clear above — popping this popover down and forcing the next one
+    open to read fresh data.
     """
     profile_dict = config["profiles"][profile]
     default_actuation = profile_dict["default_actuation"]
@@ -1249,9 +1250,9 @@ def build_dual_stage_panel(
     # Each of these commits real Daemon state and then rebuilds the panel
     # locally (the window stays open, like Apply). They call `on_commit()`
     # on success for the same reason Apply does — so dismissing the window
-    # afterwards drives the one deferred `on_change()` that refreshes every
-    # other cached editor's snapshot, even if the user never touches
-    # Save/Apply/Clear.
+    # afterwards drives the one deferred `on_change()` that refreshes the
+    # config snapshot every other key's editor opens from, even if the user
+    # never touches Save/Apply/Clear.
 
     def on_add_deep() -> None:
         if not has_primary():
@@ -1924,10 +1925,9 @@ def build_chord_binding_dialog(
     membership (`members`) is fully decided before this dialog ever opens
     (the caller's own grid selection in `device_overview.py`), so there is
     no Input picker here, unlike `build_binding_editor`'s per-Input popover.
-    A fresh dialog is built and presented per call rather than built once
-    and reused (unlike ticket 44's per-key editor windows) — `members` and
-    `existing` differ on every "Binding →"/"Edit" click, so there is nothing
-    to usefully cache here.
+    A fresh dialog is built and presented per call, like ticket 44's
+    per-key editor windows — `members` and `existing` differ on every
+    "Binding →"/"Edit" click anyway.
 
     `editing_key` is the Chord's *original* `+`-joined member-key string
     when editing an existing Chord whose membership may have just changed

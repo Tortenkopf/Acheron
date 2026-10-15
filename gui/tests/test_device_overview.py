@@ -18,7 +18,7 @@ from acheron_gui.device_overview import (
 from acheron_gui.library_view import build_library_sidebar
 from acheron_gui.inputs import ALL_INPUTS, GRID_COLS, GRID_ROWS, grid_input, input_label
 
-from .widget_tree import button_labeled, editor_content, find_all, find_one, pick_colour
+from .widget_tree import button_labeled, editor_content, find_all, find_one, pick_colour, toplevels
 
 
 def _build(stub, ui_state):
@@ -147,6 +147,49 @@ def test_an_input_button_exposes_the_editor_window_it_opened_once_clicked():
     window = open_editor_window(btn)
     assert window.get_title() == "Default / base / 1"
     find_one(window.get_child(), lambda w: isinstance(w, Gtk.Button) and w.get_label() == "Save")
+
+
+def test_building_device_overview_builds_no_editor_windows():
+    _build(DaemonStub(), {})
+
+    assert len(toplevels()) == 0
+
+
+def test_closing_an_input_buttons_editor_destroys_it():
+    stub = DaemonStub()
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+    btn.emit("clicked")
+    assert len(toplevels()) == 1
+
+    open_editor_window(btn).emit("close-request")
+
+    assert open_editor_window(btn) is None
+    assert len(toplevels()) == 0
+
+
+def test_saving_in_an_input_buttons_editor_destroys_it():
+    stub = DaemonStub()
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "mode_key", lambda: None)
+
+    button_labeled(editor_content(btn), "Save").emit("clicked")
+
+    assert open_editor_window(btn) is None
+    assert len(toplevels()) == 0
+
+
+def test_each_open_of_an_input_button_builds_a_fresh_editor_window():
+    stub = DaemonStub()
+    btn = make_input_button(stub, stub.get_config(), "Default", "base", "grid_r1c1", lambda: None)
+    btn.emit("clicked")
+    first = open_editor_window(btn)
+    first.emit("close-request")
+
+    btn.emit("clicked")
+
+    second = open_editor_window(btn)
+    assert second is not first
+    assert second.get_title() == "Default / base / 1"
+    assert len(toplevels()) == 1
 
 
 def test_an_input_button_in_chord_selecting_mode_opens_no_editor_window():

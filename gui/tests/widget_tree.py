@@ -67,6 +67,13 @@ def button_labeled(root: Gtk.Widget, label: str) -> Gtk.Button:
     return find_one(root, lambda w: isinstance(w, Gtk.Button) and w.get_label() == label)
 
 
+def toplevels() -> list[Gtk.Window]:
+    """Every top-level window GTK is still holding in its process-wide
+    list, i.e. every one not yet destroyed."""
+    model = Gtk.Window.get_toplevels()
+    return [model.get_item(i) for i in range(model.get_n_items())]
+
+
 def open_window(btn: Gtk.Widget) -> Gtk.Window:
     """The editor window `btn` has open, clicking it first if nothing is
     open yet — the same path a user takes. `present()` is a no-op under

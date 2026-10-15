@@ -362,10 +362,10 @@ def test_reset_all_keys_to_profile_default_calls_reset_actuation_points():
 
 def test_set_as_profile_default_closes_the_popover_and_refreshes_the_cached_config():
     # Ticket 27's live-hardware verification caught this: every Grid key's
-    # popover is pre-built once from a single `GetConfig()` snapshot, and
-    # there's no Daemon signal for a `default_actuation` change (unlike
-    # `capture_mode`) — so without forcing a rebuild here, a new default was
-    # invisible in any freshly opened popover until the whole GUI restarted.
+    # editor is built from the single `GetConfig()` snapshot taken at the
+    # last rebuild, and there's no Daemon signal for a `default_actuation`
+    # change (unlike `capture_mode`) — so without forcing a rebuild here, a
+    # new default was invisible in any freshly opened popover until the whole GUI restarted.
     stub = DaemonStub()
     changed = []
 
@@ -1977,7 +1977,9 @@ def test_close_after_apply_drives_exactly_one_on_change():
     _dismiss(btn)
     assert changed == [1]
 
-    _dismiss(btn)  # a second dismissal must not re-fire
+    # The window was destroyed on close; a fresh session must not re-fire.
+    btn.emit("clicked")
+    _dismiss(btn)
     assert changed == [1]
 
 
@@ -2011,7 +2013,9 @@ def test_save_after_apply_still_commits_and_closes_once():
         {"trigger": "hold_to_repeat", "type": "keypress", "key": "KEY_F2", "modifiers": []},
     )
     assert changed == [1]
-    _dismiss(btn)  # nothing left to flush
+    assert open_editor_window(btn) is None  # Save destroyed the window
+    btn.emit("clicked")  # a fresh session has nothing left to flush
+    _dismiss(btn)
     assert changed == [1]
 
 
@@ -2065,8 +2069,8 @@ def test_apply_with_an_axis_primary_falls_back_to_close_and_reopen():
 
 def test_add_deep_stage_then_dismiss_drives_exactly_one_on_change():
     # A structural edit that commits real Daemon state also arms the deferred
-    # rebuild, so closing the window afterwards refreshes the other cached
-    # editors even though Save/Apply/Clear were never clicked.
+    # rebuild, so closing the window afterwards refreshes the snapshot the
+    # other editors open from even though Save/Apply/Clear were never clicked.
     stub = DaemonStub()
     stub.set_binding(
         "grid_r1c1", "base",
@@ -2079,5 +2083,6 @@ def test_add_deep_stage_then_dismiss_drives_exactly_one_on_change():
 
     _dismiss(btn)
     assert changed == [1]
+    btn.emit("clicked")
     _dismiss(btn)
     assert changed == [1]
